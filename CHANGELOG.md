@@ -4,6 +4,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Windows x64 and MinGW-w64 G++ are the supported platform and compiler.
+  The C++23 header remains C++23; the C++26 module uses static reflection.
+- The public header lives in `include/vmhook/vmhook.hpp`; the primary module
+  source lives in `modules/vmhook.ixx`. Both module interfaces contain no
+  preprocessor directives; the Windows bridge imports an SDK header unit.
+  `tools/make_header.py` regenerates the standalone header.
+- Static and instance wrappers use `getMethod` and `getField`. Instance lookup
+  takes an explicit receiver, such as `getMethod("add", *this)`; static lookup
+  needs only the name. Checked lookup arrows report missing members with
+  `vmhook::exception` instead of dereferencing an empty optional.
+- JNI and JVMTI calls are removed, including hidden function-table calls,
+  native-thread attachment, JNI string/object helpers, and global references.
+  Native threads submit `vmhook::dispatch` tasks; an existing hooked Java
+  thread services them. The application must keep reaching a hook.
+- Object construction first tries the current Java thread's TLAB, then can
+  invoke an already-loaded Java `Unsafe.allocateInstance` method through the
+  Java-call backend before invoking the selected constructor. Classes must
+  already be loaded, initialized, and concrete. Raw arrays/String assembly
+  retain their TLAB-only allocation path.
+- `method_proxy::value_t::was_invoked()` distinguishes refused calls from
+  successfully invoked methods returning void, null, or zero. Construction
+  rejects an object whose Java constructor was not invoked.
+- Public reference field stores require the Epsilon collector until a correct
+  write-barrier backend exists. Epoch checks detect some stale references and
+  do not establish a GC-root or pinning guarantee.
+- Typed reference fields and object-returning calls require verified compressed
+  oops. Wide reference slots need the appropriate lower-level access API.
+- Compact object headers use detected VM flags and exported mark-word metadata
+  for supported class/array reads. Direct TLAB assembly remains limited to
+  ordinary headers; object construction can use the Java allocation backend.
+  Calls refresh their bound receiver and directly supplied wrapper arguments
+  after collection during that call. Receiver-bound method proxies must not
+  outlive their C++ wrapper; the temporary handles do not persist after a call.
+- README and build configuration describe the implemented interfaces and
+  runtime boundaries. Historical benchmarks are not current performance claims.
+
+### Removed
+
+- Scoped hooks and their RAII handles. Hooks have explicit persistent lifetime.
+- `static_method` and `static_field`; use the receiver-free `getMethod` and
+  `getField` overloads. Legacy snake_case instance lookups remain available.
+- Compiler and operating-system branches outside Windows x64 G++.
+- JIT entry/flag rewrites, deoptimization sweeps, and the hook-repair watchdog.
+  Hooks observe the interpreter path; compiled/inlined calls can bypass them.
+- Undocumented JNI fallback behavior.
+- Build targets that refer to missing examples, injectors, or test trees.
+
+The entries below preserve historical release notes. Earlier platform support,
+APIs, JNI paths, test counts, timing figures, and claimed artifacts describe
+those entries as originally recorded; they have not been independently
+revalidated and are not guarantees for the current implementation. Use the
+README and current source for the supported behavior.
+
 ## [7.0.0] — 2026-08-14
 
 ### Changed

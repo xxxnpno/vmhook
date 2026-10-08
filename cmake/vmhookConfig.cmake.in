@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+if(NOT WIN32 OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    message(FATAL_ERROR "VMHook requires a Windows x64 GNU G++ target.")
+endif()
+include("${CMAKE_CURRENT_LIST_DIR}/vmhookTargets.cmake")
+check_required_components(vmhook)

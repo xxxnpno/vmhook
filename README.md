@@ -1,453 +1,358 @@
-# vmhook
+# VMHook
 
-Read fields, call methods, construct objects and hook methods in a **running HotSpot JVM**, from C++, without asking the JVM's permission. No JVMTI, no JNI.
+VMHook is a C++ library for inspecting and hooking a **running Windows x64
+HotSpot JVM** from an injected DLL. Write a C++ wrapper resembling the Java
+class, then read its fields, call its methods, or intercept a method call.
+VMHook does not use JNI or JVMTI and does not require JVM launch arguments.
 
-**A C++26 module, and g++ only**, with a **generated C++23 header** beside it for a toolchain
-that has neither modules nor reflection. No preprocessor in the library beyond the global module
-fragment that `<windows.h>` requires. The portability branches for MSVC, clang, Linux, macOS,
-iOS, Android and aarch64 are gone: this targets the newest g++ on Windows x86-64 and nothing
-else.
+Two interfaces expose the same runtime:
 
-```bash
-# the module — C++26, static reflection, and what the library is written in
-g++ -std=c++26 -freflection -fmodules -c vmhook/ext/vmhook/vmhook.ixx -o vmhook.o
-g++ -std=c++26 -freflection -fmodules your.cpp vmhook.o -o your.exe -Wl,--allow-multiple-definition
+| Interface | Language | Compiler |
+| --- | --- | --- |
+| `include/vmhook/vmhook.hpp` | C++23, permanently; no modules | MinGW-w64 G++ 14+ |
+| `modules/vmhook.ixx` | C++26/latest; named module and static reflection | MinGW-w64 G++ with the required GCC 16 features |
 
-# or the header — C++23, no flags, nothing to build first
-g++ -std=c++23 -I vmhook/ext your.cpp -o your.exe
-```
+Both target **Windows x64 only**. Java 8 and newer HotSpot builds are the
+compatibility target. VMHook relies on HotSpot internals, so this does not imply
+support for OpenJ9, every vendor build, or every collector. Available operations
+also depend on the layouts and capabilities detected in the running VM.
 
-`vmhook.hpp` is **generated from `vmhook.ixx`** by `tools/make_header.py`, so the two cannot
-drift: everything is edited in the module. The transform removes exactly the C++26 from it —
-the module preamble, `std::meta`, `^^`, annotations, `= delete("reason")` — and supplies a
-C++23 answer for each, so the same call returns the same string either way. **The header is
-C++23 and stays C++23**; nothing in it may ever need a C++26 feature.
+## Build
 
-Two things the module does that the header cannot, both diagnostics rather than behaviour:
-
-| | module | header |
-|---|---|---|
-| `type_name<T>()` | `std::meta::display_string_of(^^T)` | parses `std::source_location`, same spelling |
-| enumerator names | `std::meta::enumerators_of(^^E)` | probes values 0–127 via `source_location` |
-| `[[= vmhook::java_class("…")]]` | read at compile time | not readable; falls back to `register_class` |
-
-A consumer of the module includes its own headers **before** the import — `#include <cstdio>`
-then `import vmhook;`, never the other way round, or GCC 16.2 reports a redefinition of
-`std::__is_constant_evaluated`. It also includes `<string_view>` if it means to compare the
-views vmhook returns: their operators live in the global module fragment, which a consumer's
-lookup does not reach.
-
-That link flag is working around a **GCC 16.2 bug**, not a design choice: a function-local
-`static` inside an inline function in a module's purview is emitted into the module's object
-*and* into every consumer's, so the linker sees the same symbol twice. It happens inside
-libstdc++'s own `std::format` as well as in vmhook, so no source change avoids it. The
-definitions are identical, which is why letting the linker pick one is safe.
-
-What used to be a macro is now a value or a function template — macros do not cross a module
-boundary, so a consumer would never have seen them:
-
-| was | is |
-|---|---|
-| `VMHOOK_VERSION_MAJOR` … | `vmhook::version_major`, `version_minor`, `version_patch`, `version`, `version_string` |
-| `VMHOOK_DEBUG_LOGS` | `vmhook::debug_logs` — a `constexpr bool` behind `if constexpr` |
-| `VMHOOK_LOG_FILE` | `vmhook::log_file_path` — a **run-time** path, settable after the fact |
-| `VMHOOK_AUTO_ATTACH_THREADS` | `vmhook::auto_attach_threads` |
-| `VMHOOK_DISABLE_AUTO_REPAIR` | `vmhook::auto_repair` |
-| `VMHOOK_LOG(...)` | `vmhook::detail::log_line(...)` — a variadic function template |
-
----
-
-## Wrapping a class
-
-When you want to work with a java class, reproduce the elements you want to work with in cpp.
+For the header, include it and compile your DLL as C++23:
 
 ```cpp
-import vmhook;
-
-namespace sdk
-{
-    // if you want to work with the java Entity class
-    // reproduce this template for every class you'll work with
-    class entity : public vmhook::object<sdk::entity>
-    {
-    public:
-        entity(const vmhook::oop_t instance)
-            : vmhook::object<sdk::entity>{ instance } {}
-
-        // methods
-    };
-}
-
-// associate your cpp class with the java class
-vmhook::register_class<sdk::entity>("net/minecraft/entity/Entity");
+#include <vmhook/vmhook.hpp>
 ```
 
-## Getting a value
-
-```cpp
-// Entity class has a field named health, here is how to obtain it
-auto get_health()
-     -> float
-{
-    return get_field("health")->get();
-}
-
-// std::string = java.lang.String
-auto get_name()
-    -> std::string
-{
-    return get_field("name")->get();
-}
-
-// for objects other than string always return a unique_ptr, not the object itself
-auto get_riding_entity()
-    -> std::unique_ptr<sdk::entity>
-{
-    return get_field("ridingEntity")->get();
-}
-
-// a STATIC java field reads exactly like an instance one, nothing extra
-auto get_entity_count()
-    -> std::int32_t
-{
-    return get_field("entityCount")->get();
-}
+```sh
+g++ -std=c++23 -shared -I include payload.cpp -o payload.dll
 ```
 
-## Setting a value
+A CMake build requires CMake 3.28 or newer.
 
-```cpp
-// same logic as get(), if the field is static, use the same syntax
-auto set_health(float health)
-    -> void
-{
-    get_field("health")->set(health);
-}
-
-auto set_name(const std::string& name)
-    -> void
-{
-    get_field("name")->set(name);
-}
-
-auto set_riding_entity(const std::unique_ptr<sdk::entity>& entity)
-    -> void
-{
-    get_field("ridingEntity")->set(entity);
-}
-
-// a STATIC java field writes exactly like an instance one
-auto set_entity_count(std::int32_t count)
-    -> void
-{
-    get_field("entityCount")->set(count);
-}
-```
-## Calling a method
-
-```cpp
-// syntax for method calling
-auto kill() const
-    -> void
-{
-    get_method("kill")->call();
-}
-
-auto get_distance_to_entity(const std::unique_ptr<sdk::entity>& entity)
-    -> float
-{
-    return get_method("getDistanceToEntity")->call(entity);
-}
-
-auto add_chat_message(const std::string& message, const std::int32_t id)
-    -> bool
-{
-    return get_method("addChatMessage")->call(message, id);
-}
-
-// a STATIC java method calls exactly like an instance one
-auto count_all()
-    -> std::int32_t
-{
-    return get_method("countAll")->call();
-}
-```
-
-## Creating objects
-
-```cpp
-// creating objects using a java constructor (vmhook::make_unique, NOT std::make_unique!!!)
-const std::unique_ptr<sdk::entity> fresh{ vmhook::make_unique<sdk::entity>() };
-
-// the unique_ptr is never nullptr (unless no more ram ofc), but if the java object is null, ->get_instance() will return nullptr
-// the unique_ptr is NOT the java object
-if (fresh->get_instance())
-{
-    fresh->set_health(20.0f);
-}
-```
-
-### A basic hook
-
-```cpp
-// reproduce the java args with cpp ones and add vmhook::return_value& return_value as the first one
-// no thizz in static methods ofc
-auto run_tick_hook(vmhook::return_value& return_value, const std::unique_ptr<sdk::minecraft>& thizz)
-    -> void
-{
-    // runs on the game thread, inside the call
-}
-
-// don't forget to declare the hook
-vmhook::hook<sdk::minecraft>("runTick", &zoo::run_tick_hook);
-```
-
-### Changing an argument
-
-```cpp
-auto send_chat_message_hook(vmhook::return_value& return_value, const std::unique_ptr<sdk::entity>& thizz, const std::string& message)
-    -> void
-{
-    if (message == "/hi")
-    {
-        // 0 is NOT thizz, be careful
-        return_value.set_arg(0, "/hello");
-    }
-
-    // the java method will run as normal but its arg will be changed
-}
-```
-
-### Cancelling the call
-
-```cpp
-auto attack_entity_hook(vmhook::return_value& return_value, const std::unique_ptr<sdk::entity>& thizz, const std::unique_ptr<sdk::entity>& target)
-    -> void
-{
-    // the java method will not run
-    if (!target->get_instance())
-    {
-        // only works for java void methods
-        return_value.cancel();
-    }
-}
-```
-
-### Forcing a return value
-
-```cpp
-auto is_singleplayer_hook(vmhook::return_value& return_value, const std::unique_ptr<sdk::minecraft>& thizz)
-    -> void
-{
-    // java isSingleplayer returns a bool
-    // we force the return value to true
-    return_value.set(true);
-
-    // even though isSingleplayer returns a bool, cpp hooks are always void
-}
-```
-
-### Getting caller info
-
-```cpp
-auto ray_trace_blocks_hook(vmhook::return_value& return_value, const std::unique_ptr<sdk::entity>& thizz)
-    -> void
-{
-    const vmhook::return_value::caller_info caller{ return_value.caller() };
-
-    // if you want to hook a method but only when it's called from "orientCamera"
-    // check caller struct for more tools
-    if (caller.valid() && caller.method_name == "orientCamera")
-    {
-        return_value.cancel();
-    }
-}
-```
-### Removing hooks
-
-```cpp
-// run this once before uninjecting
-vmhook::shutdown_hooks();
-```
-
-## Faster builds
-
-Measured here on GCC 16.2.0, one TU that names `vmhook::version` and nothing
-else:
-
-| | cost |
-|---|---|
-| `#include <vmhook/vmhook.hpp>` | **1.74 s per TU**, every TU |
-| `import vmhook;` | **0.10 s per TU**, plus 4 s once to build the module |
-
-Seventeen times cheaper per TU, and that is the whole argument for the module.
-
-### Take the prebuilt one
-
-Every [release](https://github.com/xxxnpno/vmhook/releases) carries the module
-already compiled, so you pay neither the 4 s nor the 1.7 s:
-
-```
-libvmhook.a    the module's static archive — this toolchain's "vmhook.lib"
-vmhook.gcm     the compiled module interface
-vmhook.ixx     the module source
-vmhook.hpp     the generated C++23 header
-```
-
-Put `vmhook.gcm` in a `gcm.cache/` directory beside where you compile, link
-`libvmhook.a`, and `import vmhook;` costs a tenth of a second with nothing to
-build first:
-
-```bash
-mkdir -p gcm.cache && cp /path/to/vmhook.gcm gcm.cache/
-g++ -std=c++26 -freflection -fmodules -O2 -c your.cpp -o your.o
-g++ your.o -l:libvmhook.a -o your.exe -Wl,--allow-multiple-definition
-```
-
-**The `.gcm` is not portable, by design.** It is GCC's own on-disk form of the
-module, valid only for the exact compiler build and flags named in the release's
-`BUILD-INFO.txt`. Any other compiler rejects it and rebuilds from `vmhook.ixx` —
-correct behaviour, and it costs only the 4 s the file was saving. The archive and
-the two sources have no such tie.
-
-### Or build it yourself
+A consuming CMake project can use the header target:
 
 ```cmake
 add_subdirectory(vmhook)
-set(VMHOOK_BUILD_MODULE ON)
-target_link_libraries(your_payload PRIVATE vmhook::module)
+target_link_libraries(payload PRIVATE vmhook::vmhook)
 ```
 
-### If you are on the header
+For the module, use CMake 4.0+, Python 3.10+, and a Windows G++ toolchain that
+provides `import std`, C++26 reflection, and named modules. Ninja is recommended:
 
-Link `vmhook::compiled` instead of `vmhook::vmhook` and your targets inherit a
-precompiled header built from `vmhook.hpp`:
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=g++ -DVMHOOK_BUILD_MODULE=ON
+cmake --build build
+```
+
+In a consuming project, set `VMHOOK_BUILD_MODULE` before adding VMHook and link
+`vmhook::module`:
 
 ```cmake
-target_link_libraries(your_payload PRIVATE vmhook::compiled)
+set(VMHOOK_BUILD_MODULE ON CACHE BOOL "Build the VMHook module")
+add_subdirectory(vmhook)
+target_link_libraries(payload PRIVATE vmhook::module)
 ```
 
-A 7-TU project, rebuilding all of its sources: **12.3 s → 2.2 s** on MSVC 19.44,
-**12.1 s → 6.8 s** on GCC 15. The PCH costs a few seconds to build once, so a
-one-TU project gains nothing — keep `vmhook::vmhook` there. A PCH cannot ship
-(it is tied to the exact compiler and flags that made it), so an installed
-vmhook needs you to ask for one yourself:
-
-```cmake
-target_precompile_headers(your_payload PRIVATE <vmhook/vmhook.hpp>)
+```cpp
+import std;
+import vmhook;
 ```
 
-`vmhook::compiled_version()` returns the version the archive was built from —
-compare it with `vmhook::version` if you ever suspect a stale one.
+The module uses reflection for compile-time type names, enumerator names, and
+Java-class annotations. Neither `.ixx` file contains preprocessor directives.
+The Windows module imports an SDK header unit from
+`include/vmhook/detail/windows.hpp`. The C++23 header embeds that boundary and
+is generated from the module with explicit C++23 replacements:
 
-## How the hook actually works
-
-Nothing here rewrites your Java method. The bytecode is untouched, the class is
-never redefined, and the JVM is never told anything happened.
-
-### 1. Every method has an entry point, and it is a pointer
-
-A HotSpot `Method` is a metadata object, and three of its fields are addresses
-the VM jumps to when someone calls that method:
-
-```
-Method
-  _i2i_entry             <- the interpreter's entry for this method
-  _from_interpreted_entry <- what interpreted callers jump to
-  _from_compiled_entry    <- what JIT-compiled callers jump to
-  _code                   <- the compiled nmethod, or null if not JIT'd yet
+```sh
+python tools/make_header.py
+python tools/make_header.py --check
 ```
 
-`_i2i_entry` points into the "interpreter to interpreter" stub — the machine
-code that runs when a Java method starts executing interpreted. vmhook reads all
-of these through VMStructs, by name, so no offset is hardcoded.
+`tools/build_module.py` builds the standard library, SDK header unit, Windows
+module, and VMHook module in dependency order. The CMake target supplies its
+module mapper and linker settings to consumers.
 
-One thing that matters later: **that stub is shared**. HotSpot generates one per
-method *shape*, not one per method, so many methods enter through the same
-address.
+Build module artifacts with the compiler and flags used by your application.
+A compiled module interface is a compiler cache, not a portable release format.
 
-### 2. vmhook writes a jump inside that stub
+Enable the repository checks with `-DBUILD_TESTING=ON`, build, and run
+`ctest --test-dir build --output-on-failure`. These checks do not by themselves
+establish compatibility with a live injected JVM.
 
-`vmhook::hook<T>("name", &fn)` finds the `Method`, then scans its i2i stub for an
-injection point — a specific `mov BYTE PTR [r15+imm32], imm8` (the thread-state
-write) that sits after the frame is built and the arguments are laid out, but
-before the first bytecode runs. That is the moment where `thizz` and every
-argument are already in place.
+## Wrap a Java class
 
-There it saves the original 5 bytes and writes `E9 <rel32>` — a jump to a small
-trampoline vmhook generated itself. The trampoline is allocated *within ±2GB* of
-the stub on purpose, because a 5-byte relative jump cannot reach further.
+Suppose the application has loaded this Java class:
 
-The trampoline:
+```java
+package example;
 
-- saves the interpreter's register state,
-- hands the frame pointer (`rbp`) and the `JavaThread` (`r15`) to vmhook's C++
-  dispatcher,
-- the dispatcher reads the **real `Method*` out of the frame** — remember the
-  stub is shared, so most calls arriving here belong to methods you never hooked,
-  and those are passed straight through,
-- for a hooked one, it walks the frame to `locals[]`, where `thizz` and the
-  arguments live, and decodes them into the C++ parameter types you declared,
-- it calls your function,
-- then either continues into the real method, or — if you called `cancel()` or
-  `set()` — writes the return slot and returns to the caller without the Java
-  method ever running.
+public class Counter {
+    public int value;
+    public static int total;
 
-That is why your parameters mirror the Java signature: they are read
-positionally out of interpreter slots. A `long` or a `double` occupies **two**
-slots, which vmhook works out from the method's descriptor rather than from your
-C++ types.
+    public Counter(int initial) { value = initial; }
+    public int add(int amount) { return value += amount; }
+    public static int count() { return total; }
+    public static void tick() { /* called regularly by the application */ }
+}
+```
 
-If another tool already patched that injection point (the first byte is already
-`E9`), vmhook chains in front of it rather than overwriting it, so both hooks
-still fire.
+Expose the members you need in C++. The same `getMethod` and `getField` names
+serve static and instance access:
 
-### 3. The JIT has to be pushed out of the way
+```cpp
+class Counter : public vmhook::object<Counter>
+{
+public:
+    using vmhook::object<Counter>::object;
 
-Patching `_i2i_entry` only affects the *interpreted* path. A method HotSpot has
-already compiled does not go through the interpreter at all — `_code` points at
-an nmethod and callers jump straight into machine code. The hook would install
-successfully and never fire.
+    auto value() const -> std::int32_t
+    {
+        return getField("value", *this)->get();
+    }
 
-So on install, for a method that is already compiled, vmhook:
+    auto value(std::int32_t next) -> void
+    {
+        getField("value", *this)->set(next);
+    }
 
-- points `_from_interpreted_entry` back at the (now patched) `_i2i_entry`,
-- points `_from_compiled_entry` at the **c2i adapter**, the stub that converts a
-  compiled call frame into an interpreter frame,
-- clears `_code` last, so the two writes above are visible before anyone
-  observes that the compiled version is gone.
+    auto add(std::int32_t amount) -> std::int32_t
+    {
+        return getMethod("add", *this)->call(amount);
+    }
 
-The c2i adapter is not always available to ask for: `AdapterHandlerEntry` is not
-exported by any JDK's VMStructs. vmhook derives it instead — adapters are shared
-per signature, so any interpreted method with the same descriptor and
-static-ness has the right one in its `_from_compiled_entry`, and a method that
-has itself been deoptimised once publishes its own from then on.
+    static auto count() -> std::int32_t
+    {
+        return getMethod("count")->call();
+    }
 
-The method is now interpreted again, and interpreted means patched. On the same
-install `hook()` also marks the method not-compilable so the JIT does not simply
-recompile it a second later (that bit lives in `Method::_access_flags` up to JDK
-23 and in `MethodFlags::_status` from JDK 24), and `_dont_inline` so it does not
-get inlined into a future caller. A background watchdog then re-checks every
-installed hook once a second and re-applies any that HotSpot managed to undo.
+    static auto total() -> std::int32_t
+    {
+        return getField("total")->get();
+    }
+};
+```
 
-**You never call any of this yourself.** There is no "deoptimise first" step:
-`vmhook::deoptimize_methods_if` and `deoptimize_all_jit_compiled_methods` exist
-for sweeping *other* methods you did not hook, and hooking a hot method needs
-none of it. You also never call `verify_hooks()` — the watchdog is what calls
-it, from the moment your first hook installs.
+Register the wrapper once during setup, after the Java class has loaded:
 
-The one case none of this reaches: a *caller* that was compiled with your method
-**inlined** into it has no call to intercept at all. Those call sites resolve
-themselves the next time HotSpot reaches a safepoint and re-evaluates the
-inline cache.
+```cpp
+if (!vmhook::register_class<Counter>("example/Counter"))
+{
+    // The class is not available yet; retry setup when it has loaded.
+    return;
+}
+```
 
-### 4. Removing them
+With the module, place the name on the class at compile time:
 
-`shutdown_hooks()` writes the saved original bytes back over every patched
-entry and stops the watchdog.
+```cpp
+class [[= vmhook::java_class("example/Counter")]] Counter
+    : public vmhook::object<Counter>
+{
+public:
+    using vmhook::object<Counter>::object;
+    // The same wrapper members as above.
+};
 
-Removing a hook stops threads from *entering* it. It cannot evict a thread that
-is already inside one, and vmhook keeps no in-flight count — so unloading your
-DLL right after is how you kill the process. If your tool supports detaching,
-prefer leaving the module mapped.
+const bool registered = vmhook::register_class<Counter>();
+```
 
+The C++23 header uses the explicit string registration shown first.
+
+Static access needs no object. Instance access supplies `*this`, so the lookup
+uses that object's runtime class. There is no separate `staticMethod` or
+`staticField` API. When overloads need an exact JVM descriptor, use
+`getMethod("add", "(I)I", *this)` or `getMethod("count", "()I")`.
+
+A missing member throws `vmhook::exception` when the new lookup's `->` is used;
+you can test the lookup before accessing it. Raw call results expose
+`was_invoked()` to distinguish refusal from a real void/null/zero result, and
+`threw()` plus `exception_class` for a Java exception. Converting directly to a
+primitive return type hides a refused call behind its default value; retain the
+raw result when this distinction matters. The legacy snake_case instance
+accessors remain available, but return optional lookups that must be checked.
+
+Primitive types use their matching C++ types, `std::string` represents a Java
+String, and `std::unique_ptr<Wrapper>` represents another wrapped object. The
+unique pointer owns the **C++ wrapper**, not the Java object and not a GC root.
+Resolve and use Java references within the executing Java-thread operation;
+copy ordinary C++ values out when work must cross threads.
+
+A call refreshes its bound receiver and directly supplied C++ wrapper arguments
+after GC during that call. A receiver-bound method proxy must not outlive its
+wrapper. Those temporary VM handles end with the call; unrelated wrappers and
+captured raw addresses are not retained across other Java calls.
+
+## Call Java from a C++ worker thread
+
+A native worker submits work with `vmhook::dispatch`. VMHook executes it on an
+existing Java thread when that thread next reaches an installed hook. It does
+not attach the native thread through JNI or fabricate a JavaThread.
+
+First install a hook on a method the application continues to execute through
+the interpreter:
+
+```cpp
+if (!vmhook::hook<Counter>("tick", [](vmhook::return_value&) -> void {}))
+{
+    return;
+}
+```
+
+Then a C++ worker can request a method call:
+
+```cpp
+auto pending = vmhook::dispatch([]() -> std::int32_t
+{
+    const auto result = Counter::getMethod("count")->call();
+    if (!result.was_invoked() || result.threw())
+    {
+        throw vmhook::exception{"Counter.count invocation failed"};
+    }
+    return result;
+});
+
+if (pending.wait_for(std::chrono::seconds{1}) == std::future_status::ready)
+{
+    const auto count = pending.get();
+}
+```
+
+The future becomes ready only when a Java thread services the queue. Submitting
+without a reachable hook can leave it pending indefinitely; a timeout does not
+cancel the task. Calling `dispatch` inside a validated VMHook callback runs the
+task immediately. Resolve wrappers inside the task instead of capturing raw
+Java object addresses from another thread, and capture ordinary C++ values by
+value when the task may outlive its submitting scope.
+
+Object construction belongs inside the same operation:
+
+```cpp
+auto pending = vmhook::dispatch([]() -> std::int32_t
+{
+    auto counter = vmhook::make_unique<Counter>(std::int32_t{10});
+    if (!counter || !counter->get_instance())
+    {
+        throw vmhook::exception{"Counter construction unavailable"};
+    }
+    return counter->add(5);
+});
+```
+
+`vmhook::make_unique` allocates a Java object and invokes its Java constructor;
+`std::make_unique` only creates a C++ wrapper. The Java class must already be
+loaded, initialized, and concrete. VMHook first tries the executing thread's
+TLAB when its layout permits direct allocation. If that fails, it can invoke
+an already-loaded Java `Unsafe.allocateInstance` method through the same Java
+call backend, then invoke the selected constructor. This allocation route does
+not call a JNI API or a native allocation export directly. Raw arrays and String
+assembly still use the current thread's TLAB without a VM allocation fallback.
+
+## Hook a method
+
+A hook mirrors the Java parameters, with `vmhook::return_value&` first. An
+instance method also receives its wrapper as the first parameter after that:
+
+```cpp
+auto add_hook(vmhook::return_value& result,
+              const std::unique_ptr<Counter>& self,
+              std::int32_t amount) -> void
+{
+    if (amount < 0)
+    {
+        result.set(std::int32_t{0}); // return immediately instead of running Java
+    }
+}
+
+const bool installed = vmhook::hook<Counter>("add", "(I)I", &add_hook);
+```
+
+`result.set_arg(0, value)` replaces the first Java argument; the receiver is
+not counted. `result.cancel()` skips a void method, while `result.set(value)`
+forces a return value. Hooks persist until `vmhook::shutdown_hooks()`; there
+are no scoped hooks.
+
+VMHook intercepts HotSpot's shared interpreter entry stubs and dispatches by
+the actual `Method*`. It leaves bytecode, JIT flags, and compiled method entries
+alone. Compiled or inlined calls can bypass the hook, including calls compiled
+after installation. Ordinary safepoints do not remove existing inlined code.
+A successful install confirms registration of an interpreter observer; test
+the call paths you need on the target JVM.
+
+Installation suspends other process threads and checks their contexts before
+patching code. Unsupported stub layouts or foreign patches are refused.
+`shutdown_hooks()` removes callbacks and attempts to restore patched entries.
+Retired trampolines are retained because VMHook cannot prove that every JVM
+thread has left generated code. Keep the injected DLL loaded.
+
+## Runtime boundaries
+
+- JNI-free invocation is available in validated VMHook Java-thread callbacks
+  and dispatched tasks. Direct invocation from an arbitrary native thread is
+  refused.
+- Raw Java object addresses can move or die during GC. Snapshot/epoch checks
+  detect some stale references; they do not pin objects or prove safety against
+  concurrent collection. A future is not a GC root.
+- Public Java reference field stores are supported only for a detected Epsilon
+  collector. Moving collectors need write-barrier support that VMHook does not
+  implement. Primitive field writes have a separate path.
+- Typed reference fields and object-returning method calls currently require
+  verified compressed oops. Uncompressed references are available only through
+  lower-level APIs with an explicitly correct slot width; typed wrappers refuse
+  them.
+- Compact headers are detected from VM flags and exported mark-word coordinates.
+  Supported states permit class/array reads; unknown or forwarding states are
+  refused. Object construction can use the Java allocation backend, while raw
+  String/array assembly still needs ordinary headers and available TLAB space.
+  [JEP 534](https://openjdk.org/jeps/534) makes compact headers the Java 27 default;
+  its [OpenJDK implementation](https://github.com/openjdk/jdk/pull/30322) is the
+  reference for that change.
+- Unsupported layouts, concurrent relocating collectors, or unavailable
+  allocation space can make individual operations unavailable.
+  A class must already be loaded; name lookup alone can be ambiguous across
+  class loaders.
+- Invocation and allocation use experimental HotSpot call-frame and handle
+  support. Native-handle extension storage is retained for process lifetime,
+  including after its Java thread exits. Live moving-GC behavior needs separate
+  validation on the exact Windows JDK build.
+
+Compilation checks and live JVM tests establish different things. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for validation expectations and
+[CHANGELOG.md](CHANGELOG.md) for migration notes.
+
+## Validation evidence
+
+Both interfaces passed the same 12 strict injected-runtime checks on these
+Windows x64 Temurin builds under Wine 10.0. The C++23 DLL was built with
+MinGW-w64 G++ 14.2.0; the C++26 module DLL with Windows G++ 16.2.0.
+The fixtures launched their JVMs normally, without tuning or agent arguments.
+
+| Windows JDK build | C++23 header | C++26 module |
+| --- | --- | --- |
+| 8u504-b01 | Passed | Passed |
+| 17.0.20.1+1 | Passed | Passed |
+| 21.0.12.1+1 | Passed | Passed |
+| 25.0.4.1+1 | Passed | Passed |
+| 27+35, default compact headers | Passed | Passed |
+
+The checks cover metadata, native-thread refusal, hooks, mixed argument
+reads/writes, worker dispatch, static/instance invocation, construction, Java
+exceptions, Unicode and embedded-NUL String reads, wrapper arguments and
+receivers across 32 forced-GC iterations, cancellation, and shutdown.
+Seven header/source checks and six module executable suites also passed,
+including reflection annotations, two translation units, memory boundaries,
+codec guards, fields, registry concurrency, dispatch, patching and watchers.
+
+These are finite results for the listed builds under Wine, not proof for every
+Windows JVM or collector. The [Windows CI workflow](.github/workflows/build.yml)
+repeats both interfaces and the five JDK versions on native Windows runners;
+consult its run results for native-Windows evidence.
+
+Primary implementation references:
+[OpenJDK HotSpot](https://github.com/openjdk/jdk/tree/master/src/hotspot),
+[Windows x64 ABI](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention),
+[GCC C++ feature status](https://gcc.gnu.org/projects/cxx-status.html), and
+[GCC module documentation](https://gcc.gnu.org/onlinedocs/gcc/C_002b_002b-Modules.html).
