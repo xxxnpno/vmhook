@@ -200,12 +200,25 @@ probe across the full range. Seven header/source checks and six module
 executable suites passed; the README reflection example compiled, linked and
 ran with the generated standard-library overlay.
 
+Native Windows CI additionally passed the complete Java 8–27 public-wrapper
+matrix for the G++ 14.2 C++23 header and G++ 16.2 C++26 module: **400/400 checks
+per interface**. At
+[commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c),
+the [push run](https://github.com/xxxnpno/vmhook/actions/runs/37995958477) and
+[PR run](https://github.com/xxxnpno/vmhook/actions/runs/37995966320) each passed
+**53/53 jobs**: 52 on Windows Server 2025 (10.0.26100, runner image
+`windows-2025-vs2026` version `20260925.250.1`) and one profile-reproduction job
+on Ubuntu. Each run passed 40 native-thread jobs, each enforcing all 20 checks,
+and 10 interpreter/dispatch runtime jobs on Java 8/17/21/25/27, each enforcing
+12 full-runtime checks. Windows builds also passed 7/7 G++ 14.2 header suites
+and 13/13 G++ 16.2 combined header/module suites.
+
 These are finite results for the manifest's exact Windows x64 builds and default
-collectors, executed under **Wine 10.0**. They do not establish native-Windows
-execution or every JVM in the range.
-The [Windows CI workflow](../.github/workflows/build.yml) repeats both public
-interfaces across all 20 versions; consult the actual workflow results for
-native-Windows evidence.
+collectors; they do not establish every JVM in the range. The G++ 16.2 header's
+full public runtime matrix and the 18 explicit-PDB runs per G++ 16.2 interface
+remain **Wine 10.0** results. The
+[Windows CI workflow](../.github/workflows/build.yml) preserves the native
+Windows matrices for subsequent changes.
 
 ## Implementation references
 

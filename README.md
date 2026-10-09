@@ -299,23 +299,30 @@ The [profile manifest](data/native_profiles.json) identifies the built-in
 images. Both interfaces passed all **20 native-thread checks on each Java major
 8–27**, with the JVMs launched normally:
 
-| Interface | Compiler | Result on the 20 pinned Windows x64 builds |
-| --- | --- | --- |
-| C++23 header | MinGW-w64 G++ 14.2 | 400/400 checks passed |
-| C++23 header | Windows G++ 16.2 | 400/400 checks passed |
-| C++26 module | Windows G++ 16.2 | 400/400 checks passed |
+| Interface | Compiler | Wine 10.0 | Native Windows CI |
+| --- | --- | --- | --- |
+| C++23 header | MinGW-w64 G++ 14.2 | 400/400 checks passed | 400/400 checks passed |
+| C++23 header | Windows G++ 16.2 | 400/400 checks passed | Public runtime matrix not run |
+| C++26 module | Windows G++ 16.2 | 400/400 checks passed | 400/400 checks passed |
 
-Both G++ 16.2 interfaces also passed **360/360 checks each** with matching-PDB
-resolution explicitly selected on Java 8 and 11–27. The seven header/source
+Both G++ 16.2 interfaces also passed **360/360 checks each under Wine 10.0** with
+matching-PDB resolution explicitly selected on Java 8 and 11–27. The seven header/source
 checks and six module executable suites passed, as did the README's reflection
 example. The tests include idle GC with moving collectors, actual compiled methods, same-thread
 execution and repeated/concurrent attachment without installing hooks.
 
-These runs used **Wine 10.0** and the listed exact builds/default collectors.
-They do not establish native-Windows execution or every vendor/collector
-combination. The [Windows CI workflow](.github/workflows/build.yml) is configured
-to repeat both interfaces across Java 8–27; consult its run results for
-native-Windows evidence.
+At [commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c),
+both the [push run](https://github.com/xxxnpno/vmhook/actions/runs/37995958477) and
+[PR run](https://github.com/xxxnpno/vmhook/actions/runs/37995966320) of the
+[Windows CI workflow](.github/workflows/build.yml) passed **53/53 jobs** each:
+52 jobs on native Windows Server 2025 and one profile-reproduction job on Ubuntu.
+Each run passed all 40 native-thread jobs across Java 8–27 and both interfaces,
+plus all 10 interpreter/dispatch runtime jobs on Java 8/17/21/25/27. Native
+Windows builds passed 7/7 G++ 14.2 header suites and 13/13 G++ 16.2 combined
+header/module suites. These finite results cover the manifest's exact Windows
+x64 builds and default collectors; they do not establish every vendor/collector
+combination. The G++ 16.2 header's full public runtime matrix and explicit-PDB
+validation remain Wine-only results.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for validation expectations and
 [CHANGELOG.md](CHANGELOG.md) for migration notes.
