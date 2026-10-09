@@ -192,6 +192,12 @@ A native worker submits work with `vmhook::dispatch`. VMHook executes it on an
 existing Java thread when that thread next reaches an installed hook. It does
 not attach the native thread through JNI or fabricate a JavaThread.
 
+Direct execution on the worker's own OS thread is possible after registering
+that thread with HotSpot. An isolated, exact-build experiment has verified that
+mechanism without calling JNI/JVMTI. It is not yet exposed by these wrappers;
+see [native-thread calling research](docs/native-threads.md) for the tested
+profile, GC lifetime requirements, and integration limits.
+
 First install a hook on a method the application continues to execute through
 the interpreter:
 
