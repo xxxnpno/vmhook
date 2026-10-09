@@ -72,6 +72,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   Hooks observe interpreter entries; compiled or inlined calls can bypass them.
 - Build targets referring to missing examples, injectors or test trees.
 
+### Fixed
+
+- Interpreter trampoline allocation keeps its strict nearby-address contract.
+  A failed hint no longer falls back outside the relative jump's range.
+  Cancellation tests use a previously unused method, verify its body is skipped,
+  and verify normal execution resumes after shutdown.
+
 The entries below preserve historical release notes. Earlier platform support,
 APIs, JNI paths, test counts, timing figures and claimed artifacts describe
 those entries as originally recorded; they have not been independently

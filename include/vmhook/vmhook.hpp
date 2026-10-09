@@ -486,9 +486,12 @@ namespace vmhook
 
         /*
             @brief Reserves and commits executable writable memory with VirtualAlloc.
-            @details A non-null address hint is tried first; failure retries without the hint.
+            @details A non-null address hint is tried first. Unless allow_fallback is
+            false, failure retries without the hint. Relative-jump allocations must
+            disable that fallback to preserve their address-range contract.
         */
-        inline auto allocate_rwx(void* address_hint, std::size_t size) noexcept -> void*
+        inline auto allocate_rwx(void* address_hint, std::size_t size,
+                                 bool allow_fallback = true) noexcept -> void*
         {
             if (size == 0)
             {
@@ -498,7 +501,7 @@ namespace vmhook
                                          vmhook::windows::mem_commit | vmhook::windows::mem_reserve,
                                          vmhook::windows::page_execute_readwrite) };
             // VirtualAlloc requires an available hinted range. Retry without the hint if it is occupied.
-            if (result == nullptr && address_hint != nullptr)
+            if (allow_fallback && result == nullptr && address_hint != nullptr)
             {
                 result = vmhook::windows::VirtualAlloc(nullptr, size,
                                         vmhook::windows::mem_commit | vmhook::windows::mem_reserve,
@@ -2814,9 +2817,8 @@ namespace vmhook
 
             /*
                 @brief Returns the current nmethod pointer (_code field).
-                @details Non-null when the method has been JIT-compiled; null when interpreted.
-                         Writing null forces HotSpot dispatch to treat the method as uncompiled
-                         without freeing the compiled code.
+                @details Read-only snapshot of the current compiled-code association.
+                         A null value does not establish that every caller is interpreted.
             */
             auto get_code() const noexcept
                 -> void*
@@ -2881,7 +2883,7 @@ namespace vmhook
             /*
                 @brief Returns the AdapterHandlerEntry* (_adapter field).
                 @details Stores the calling-convention adapters (i2c / c2i) for this method.
-                         Used to obtain the c2i entry when deoptimising a compiled method.
+                         Read-only adapter inspection; hooks do not alter compiled entries.
 
                 JDK 8 exports Method::_adapter via gHotSpotVMStructs and the
                 first branch returns immediately.  JDK 9+ dropped the field
@@ -2918,24 +2920,8 @@ namespace vmhook
                     return adapter;
                 }
 
-                // Slow path: JDK 9+ — heuristic detection, cached on success
-                // only.  Used to also cache the failure case as SIZE_MAX,
-                // but that was disastrous on Forge 1.8.9 / JDK 17: the
-                // first JIT-compiled method we probe (runTick) sometimes
-                // has its _adapter slot in an in-flight state where
-                // validation fails, which locked the cache to "failed"
-                // forever and made every later c2i lookup return nullptr.
-                // Downstream that bumped every JIT-compiled hook
-                // (orientCamera, rayTraceBlocks, ...) into the
-                // forced-deopt fallback - compiled callers kept bypassing
-                // the hook and e.g. camera_no_clip never fired.
-                //
-                // Retrying on every call until one Method validates lets a
-                // later, well-initialised Method (rayTraceBlocks, etc.)
-                // discover the offset, after which the cache is set and
-                // every subsequent call is a fast read.  get_adapter() is
-                // only invoked from hook install / shutdown, never from
-                // the hot detour path, so the per-call probe is cheap.
+                // Cache only a successfully validated offset. Retry a failed
+                // probe because a Method may not yet have an initialized adapter.
                 static std::atomic<std::size_t> cached_offset{ 0 };
                 std::size_t offset{ cached_offset.load(std::memory_order_acquire) };
                 if (offset == 0)
@@ -5517,6 +5503,7 @@ namespace vmhook
             const std::uintptr_t allocation_granularity{ static_cast<std::uintptr_t>(
                 vmhook::os::allocation_granularity()) };
             const std::uintptr_t target_address{ reinterpret_cast<std::uintptr_t>(nearby_addr) };
+            if (target_address > maximum_application_address - 5) { return nullptr; }
             const std::uintptr_t relative_limit{ static_cast<std::uintptr_t>(
                 (std::numeric_limits<std::int32_t>::max)()) };
 
@@ -5542,6 +5529,25 @@ namespace vmhook
                 target_address > maximum_application_address - relative_limit
                     ? maximum_application_address
                     : (std::min)(maximum_application_address, target_address + relative_limit)
+            };
+
+            const auto try_candidate = [&](const std::uintptr_t candidate) noexcept -> std::uint8_t*
+            {
+                // A failed hint must not silently allocate elsewhere. Even a
+                // successful reservation is checked against the actual JMP PC.
+                auto* const allocated = static_cast<std::uint8_t*>(vmhook::os::allocate_rwx(
+                    reinterpret_cast<void*>(candidate), size, false));
+                if (!allocated) { return nullptr; }
+                const auto displacement = static_cast<std::int64_t>(
+                    reinterpret_cast<std::uintptr_t>(allocated))
+                    - static_cast<std::int64_t>(target_address + 5);
+                if (displacement < std::numeric_limits<std::int32_t>::min()
+                    || displacement > std::numeric_limits<std::int32_t>::max())
+                {
+                    vmhook::os::release(allocated, size);
+                    return nullptr;
+                }
+                return allocated;
             };
 
             auto try_allocate_in_region = [&](const std::uintptr_t region_base,
@@ -5573,27 +5579,24 @@ namespace vmhook
                     align_down(target_address, allocation_granularity)
                 };
 
-                if (void* const allocated{ vmhook::os::allocate_rwx(
-                        reinterpret_cast<void*>(preferred_candidate), size) })
+                if (auto* const allocated{ try_candidate(preferred_candidate) })
                 {
-                    return reinterpret_cast<std::uint8_t*>(allocated);
+                    return allocated;
                 }
 
                 if (preferred_candidate != first_candidate)
                 {
-                    if (void* const allocated{ vmhook::os::allocate_rwx(
-                            reinterpret_cast<void*>(first_candidate), size) })
+                    if (auto* const allocated{ try_candidate(first_candidate) })
                     {
-                        return reinterpret_cast<std::uint8_t*>(allocated);
+                        return allocated;
                     }
                 }
 
                 if (preferred_candidate != last_candidate && first_candidate != last_candidate)
                 {
-                    if (void* const allocated{ vmhook::os::allocate_rwx(
-                            reinterpret_cast<void*>(last_candidate), size) })
+                    if (auto* const allocated{ try_candidate(last_candidate) })
                     {
-                        return reinterpret_cast<std::uint8_t*>(allocated);
+                        return allocated;
                     }
                 }
 
@@ -6342,11 +6345,8 @@ namespace vmhook
             @param adapter  AdapterHandlerEntry* stored in Method._adapter.
             @return The c2i entry address, or nullptr if not available.
             @details
-            Used when deoptimising a hook to redirect Method._from_compiled_entry to the
-            c2i adapter, so compiled callers that miss their inline cache re-enter the
-            interpreter and reach our patched i2i stub.
-            AdapterHandlerEntry._c2i_entry is exported via gHotSpotVMStructs on all
-            supported JDK versions (8 through 26).
+            Read-only inspection. If the current VM does not export the field,
+            this accessor returns nullptr. It does not redirect compiled callers.
         */
         inline auto get_c2i_entry_from_adapter(void* const adapter) noexcept
             -> void*
@@ -6421,10 +6421,8 @@ namespace vmhook
             @details
             Resolves "Method::<field_name>" via gHotSpotVMStructs (cached by the
             caller's static) and reads the void* at that offset through
-            safe_read_pointer — never a raw `*ptr`.  Used by the deopt sweep to
-            read Method::_code / _i2i_entry / _adapter off a possibly-cold Method*
-            without faulting: an unreadable field returns nullptr and the caller
-            skips the method.  Returns false (and leaves out=nullptr) when the
+            safe_read_pointer rather than a raw dereference. An unreadable field
+            returns nullptr. Returns false (and leaves out=nullptr) when the
             field is unresolved, the Method* is invalid, or the slot is unreadable.
 
             @param m       Method* to read from (re-validated here).
@@ -6456,14 +6454,9 @@ namespace vmhook
         /*
             @brief Validates that a candidate pointer looks like an AdapterHandlerEntry.
             @details
-            Reads two slots inside the candidate at offsets known from
-            VMStructs (_i2c_entry at offset 0 of every AHE layout we've
-            seen, plus _c2i_entry at the exported offset) and confirms
-            both point into executable memory.  Real AHE instances always
-            satisfy this because their entries live in HotSpot's code
-            cache, while random non-AHE pointers fail it with very high
-            probability (a stray pointer that points at three consecutive
-            executable-region pointers is astronomically unlikely).
+            Reads the i2c and c2i slots and checks that both addresses belong
+            to committed executable regions. This is a heuristic filter,
+            not proof of the candidate's type or metadata lifetime.
 
             @param candidate            Pointer treated as a possible AdapterHandlerEntry*.
             @param c2i_offset_in_ahe    Byte offset of _c2i_entry within the AHE.
@@ -7014,14 +7007,6 @@ namespace vmhook
 
             plus a leading receiver word for a non-static method.
 
-            Matching on the raw descriptor instead -- which is what this did
-            first -- is far stricter than the thing it is modelling, and the cost
-            is not theoretical: on a live JDK 26 Minecraft it found donors for 1
-            signature out of 24 and refused the rest, because it treated
-            `()Lnet/minecraft/client/Minecraft;` and `()V` as different keys when
-            HotSpot gives them the SAME adapter.  Every refusal then fell through
-            to a path that could not deoptimise.
-
             Encoded as a small string ("I", "L", "F", "D" per word) purely so it
             can key a map; the letters are the normalised classes above, not the
             descriptor characters they came from -- note that an object argument
@@ -7121,17 +7106,9 @@ namespace vmhook
         /*
             @brief Harvests borrowed-adapter evidence, stopping as soon as it can.
             @details
-            Every read here is os::safe_read, which on Windows is a
-            ReadProcessMemory SYSCALL.  A full sweep of a running Minecraft is
-            223,016 methods, and touching _code, the access flags and
-            _from_compiled_entry on each is on the order of 450,000 syscalls --
-            about three seconds, paid before the first hook fires.
-
-            Almost all of it is wasted.  A hook needs the adapter for ONE
-            signature, and common shapes are found within the first handful of
-            classes.  So the walk takes the key it is looking for and stops the
-            moment that key has two corroborating votes; everything harvested on
-            the way is kept, because it is free and the next lookup may want it.
+            This retained read-only adapter lookup stops after the requested key
+            has two corroborating votes. Evidence collected along the way is
+            cached for subsequent lookups. Hook installation does not use it.
 
             `complete` records whether the graph was exhausted.  Only then is a
             missing key known to be genuinely absent -- before that, a miss just
@@ -7139,8 +7116,7 @@ namespace vmhook
             incomplete index therefore re-runs the walk with no stop key, once,
             and from then on the answer is authoritative.
 
-            The counters are logged whenever a walk runs, because a silent zero
-            is what made the previous version's failure invisible.
+            The counters are logged whenever a walk runs.
         */
         struct c2i_index_state
         {
@@ -7227,8 +7203,8 @@ namespace vmhook
                             // shared _abstract_method_handler, whose c2i entry IS
                             // the AbstractMethodError stub -- and an abstract
                             // method has _code == nullptr, so it looks like a
-                            // perfect donor.  Borrowing one points the hooked
-                            // method at a throw.
+                             // plausible donor. Its throwing entry is not a
+                             // usable calling-convention adapter candidate.
                             // NATIVE: _from_compiled_entry is the native wrapper.
                             constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
                             constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
@@ -16378,10 +16354,8 @@ namespace vmhook
         /*
             @brief Returns the underlying HotSpot Method* (for advanced consumers).
             @details
-            Mirror of field_proxy::raw_address.  Lets users who want to drive
-            lower-level HotSpot APIs (custom hook trampolines, deopt sweeps,
-            interpreter-entry rewrites) reach the Method* without going through
-            vmhook::hook<T>().  Most code should prefer call() / hook<T>().
+            Mirror of field_proxy::raw_address for read-only metadata inspection.
+            Most code should prefer call() / hook<T>().
 
             Native contexts return the current metadata snapshot or nullptr for
             an expired/foreign proxy. Hold a native_backend::operation while

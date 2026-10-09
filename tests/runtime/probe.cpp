@@ -15,6 +15,8 @@ namespace
         using vmhook::object<fixture>::object;
         static auto total() -> std::int32_t { return getField("total")->get(); }
         static auto arguments_mutated() -> bool { return getField("argumentMutation")->get(); }
+        static auto request_cancellation() -> void { getField("cancelRequested")->set(true); }
+        static auto cancellation_body() -> std::int32_t { return getField("cancelBody")->get(); }
         static auto count_result() -> vmhook::method_proxy::value_t
         {
             return getMethod("count", "()I")->call();
@@ -114,26 +116,37 @@ namespace
 
     auto verify_hook_lifecycle(std::ostream& output) -> void
     {
+        // Keep field control and observations safe across the fixture's moving GC.
+        vmhook::native_thread_context context{"VMHook-lifecycle-fixture"};
         vmhook::shutdown_hooks();
-        const bool installed = vmhook::hook<fixture>("tick", "()V", [](vmhook::return_value& value)
+        cancelled_calls.store(0, std::memory_order_relaxed);
+        const auto body_before = context.valid() ? fixture::cancellation_body() : -1;
+        // This method is never called before installation. Keep tick's normal
+        // pacing so interpreter coverage does not depend on JIT warmup timing.
+        const bool installed = context.valid()
+            && vmhook::hook<fixture>("cancelProbe", "()V", [](vmhook::return_value& value)
         {
             cancelled_calls.fetch_add(1, std::memory_order_relaxed);
             value.cancel();
         });
+        if (installed) { fixture::request_cancellation(); }
         for (int attempt = 0; installed && attempt < 500
-            && cancelled_calls.load(std::memory_order_relaxed) < 100; ++attempt)
+            && cancelled_calls.load(std::memory_order_relaxed) < 16; ++attempt)
         {
             ::Sleep(10);
         }
         output << "cancellation="
-               << (installed && cancelled_calls.load(std::memory_order_relaxed) >= 100 ? "pass" : "fail") << '\n';
+               << (installed && cancelled_calls.load(std::memory_order_relaxed) >= 16
+                   && body_before == 0 && fixture::cancellation_body() == 0 ? "pass" : "fail") << '\n';
         vmhook::shutdown_hooks();
         ::Sleep(100);
         const auto after = cancelled_calls.load(std::memory_order_relaxed);
+        const auto body_after = context.valid() ? fixture::cancellation_body() : -1;
         ::Sleep(200);
         output << "shutdown="
                << (cancelled_calls.load(std::memory_order_relaxed) == after
-                   && vmhook::verify_hooks() == 0 ? "pass" : "fail") << '\n';
+                   && vmhook::verify_hooks() == 0 && context.valid()
+                   && fixture::cancellation_body() > body_after ? "pass" : "fail") << '\n';
     }
 
     auto worker(void*) -> DWORD

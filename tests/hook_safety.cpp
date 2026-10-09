@@ -55,6 +55,16 @@ int main()
     auto* code = static_cast<std::uint8_t*>(
         vmhook::windows::VirtualAlloc(nullptr, 8192, vmhook::windows::mem_commit | vmhook::windows::mem_reserve, vmhook::windows::page_execute_readwrite));
     if (!code) { return 1; }
+    check(vmhook::os::allocate_rwx(code, 4096, false) == nullptr,
+          "an occupied strict allocation hint cannot fall back to another address");
+    auto* const nearby = vmhook::hotspot::allocate_nearby_memory(code, 4096);
+    const auto displacement = nearby ? static_cast<std::int64_t>(
+        reinterpret_cast<std::uintptr_t>(nearby)) - static_cast<std::int64_t>(
+        reinterpret_cast<std::uintptr_t>(code) + 5) : std::numeric_limits<std::int64_t>::max();
+    check(nearby && displacement >= std::numeric_limits<std::int32_t>::min()
+          && displacement <= std::numeric_limits<std::int32_t>::max(),
+          "a trampoline reservation remains reachable by its five-byte relative jump");
+    if (nearby) { vmhook::os::release(nearby, 4096); }
     const std::array<std::uint8_t, 24> normal_entry{
         0x50, 0x55, 0x48, 0x89, 0xe5, 0x41, 0x55,
         0x41, 0xc6, 0x87, 0x34, 0x12, 0, 0, 1,
