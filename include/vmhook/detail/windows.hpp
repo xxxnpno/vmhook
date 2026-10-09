@@ -27,6 +27,7 @@ namespace vmhook::windows
     using ::LONG;
     using ::MEMORY_BASIC_INFORMATION;
     using ::PVOID;
+    using ::RUNTIME_FUNCTION;
     using ::SIZE_T;
     using ::SYSTEM_INFO;
     using ::THREADENTRY32;
@@ -42,6 +43,7 @@ namespace vmhook::windows
     using ::GetCurrentThreadId;
     using ::GetModuleHandleA;
     using ::GetModuleHandleW;
+    using ::GetModuleHandleExW;
     using ::GetModuleFileNameA;
     using ::GetModuleFileNameW;
     using ::GetEnvironmentVariableA;
@@ -54,6 +56,8 @@ namespace vmhook::windows
     using ::ReadProcessMemory;
     using ::RemoveVectoredExceptionHandler;
     using ::ResumeThread;
+    using ::RtlAddFunctionTable;
+    using ::RtlDeleteFunctionTable;
     using ::SetThreadContext;
     using ::SuspendThread;
     using ::TerminateProcess;
@@ -95,6 +99,8 @@ namespace vmhook::windows
     inline constexpr DWORD synchronize{ SYNCHRONIZE };
     inline constexpr DWORD wait_object_0{ WAIT_OBJECT_0 };
     inline constexpr DWORD duplicate_same_access{ DUPLICATE_SAME_ACCESS };
+    inline constexpr DWORD module_handle_from_address{ GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS };
+    inline constexpr DWORD module_handle_pin{ GET_MODULE_HANDLE_EX_FLAG_PIN };
     inline constexpr DWORD error_write_fault{ ERROR_WRITE_FAULT };
     inline constexpr DWORD context_control{ CONTEXT_CONTROL };
     inline constexpr DWORD context_debug_registers{ CONTEXT_DEBUG_REGISTERS };

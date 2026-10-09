@@ -6187,11 +6187,60 @@ namespace vmhook
             vmhook::hotspot::midi2i_hook* hook{ nullptr };
         };
 
-        // Every registry access holds this mutex. Dispatch retains a shared
-        // callable and releases it before invoking arbitrary user code.
+        // Writers serialize installation. Interpreter dispatch reads an immutable
+        // snapshot: a Java-state thread must neither wait for this mutex nor
+        // skip a registered callback when an installation holds it.
         inline std::vector<vmhook::hotspot::hooked_method> g_hooked_methods{};
         inline std::mutex g_hooked_methods_mutex{};
         inline std::atomic<bool> g_shutdown_requested{ false };
+
+        struct hook_dispatch_snapshot
+        {
+            std::vector<vmhook::hotspot::hooked_method> methods{};
+        };
+        inline std::atomic<const hook_dispatch_snapshot*> g_hook_dispatch{};
+        inline std::atomic<std::size_t> g_hook_dispatch_readers{};
+        inline std::vector<std::unique_ptr<hook_dispatch_snapshot>> g_hook_dispatch_snapshots{};
+
+        struct hook_dispatch_reader
+        {
+            const hook_dispatch_snapshot* snapshot{};
+            hook_dispatch_reader() noexcept
+            {
+                // The increment, publication and pointer load share one order.
+                // A writer can reclaim an old snapshot only when no reader could
+                // have loaded it. A reader starting after that check sees the
+                // new publication.
+                g_hook_dispatch_readers.fetch_add(1, std::memory_order_seq_cst);
+                this->snapshot = g_hook_dispatch.load(std::memory_order_seq_cst);
+            }
+            ~hook_dispatch_reader()
+            { g_hook_dispatch_readers.fetch_sub(1, std::memory_order_seq_cst); }
+            hook_dispatch_reader(const hook_dispatch_reader&) = delete;
+            auto operator=(const hook_dispatch_reader&) -> hook_dispatch_reader& = delete;
+        };
+
+        // Both vectors must have spare capacity prepared before a code patch.
+        // Destroy the returned snapshots after releasing the installation mutex:
+        // captured user objects may run arbitrary C++ destructors.
+        inline auto collect_hook_dispatch_locked(
+            std::vector<std::unique_ptr<hook_dispatch_snapshot>>& retired) noexcept -> void
+        {
+            if (g_hook_dispatch_readers.load(std::memory_order_seq_cst) != 0) { return; }
+            const auto* const current{ g_hook_dispatch.load(std::memory_order_seq_cst) };
+            for (auto& snapshot : g_hook_dispatch_snapshots)
+            {
+                if (snapshot.get() != current) { retired.push_back(std::move(snapshot)); }
+            }
+            std::erase_if(g_hook_dispatch_snapshots, [](const auto& snapshot) { return !snapshot; });
+        }
+
+        inline auto publish_hook_dispatch_locked(std::unique_ptr<hook_dispatch_snapshot> next) noexcept -> void
+        {
+            const auto* const pointer{ next.get() };
+            g_hook_dispatch_snapshots.push_back(std::move(next));
+            g_hook_dispatch.store(pointer, std::memory_order_seq_cst);
+        }
 
         /*
             @brief Global list of all i2i entry points that have been patched and their hooks.
@@ -6287,25 +6336,23 @@ namespace vmhook
                 { return 0; }
                 const auto* const current_method{ frame_pointer->get_method() };
                 if (!current_method) { return 0; }
-                std::shared_ptr<vmhook::hotspot::hook_callback_t> callback{};
+                const hook_dispatch_reader reader{};
+                const vmhook::hotspot::hook_callback_t* callback{};
+                if (!reader.snapshot) { return 0; }
+                const auto* const const_method{ current_method->get_const_method() };
                 {
-                    // Stay able to reach the interpreter's next safepoint poll;
-                    // a Java-state callback cannot park on a native mutex.
-                    std::unique_lock<std::mutex> lock{ vmhook::hotspot::g_hooked_methods_mutex, std::try_to_lock };
-                    if (!lock.owns_lock()) { return 0; }
                     if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire)) { return 0; }
-                    for (const auto& entry : vmhook::hotspot::g_hooked_methods)
+                    for (const auto& entry : reader.snapshot->methods)
                     {
                         if (entry.method == current_method
-                            && entry.const_method_identity == current_method->get_const_method()
-                            && entry.expected_method_name == current_method->get_name()
-                            && entry.expected_signature == current_method->get_signature())
-                        { callback = entry.detour; break; }
+                            && entry.const_method_identity == const_method)
+                        { callback = entry.detour.get(); break; }
                     }
                 }
                 if (!callback) { return 0; }
-                // Own the callable while the mutex is released: callbacks may
-                // install/shutdown hooks, recurse into Java, or overlap teardown.
+                // Keep the immutable snapshot alive through the callback. No
+                // callback ownership operation takes a registry lock or frees
+                // captured user objects while this Java thread is dispatching.
                 const current_thread_guard current_thread{ thread };
                 vmhook::hotspot::detour_java_anchor_t anchor{};
                 const auto sp{ reinterpret_cast<std::uintptr_t>(slot)
@@ -9092,6 +9139,7 @@ namespace vmhook
             method_entry.expected_method_name = std::string{ method_name };
             method_entry.expected_signature = found_method->get_signature();
 
+            std::vector<std::unique_ptr<vmhook::hotspot::hook_dispatch_snapshot>> retired_snapshots{};
             std::lock_guard<std::mutex> install_lock{ vmhook::hotspot::g_hooked_methods_mutex };
             if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire)) { return false; }
             for (const auto& existing : vmhook::hotspot::g_hooked_methods)
@@ -9102,6 +9150,11 @@ namespace vmhook
             // the callback after patch succeeds cannot then fail on allocation.
             vmhook::hotspot::g_hooked_methods.reserve(vmhook::hotspot::g_hooked_methods.size() + 1);
             vmhook::hotspot::g_hooked_i2i_entries.reserve(vmhook::hotspot::g_hooked_i2i_entries.size() + 1);
+            vmhook::hotspot::g_hook_dispatch_snapshots.reserve(vmhook::hotspot::g_hook_dispatch_snapshots.size() + 1);
+            retired_snapshots.reserve(vmhook::hotspot::g_hook_dispatch_snapshots.size() + 1);
+            auto next_dispatch{ std::make_unique<vmhook::hotspot::hook_dispatch_snapshot>() };
+            next_dispatch->methods = vmhook::hotspot::g_hooked_methods;
+            next_dispatch->methods.push_back(method_entry);
             const auto existing_stub{ std::find_if(vmhook::hotspot::g_hooked_i2i_entries.begin(),
                 vmhook::hotspot::g_hooked_i2i_entries.end(), [i2i](const auto& entry) { return entry.i2i_entry == i2i; }) };
             if (existing_stub == vmhook::hotspot::g_hooked_i2i_entries.end())
@@ -9114,6 +9167,8 @@ namespace vmhook
                 vmhook::hotspot::g_hooked_i2i_entries.push_back({ i2i, installed.release() });
             }
             vmhook::hotspot::g_hooked_methods.push_back(std::move(method_entry));
+            vmhook::hotspot::publish_hook_dispatch_locked(std::move(next_dispatch));
+            vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
             return true;
         }
         catch (const std::exception& exception)
@@ -9154,18 +9209,22 @@ namespace vmhook
     namespace detail { inline auto reset_watcher_latches() noexcept -> void; }
 
     // Removing observers does not permit unloading the DLL: callbacks already
-    // copied for dispatch and threads already inside a trampoline may complete
+    // selected for dispatch and threads already inside a trampoline may complete
     // afterwards. The embedding DLL stays resident for the JVM's lifetime.
     inline auto shutdown_hooks() noexcept -> void
     {
         vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
         try
         {
+            std::vector<std::unique_ptr<vmhook::hotspot::hook_dispatch_snapshot>> retired_snapshots{};
             {
                 std::lock_guard<std::mutex> lock{ vmhook::hotspot::g_hooked_methods_mutex };
+                retired_snapshots.reserve(vmhook::hotspot::g_hook_dispatch_snapshots.size());
+                vmhook::hotspot::g_hook_dispatch.store(nullptr, std::memory_order_seq_cst);
                 vmhook::hotspot::g_hooked_methods.clear();
                 for (const auto& entry : vmhook::hotspot::g_hooked_i2i_entries) { delete entry.hook; }
                 vmhook::hotspot::g_hooked_i2i_entries.clear();
+                vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
             }
             vmhook::detail::reset_watcher_latches();
         }

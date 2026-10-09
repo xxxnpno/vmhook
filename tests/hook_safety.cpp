@@ -3,6 +3,7 @@ import std;
 import vmhook;
 import vmhook.windows;
 #else
+#include <latch>
 #include <vmhook/vmhook.hpp>
 #endif
 
@@ -17,6 +18,66 @@ int main()
             ++failures;
         }
     };
+
+    // An in-flight callback must finish while an administrator holds the
+    // installation mutex and removes its registration. Its captured objects
+    // remain alive until that reader leaves and are destroyed outside the lock.
+    std::atomic<unsigned> callback_calls{};
+    std::atomic<unsigned> capture_destructions{};
+    std::atomic<bool> destruction_under_lock{};
+    auto capture = std::shared_ptr<int>(new int{7}, [&](int* value)
+    {
+        if (vmhook::hotspot::g_hooked_methods_mutex.try_lock())
+        { vmhook::hotspot::g_hooked_methods_mutex.unlock(); }
+        else { destruction_under_lock.store(true); }
+        delete value;
+        ++capture_destructions;
+    });
+    auto snapshot = std::make_unique<vmhook::hotspot::hook_dispatch_snapshot>();
+    snapshot->methods.emplace_back();
+    snapshot->methods.back().detour = std::make_shared<vmhook::hotspot::hook_callback_t>(
+        [capture, &callback_calls](vmhook::hotspot::frame*, vmhook::hotspot::java_thread*,
+                                  vmhook::hotspot::return_slot*)
+        { if (*capture == 7) { ++callback_calls; } });
+    capture.reset();
+    {
+        std::lock_guard lock{vmhook::hotspot::g_hooked_methods_mutex};
+        vmhook::hotspot::g_hook_dispatch_snapshots.reserve(2);
+        vmhook::hotspot::publish_hook_dispatch_locked(std::move(snapshot));
+    }
+    std::latch acquired{1}, removed{1}, invoked{1};
+    std::thread dispatching([&]
+    {
+        const vmhook::hotspot::hook_dispatch_reader reader{};
+        acquired.count_down();
+        removed.wait();
+        if (reader.snapshot && !reader.snapshot->methods.empty())
+        { (*reader.snapshot->methods.front().detour)(nullptr, nullptr, nullptr); }
+        invoked.count_down();
+    });
+    acquired.wait();
+    std::vector<std::unique_ptr<vmhook::hotspot::hook_dispatch_snapshot>> retired_snapshots;
+    retired_snapshots.reserve(2);
+    {
+        std::lock_guard lock{vmhook::hotspot::g_hooked_methods_mutex};
+        vmhook::hotspot::g_hook_dispatch.store(nullptr, std::memory_order_seq_cst);
+        vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
+        check(retired_snapshots.empty() && capture_destructions.load() == 0,
+              "removal retains the capture of an active dispatch");
+        removed.count_down();
+        invoked.wait();
+        check(callback_calls.load() == 1,
+              "an active dispatch invokes its callback while the installation mutex is held");
+    }
+    dispatching.join();
+    {
+        std::lock_guard lock{vmhook::hotspot::g_hooked_methods_mutex};
+        vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
+    }
+    retired_snapshots.clear();
+    check(capture_destructions.load() == 1 && !destruction_under_lock.load(),
+          "retired callback captures are released once, outside the installation mutex");
+
     const std::array<std::uint8_t, 4> vex{0xc5, 0xf8, 0x58, 0xc0};
     const std::array<std::uint8_t, 3> vzeroupper{0xc5, 0xf8, 0x77};
     const std::array<std::uint8_t, 1> unknown{0x62};
