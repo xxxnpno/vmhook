@@ -9,6 +9,79 @@ import vmhook.windows;
 
 static_assert(sizeof(void*) == 8, "VMHook requires Windows x64.");
 
+export namespace vmhook::hotspot { struct method; struct klass; }
+export namespace vmhook::detail::jit_backend
+{
+    inline auto at_safepoint(void (*callback)(void*) noexcept, void* opaque) noexcept -> bool;
+    inline auto with_vm_state(void (*callback)(void*) noexcept, void* opaque) noexcept -> bool;
+    inline auto return_handler(vmhook::hotspot::method*) noexcept -> void*;
+    inline auto throw_handler() noexcept -> void*;
+    inline auto metadata_contains(void*, vmhook::hotspot::method*) noexcept -> bool;
+    inline auto method_is_excluded(vmhook::hotspot::method*) noexcept -> bool;
+    inline auto holder_linked(vmhook::hotspot::klass*) noexcept -> bool;
+    inline auto install_method_policy(vmhook::hotspot::method*, bool (*)(void*) noexcept, void*, std::shared_ptr<void>&) noexcept -> bool;
+    inline auto release_method_policy_at_safepoint(const std::shared_ptr<void>&) noexcept -> void;
+    inline auto acquire_field_interpretation() noexcept -> bool;
+    inline auto release_field_interpretation() noexcept -> void;
+}
+export namespace vmhook::detail
+{
+    inline auto prepare_hook_roots() noexcept -> bool;
+    inline auto flush_hook_roots() noexcept -> void;
+    inline auto retain_hook_klass(vmhook::hotspot::klass*) noexcept -> std::shared_ptr<void>;
+    inline auto prepare_class_hooks(vmhook::hotspot::klass*) noexcept -> bool;
+    inline auto finish_class_hooks(vmhook::hotspot::klass*, bool) noexcept -> void;
+    inline auto fail_class_hook_preparation(void*) noexcept -> void;
+}
+
+export namespace vmhook::hotspot
+{
+    struct java_thread;
+    struct method;
+    struct return_slot;
+    struct detour_java_anchor_t;
+}
+
+export namespace vmhook::detail::native_backend
+{
+    struct context_lifetime;
+    struct root_ticket;
+    using root = std::shared_ptr<root_ticket>;
+    class operation final
+    {
+        std::shared_ptr<context_lifetime> context_{};
+        void* thread_{};
+        bool entered_{};
+        bool valid_{};
+    public:
+        operation() noexcept;
+        ~operation();
+        operation(const operation&) = delete;
+        auto operator=(const operation&) -> operation& = delete;
+        [[nodiscard]] auto valid() const noexcept -> bool { return this->valid_; }
+        explicit operator bool() const noexcept { return this->valid_; }
+    };
+    inline auto retain_oop(void*) noexcept -> root;
+}
+
+export namespace vmhook::detail
+{
+    using borrowed_callback = void(*)(void*);
+    inline auto borrowed_callback_supported() noexcept -> bool;
+    inline auto execute_borrowed_callback(hotspot::java_thread*, hotspot::detour_java_anchor_t,
+                                         borrowed_callback, void*) noexcept -> bool;
+    inline auto track_callback_oop_snapshot(void*, const native_backend::root&) noexcept -> void;
+    inline auto resolve_callback_oop_snapshot(void*) noexcept -> void*;
+    inline auto set_callback_reference(hotspot::return_slot*, const native_backend::root&) noexcept -> bool;
+    inline auto set_callback_reference_snapshot(hotspot::return_slot*, void*) noexcept -> bool;
+}
+
+export namespace vmhook::detail::jit_backend
+{
+    inline auto return_handler(hotspot::method*) noexcept -> void*;
+    inline auto throw_handler() noexcept -> void*;
+}
+
 export namespace vmhook
 {
     /*
@@ -468,123 +541,6 @@ export namespace vmhook
             vmhook::windows::FlushInstructionCache(vmhook::windows::GetCurrentProcess(), address, size);
         }
 
-        // ------------------------------------------------------------
-        // Hardware data breakpoints
-        // ------------------------------------------------------------
-        // x86_64 exposes four debug registers (DR0–DR3) that fire a
-        // #DB exception when a configured memory access matches.  On
-        // Windows we set them via SetThreadContext and catch the
-        // exception with a vectored exception handler; the watch
-        // remains zero-overhead until the trap actually fires.
-        //
-        // Currently a Windows-only path; on other platforms the
-        // companion vmhook::watch_static_field<> returns an empty
-        // handle and logs an error (there is no polling fallback).
-        // The capability flag below lets callers query support at
-        // compile time.
-
-
-        /*
-            @brief Type of memory access the breakpoint should trap on.
-        */
-        enum class data_breakpoint_kind : std::uint8_t
-        {
-            write    = 0b01,  // only writes
-            read_write = 0b11,  // reads and writes (no execute)
-        };
-
-        /*
-            @brief Length of the memory window the breakpoint guards.
-        */
-        enum class data_breakpoint_length : std::uint8_t
-        {
-            one_byte    = 0b00,
-            two_bytes   = 0b01,
-            eight_bytes = 0b10,
-            four_bytes  = 0b11,
-        };
-
-        namespace detail_dr
-        {
-            /*
-                @brief Builds a DR7 control mask enabling the given slot
-                       (0-3) for the given access kind / length.
-                @details
-                Per Intel SDM:
-                  - L0/L1/L2/L3 (bits 0,2,4,6) enable the local breakpoint.
-                  - R/W and LEN fields live at (16+4*slot) and (18+4*slot)
-                    respectively.  We keep the global enables (G*) cleared
-                    so the trap only applies to threads we explicitly
-                    configure.
-            */
-            inline auto build_dr7(int slot, data_breakpoint_kind rw,
-                                  data_breakpoint_length len) noexcept -> std::uint64_t
-            {
-                const std::uint64_t local_enable{ std::uint64_t{ 1 } << (slot * 2) };
-                const std::uint64_t rw_bits     { static_cast<std::uint64_t>(rw)
-                                                  << (16 + slot * 4) };
-                const std::uint64_t len_bits    { static_cast<std::uint64_t>(len)
-                                                  << (18 + slot * 4) };
-                return local_enable | rw_bits | len_bits;
-            }
-
-            struct thread_update_result
-            {
-                std::size_t examined{};
-                std::size_t applied{};
-                std::size_t failed{};
-                bool enumerated{};
-                [[nodiscard]] auto complete() const noexcept -> bool
-                { return enumerated && failed == 0; }
-            };
-
-            // Each callback receives a SUSPENDED other thread. It must not
-            // allocate, log, or acquire a C++ mutex; the target can own those
-            // resources. The calling thread is intentionally never suspended.
-            template<typename callback_type>
-            inline auto for_each_thread(callback_type&& callback) noexcept -> thread_update_result
-            {
-                thread_update_result result{};
-                const auto snapshot{ vmhook::windows::CreateToolhelp32Snapshot(vmhook::windows::snapshot_threads, 0) };
-                if (snapshot == vmhook::windows::invalid_handle_value) { return result; }
-                vmhook::windows::THREADENTRY32 entry{};
-                entry.dwSize = sizeof(entry);
-                if (!vmhook::windows::Thread32First(snapshot, &entry))
-                { vmhook::windows::CloseHandle(snapshot); return result; }
-                const auto process_id{ vmhook::windows::GetCurrentProcessId() };
-                const auto caller_id{ vmhook::windows::GetCurrentThreadId() };
-                do
-                {
-                    if (entry.dwSize >= vmhook::windows::thread_owner_process_id_offset + sizeof(entry.th32OwnerProcessID)
-                        && entry.th32OwnerProcessID == process_id && entry.th32ThreadID != caller_id)
-                    {
-                        ++result.examined;
-                        const auto thread{ vmhook::windows::OpenThread(
-                            vmhook::windows::thread_get_context | vmhook::windows::thread_set_context
-                                | vmhook::windows::thread_suspend_resume, false, entry.th32ThreadID) };
-                        if (!thread) { ++result.failed; }
-                        else
-                        {
-                            if (vmhook::windows::SuspendThread(thread) == static_cast<vmhook::windows::DWORD>(-1))
-                            { ++result.failed; }
-                            else
-                            {
-                                bool applied{};
-                                try { applied = callback(thread); } catch (...) {}
-                                if (vmhook::windows::ResumeThread(thread) == static_cast<vmhook::windows::DWORD>(-1))
-                                { applied = false; }
-                                if (applied) { ++result.applied; } else { ++result.failed; }
-                            }
-                            vmhook::windows::CloseHandle(thread);
-                        }
-                    }
-                    entry.dwSize = sizeof(entry);
-                } while (vmhook::windows::Thread32Next(snapshot, &entry));
-                result.enumerated = true;
-                vmhook::windows::CloseHandle(snapshot);
-                return result;
-            }
-        } // namespace detail_dr
     } // namespace os
 
     namespace hotspot
@@ -621,6 +577,7 @@ export namespace vmhook
     }
 
     class object_base;
+    template<typename wrapper_type> class borrowed;
 
     /*
         @brief Handle passed as the first argument to every hook callback.
@@ -646,6 +603,7 @@ export namespace vmhook
         }
 
         template<typename value_type>
+            requires (!std::is_base_of_v<vmhook::object_base, value_type>)
         auto set(const value_type value) noexcept
             -> void
         {
@@ -655,6 +613,15 @@ export namespace vmhook
                           "return_value::set: value_type must be trivially copyable - the slot is "
                           "a raw 64-bit cell, not a managed object.  Pass a primitive, an oop "
                           "pointer (void*), or a small POD by value.");
+            if constexpr (std::is_pointer_v<value_type>)
+            {
+                if (value)
+                {
+                    (void)vmhook::detail::set_callback_reference_snapshot(this->return_slot,
+                        const_cast<void*>(static_cast<const void*>(value)));
+                    return;
+                }
+            }
             this->return_slot->cancel = true;
 
             // Sign-extend signed integers smaller than int64 BEFORE writing the
@@ -702,6 +669,12 @@ export namespace vmhook
             this->return_slot->cancel = true;
             this->return_slot->retval = 0;
         }
+
+        auto set(const vmhook::object_base& value) noexcept -> void;
+        template<typename wrapper_type>
+        auto set(const vmhook::borrowed<wrapper_type>& value) noexcept -> void;
+        auto set(const vmhook::detail::native_backend::root& value) noexcept -> void
+        { (void)vmhook::detail::set_callback_reference(this->return_slot, value); }
 
         auto cancel() noexcept
             -> void
@@ -907,6 +880,8 @@ export namespace vmhook
         inline auto pump_dispatch() noexcept -> void;
         inline auto java_heap_mutation_supported() noexcept -> bool;
         inline auto java_execution_supported() noexcept -> bool;
+        inline auto class_event_notification_active() noexcept -> bool;
+        inline auto ensure_class_events_installed() noexcept -> bool;
         auto java_object_alignment() noexcept -> std::size_t;
         auto compressed_klass_mode() noexcept -> std::optional<bool>;
         auto compact_object_header_mode() noexcept -> std::optional<bool>;
@@ -5917,8 +5892,30 @@ export namespace vmhook
             return changed;
         }
 
-        // Persistent interpreter observation. It does not alter Method::_code,
-        // compiler flags, nmethods, inline caches, or existing compiled callers.
+        // Only the real VMThread safepoint transaction calls this helper.
+        // Bytes and executable storage are prepared by the native owner first.
+        inline auto replace_interpreter_code_at_safepoint(std::uint8_t* const target,
+            const std::array<std::uint8_t, 8>& expected,
+            const std::array<std::uint8_t, 8>& replacement) noexcept -> bool
+        {
+            std::array<std::uint8_t, 8> current{};
+            if (!vmhook::os::safe_read(current.data(), target, current.size()) || current != expected) { return false; }
+            vmhook::windows::DWORD protection{};
+            if (!vmhook::windows::VirtualProtect(target, replacement.size(), vmhook::windows::page_execute_readwrite, &protection)) { return false; }
+            std::memcpy(target, replacement.data(), replacement.size());
+            const bool flushed{ vmhook::windows::FlushInstructionCache(vmhook::windows::GetCurrentProcess(), target, replacement.size()) != false };
+            if (!flushed)
+            {
+                std::memcpy(target, expected.data(), expected.size());
+                vmhook::windows::FlushInstructionCache(vmhook::windows::GetCurrentProcess(), target, expected.size());
+            }
+            vmhook::windows::DWORD ignored{};
+            vmhook::windows::VirtualProtect(target, replacement.size(), protection, &ignored);
+            return flushed;
+        }
+
+        // Prepare outside the VM safepoint; activation is the final commit after
+        // compiler quiescence and real invalidation of existing inline callers.
         class midi2i_hook final
         {
         public:
@@ -5959,10 +5956,9 @@ export namespace vmhook
                 const std::size_t branch_offset{ assembly.size() };
                 emit({ 0x0f, 0x84, 0, 0, 0, 0 });
 
-                // Return before method synchronization has acquired a monitor.
-                // Clear the flag set by the displaced normal-entry instruction.
-                assembly.insert(assembly.end(), this->original.begin(), this->original.end());
-                assembly.back() = 0;
+                // The real interpreter return/throw entry consumes the
+                // displaced do_not_unlock_if_synchronized flag and performs
+                // safepoint, stack-watermark and activation unwind work.
                 emit({ 0x48, 0x8b, 0x44, 0x24, 0x08 });
                 const auto restore_vectors = [&emit]()
                 {
@@ -5974,9 +5970,10 @@ export namespace vmhook
                            0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5a, 0x59 });
                 };
                 restore_vectors();
-                emit({ 0x48, 0x83, 0xc4, 0x08, 0x9d, 0x66, 0x48, 0x0f, 0x6e, 0xc0,
-                       0x48, 0x8b, 0x5d, 0xf8, 0x48, 0x89, 0xec, 0x5d, 0x5e,
-                       0x48, 0x89, 0xdc, 0xff, 0xe6 });
+                // common_detour replaces the saved RAX word with a
+                // validated interpreter entry PC only on cancellation.
+                emit({ 0x4c, 0x8b, 0x1c, 0x24, 0x48, 0x83, 0xc4, 0x08, 0x9d,
+                       0x66, 0x48, 0x0f, 0x6e, 0xc0, 0x41, 0xff, 0xe3 });
                 const std::size_t resume_offset{ assembly.size() };
                 restore_vectors();
                 emit({ 0x58, 0x9d, 0xff, 0x25, 0, 0, 0, 0 });
@@ -6005,19 +6002,32 @@ export namespace vmhook
                 this->patch = { 0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
                 const auto relative{ static_cast<std::int32_t>(delta) };
                 std::memcpy(this->patch.data() + 1, &relative, sizeof(relative));
-                if (!vmhook::hotspot::replace_interpreter_code(target, this->original, this->patch))
-                { this->release_unpublished(); return; }
                 this->error = false;
             }
 
             ~midi2i_hook()
             {
-                if (this->error) { return; }
-                (void)vmhook::hotspot::replace_interpreter_code(this->target, this->patch, this->original);
-                // Retain executable code: a suspended thread may already have
-                // passed the entry JMP, or hold a return address into this stub.
-                // This allocation is one Windows allocation granule per shared
-                // entry for every installation. The DLL must remain loaded.
+                if (!this->published) { this->release_unpublished(); return; }
+                if (this->active)
+                {
+                    (void)vmhook::detail::jit_backend::at_safepoint([](void* const opaque) noexcept
+                    { (void)static_cast<midi2i_hook*>(opaque)->remove_at_safepoint(); }, this);
+                }
+                // A thread can still have a return PC into published code.
+                // The allocation and embedding DLL stay resident.
+            }
+
+            [[nodiscard]] auto activate_at_safepoint() noexcept -> bool
+            {
+                if (this->error || this->active) { return false; }
+                if (!replace_interpreter_code_at_safepoint(this->target, this->original, this->patch)) { return false; }
+                this->published = this->active = true; return true;
+            }
+            [[nodiscard]] auto remove_at_safepoint() noexcept -> bool
+            {
+                if (!this->active) { return true; }
+                if (!replace_interpreter_code_at_safepoint(this->target, this->patch, this->original)) { return false; }
+                this->active = false; return true;
             }
 
             [[nodiscard]] auto has_error() const noexcept -> bool { return this->error; }
@@ -6027,7 +6037,7 @@ export namespace vmhook
             [[nodiscard]] auto verify_and_repair() const noexcept -> bool
             {
                 std::array<std::uint8_t, 8> current{};
-                return !this->error && vmhook::os::safe_read(current.data(), this->target, current.size())
+                return !this->error && this->active && vmhook::os::safe_read(current.data(), this->target, current.size())
                     && current == this->patch;
             }
 
@@ -6043,6 +6053,7 @@ export namespace vmhook
             std::array<std::uint8_t, 8> original{};
             std::array<std::uint8_t, 8> patch{};
             bool error{ true };
+            bool published{}, active{};
         };
 
         using hook_callback_t = std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*)>;
@@ -6051,6 +6062,8 @@ export namespace vmhook
             vmhook::hotspot::method* method{};
             const vmhook::hotspot::const_method* const_method_identity{};
             std::shared_ptr<vmhook::hotspot::hook_callback_t> detour{};
+            std::shared_ptr<void> metadata_pin{};
+            std::shared_ptr<void> jit_policy{};
             std::string expected_class_name{};
             std::string expected_method_name{};
             std::string expected_signature{};
@@ -6147,8 +6160,11 @@ export namespace vmhook
         inline auto in_java_detour() noexcept -> bool
         {
             auto* const thread{ vmhook::hotspot::current_java_thread };
-            return thread && vmhook::hotspot::current_detour_anchor.valid
-                && thread->get_thread_state() == vmhook::hotspot::java_thread_state::_thread_in_Java;
+            if (!thread || !vmhook::hotspot::current_detour_anchor.valid) { return false; }
+            const auto state{ thread->get_thread_state() };
+            return state == vmhook::hotspot::java_thread_state::_thread_in_Java
+                || state == vmhook::hotspot::java_thread_state::_thread_in_vm
+                || state == vmhook::hotspot::java_thread_state::_thread_in_native;
         }
 
 
@@ -6250,8 +6266,48 @@ export namespace vmhook
                 if (!anchor.valid) { return 0; }
                 const detour_anchor_guard anchor_guard{ anchor };
                 const interpreter_locals_guard locals_guard{ frame_pointer, locals };
-                vmhook::detail::pump_dispatch();
-                (*callback)(frame_pointer, thread, slot);
+                struct callback_arguments
+                {
+                    const vmhook::hotspot::hook_callback_t* callback;
+                    vmhook::hotspot::frame* frame;
+                    vmhook::hotspot::java_thread* thread;
+                    vmhook::hotspot::return_slot* slot;
+                } arguments{ callback, frame_pointer, thread, slot };
+                const bool completed{ vmhook::detail::execute_borrowed_callback(thread, anchor,
+                    +[](void* const opaque)
+                    {
+                        auto& call{ *static_cast<callback_arguments*>(opaque) };
+                        vmhook::detail::pump_dispatch();
+                        (*call.callback)(call.frame, call.thread, call.slot);
+                    }, &arguments) };
+                if (!completed) { slot->cancel = false; slot->retval = 0; }
+                // The genuine VM-to-Java transition may deliver an async
+                // exception. Use the original interpreter throw continuation;
+                // a native return-PC forwarding stub cannot consume this frame.
+                auto** const saved_rax{ reinterpret_cast<void**>(slot)
+                    + vmhook::hotspot::trampoline_pushed_words - 2 };
+                const auto* const pending_entry{
+                    vmhook::hotspot::iterate_struct_entries("JavaThread", "_pending_exception") };
+                void* pending{};
+                auto* const pending_slot{ pending_entry
+                    ? reinterpret_cast<std::byte*>(thread) + pending_entry->offset : nullptr };
+                if (pending_slot && vmhook::os::safe_read(&pending, pending_slot, sizeof(pending)) && pending)
+                {
+                    void* const handler{ vmhook::detail::jit_backend::throw_handler() };
+                    if (!handler) { std::terminate(); }
+                    *saved_rax = handler;
+                    slot->cancel = true;
+                    std::memcpy(&slot->retval, &pending, sizeof(pending));
+                    void* null{};
+                    if (!vmhook::os::safe_write(pending_slot, &null, sizeof(null))) { std::terminate(); }
+                }
+                else if (slot->cancel)
+                {
+                    void* const handler{ vmhook::detail::jit_backend::return_handler(
+                        const_cast<vmhook::hotspot::method*>(current_method)) };
+                    if (!handler) { std::terminate(); }
+                    *saved_rax = handler;
+                }
                 return slot->cancel ? slot->retval : 0;
             }
             catch (const std::exception& exception)
@@ -6685,9 +6741,11 @@ export namespace vmhook
         the HotSpot ClassLoaderDataGraph entirely via gHotSpotVMStructs, without any
         JNI or JVMTI calls. Results are cached on first lookup.
 
-        Thread-safe: cache reads and writes are serialised via
-        klass_lookup_cache_mutex.  The HotSpot walk itself is safe to run
-        concurrently — it only reads exported VMStructs.
+        Cache operations are serialized by klass_lookup_cache_mutex. The
+        exported VMStructs describe layouts; they do not provide a coherent
+        graph snapshot or protect metadata against unloading. A native context
+        performs its lookup in VM state and retains the selected class mirror.
+        Free-standing raw metadata lookups do not provide that lifetime guarantee.
     */
     auto find_class(const std::string_view class_name)
         -> vmhook::hotspot::klass*
@@ -6733,23 +6791,10 @@ export namespace vmhook
             {
                 vmhook::hotspot::klass* const cached_klass{ cache_entry->second };
 
-                // Stale-cache check.  Class redefinition (JVMTI
-                // RedefineClasses / RetransformClasses, or class
-                // unloading + reload) can free the klass we cached.  A
-                // subsequent find_class hit would return that dangling
-                // pointer and every downstream consumer (get_field walks
-                // for the SDK, Method* iteration for hook re-install, the
-                // ClassLoaderDataGraph capture) would silently read
-                // garbage and bail.  Cheap validation: read the klass's
-                // own name symbol and compare to the requested name.
-                // If they match, the klass is still the one we cached;
-                // if they don't, the klass was replaced and we need to
-                // re-resolve.
-                //
-                // klass::get_name and symbol::to_string both already
-                // gate every dereference behind is_valid_pointer +
-                // try/catch, so a hit on freed memory returns "" or
-                // nullptr rather than AV-ing.
+                // This name check can reject an obviously stale raw cache
+                // entry. Readable memory and a matching name do not establish
+                // identity or lifetime after unloading/address reuse. Use a
+                // rooted native context for operations requiring those guarantees.
                 if (cached_klass && vmhook::hotspot::is_valid_pointer(cached_klass))
                 {
                     const vmhook::hotspot::symbol* const name_sym{ cached_klass->get_name() };
@@ -7988,18 +8033,15 @@ export namespace vmhook
     }
 
     // -------------------------------------------------------------------------
-    // Watchers: event-driven hooks for field-value changes and for
-    // newly-loaded Java classes.  No background polling, no idle CPU —
-    // the field watcher installs a hardware data breakpoint that fires
-    // synchronously on the writing thread, and the class-load watcher
-    // observes interpreted calls through java.lang.ClassLoader.defineClass.
-    // Compiled calls bypass this observer; native/abstract entries are refused.
-    // watch_handle disarms the trap / unregisters the callback when it
-    // goes out of scope.
+    // Persistent method/field hooks and class observers are removed explicitly.
+    // This compatibility handle owns only watch_static_field/on_exception
+    // observers and unregisters one observer when stopped or destroyed.
+    // Static fields use synchronous ASM templates; class events use native
+    // HotSpot registration entries. Neither observer samples Java heap slots.
     // -------------------------------------------------------------------------
 
     /*
-        @brief RAII handle for an event-driven watcher (field-change / class-load).
+        @brief Compatibility handle for a field-write or exception observer.
         @details
         The handle owns a disarm callback that runs exactly once, either
         when stop() is called explicitly or when the handle is destroyed.
@@ -8050,8 +8092,8 @@ export namespace vmhook
 
         /*
             @brief Disables further delivery (idempotent).
-            @details A callback already in progress may finish. A failed or
-            partial hardware cleanup retains slot ownership for pending traps.
+            @details A callback already in progress may finish. The owned
+            unregister callback runs once; subsequent stop() calls do nothing.
         */
         auto stop() noexcept -> void
         {
@@ -8340,6 +8382,7 @@ export namespace vmhook
             -> std::remove_cvref_t<value_type>
         {
             using base_t = std::remove_cvref_t<value_type>;
+            vmhook::detail::native_backend::operation access{};
 
             // Bound interpreter-local indices before negative-offset addressing.
             // Descriptor checks below also verify that the chosen slot begins a
@@ -8428,7 +8471,7 @@ export namespace vmhook
                 // A null slot yields a default-constructed (empty, never
                 // expired) borrow, which is the honest reading of a Java null -
                 // `if (arg)` is false for both, and expired() distinguishes them.
-                return base_t{ decode_oop(raw_value) };
+                return base_t{ decode_oop(raw_value), vmhook::detail::native_backend::retain_oop(raw_value) };
             }
             else if constexpr (is_unique_ptr_v<base_t>)
             {
@@ -8439,14 +8482,20 @@ export namespace vmhook
                 // Construct the statically known wrapper around the decoded
                 // reference. Registration controls its later member lookups.
                 using element_t = typename base_t::element_type;
-                return vmhook::detail::wrap_object<element_t>(decode_oop(raw_value));
+                auto wrapped{ vmhook::detail::wrap_object<element_t>(decode_oop(raw_value)) };
+                if (wrapped) { wrapped->set_native_root(vmhook::detail::native_backend::retain_oop(raw_value)); }
+                return wrapped;
             }
             else if constexpr (is_java_wrapper_v<base_t>)
             {
-                return base_t{ decode_oop(raw_value) };
+                base_t wrapped{ decode_oop(raw_value) };
+                wrapped.set_native_root(vmhook::detail::native_backend::retain_oop(raw_value));
+                return wrapped;
             }
             else if constexpr (std::is_pointer_v<base_t>)
             {
+                vmhook::detail::track_callback_oop_snapshot(raw_value,
+                    vmhook::detail::native_backend::retain_oop(raw_value));
                 return reinterpret_cast<base_t>(decode_oop(raw_value));
             }
             else if constexpr (sizeof(base_t) <= sizeof(void*))
@@ -8505,6 +8554,7 @@ export namespace vmhook
 
     inline auto return_value::caller() const noexcept -> caller_info
     {
+        vmhook::detail::native_backend::operation access{};
         caller_info empty{};
         if (!this->stack_frame)
         {
@@ -8626,6 +8676,7 @@ export namespace vmhook
     inline auto return_value::stack_trace(std::size_t max_depth) const noexcept
         -> std::vector<caller_info>
     {
+        vmhook::detail::native_backend::operation access{};
         std::vector<caller_info> frames{};
         if (max_depth == 0)
         {
@@ -8749,6 +8800,8 @@ export namespace vmhook
     {
         try
         {
+            vmhook::detail::native_backend::operation access{};
+            if (!access) { return false; }
             using clean_value_type = std::decay_t<value_type>;
             if (!this->stack_frame || index < 0) { return false; }
             void** const locals{ this->stack_frame->get_locals() };
@@ -8900,7 +8953,9 @@ export namespace vmhook
             else if constexpr (std::is_pointer_v<clean_value_type>
                                && std::is_void_v<std::remove_pointer_t<clean_value_type>>)
             {
-                return store_oop(const_cast<void*>(static_cast<const void*>(value)));
+                void* const snapshot{ const_cast<void*>(static_cast<const void*>(value)) };
+                void* const current{ vmhook::detail::resolve_callback_oop_snapshot(snapshot) };
+                return (!snapshot || current) && store_oop(current);
             }
             else if constexpr (std::is_trivially_copyable_v<clean_value_type> && sizeof(clean_value_type) <= sizeof(void*))
             {
@@ -8938,9 +8993,9 @@ export namespace vmhook
         catch (...) { return false; }
     }
 
-    // Persistent observer for the template interpreter entry. Compiled and
-    // inlined invocations bypass this observer; installation never changes JIT
-    // configuration or pretends that pointer stores are VM deoptimization.
+    // Installation excludes this method from compilation and inlining, drains
+    // existing compiler tasks and invalidates compiled callers at a real VM
+    // safepoint before publishing the interpreter callback.
     template<class wrapper_type>
     inline auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
@@ -8958,31 +9013,49 @@ export namespace vmhook
             const std::string registered_name{ vmhook::detail::registered_class_name<wrapper_type>() };
             if (registered_name.empty())
             { throw vmhook::exception{ "Register the wrapper class before installing a hook." }; }
-            vmhook::hotspot::klass* const target_klass{ vmhook::find_class(registered_name) };
-            if (!target_klass) { throw vmhook::exception{ "Java class is not loaded." }; }
-            std::int32_t method_count{};
-            vmhook::hotspot::method** methods_array{};
-            if (!vmhook::hotspot::safe_klass_methods(target_klass, methods_array, method_count))
-            { throw vmhook::exception{ "Java method metadata is unavailable." }; }
-            vmhook::hotspot::method* found_method{};
-            for (std::int32_t index{}; index < method_count; ++index)
+            if (!vmhook::detail::prepare_hook_roots())
+            { throw vmhook::exception{ "Persistent hook metadata roots are unavailable." }; }
+            struct metadata_lookup final
             {
-                auto* const candidate{ static_cast<vmhook::hotspot::method*>(const_cast<void*>(
-                    vmhook::hotspot::safe_read_pointer(methods_array + index))) };
-                if (candidate && candidate->get_name() == method_name
-                    && (method_signature.empty() || candidate->get_signature() == method_signature))
+                const std::string* class_name{};
+                std::string_view name{}, descriptor{};
+                vmhook::hotspot::method* method{};
+                std::shared_ptr<void> pin{};
+                std::uint16_t access_flags{};
+                bool duplicate{};
+            } lookup{ &registered_name, method_name, method_signature };
+            const bool looked_up{ vmhook::detail::jit_backend::with_vm_state([](void* const opaque) noexcept
+            {
+                auto& request{ *static_cast<metadata_lookup*>(opaque) };
+                try
                 {
-                    if (found_method) { throw vmhook::exception{ "Overloaded method: pass its JVM descriptor to hook()." }; }
-                    found_method = candidate;
+                    auto* const klass{ vmhook::find_class(*request.class_name) };
+                    vmhook::hotspot::method** methods{}; std::int32_t count{};
+                    if (!klass || !vmhook::detail::jit_backend::holder_linked(klass)
+                        || !vmhook::hotspot::safe_klass_methods(klass, methods, count)) { return; }
+                    for (std::int32_t index{}; index < count; ++index)
+                    {
+                        auto* const candidate{ methods[index] };
+                        if (candidate && candidate->get_name() == request.name
+                            && (request.descriptor.empty() || candidate->get_signature() == request.descriptor))
+                        {
+                            if (request.method) { request.duplicate = true; return; }
+                            request.method = candidate;
+                        }
+                    }
+                    if (!request.method || request.name == "<init>" || request.name == "<clinit>"
+                        || !vmhook::os::safe_read(&request.access_flags, request.method->get_access_flags(), sizeof(request.access_flags))
+                        || (request.access_flags & (0x0100u | 0x0400u)) != 0) { request.method = nullptr; return; }
+                    request.pin = vmhook::detail::retain_hook_klass(klass);
+                    if (!request.pin) { request.method = nullptr; }
                 }
-            }
-            if (!found_method) { throw vmhook::exception{ "Java method was not found." }; }
-            if (method_name == "<init>" || method_name == "<clinit>")
-            { throw vmhook::exception{ "Constructor and class-initializer hooks are unsupported." }; }
-            std::uint16_t access_flags{};
-            if (!vmhook::os::safe_read(&access_flags, found_method->get_access_flags(), sizeof(access_flags))
-                || (access_flags & (0x0100u | 0x0400u)) != 0)
-            { throw vmhook::exception{ "Native, abstract, or unreadable Java methods cannot use an interpreter hook." }; }
+                catch (...) { request.method = nullptr; }
+            }, &lookup) };
+            if (lookup.duplicate) { throw vmhook::exception{ "Overloaded method: pass its JVM descriptor to hook()." }; }
+            if (!looked_up || !lookup.method || !lookup.pin)
+            { throw vmhook::exception{ "Java method is unavailable or unsupported; native, abstract and constructor hooks are refused." }; }
+            auto* const found_method{ lookup.method };
+            const auto access_flags{ lookup.access_flags };
             void* const i2i{ found_method->get_i2i_entry() };
             if (!i2i) { throw vmhook::exception{ "Java interpreter entry is unavailable." }; }
 
@@ -9018,6 +9091,7 @@ export namespace vmhook
             method_entry.method = found_method;
             method_entry.const_method_identity = found_method->get_const_method();
             method_entry.detour = std::make_shared<vmhook::hotspot::hook_callback_t>(std::move(wrapper_detour));
+            method_entry.metadata_pin = std::move(lookup.pin);
             method_entry.expected_class_name = registered_name;
             method_entry.expected_method_name = std::string{ method_name };
             method_entry.expected_signature = found_method->get_signature();
@@ -9040,17 +9114,36 @@ export namespace vmhook
             next_dispatch->methods.push_back(method_entry);
             const auto existing_stub{ std::find_if(vmhook::hotspot::g_hooked_i2i_entries.begin(),
                 vmhook::hotspot::g_hooked_i2i_entries.end(), [i2i](const auto& entry) { return entry.i2i_entry == i2i; }) };
+            std::unique_ptr<vmhook::hotspot::midi2i_hook> prepared_stub{};
             if (existing_stub == vmhook::hotspot::g_hooked_i2i_entries.end())
             {
                 auto* const target{ static_cast<std::uint8_t*>(vmhook::hotspot::find_hook_location(i2i)) };
                 if (!target) { throw vmhook::exception{ "Unsupported interpreter entry instruction layout." }; }
-                auto installed{ std::make_unique<vmhook::hotspot::midi2i_hook>(target, vmhook::hotspot::common_detour) };
-                if (installed->has_error())
-                { throw vmhook::exception{ "Interpreter code patch transaction failed; target was left unchanged." }; }
-                vmhook::hotspot::g_hooked_i2i_entries.push_back({ i2i, installed.release() });
+                prepared_stub = std::make_unique<vmhook::hotspot::midi2i_hook>(target, vmhook::hotspot::common_detour);
+                if (prepared_stub->has_error()) { throw vmhook::exception{ "Interpreter trampoline preparation failed." }; }
             }
-            vmhook::hotspot::g_hooked_methods.push_back(std::move(method_entry));
-            vmhook::hotspot::publish_hook_dispatch_locked(std::move(next_dispatch));
+            struct prepared_install final
+            {
+                void* i2i{};
+                vmhook::hotspot::hooked_method* method{};
+                std::unique_ptr<vmhook::hotspot::midi2i_hook>* stub{};
+                std::unique_ptr<vmhook::hotspot::hook_dispatch_snapshot>* dispatch{};
+            } installation{ i2i, &method_entry, &prepared_stub, &next_dispatch };
+            const bool installed{ vmhook::detail::jit_backend::install_method_policy(found_method,
+                [](void* const opaque) noexcept -> bool
+                {
+                    auto& transaction{ *static_cast<prepared_install*>(opaque) };
+                    if (*transaction.stub && !(*transaction.stub)->activate_at_safepoint()) { return false; }
+                    // Capacities, callback objects, metadata roots and code bytes
+                    // are ready before this safepoint. Publication cannot allocate.
+                    (*transaction.dispatch)->methods.back().jit_policy = transaction.method->jit_policy;
+                    if (*transaction.stub)
+                    { vmhook::hotspot::g_hooked_i2i_entries.push_back({ transaction.i2i, transaction.stub->release() }); }
+                    vmhook::hotspot::g_hooked_methods.push_back(std::move(*transaction.method));
+                    vmhook::hotspot::publish_hook_dispatch_locked(std::move(*transaction.dispatch));
+                    return true;
+                }, &installation, method_entry.jit_policy) };
+            if (!installed) { throw vmhook::exception{ "HotSpot compilation/deoptimization hook transaction failed." }; }
             vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
             return true;
         }
@@ -9089,7 +9182,12 @@ export namespace vmhook
         catch (...) { return 0; }
     }
 
-    namespace detail { inline auto reset_watcher_latches() noexcept -> void; }
+    namespace detail
+    {
+        inline auto reset_watcher_latches() noexcept -> void;
+        inline auto shutdown_field_hooks() noexcept -> void;
+        inline auto disable_class_observers() noexcept -> void;
+    }
 
     // Removing observers does not permit unloading the DLL: callbacks already
     // selected for dispatch and threads already inside a trampoline may complete
@@ -9097,19 +9195,41 @@ export namespace vmhook
     inline auto shutdown_hooks() noexcept -> void
     {
         vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
+        // These registries can be active independently of method hooks. Their
+        // callback publication must stop even when a method VM operation fails.
+        vmhook::detail::disable_class_observers();
+        vmhook::detail::shutdown_field_hooks();
         try
         {
             std::vector<std::unique_ptr<vmhook::hotspot::hook_dispatch_snapshot>> retired_snapshots{};
+            bool removed{};
             {
                 std::lock_guard<std::mutex> lock{ vmhook::hotspot::g_hooked_methods_mutex };
                 retired_snapshots.reserve(vmhook::hotspot::g_hook_dispatch_snapshots.size());
-                vmhook::hotspot::g_hook_dispatch.store(nullptr, std::memory_order_seq_cst);
-                vmhook::hotspot::g_hooked_methods.clear();
-                for (const auto& entry : vmhook::hotspot::g_hooked_i2i_entries) { delete entry.hook; }
-                vmhook::hotspot::g_hooked_i2i_entries.clear();
-                vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
+                removed = vmhook::detail::jit_backend::at_safepoint([](void*) noexcept
+                {
+                    vmhook::hotspot::g_hook_dispatch.store(nullptr, std::memory_order_seq_cst);
+                    for (const auto& entry : vmhook::hotspot::g_hooked_i2i_entries)
+                    { if (entry.hook) { (void)entry.hook->remove_at_safepoint(); } }
+                    for (const auto& entry : vmhook::hotspot::g_hooked_methods)
+                    { vmhook::detail::jit_backend::release_method_policy_at_safepoint(entry.jit_policy); }
+                }, nullptr);
+                if (removed)
+                {
+                    // Destruction and root-release bookkeeping occur on the
+                    // native owner after Java threads leave the safepoint.
+                    vmhook::hotspot::g_hooked_methods.clear();
+                    for (const auto& entry : vmhook::hotspot::g_hooked_i2i_entries) { delete entry.hook; }
+                    vmhook::hotspot::g_hooked_i2i_entries.clear();
+                    vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
+                }
             }
-            vmhook::detail::reset_watcher_latches();
+            if (removed)
+            {
+                retired_snapshots.clear();
+                vmhook::detail::flush_hook_roots();
+                vmhook::detail::reset_watcher_latches();
+            }
         }
         catch (...) {}
         vmhook::hotspot::g_shutdown_requested.store(false, std::memory_order_release);
@@ -9859,162 +9979,162 @@ struct size_entry{std::string_view type;std::size_t size;};
 struct enum_entry{std::string_view type,name;int value;};
 struct capabilities{bool new_attaching_factory,native_transition_async_arg,cleanup_bool_arg,delete_flags_arg,guards_subobject,monitor_owner,jfr_before_publish,java_calls_by_value,anchor_thread_arg;};
 struct profile_entry{std::array<unsigned char,16> guid;std::uint32_t age,image_size,pe_timestamp;int java_feature;capabilities caps;std::span<const symbol_entry> symbols;std::span<const field_entry> fields;std::span<const size_entry> sizes;std::span<const enum_entry> enums;};
-inline constexpr symbol_entry symbols_8[]{{"java_thread_ctor",2229456},{"allocate_thread",2233136},{"malloc",2083520},{"current_thread",2264640},{"initialize_tls",2249424},{"is_tls_initialized",2264688},{"record_stack",2258656},{"create_os_thread",2583472},{"create_guards",2237616},{"remove_guards",2260448},{"tlab_initialize",891200},{"use_tlab",8114404},{"cache_globals",16576},{"vm_exited",8474112},{"java_version",8467128},{"threads_lock",8467488},{"old_lock",2054672},{"lock_without_safepoint",2054672},{"unlock",2054048},{"allocate_handle_block_legacy",2047776},{"add_thread",2232960},{"main_thread_group_raw",8462632},{"allocate_thread_object",2233936},{"set_thread_status",344544},{"jfr_thread_start",3519504},{"setup_fpu",16576},{"java_thread_id",345168},{"java_thread_tid_offset",8359112},{"cleanup_failed",2237248},{"exit_thread",2244192},{"delete_thread",2232176},{"clear_exception",2461824},{"native_to_vm",53120},{"vm_to_native",53008},{"native_to_vm_ctor",51056},{"vm_to_native_ctor",262816},{"anchor_walkable",2859376},{"handle_mark_initialize",2032672},{"handle_mark_destroy",2032544},{"arena_grow",744336},{"method_handle_construct",57040},{"method_handle_destroy",20176},{"java_calls",2038768},{"klass_initialize",989680},{"klass_check",977968},{"klass_allocate",975776},{"new_string_unicode",322976}};
-inline constexpr field_entry fields_8[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",56},{"Thread","_tlab",88},{"Thread","_osthread",392},{"Thread","_handle_area",408},{"Thread","_stack_base",424},{"Thread","_stack_size",432},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",56},{"JavaThread","_tlab",88},{"JavaThread","_osthread",392},{"JavaThread","_handle_area",408},{"JavaThread","_stack_base",424},{"JavaThread","_stack_size",432},{"JavaThread","_threadObj",568},{"JavaThread","_anchor",576},{"JavaThread","_thread_state",728},{"JavaThread","_jni_attach_state",768},{"JavaThread","_stack_guard_state",772},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"Flag","_type",0},{"Flag","_name",8},{"Flag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",0},{"Symbol","_body",8},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_8[]{{"Thread",552},{"ThreadShadow",32},{"JavaThread",1072},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",120},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"Flag",32},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",48},{"ConstantPool",80},{"Symbol",12},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",96},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",12}};
-inline constexpr enum_entry enums_8[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",2}};
+inline constexpr symbol_entry symbols_8[]{{"add_thread",2232960},{"allocate_handle_block_legacy",2047776},{"allocate_thread",2233136},{"allocate_thread_object",2233936},{"anchor_walkable",2859376},{"arena_grow",744336},{"array_complete",909600},{"array_restore",911200},{"bytecode_lengths",8378608},{"cache_globals",16576},{"class_add",279120},{"class_define",383600},{"class_loader_data_head",8358904},{"class_parse",398992},{"class_resolve_stream",400400},{"cleanup_failed",2237248},{"clear_exception",2461824},{"codecache_lock",8467432},{"compile_jobs",8049224},{"compile_lock",8467624},{"compile_queue_lock",8467632},{"compiler_vtable",6389056},{"create_guards",2237616},{"create_os_thread",2583472},{"current_thread",2264640},{"delete_thread",2232176},{"exit_thread",2244192},{"field_special_exit10",2248608},{"field_throw_exception_entry",8381272},{"field_vm_to_java_destroy",644256},{"handle_mark_destroy",2032544},{"handle_mark_initialize",2032672},{"initialize_tls",2249424},{"interpreter_code",8380816},{"interpreter_entry_table",8380848},{"interpreter_normal_table",8402032},{"interpreter_throw_exception",8381272},{"is_not_compilable",1139824},{"is_not_osr_compilable",1139936},{"is_tls_initialized",2264688},{"java_calls",2038768},{"java_thread_ctor",2229456},{"java_thread_id",345168},{"java_thread_tid_offset",8359112},{"java_version",8467128},{"jfr_thread_start",3519504},{"klass_allocate",975776},{"klass_check",977968},{"klass_initialize",989680},{"lock_without_safepoint",2054672},{"main_thread_group_raw",8462632},{"malloc",2083520},{"mark_all",473776},{"mark_for",474144},{"method_handle_construct",57040},{"method_handle_destroy",20176},{"native_to_vm",53120},{"native_to_vm_ctor",51056},{"new_string_unicode",322976},{"nmethod_metadata_do",528624},{"old_lock",2054672},{"record_stack",2258656},{"remove_guards",2260448},{"set_not_compilable",1150432},{"set_not_osr_compilable",1150608},{"set_thread_status",344544},{"setup_fpu",16576},{"threads_do",2263696},{"threads_lock",8467488},{"tlab_initialize",891200},{"unlock",2054048},{"use_compiler",8115090},{"use_tlab",8114404},{"vm_deoptimize_doit",2292368},{"vm_deoptimize_vtable",6256232},{"vm_execute",2287424},{"vm_exited",8474112},{"vm_to_native",53008},{"vm_to_native_ctor",262816}};
+inline constexpr field_entry fields_8[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoaderData","_class_loader",0},{"ClassLoaderData","_deallocate_list",64},{"ClassLoaderData","_klasses",40},{"ClassLoaderData","_next",72},{"CompileTask","_compile_id",8},{"CompilerThread","_task",1096},{"ConstMethod","_code_size",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_result_type",30},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"Flag","_addr",16},{"Flag","_name",8},{"Flag","_type",0},{"InstanceKlass","_init_state",370},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",56},{"JavaThread","_anchor",576},{"JavaThread","_handle_area",408},{"JavaThread","_jni_attach_state",768},{"JavaThread","_osthread",392},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",712},{"JavaThread","_stack_base",424},{"JavaThread","_stack_guard_state",772},{"JavaThread","_stack_size",432},{"JavaThread","_suspend_flags",48},{"JavaThread","_threadObj",568},{"JavaThread","_thread_state",728},{"JavaThread","_tlab",88},{"JavaThread","_vm_result",672},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",156},{"Klass","_class_loader_data",144},{"Klass","_java_mirror",104},{"Klass","_layout_helper",8},{"Klass","_name",16},{"Klass","_next_link",136},{"KlassHandle","_value",0},{"Method","_access_flags",32},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_dont_inline",43},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",42},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",8},{"Symbol","_length",0},{"Thread","_active_handles",56},{"Thread","_handle_area",408},{"Thread","_osthread",392},{"Thread","_pending_exception",8},{"Thread","_stack_base",424},{"Thread","_stack_size",432},{"Thread","_tlab",88},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_priority",16},{"VM_Operation","_timestamp",20},{"instanceKlassHandle","_value",0},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",208},{"nmethod","_compile_id",204},{"nmethod","_method",64},{"nmethod","_state",220}};
+inline constexpr size_entry sizes_8[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",240},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoaderData",88},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::<unnamed-enum-stop_compilation>",0},{"CompileTask",128},{"CompilerThread",1136},{"ConstMethod",48},{"ConstantPool",80},{"ConstantPoolCache",16},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Flag",32},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",440},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",12},{"JNIHandleBlock",312},{"JavaCallArguments",120},{"JavaFrameAnchor",24},{"JavaThread",1072},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::StackGuardState",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaValue",16},{"Klass",200},{"KlassHandle",8},{"MemoryType",0},{"Method",88},{"Monitor",120},{"Mutex",120},{"OSThread",48},{"ObservationABI",0},{"StubQueue",48},{"Symbol",12},{"Thread",552},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadInVMfromNative",8},{"ThreadLocalAllocBuffer",96},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_Deoptimize",40},{"VM_Operation",40},{"instanceKlassHandle",8},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",288}};
+inline constexpr enum_entry enums_8[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",26},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",235},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::<unnamed-enum-stop_compilation>","run_compilation",1},{"CompileBroker::<unnamed-enum-stop_compilation>","shutdown_compilaton",2},{"CompileBroker::<unnamed-enum-stop_compilation>","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"Flag","storage_size__addr",8},{"Flag","storage_size__name",8},{"Flag","storage_size__type",8},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_guard_state",4},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",96},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"KlassHandle","storage_size__value",8},{"MemoryType","mtThread",2},{"Method","bit_length__dont_inline",1},{"Method","bit_position__dont_inline",5},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__dont_inline",1},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",1},{"ObservationABI","anonymous_klass_mask",8},{"ObservationABI","anonymous_klass_offset",272},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",0},{"ObservationABI","hidden_klass_mask",0},{"ObservationABI","hidden_klass_offset",0},{"ObservationABI","hidden_klass_width",0},{"ObservationABI","method_dont_inline_mask",32},{"ObservationABI","method_dont_inline_offset",43},{"ObservationABI","method_dont_inline_storage_size",1},{"ObservationABI","nmethod_metadata_closure",0},{"ObservationABI","set_not_compilable_old_args",1},{"ObservationABI","thread_is_java_slot",4},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",1},{"Symbol","storage_size__length",2},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",96},{"Thread::SuspendFlags","_deopt_suspend",268435456},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__priority",4},{"VM_Operation","storage_size__timestamp",4},{"VM_Operation","vtable___vecDelDtor",0},{"VM_Operation","vtable_allow_nested_vm_operations",7},{"VM_Operation","vtable_count",13},{"VM_Operation","vtable_doit",1},{"VM_Operation","vtable_doit_epilogue",3},{"VM_Operation","vtable_doit_prologue",2},{"VM_Operation","vtable_evaluate_at_safepoint",10},{"VM_Operation","vtable_evaluate_concurrently",11},{"VM_Operation","vtable_evaluation_mode",6},{"VM_Operation","vtable_is_cheap_allocated",8},{"VM_Operation","vtable_is_methodCompiler",4},{"VM_Operation","vtable_oops_do",9},{"VM_Operation","vtable_print_on_error",12},{"VM_Operation","vtable_type",5},{"VM_Operation","vtable_~VM_Operation",0},{"instanceKlassHandle","storage_size__value",8},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_8{
 {148,117,137,121,227,74,255,70,138,59,6,176,0,48,129,190},1,9015296,1787151737,8,
 {0,0,0,1,0,0,0,1,1},
 symbols_8,fields_8,sizes_8,enums_8};
-inline constexpr symbol_entry symbols_9[]{{"allocate_thread",6387360},{"java_thread_ctor",6384032},{"record_stack",6414096},{"initialize_tls",6403456},{"create_os_thread",5480768},{"create_guards",6393248},{"cache_globals",2875488},{"threads_lock",9440712},{"lock",5366928},{"add_thread",6387184},{"unlock",5367776},{"handle_mark_initialize",3116544},{"handle_mark_destroy",3116032},{"arena_grow",683856},{"allocate_thread_object",6388128},{"clear_exception",2659024},{"cleanup_failed",6391264},{"set_thread_status",3365104},{"vm_to_native",945808},{"setup_fpu",2875488},{"current_thread",6425168},{"is_tls_initialized",6425136},{"native_to_vm",1149280},{"exit_thread",6397888},{"delete_thread",6386304},{"remove_guards",6415568},{"vm_exited",9589616},{"java_calls",3319808},{"klass_check",3224240},{"klass_initialize",3232608},{"klass_allocate",3221376},{"method_handle_construct",3115872},{"method_handle_destroy",3116128},{"new_string_unicode",3343200},{"tlab_initialize",6423008},{"use_tlab",9045822},{"main_thread_group_raw",9565176},{"lock_without_safepoint",5366928},{"allocate_handle_block_legacy",3614784}};
-inline constexpr field_entry fields_9[]{{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"Symbol","_length",0},{"Symbol","_body",6},{"Arena","_hwm",24},{"Arena","_max",32},{"ThreadShadow","_pending_exception",8},{"Thread","_active_handles",56},{"Thread","_tlab",88},{"Thread","_pending_exception",8},{"Thread","_handle_area",280},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",56},{"JavaThread","_tlab",88},{"JavaThread","_handle_area",280},{"JavaThread","_threadObj",432},{"JavaThread","_anchor",440},{"JavaThread","_thread_state",592},{"JavaThread","_osthread",264},{"JavaThread","_stack_base",296},{"JavaThread","_stack_size",304},{"JavaThread","_jni_attach_state",632},{"JavaThread","_stack_guard_state",672},{"Flag","_type",0},{"Flag","_name",8},{"Flag","_addr",16},{"JDK_Version","_major",0},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"JavaValue","_type",0},{"JavaValue","_value",8},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120}};
-inline constexpr size_entry sizes_9[]{{"ConstantPool",72},{"Method",80},{"ConstMethod",56},{"Symbol",8},{"ThreadLocalAllocBuffer",96},{"Arena",48},{"Chunk",16},{"ThreadShadow",32},{"Thread",424},{"JavaThread",960},{"OSThread",48},{"JavaFrameAnchor",24},{"JNIHandleBlock",312},{"Flag",32},{"JDK_Version",7},{"JavaThreadState",4},{"AccessFlags",4},{"BasicType",4},{"Handle",8},{"methodHandle",16},{"HandleMark",56},{"HandleArea",56},{"JavaValue",16},{"JavaCallArguments",128},{"MemoryType",4},{"MEMFLAGS",4},{"JavaThread::StackGuardState",4},{"JavaThread::JNIAttachStates",4},{"JavaThread::TerminatedTypes",4},{"JavaThread::ExitType",4},{"JavaThreadStatus",4},{"AllocFailStrategy::AllocFailEnum",4}};
-inline constexpr enum_entry enums_9[]{{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"MemoryType","mtThread",2},{"MEMFLAGS","mtThread",2},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_9[]{{"add_thread",6387184},{"allocate_handle_block_legacy",3614784},{"allocate_thread",6387360},{"allocate_thread_object",6388128},{"arena_grow",683856},{"array_complete",732912},{"array_restore",734592},{"bytecode_lengths",9345776},{"cache_globals",2875488},{"class_add",1769808},{"class_define",6254480},{"class_loader_data_head",9364920},{"class_parse",6268576},{"class_resolve_stream",6269696},{"cleanup_failed",6391264},{"clear_exception",2659024},{"codecache_lock",9440648},{"compile_jobs",8997776},{"compile_lock",9440816},{"compiler_vtable",7951024},{"create_guards",6393248},{"create_os_thread",5480768},{"current_thread",6425168},{"delete_thread",6386304},{"exit_thread",6397888},{"field_throw_exception_entry",9481432},{"field_vm_to_java_destroy",1423632},{"handle_mark_destroy",3116032},{"handle_mark_initialize",3116544},{"initialize_tls",6403456},{"interpreter_code",9337280},{"interpreter_entry_table",9337312},{"interpreter_normal_table",9502192},{"interpreter_throw_exception",9481432},{"is_not_compilable",5252576},{"is_not_osr_compilable",5252704},{"is_tls_initialized",6425136},{"java_calls",3319808},{"java_thread_ctor",6384032},{"klass_allocate",3221376},{"klass_check",3224240},{"klass_initialize",3232608},{"lock",5366928},{"lock_without_safepoint",5366928},{"main_thread_group_raw",9565176},{"mark_all",1883424},{"method_handle_construct",3115872},{"method_handle_destroy",3116128},{"native_to_vm",1149280},{"new_string_unicode",3343200},{"nmethod_metadata_do",5393008},{"record_stack",6414096},{"remove_guards",6415568},{"set_not_compilable",5262512},{"set_not_osr_compilable",5262672},{"set_thread_status",3365104},{"setup_fpu",2875488},{"threads_do",6419520},{"threads_lock",9440712},{"tlab_initialize",6423008},{"unlock",5367776},{"use_compiler",9001764},{"use_tlab",9045822},{"vm_deoptimize_doit",6646432},{"vm_deoptimize_vtable",7518504},{"vm_execute",6642960},{"vm_exited",9589616},{"vm_to_native",945808}};
+inline constexpr field_entry fields_9[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoaderData","_class_loader",0},{"ClassLoaderData","_deallocate_list",80},{"ClassLoaderData","_klasses",48},{"ClassLoaderData","_next",88},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",984},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"Flag","_addr",16},{"Flag","_name",8},{"Flag","_type",0},{"InstanceKlass","_init_state",362},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",56},{"JavaThread","_anchor",440},{"JavaThread","_handle_area",280},{"JavaThread","_jni_attach_state",632},{"JavaThread","_osthread",264},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",576},{"JavaThread","_stack_base",296},{"JavaThread","_stack_guard_state",672},{"JavaThread","_stack_size",304},{"JavaThread","_suspend_flags",48},{"JavaThread","_threadObj",432},{"JavaThread","_thread_state",592},{"JavaThread","_tlab",88},{"JavaThread","_vm_result",536},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",156},{"Klass","_class_loader_data",144},{"Klass","_java_mirror",104},{"Klass","_layout_helper",8},{"Klass","_name",16},{"Klass","_next_link",136},{"KlassHandle","_value",0},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",0},{"Thread","_active_handles",56},{"Thread","_handle_area",280},{"Thread","_pending_exception",8},{"Thread","_tlab",88},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_priority",16},{"VM_Operation","_timestamp",20},{"instanceKlassHandle","_value",0},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",336},{"nmethod","_compile_id",332},{"nmethod","_method",120},{"nmethod","_state",342}};
+inline constexpr size_entry sizes_9[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",4},{"Arena",48},{"ArrayKlass",216},{"BasicType",4},{"Bytecodes::Code",4},{"Chunk",16},{"ClassLoaderData",96},{"CompLevel",0},{"CompileBroker::<unnamed-enum-stop_compilation>",0},{"CompileTask",128},{"CompiledMethod",208},{"CompilerThread",1016},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",16},{"ConstantPoolCacheEntry",32},{"DispatchTable",20480},{"Flag",32},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",432},{"InstanceKlass::ClassState",4},{"InterpreterCodelet",24},{"JDK_Version",7},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",960},{"JavaThread::ExitType",4},{"JavaThread::JNIAttachStates",4},{"JavaThread::StackGuardState",4},{"JavaThread::TerminatedTypes",4},{"JavaThreadState",4},{"JavaThreadStatus",4},{"JavaValue",16},{"Klass",192},{"KlassHandle",8},{"MEMFLAGS",4},{"MemoryType",4},{"Method",80},{"Method::Flags",0},{"OSThread",48},{"ObservationABI",0},{"StubQueue",48},{"Symbol",8},{"Thread",424},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadLocalAllocBuffer",96},{"ThreadShadow",32},{"TosState",0},{"VM_Deoptimize",40},{"VM_Operation",40},{"instanceKlassHandle",8},{"methodHandle",16},{"nmethod",368}};
+inline constexpr enum_entry enums_9[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",34},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::<unnamed-enum-stop_compilation>","run_compilation",1},{"CompileBroker::<unnamed-enum-stop_compilation>","shutdown_compilaton",2},{"CompileBroker::<unnamed-enum-stop_compilation>","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"DispatchTable","storage_size__table",20480},{"Flag","storage_size__name",8},{"Flag","storage_size__type",8},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"KlassHandle","storage_size__value",8},{"MEMFLAGS","mtThread",2},{"MemoryType","mtThread",2},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"ObservationABI","anonymous_klass_mask",32},{"ObservationABI","anonymous_klass_offset",274},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",0},{"ObservationABI","hidden_klass_mask",0},{"ObservationABI","hidden_klass_offset",0},{"ObservationABI","hidden_klass_width",0},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",0},{"ObservationABI","set_not_compilable_old_args",1},{"ObservationABI","thread_is_java_slot",4},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Thread","storage_size__active_handles",8},{"Thread::SuspendFlags","_deopt_suspend",268435456},{"Thread::SuspendFlags","_external_suspend",536870912},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__priority",4},{"VM_Operation","storage_size__timestamp",4},{"VM_Operation","vtable_allow_nested_vm_operations",7},{"VM_Operation","vtable_count",13},{"VM_Operation","vtable_doit",1},{"VM_Operation","vtable_doit_epilogue",3},{"VM_Operation","vtable_doit_prologue",2},{"VM_Operation","vtable_evaluate_at_safepoint",10},{"VM_Operation","vtable_evaluate_concurrently",11},{"VM_Operation","vtable_evaluation_mode",6},{"VM_Operation","vtable_is_cheap_allocated",8},{"VM_Operation","vtable_is_methodCompiler",4},{"VM_Operation","vtable_oops_do",9},{"VM_Operation","vtable_print_on_error",12},{"VM_Operation","vtable_type",5},{"VM_Operation","vtable_~VM_Operation",0},{"instanceKlassHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_9{
 {235,166,202,212,168,175,95,69,142,33,158,149,21,182,42,63},1,10166272,1538933834,9,
 {0,0,0,1,0,0,0,0,0},
 symbols_9,fields_9,sizes_9,enums_9};
-inline constexpr symbol_entry symbols_10[]{{"allocate_thread",6496784},{"java_thread_ctor",6493456},{"record_stack",6524464},{"initialize_tls",6513216},{"create_os_thread",5552272},{"create_guards",6502608},{"cache_globals",5165616},{"threads_lock",9682832},{"lock",5433168},{"add_thread",6496592},{"unlock",5433968},{"handle_mark_initialize",3293040},{"handle_mark_destroy",3292528},{"arena_grow",764336},{"allocate_thread_object",6497552},{"clear_exception",2777728},{"cleanup_failed",6500784},{"set_thread_status",3545888},{"vm_to_native",1024752},{"setup_fpu",5165616},{"current_thread",6535696},{"is_tls_initialized",6535664},{"native_to_vm",1223168},{"exit_thread",6507584},{"delete_thread",6529152},{"remove_guards",6525808},{"vm_exited",9832480},{"java_calls",3505088},{"klass_check",3403408},{"klass_initialize",3411968},{"klass_allocate",3400544},{"method_handle_construct",3292368},{"method_handle_destroy",3292624},{"new_string_unicode",3527680},{"tlab_initialize",6533568},{"use_tlab",9218979},{"main_thread_group_raw",9807752},{"lock_without_safepoint",5433168},{"allocate_handle_block_legacy",3749792}};
-inline constexpr field_entry fields_10[]{{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"Symbol","_length",0},{"Symbol","_body",6},{"Arena","_hwm",24},{"Arena","_max",32},{"ThreadShadow","_pending_exception",8},{"Thread","_active_handles",80},{"Thread","_tlab",120},{"Thread","_pending_exception",8},{"Thread","_handle_area",312},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",80},{"JavaThread","_tlab",120},{"JavaThread","_handle_area",312},{"JavaThread","_threadObj",472},{"JavaThread","_anchor",480},{"JavaThread","_thread_state",632},{"JavaThread","_osthread",296},{"JavaThread","_stack_base",328},{"JavaThread","_stack_size",336},{"JavaThread","_jni_attach_state",672},{"JavaThread","_stack_guard_state",712},{"Flag","_type",0},{"Flag","_name",8},{"Flag","_addr",16},{"JDK_Version","_major",0},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"JavaValue","_type",0},{"JavaValue","_value",8},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120}};
-inline constexpr size_entry sizes_10[]{{"ConstantPool",64},{"Method",88},{"ConstMethod",56},{"Symbol",8},{"ThreadLocalAllocBuffer",96},{"Arena",48},{"ThreadShadow",32},{"Thread",456},{"JavaThread",1016},{"OSThread",48},{"JavaFrameAnchor",24},{"JNIHandleBlock",312},{"Flag",40},{"JDK_Version",7},{"JavaThreadState",4},{"AccessFlags",4},{"BasicType",4},{"JavaThread::TerminatedTypes",4},{"Handle",8},{"methodHandle",16},{"HandleMark",56},{"HandleArea",56},{"JavaValue",16},{"JavaCallArguments",128},{"MemoryType",4},{"MEMFLAGS",4},{"JavaThread::StackGuardState",4},{"JavaThread::JNIAttachStates",4},{"JavaThread::ExitType",4},{"JavaThreadStatus",4},{"AllocFailStrategy::AllocFailEnum",4}};
-inline constexpr enum_entry enums_10[]{{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"MemoryType","mtThread",2},{"MEMFLAGS","mtThread",2},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_10[]{{"add_thread",6496592},{"allocate_handle_block_legacy",3749792},{"allocate_thread",6496784},{"allocate_thread_object",6497552},{"arena_grow",764336},{"array_complete",808144},{"array_restore",810224},{"bytecode_lengths",9586800},{"cache_globals",5165616},{"class_add",1833840},{"class_define",6350816},{"class_loader_data_head",9606128},{"class_parse",6366640},{"class_resolve_stream",6367808},{"cleanup_failed",6500784},{"clear_exception",2777728},{"codecache_lock",9682760},{"compile_jobs",9215424},{"compile_lock",9682936},{"compiler_vtable",8132064},{"create_guards",6502608},{"create_os_thread",5552272},{"current_thread",6535696},{"delete_thread",6529152},{"exit_thread",6507584},{"field_enable_guards10",6507200},{"field_special_exit10",6511024},{"field_throw_exception_entry",9724440},{"field_vm_to_java_transition10",1513056},{"handle_mark_destroy",3292528},{"handle_mark_initialize",3293040},{"initialize_tls",6513216},{"interpreter_code",9577600},{"interpreter_entry_table",9577632},{"interpreter_normal_table",9745200},{"interpreter_throw_exception",9724440},{"is_not_compilable",5322240},{"is_not_osr_compilable",5322368},{"is_tls_initialized",6535664},{"java_calls",3505088},{"java_thread_ctor",6493456},{"klass_allocate",3400544},{"klass_check",3403408},{"klass_initialize",3411968},{"lock",5433168},{"lock_without_safepoint",5433168},{"main_thread_group_raw",9807752},{"mark_all",1963088},{"method_handle_construct",3292368},{"method_handle_destroy",3292624},{"native_to_vm",1223168},{"new_string_unicode",3527680},{"nmethod_metadata_do",5459392},{"record_stack",6524464},{"remove_guards",6525808},{"set_not_compilable",5332176},{"set_not_osr_compilable",5332336},{"set_thread_status",3545888},{"setup_fpu",5165616},{"threads_do",6529760},{"threads_lock",9682832},{"tlab_initialize",6533568},{"unlock",5433968},{"use_compiler",9219556},{"use_tlab",9218979},{"vm_deoptimize_doit",6759920},{"vm_deoptimize_vtable",7511248},{"vm_execute",6756288},{"vm_exited",9832480},{"vm_to_native",1024752}};
+inline constexpr field_entry fields_10[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoaderData","_class_loader",0},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1040},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",52},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"Flag","_addr",16},{"Flag","_name",8},{"Flag","_type",0},{"InstanceKlass","_init_state",354},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",80},{"JavaThread","_anchor",480},{"JavaThread","_handle_area",312},{"JavaThread","_jni_attach_state",672},{"JavaThread","_osthread",296},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",616},{"JavaThread","_stack_base",328},{"JavaThread","_stack_guard_state",712},{"JavaThread","_stack_size",336},{"JavaThread","_suspend_flags",72},{"JavaThread","_threadObj",472},{"JavaThread","_thread_state",632},{"JavaThread","_tlab",120},{"JavaThread","_vm_result",576},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",156},{"Klass","_class_loader_data",144},{"Klass","_java_mirror",104},{"Klass","_layout_helper",8},{"Klass","_name",16},{"Klass","_next_link",136},{"KlassHandle","_value",0},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",0},{"Thread","_active_handles",80},{"Thread","_handle_area",312},{"Thread","_pending_exception",8},{"Thread","_tlab",120},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_priority",16},{"VM_Operation","_timestamp",20},{"instanceKlassHandle","_value",0},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",344},{"nmethod","_compile_id",340},{"nmethod","_method",120},{"nmethod","_state",350}};
+inline constexpr size_entry sizes_10[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",4},{"Arena",48},{"ArrayKlass",216},{"BasicType",4},{"Bytecodes::Code",4},{"ClassLoaderData",120},{"CompLevel",0},{"CompileBroker::CompilerActivity",0},{"CompileTask",128},{"CompiledMethod",208},{"CompilerThread",1072},{"ConstMethod",56},{"ConstantPool",64},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"DispatchTable",20480},{"Flag",40},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",424},{"InstanceKlass::ClassState",4},{"InterpreterCodelet",24},{"JDK_Version",7},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1016},{"JavaThread::ExitType",4},{"JavaThread::JNIAttachStates",4},{"JavaThread::StackGuardState",4},{"JavaThread::TerminatedTypes",4},{"JavaThreadState",4},{"JavaThreadStatus",4},{"JavaValue",16},{"Klass",192},{"KlassHandle",8},{"MEMFLAGS",4},{"MemoryType",4},{"Method",88},{"Method::Flags",0},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"StubQueue",48},{"Symbol",8},{"Thread",456},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadLocalAllocBuffer",96},{"ThreadShadow",32},{"TosState",0},{"VM_Deoptimize",40},{"VM_Operation",40},{"instanceKlassHandle",8},{"methodHandle",16},{"nmethod",376}};
+inline constexpr enum_entry enums_10[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",34},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"DispatchTable","storage_size__table",20480},{"Flag","storage_size__name",8},{"Flag","storage_size__type",8},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"KlassHandle","storage_size__value",8},{"MEMFLAGS","mtThread",2},{"MemoryType","mtThread",2},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"ObservationABI","anonymous_klass_mask",32},{"ObservationABI","anonymous_klass_offset",274},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",0},{"ObservationABI","hidden_klass_mask",0},{"ObservationABI","hidden_klass_offset",0},{"ObservationABI","hidden_klass_width",0},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",0},{"ObservationABI","set_not_compilable_old_args",1},{"ObservationABI","thread_is_java_slot",4},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Thread","storage_size__active_handles",8},{"Thread::SuspendFlags","_deopt_suspend",268435456},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__priority",4},{"VM_Operation","storage_size__timestamp",4},{"VM_Operation","vtable_allow_nested_vm_operations",7},{"VM_Operation","vtable_count",13},{"VM_Operation","vtable_doit",1},{"VM_Operation","vtable_doit_epilogue",3},{"VM_Operation","vtable_doit_prologue",2},{"VM_Operation","vtable_evaluate_at_safepoint",10},{"VM_Operation","vtable_evaluate_concurrently",11},{"VM_Operation","vtable_evaluation_mode",6},{"VM_Operation","vtable_is_cheap_allocated",8},{"VM_Operation","vtable_is_methodCompiler",4},{"VM_Operation","vtable_oops_do",9},{"VM_Operation","vtable_print_on_error",12},{"VM_Operation","vtable_type",5},{"VM_Operation","vtable_~VM_Operation",0},{"instanceKlassHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8}};
 inline constexpr profile_entry profile_10{
 {126,134,29,206,158,24,61,64,132,195,159,211,72,213,114,253},1,10432512,1543318357,10,
 {0,0,0,0,0,0,0,0,0},
 symbols_10,fields_10,sizes_10,enums_10};
-inline constexpr symbol_entry symbols_11[]{{"java_thread_ctor",7928624},{"allocate_thread",7932960},{"malloc",6518976},{"current_thread",7979136},{"initialize_tls",7949008},{"is_tls_initialized",7979104},{"record_stack",7962032},{"register_stack",7962160},{"create_os_thread",6542288},{"create_guards",7937728},{"remove_guards",7963664},{"tlab_initialize",7976608},{"use_tlab",11022948},{"cache_globals",33424},{"vm_exited",11674672},{"java_version",11452736},{"threads_lock",11528208},{"old_lock",6377968},{"lock_without_safepoint",6377968},{"unlock",6377280},{"allocate_handle_block_legacy",4253104},{"add_thread",7932752},{"main_thread_group_raw",11663672},{"allocate_thread_object",7933632},{"set_thread_status",3830720},{"jfr_thread_start",3832656},{"setup_fpu",33424},{"java_thread_id",3831072},{"java_thread_tid_offset",11452892},{"cleanup_failed",7937056},{"exit_thread",7943392},{"delete_thread",7966640},{"clear_exception",3051376},{"native_to_vm",1372656},{"vm_to_native",1142144},{"native_to_vm_ctor",1316192},{"vm_to_native_ctor",2004640},{"anchor_walkable",3080656},{"handle_mark_initialize",3540560},{"handle_mark_destroy",3540256},{"arena_grow",798192},{"method_handle_construct",3540112},{"method_handle_destroy",3540368},{"java_calls",3784032},{"klass_initialize",3685616},{"klass_check",3673008},{"klass_allocate",3669712},{"new_string_unicode",3806976}};
-inline constexpr field_entry fields_11[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",224},{"Thread","_tlab",272},{"Thread","_osthread",624},{"Thread","_handle_area",640},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",224},{"JavaThread","_tlab",272},{"JavaThread","_osthread",624},{"JavaThread","_handle_area",640},{"JavaThread","_stack_base",656},{"JavaThread","_stack_size",664},{"JavaThread","_threadObj",808},{"JavaThread","_anchor",816},{"JavaThread","_thread_state",968},{"JavaThread","_jni_attach_state",1008},{"JavaThread","_stack_guard_state",1064},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_11[]{{"Thread",792},{"ThreadShadow",32},{"JavaThread",1256},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",7}};
-inline constexpr enum_entry enums_11[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr symbol_entry symbols_11[]{{"add_thread",7932752},{"allocate_handle_block_legacy",4253104},{"allocate_thread",7932960},{"allocate_thread_object",7933632},{"anchor_walkable",3080656},{"arena_grow",798192},{"array_complete",837136},{"array_restore",838640},{"bytecode_lengths",11415008},{"cache_globals",33424},{"class_add",2026448},{"class_define",7767808},{"class_loader_data_head",11434656},{"class_parse",7786512},{"class_resolve_stream",7787568},{"cleanup_failed",7937056},{"clear_exception",3051376},{"codecache_lock",11528136},{"compilation_lock",11528352},{"compile_jobs",11015328},{"compile_lock",11528328},{"compile_queue_lock",11528336},{"compiler_vtable",9724440},{"create_guards",7937728},{"create_os_thread",6542288},{"current_thread",7979136},{"delete_thread",7966640},{"exit_thread",7943392},{"field_enable_guards10",7943184},{"field_special_exit10",7945920},{"field_throw_exception_entry",11571944},{"field_vm_to_java_destroy",1645280},{"field_vm_to_java_transition10",1660448},{"handle_mark_destroy",3540256},{"handle_mark_initialize",3540560},{"initialize_tls",7949008},{"interpreter_code",11405696},{"interpreter_entry_table",11405728},{"interpreter_normal_table",11592704},{"interpreter_throw_exception",11571944},{"is_not_compilable",6251264},{"is_not_osr_compilable",6251376},{"is_tls_initialized",7979104},{"java_calls",3784032},{"java_thread_ctor",7928624},{"java_thread_id",3831072},{"java_thread_tid_offset",11452892},{"java_version",11452736},{"jfr_thread_start",3832656},{"klass_allocate",3669712},{"klass_check",3673008},{"klass_initialize",3685616},{"lock_without_safepoint",6377968},{"main_thread_group_raw",11663672},{"malloc",6518976},{"mark_all",2101344},{"mark_for",2102048},{"method_handle_construct",3540112},{"method_handle_destroy",3540368},{"native_to_vm",1372656},{"native_to_vm_ctor",1316192},{"new_string_unicode",3806976},{"nmethod_metadata_do",6408224},{"old_lock",6377968},{"record_stack",7962032},{"register_stack",7962160},{"remove_guards",7963664},{"set_not_compilable",6263184},{"set_not_osr_compilable",6263360},{"set_thread_status",3830720},{"setup_fpu",33424},{"threads_do",7951184},{"threads_lock",11528208},{"tlab_initialize",7976608},{"unlock",6377280},{"use_compiler",11021066},{"use_tlab",11022948},{"vm_clear_ics_doit",8230368},{"vm_clear_ics_vtable",9869360},{"vm_deoptimize_doit",8230384},{"vm_deoptimize_vtable",9038280},{"vm_execute",8250992},{"vm_exited",11674672},{"vm_to_native",1142144},{"vm_to_native_ctor",2004640}};
+inline constexpr field_entry fields_11[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1280},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",52},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",394},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JVMFlag","_addr",16},{"JVMFlag","_name",8},{"JVMFlag","_type",0},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",224},{"JavaThread","_anchor",816},{"JavaThread","_handle_area",640},{"JavaThread","_jni_attach_state",1008},{"JavaThread","_osthread",624},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",952},{"JavaThread","_stack_base",656},{"JavaThread","_stack_guard_state",1064},{"JavaThread","_stack_size",664},{"JavaThread","_suspend_flags",216},{"JavaThread","_threadObj",808},{"JavaThread","_thread_state",968},{"JavaThread","_tlab",272},{"JavaThread","_vm_result",912},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"OopHandle","_obj",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",0},{"Thread","_active_handles",224},{"Thread","_handle_area",640},{"Thread","_osthread",624},{"Thread","_pending_exception",8},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"Thread","_tlab",272},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_priority",16},{"VM_Operation","_timestamp",20},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",336},{"nmethod","_compile_id",332},{"nmethod","_method",120},{"nmethod","_state",343}};
+inline constexpr size_entry sizes_11[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",232},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",136},{"CompiledMethod",208},{"CompilerThread",1320},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",64},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",464},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",7},{"JNIHandleBlock",312},{"JVMFlag",40},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1256},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::StackGuardState",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaValue",16},{"Klass",208},{"MemoryType",0},{"Method",88},{"Method::Flags",0},{"Monitor",120},{"Mutex",120},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"StubQueue",48},{"Symbol",8},{"Thread",792},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadInVMfromNative",8},{"ThreadLocalAllocBuffer",128},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",48},{"VM_Deoptimize",40},{"VM_Operation",40},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",376}};
+inline constexpr enum_entry enums_11[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",34},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",8},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_guard_state",4},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",128},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MemoryType","mtThread",2},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"ObservationABI","anonymous_klass_mask",32},{"ObservationABI","anonymous_klass_offset",314},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",0},{"ObservationABI","hidden_klass_mask",0},{"ObservationABI","hidden_klass_offset",0},{"ObservationABI","hidden_klass_width",0},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",0},{"ObservationABI","set_not_compilable_old_args",1},{"ObservationABI","thread_is_java_slot",4},{"OopHandle","storage_size__obj",8},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",128},{"Thread::SuspendFlags","_deopt_suspend",268435456},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__priority",4},{"VM_Operation","storage_size__timestamp",4},{"VM_Operation","vtable___vecDelDtor",0},{"VM_Operation","vtable_allow_nested_vm_operations",7},{"VM_Operation","vtable_count",13},{"VM_Operation","vtable_doit",1},{"VM_Operation","vtable_doit_epilogue",3},{"VM_Operation","vtable_doit_prologue",2},{"VM_Operation","vtable_evaluate_at_safepoint",10},{"VM_Operation","vtable_evaluate_concurrently",11},{"VM_Operation","vtable_evaluation_mode",6},{"VM_Operation","vtable_is_cheap_allocated",8},{"VM_Operation","vtable_is_methodCompiler",4},{"VM_Operation","vtable_oops_do",9},{"VM_Operation","vtable_print_on_error",12},{"VM_Operation","vtable_type",5},{"VM_Operation","vtable_~VM_Operation",0},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_11{
 {82,139,244,174,119,12,135,9,252,84,237,205,129,137,89,96},1,12328960,1502678380,11,
 {0,0,1,0,0,0,0,0,1},
 symbols_11,fields_11,sizes_11,enums_11};
-inline constexpr symbol_entry symbols_12[]{{"java_thread_ctor",7729056},{"allocate_thread",7733312},{"malloc",6204624},{"current_thread",7772304},{"initialize_tls",7748576},{"is_tls_initialized",7772272},{"record_stack",7760336},{"register_stack",7760464},{"create_os_thread",6228016},{"create_guards",7737664},{"remove_guards",7762000},{"tlab_initialize",7768704},{"use_tlab",10736466},{"cache_globals",35616},{"vm_exited",11566960},{"java_version",11293232},{"threads_lock",11368296},{"old_lock",6067296},{"lock_without_safepoint",6067296},{"unlock",6066720},{"allocate_handle_block_legacy",4075680},{"add_thread",7733104},{"main_thread_group_raw",11556800},{"allocate_thread_object",7733984},{"set_thread_status",3683936},{"jfr_thread_start",3686464},{"setup_fpu",35616},{"java_thread_id",3684928},{"java_thread_tid_offset",11293388},{"cleanup_failed",7736992},{"exit_thread",7743456},{"delete_thread",7765456},{"clear_exception",2918544},{"native_to_vm",1276640},{"vm_to_native",1048352},{"native_to_vm_ctor",1220208},{"vm_to_native_ctor",1896624},{"anchor_walkable",2945136},{"handle_mark_initialize",3399408},{"handle_mark_destroy",3399120},{"arena_grow",779760},{"method_handle_construct",3398992},{"method_handle_destroy",3399232},{"java_calls",3637888},{"klass_initialize",3541328},{"klass_check",3529728},{"klass_allocate",3527216},{"new_string_unicode",3659920}};
-inline constexpr field_entry fields_12[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",224},{"Thread","_tlab",272},{"Thread","_osthread",608},{"Thread","_handle_area",624},{"Thread","_stack_base",640},{"Thread","_stack_size",648},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",224},{"JavaThread","_tlab",272},{"JavaThread","_osthread",608},{"JavaThread","_handle_area",624},{"JavaThread","_stack_base",640},{"JavaThread","_stack_size",648},{"JavaThread","_threadObj",776},{"JavaThread","_anchor",784},{"JavaThread","_thread_state",936},{"JavaThread","_jni_attach_state",976},{"JavaThread","_stack_guard_state",1008},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length_and_refcount",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_12[]{{"Thread",760},{"ThreadShadow",32},{"JavaThread",1200},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",7}};
-inline constexpr enum_entry enums_12[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr symbol_entry symbols_12[]{{"add_thread",7733104},{"allocate_handle_block_legacy",4075680},{"allocate_thread",7733312},{"allocate_thread_object",7733984},{"anchor_walkable",2945136},{"arena_grow",779760},{"array_complete",816704},{"array_restore",818080},{"bytecode_lengths",11128896},{"cache_globals",35616},{"class_add",1918240},{"class_define",7511424},{"class_loader_data_head",11148576},{"class_parse",7528096},{"class_resolve_stream",7528848},{"cleanup_failed",7736992},{"clear_exception",2918544},{"codecache_lock",11368224},{"compilation_lock",11368440},{"compile_jobs",10728400},{"compile_lock",11368416},{"compile_queue_lock",11368424},{"compiler_vtable",9525280},{"create_guards",7737664},{"create_os_thread",6228016},{"current_thread",7772304},{"delete_thread",7765456},{"exit_thread",7743456},{"field_enable_guards10",7743248},{"field_special_exit10",7746032},{"field_throw_exception_entry",11465496},{"field_vm_to_java_destroy",1546608},{"handle_mark_destroy",3399120},{"handle_mark_initialize",3399408},{"initialize_tls",7748576},{"interpreter_code",11119152},{"interpreter_entry_table",11119184},{"interpreter_normal_table",11486256},{"interpreter_throw_exception",11465496},{"is_not_compilable",5941504},{"is_not_osr_compilable",5941616},{"is_tls_initialized",7772272},{"java_calls",3637888},{"java_thread_ctor",7729056},{"java_thread_id",3684928},{"java_thread_tid_offset",11293388},{"java_version",11293232},{"jfr_thread_start",3686464},{"klass_allocate",3527216},{"klass_check",3529728},{"klass_initialize",3541328},{"lock_without_safepoint",6067296},{"main_thread_group_raw",11556800},{"malloc",6204624},{"mark_all",1989936},{"mark_for",1990320},{"method_handle_construct",3398992},{"method_handle_destroy",3399232},{"native_to_vm",1276640},{"native_to_vm_ctor",1220208},{"new_string_unicode",3659920},{"nmethod_metadata_do",6096352},{"old_lock",6067296},{"record_stack",7760336},{"register_stack",7760464},{"remove_guards",7762000},{"set_not_compilable",5952704},{"set_not_osr_compilable",5952896},{"set_thread_status",3683936},{"setup_fpu",35616},{"threads_do",7750560},{"threads_lock",11368296},{"tlab_initialize",7768704},{"unlock",6066720},{"use_compiler",10734423},{"use_tlab",10736466},{"vm_clear_ics_doit",8019872},{"vm_clear_ics_vtable",9667536},{"vm_deoptimize_doit",8019888},{"vm_deoptimize_vtable",8832216},{"vm_execute",8037872},{"vm_exited",11566960},{"vm_to_native",1048352},{"vm_to_native_ctor",1896624}};
+inline constexpr field_entry fields_12[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1224},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",52},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",402},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JVMFlag","_addr",16},{"JVMFlag","_name",8},{"JVMFlag","_type",0},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",224},{"JavaThread","_anchor",784},{"JavaThread","_handle_area",624},{"JavaThread","_jni_attach_state",976},{"JavaThread","_osthread",608},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",920},{"JavaThread","_stack_base",640},{"JavaThread","_stack_guard_state",1008},{"JavaThread","_stack_size",648},{"JavaThread","_suspend_flags",216},{"JavaThread","_threadObj",776},{"JavaThread","_thread_state",936},{"JavaThread","_tlab",272},{"JavaThread","_vm_result",880},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"OopHandle","_obj",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length_and_refcount",0},{"Thread","_active_handles",224},{"Thread","_handle_area",624},{"Thread","_osthread",608},{"Thread","_pending_exception",8},{"Thread","_stack_base",640},{"Thread","_stack_size",648},{"Thread","_tlab",272},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_priority",16},{"VM_Operation","_timestamp",20},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",344},{"nmethod","_compile_id",340},{"nmethod","_method",120},{"nmethod","_state",350}};
+inline constexpr size_entry sizes_12[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",232},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",128},{"CompiledMethod",208},{"CompilerThread",1264},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",64},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",472},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",7},{"JNIHandleBlock",312},{"JVMFlag",40},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1200},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::StackGuardState",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaValue",16},{"Klass",208},{"MemoryType",0},{"Method",88},{"Method::Flags",0},{"Monitor",120},{"Mutex",120},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"StubQueue",48},{"Symbol",8},{"Thread",760},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadInVMfromNative",8},{"ThreadLocalAllocBuffer",128},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",48},{"VM_Deoptimize",40},{"VM_Operation",40},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",384}};
+inline constexpr enum_entry enums_12[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",34},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",8},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_guard_state",4},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",128},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MemoryType","mtThread",2},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"ObservationABI","anonymous_klass_mask",32},{"ObservationABI","anonymous_klass_offset",314},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",0},{"ObservationABI","hidden_klass_mask",0},{"ObservationABI","hidden_klass_offset",0},{"ObservationABI","hidden_klass_width",0},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",0},{"ObservationABI","set_not_compilable_old_args",1},{"ObservationABI","thread_is_java_slot",5},{"OopHandle","storage_size__obj",8},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length_and_refcount",4},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",128},{"Thread::SuspendFlags","_deopt_suspend",268435456},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__priority",4},{"VM_Operation","storage_size__timestamp",4},{"VM_Operation","vtable___vecDelDtor",0},{"VM_Operation","vtable_allow_nested_vm_operations",7},{"VM_Operation","vtable_count",13},{"VM_Operation","vtable_doit",1},{"VM_Operation","vtable_doit_epilogue",3},{"VM_Operation","vtable_doit_prologue",2},{"VM_Operation","vtable_evaluate_at_safepoint",10},{"VM_Operation","vtable_evaluate_concurrently",11},{"VM_Operation","vtable_evaluation_mode",6},{"VM_Operation","vtable_is_cheap_allocated",8},{"VM_Operation","vtable_is_methodCompiler",4},{"VM_Operation","vtable_oops_do",9},{"VM_Operation","vtable_print_on_error",12},{"VM_Operation","vtable_type",5},{"VM_Operation","vtable_~VM_Operation",0},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_12{
 {200,14,242,71,189,83,236,65,173,237,231,112,42,226,247,10},1,12218368,1563469866,12,
 {0,0,0,0,0,0,0,0,1},
 symbols_12,fields_12,sizes_12,enums_12};
-inline constexpr symbol_entry symbols_13[]{{"java_thread_ctor",7969488},{"allocate_thread",7973424},{"malloc",6444816},{"current_thread",8013392},{"initialize_tls",7989360},{"is_tls_initialized",8013360},{"record_stack",8001552},{"register_stack",8001680},{"create_os_thread",6467952},{"create_guards",7977600},{"remove_guards",8002960},{"tlab_initialize",8009792},{"use_tlab",10991573},{"cache_globals",39696},{"vm_exited",11835392},{"java_version",11552496},{"threads_lock",11635712},{"old_lock",6304944},{"lock_without_safepoint",6304944},{"unlock",6305296},{"allocate_handle_block_legacy",4142608},{"add_thread",7973248},{"main_thread_group_raw",11824496},{"allocate_thread_object",7974096},{"set_thread_status",3737360},{"jfr_thread_start",3739680},{"setup_fpu",39696},{"java_thread_id",3737776},{"java_thread_tid_offset",11552656},{"cleanup_failed",7976784},{"exit_thread",7983680},{"delete_thread",8006656},{"clear_exception",2960112},{"native_to_vm",1311424},{"native_to_vm_ctor",1255216},{"vm_to_native_ctor",1926480},{"anchor_walkable",2989776},{"handle_mark_initialize",3456336},{"handle_mark_destroy",3456000},{"arena_grow",807296},{"method_handle_construct",3455872},{"method_handle_destroy",3456112},{"java_calls",3691776},{"klass_initialize",3598864},{"klass_check",3586992},{"klass_allocate",3584464},{"new_string_unicode",3714208}};
-inline constexpr field_entry fields_13[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",224},{"Thread","_tlab",272},{"Thread","_osthread",608},{"Thread","_handle_area",624},{"Thread","_stack_base",640},{"Thread","_stack_size",648},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",224},{"JavaThread","_tlab",272},{"JavaThread","_osthread",608},{"JavaThread","_handle_area",624},{"JavaThread","_stack_base",640},{"JavaThread","_stack_size",648},{"JavaThread","_threadObj",744},{"JavaThread","_anchor",752},{"JavaThread","_thread_state",904},{"JavaThread","_jni_attach_state",944},{"JavaThread","_stack_guard_state",984},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length_and_refcount",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_13[]{{"Thread",736},{"ThreadShadow",32},{"JavaThread",1184},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_13[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr symbol_entry symbols_13[]{{"add_thread",7973248},{"allocate_handle_block_legacy",4142608},{"allocate_thread",7973424},{"allocate_thread_object",7974096},{"anchor_walkable",2989776},{"arena_grow",807296},{"array_complete",846224},{"array_restore",847600},{"bytecode_lengths",11388224},{"cache_globals",39696},{"class_add",1947104},{"class_define",7749120},{"class_loader_data_head",11407808},{"class_parse",7764176},{"class_resolve_stream",7765232},{"cleanup_failed",7976784},{"clear_exception",2960112},{"codecache_lock",11635656},{"compilation_lock",11635840},{"compile_jobs",10983728},{"compile_lock",11635816},{"compile_queue_lock",11635824},{"compiler_vtable",9757704},{"create_guards",7977600},{"create_os_thread",6467952},{"current_thread",8013392},{"delete_thread",8006656},{"exit_thread",7983680},{"field_enable_guards10",7983472},{"field_special_exit10",7986288},{"field_throw_exception_entry",11732984},{"field_vm_to_java_destroy",1581584},{"handle_mark_destroy",3456000},{"handle_mark_initialize",3456336},{"initialize_tls",7989360},{"interpreter_code",11378560},{"interpreter_entry_table",11378592},{"interpreter_normal_table",11753744},{"interpreter_throw_exception",11732984},{"is_not_compilable",6182304},{"is_not_osr_compilable",6182416},{"is_tls_initialized",8013360},{"java_calls",3691776},{"java_thread_ctor",7969488},{"java_thread_id",3737776},{"java_thread_tid_offset",11552656},{"java_version",11552496},{"jfr_thread_start",3739680},{"klass_allocate",3584464},{"klass_check",3586992},{"klass_initialize",3598864},{"lock_without_safepoint",6304944},{"main_thread_group_raw",11824496},{"malloc",6444816},{"mark_all",2018800},{"mark_for",2019984},{"method_handle_construct",3455872},{"method_handle_destroy",3456112},{"native_to_vm",1311424},{"native_to_vm_ctor",1255216},{"new_string_unicode",3714208},{"nmethod_metadata_do",6333440},{"old_lock",6304944},{"record_stack",8001552},{"register_stack",8001680},{"remove_guards",8002960},{"set_not_compilable",6193536},{"set_not_osr_compilable",6193728},{"set_thread_status",3737360},{"setup_fpu",39696},{"threads_do",7991568},{"threads_lock",11635712},{"tlab_initialize",8009792},{"unlock",6305296},{"use_compiler",10989607},{"use_tlab",10991573},{"vm_clear_ics_doit",8251808},{"vm_clear_ics_vtable",9904984},{"vm_deoptimize_doit",2016000},{"vm_deoptimize_vtable",9050576},{"vm_execute",8270208},{"vm_exited",11835392},{"vm_to_native_ctor",1926480}};
+inline constexpr field_entry fields_13[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1208},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",52},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",402},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JVMFlag","_addr",16},{"JVMFlag","_name",8},{"JVMFlag","_type",0},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",224},{"JavaThread","_anchor",752},{"JavaThread","_handle_area",624},{"JavaThread","_jni_attach_state",944},{"JavaThread","_osthread",608},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",888},{"JavaThread","_stack_base",640},{"JavaThread","_stack_guard_state",984},{"JavaThread","_stack_size",648},{"JavaThread","_suspend_flags",216},{"JavaThread","_threadObj",744},{"JavaThread","_thread_state",904},{"JavaThread","_tlab",272},{"JavaThread","_vm_result",848},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"OopHandle","_obj",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length_and_refcount",0},{"Thread","_active_handles",224},{"Thread","_handle_area",624},{"Thread","_osthread",608},{"Thread","_pending_exception",8},{"Thread","_stack_base",640},{"Thread","_stack_size",648},{"Thread","_tlab",272},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_priority",16},{"VM_Operation","_timestamp",20},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",320},{"nmethod","_compile_id",316},{"nmethod","_method",120},{"nmethod","_state",326}};
+inline constexpr size_entry sizes_13[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",232},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",144},{"CompiledMethod",200},{"CompilerThread",1248},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",64},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",472},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",5},{"JNIHandleBlock",312},{"JVMFlag",40},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1184},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::StackGuardState",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaValue",16},{"Klass",208},{"MemoryType",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",120},{"Mutex",120},{"NMethodClosure",8},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"StubQueue",48},{"Symbol",8},{"Thread",736},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadInVMfromNative",8},{"ThreadLocalAllocBuffer",128},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",48},{"VM_Deoptimize",40},{"VM_Operation",40},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",360}};
+inline constexpr enum_entry enums_13[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",34},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",8},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_guard_state",4},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",128},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MemoryType","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",32},{"ObservationABI","anonymous_klass_offset",314},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",0},{"ObservationABI","hidden_klass_mask",0},{"ObservationABI","hidden_klass_offset",0},{"ObservationABI","hidden_klass_width",0},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length_and_refcount",4},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",128},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__priority",4},{"VM_Operation","storage_size__timestamp",4},{"VM_Operation","vtable___vecDelDtor",0},{"VM_Operation","vtable_allow_nested_vm_operations",7},{"VM_Operation","vtable_count",14},{"VM_Operation","vtable_doit",1},{"VM_Operation","vtable_doit_epilogue",3},{"VM_Operation","vtable_doit_prologue",2},{"VM_Operation","vtable_evaluate_at_safepoint",10},{"VM_Operation","vtable_evaluate_concurrently",11},{"VM_Operation","vtable_evaluation_mode",6},{"VM_Operation","vtable_is_cheap_allocated",8},{"VM_Operation","vtable_is_methodCompiler",4},{"VM_Operation","vtable_name",13},{"VM_Operation","vtable_oops_do",9},{"VM_Operation","vtable_print_on_error",12},{"VM_Operation","vtable_type",5},{"VM_Operation","vtable_~VM_Operation",0},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_13{
 {127,52,82,218,39,175,227,66,169,91,41,145,3,151,22,242},1,12509184,1598786650,13,
 {0,0,1,0,0,0,0,0,1},
 symbols_13,fields_13,sizes_13,enums_13};
-inline constexpr symbol_entry symbols_14[]{{"java_thread_ctor",7683328},{"allocate_thread",7687248},{"malloc",6227968},{"current_thread",7732736},{"initialize_tls",7703360},{"is_tls_initialized",7732704},{"record_stack",7715600},{"register_stack",7715728},{"create_os_thread",6251056},{"create_guards",7691600},{"remove_guards",7717008},{"tlab_initialize",7728928},{"use_tlab",10673571},{"cache_globals",41632},{"vm_exited",11499392},{"java_version",11216176},{"threads_lock",11299704},{"lock",6095328},{"lock_without_safepoint",6095696},{"unlock",6096048},{"allocate_handle_block_legacy",3883760},{"add_thread",7687072},{"main_thread_group_raw",11488496},{"allocate_thread_object",7687920},{"set_thread_status",3459808},{"jfr_thread_start",3462128},{"setup_fpu",41632},{"java_thread_id",3460240},{"java_thread_tid_offset",11216340},{"cleanup_failed",7690784},{"exit_thread",7697760},{"delete_thread",7721280},{"clear_exception",2659312},{"native_to_vm",1230096},{"native_to_vm_ctor",1174032},{"vm_to_native_ctor",1842400},{"anchor_walkable",2691904},{"handle_mark_initialize",3170432},{"handle_mark_destroy",3170096},{"arena_grow",709888},{"method_handle_construct",3169968},{"method_handle_destroy",3170208},{"java_calls",3411504},{"klass_initialize",3317360},{"klass_check",3304752},{"klass_allocate",3302432},{"new_string_unicode",3434864}};
-inline constexpr field_entry fields_14[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",232},{"Thread","_tlab",280},{"Thread","_osthread",624},{"Thread","_handle_area",640},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",232},{"JavaThread","_tlab",280},{"JavaThread","_osthread",624},{"JavaThread","_handle_area",640},{"JavaThread","_stack_base",656},{"JavaThread","_stack_size",664},{"JavaThread","_threadObj",744},{"JavaThread","_anchor",752},{"JavaThread","_thread_state",896},{"JavaThread","_jni_attach_state",936},{"JavaThread","_stack_guard_state",976},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length_and_refcount",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_14[]{{"Thread",736},{"ThreadShadow",32},{"JavaThread",1176},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_14[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr symbol_entry symbols_14[]{{"add_thread",7687072},{"allocate_handle_block_legacy",3883760},{"allocate_thread",7687248},{"allocate_thread_object",7687920},{"anchor_walkable",2691904},{"arena_grow",709888},{"array_complete",748320},{"array_restore",749680},{"bytecode_lengths",11055120},{"cache_globals",41632},{"class_add",1863024},{"class_define",7463008},{"class_loader_data_head",11074896},{"class_parse",7477920},{"class_resolve_stream",7479008},{"cleanup_failed",7690784},{"clear_exception",2659312},{"codecache_lock",11299648},{"compilation_lock",11299832},{"compile_jobs",10666728},{"compile_lock",11299808},{"compile_queue_lock",11299816},{"compiler_vtable",9480024},{"create_guards",7691600},{"create_os_thread",6251056},{"current_thread",7732736},{"delete_thread",7721280},{"deoptimize_all_marked",2199568},{"exit_thread",7697760},{"field_enable_guards10",7697552},{"field_special_exit10",7700320},{"field_throw_exception_entry",11396840},{"field_vm_to_java_destroy",1501632},{"handle_mark_destroy",3170096},{"handle_mark_initialize",3170432},{"initialize_tls",7703360},{"interpreter_code",11045952},{"interpreter_entry_table",11045984},{"interpreter_normal_table",11417600},{"interpreter_throw_exception",11396840},{"is_not_compilable",5971808},{"is_not_osr_compilable",5971920},{"is_tls_initialized",7732704},{"java_calls",3411504},{"java_thread_ctor",7683328},{"java_thread_id",3460240},{"java_thread_tid_offset",11216340},{"java_version",11216176},{"jfr_thread_start",3462128},{"klass_allocate",3302432},{"klass_check",3304752},{"klass_initialize",3317360},{"lock",6095328},{"lock_without_safepoint",6095696},{"main_thread_group_raw",11488496},{"malloc",6227968},{"mark_all",1924480},{"mark_for",1925696},{"method_handle_construct",3169968},{"method_handle_destroy",3170208},{"native_to_vm",1230096},{"native_to_vm_ctor",1174032},{"new_string_unicode",3434864},{"nmethod_metadata_do",6123440},{"record_stack",7715600},{"register_stack",7715728},{"remove_guards",7717008},{"set_not_compilable",5984560},{"set_not_osr_compilable",5984752},{"set_thread_status",3459808},{"setup_fpu",41632},{"threads_do",7705648},{"threads_lock",11299704},{"tlab_initialize",7728928},{"unlock",6096048},{"use_compiler",10671950},{"use_tlab",10673571},{"vm_clear_ics_doit",7969408},{"vm_clear_ics_vtable",9626832},{"vm_execute",7988176},{"vm_exited",11499392},{"vm_to_native_ctor",1842400}};
+inline constexpr field_entry fields_14[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1200},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",52},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",410},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JVMFlag","_addr",16},{"JVMFlag","_name",8},{"JVMFlag","_type",0},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",232},{"JavaThread","_anchor",752},{"JavaThread","_handle_area",640},{"JavaThread","_jni_attach_state",936},{"JavaThread","_osthread",624},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",880},{"JavaThread","_stack_base",656},{"JavaThread","_stack_guard_state",976},{"JavaThread","_stack_size",664},{"JavaThread","_suspend_flags",224},{"JavaThread","_threadObj",744},{"JavaThread","_thread_state",896},{"JavaThread","_tlab",280},{"JavaThread","_vm_result",840},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"OopHandle","_obj",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length_and_refcount",0},{"Thread","_active_handles",232},{"Thread","_handle_area",640},{"Thread","_osthread",624},{"Thread","_pending_exception",8},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"Thread","_tlab",280},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_timestamp",16},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",312},{"nmethod","_compile_id",308},{"nmethod","_method",120},{"nmethod","_state",319}};
+inline constexpr size_entry sizes_14[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",232},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",144},{"CompiledMethod",200},{"CompilerThread",1240},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",64},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",480},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",5},{"JNIHandleBlock",312},{"JVMFlag",40},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1176},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::StackGuardState",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaValue",16},{"Klass",208},{"MemoryType",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",120},{"Mutex",120},{"NMethodClosure",8},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"StubQueue",48},{"Symbol",8},{"Thread",736},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadInVMfromNative",8},{"ThreadLocalAllocBuffer",128},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",48},{"VM_Operation",40},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",352}};
+inline constexpr enum_entry enums_14[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",34},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",8},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_guard_state",4},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",128},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MemoryType","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",32},{"ObservationABI","anonymous_klass_offset",322},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",1},{"ObservationABI","hidden_klass_mask",0},{"ObservationABI","hidden_klass_offset",0},{"ObservationABI","hidden_klass_width",0},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length_and_refcount",4},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",128},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__timestamp",4},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_count",9},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_oops_do",5},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_14{
 {206,48,166,88,66,107,165,71,178,92,192,157,67,244,82,137},1,12144640,1595098468,14,
 {0,0,1,0,0,0,0,0,1},
 symbols_14,fields_14,sizes_14,enums_14};
-inline constexpr symbol_entry symbols_15[]{{"java_thread_ctor",7681600},{"allocate_thread",7685520},{"malloc",6204208},{"current_thread",7730960},{"initialize_tls",7701600},{"is_tls_initialized",7730928},{"record_stack",7713600},{"register_stack",7713728},{"create_os_thread",6227440},{"create_guards",7689840},{"remove_guards",7714992},{"tlab_initialize",7727168},{"use_tlab",10634170},{"cache_globals",42256},{"vm_exited",11484176},{"java_version",11204936},{"threads_lock",11284200},{"lock",6068240},{"lock_without_safepoint",6068656},{"unlock",6069008},{"allocate_handle_block_legacy",3871952},{"add_thread",7685344},{"main_thread_group_raw",11473280},{"allocate_thread_object",7686144},{"set_thread_status",3400304},{"jfr_thread_start",3402592},{"setup_fpu",42256},{"java_thread_id",3400752},{"java_thread_tid_offset",11205108},{"cleanup_failed",7689024},{"exit_thread",7696032},{"delete_thread",7719488},{"clear_exception",2560032},{"native_to_vm",1115600},{"native_to_vm_ctor",1061552},{"vm_to_native_ctor",1755248},{"anchor_walkable",2600176},{"handle_mark_initialize",3105760},{"handle_mark_destroy",3105424},{"arena_grow",630112},{"method_handle_construct",3105296},{"method_handle_destroy",3105536},{"java_calls",3351616},{"klass_initialize",3256816},{"klass_check",3243792},{"klass_allocate",3240816},{"new_string_unicode",3375200}};
-inline constexpr field_entry fields_15[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",232},{"Thread","_tlab",280},{"Thread","_osthread",648},{"Thread","_handle_area",664},{"Thread","_stack_base",680},{"Thread","_stack_size",688},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",232},{"JavaThread","_tlab",280},{"JavaThread","_osthread",648},{"JavaThread","_handle_area",664},{"JavaThread","_stack_base",680},{"JavaThread","_stack_size",688},{"JavaThread","_threadObj",768},{"JavaThread","_anchor",776},{"JavaThread","_thread_state",920},{"JavaThread","_jni_attach_state",960},{"JavaThread","_stack_guard_state",1000},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_15[]{{"Thread",760},{"ThreadShadow",32},{"JavaThread",1224},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_15[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr symbol_entry symbols_15[]{{"add_thread",7685344},{"allocate_handle_block_legacy",3871952},{"allocate_thread",7685520},{"allocate_thread_object",7686144},{"anchor_walkable",2600176},{"arena_grow",630112},{"array_complete",668448},{"array_restore",669808},{"bytecode_lengths",11011088},{"cache_globals",42256},{"class_add",1775088},{"class_define",7449344},{"class_loader_data_head",11030912},{"class_parse",7464368},{"class_resolve_stream",7466080},{"cleanup_failed",7689024},{"clear_exception",2560032},{"codecache_lock",11284144},{"compilation_lock",11284336},{"compile_jobs",10627416},{"compile_lock",11284312},{"compile_queue_lock",11284320},{"compiler_vtable",9450952},{"create_guards",7689840},{"create_os_thread",6227440},{"current_thread",7730960},{"delete_thread",7719488},{"deoptimize_all_marked",2122032},{"exit_thread",7696032},{"field_enable_guards10",7695808},{"field_special_exit10",7698592},{"field_throw_exception_entry",11381656},{"field_vm_to_java_destroy",1370608},{"handle_mark_destroy",3105424},{"handle_mark_initialize",3105760},{"initialize_tls",7701600},{"interpreter_code",11001984},{"interpreter_entry_table",11002016},{"interpreter_normal_table",11402416},{"interpreter_throw_exception",11381656},{"is_not_compilable",5946112},{"is_not_osr_compilable",5946224},{"is_tls_initialized",7730928},{"java_calls",3351616},{"java_thread_ctor",7681600},{"java_thread_id",3400752},{"java_thread_tid_offset",11205108},{"java_version",11204936},{"jfr_thread_start",3402592},{"klass_allocate",3240816},{"klass_check",3243792},{"klass_initialize",3256816},{"lock",6068240},{"lock_without_safepoint",6068656},{"main_thread_group_raw",11473280},{"malloc",6204208},{"mark_all",1837088},{"mark_for",1838304},{"method_handle_construct",3105296},{"method_handle_destroy",3105536},{"native_to_vm",1115600},{"native_to_vm_ctor",1061552},{"new_string_unicode",3375200},{"nmethod_metadata_do",6096752},{"record_stack",7713600},{"register_stack",7713728},{"remove_guards",7714992},{"set_not_compilable",5958912},{"set_not_osr_compilable",5959072},{"set_thread_status",3400304},{"setup_fpu",42256},{"threads_do",7703824},{"threads_lock",11284200},{"tlab_initialize",7727168},{"unlock",6069008},{"use_compiler",10632597},{"use_tlab",10634170},{"vm_clear_ics_doit",7967168},{"vm_clear_ics_vtable",9599832},{"vm_execute",7985472},{"vm_exited",11484176},{"vm_to_native_ctor",1755248}};
+inline constexpr field_entry fields_15[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoadInfo","_is_hidden",40},{"ClassLoadInfo","_unsafe_anonymous_host",8},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1248},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",307},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JVMFlag","_addr",16},{"JVMFlag","_name",8},{"JVMFlag","_type",0},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",232},{"JavaThread","_anchor",776},{"JavaThread","_handle_area",664},{"JavaThread","_jni_attach_state",960},{"JavaThread","_osthread",648},{"JavaThread","_pending_exception",8},{"JavaThread","_special_runtime_exit_condition",904},{"JavaThread","_stack_base",680},{"JavaThread","_stack_guard_state",1000},{"JavaThread","_stack_size",688},{"JavaThread","_suspend_flags",224},{"JavaThread","_threadObj",768},{"JavaThread","_thread_state",920},{"JavaThread","_tlab",280},{"JavaThread","_vm_result",864},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"OopHandle","_obj",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_active_handles",232},{"Thread","_handle_area",664},{"Thread","_osthread",648},{"Thread","_pending_exception",8},{"Thread","_stack_base",680},{"Thread","_stack_size",688},{"Thread","_tlab",280},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"VM_Operation","_next",24},{"VM_Operation","_prev",32},{"VM_Operation","_timestamp",16},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",312},{"nmethod","_compile_id",308},{"nmethod","_method",120},{"nmethod","_state",319}};
+inline constexpr size_entry sizes_15[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",48},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",144},{"CompiledMethod",200},{"CompilerThread",1288},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",456},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",5},{"JNIHandleBlock",312},{"JVMFlag",40},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1224},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::StackGuardState",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaValue",16},{"Klass",200},{"MemoryType",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",120},{"Mutex",120},{"NMethodClosure",8},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"StubQueue",48},{"Symbol",8},{"Thread",760},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadInVMfromNative",8},{"ThreadLocalAllocBuffer",128},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",48},{"VM_Operation",40},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",352}};
+inline constexpr enum_entry enums_15[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",34},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoadInfo","storage_size__unsafe_anonymous_host",8},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",8},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_guard_state",4},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",128},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MemoryType","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",8},{"ObservationABI","anonymous_klass_offset",310},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",24},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",32},{"ObservationABI","deopt_mode",1},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",164},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",128},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","storage_size__next",8},{"VM_Operation","storage_size__prev",8},{"VM_Operation","storage_size__timestamp",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_count",8},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",5},{"VM_Operation","vtable_name",7},{"VM_Operation","vtable_print_on_error",6},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_15{
 {32,77,215,238,166,43,34,67,168,208,140,225,249,163,128,36},1,12120064,1611514237,15,
 {0,0,1,0,0,0,0,0,1},
 symbols_15,fields_15,sizes_15,enums_15};
-inline constexpr symbol_entry symbols_16[]{{"java_thread_ctor",8230304},{"allocate_thread",8233520},{"malloc",6732272},{"current_thread",8275696},{"initialize_tls",8248000},{"is_tls_initialized",8275664},{"record_stack",8259392},{"register_stack",8259536},{"unregister_stack",8264640},{"create_os_thread",6755680},{"create_guards",7669936},{"remove_guards",7672368},{"tlab_initialize",8271808},{"use_tlab",11479863},{"cache_globals",39632},{"vm_exited",12145000},{"java_version",11915216},{"threads_lock",11994520},{"lock",6593840},{"lock_without_safepoint",6594256},{"unlock",6594672},{"allocate_handle_block",4266224},{"add_thread",8233312},{"main_thread_group",8375232},{"allocate_thread_object",8234128},{"thread_object",8264384},{"set_thread_status",3766656},{"jfr_thread_start",3768960},{"setup_fpu",39632},{"java_thread_id",3767120},{"java_thread_tid_offset",11915388},{"cleanup_failed",8236464},{"exit_thread",8242736},{"delete_thread",8263904},{"clear_exception",2892432},{"native_to_vm",1373488},{"native_to_vm_ctor",1318208},{"vm_to_native_ctor",2067184},{"anchor_walkable",2940208},{"handle_mark_initialize",3469296},{"handle_mark_destroy",3468944},{"arena_grow",751888},{"method_handle_construct",3468800},{"method_handle_destroy",3469056},{"java_calls",3714832},{"klass_initialize",3619264},{"klass_check",3606880},{"klass_allocate",3603296},{"new_string_unicode",3739696}};
-inline constexpr field_entry fields_16[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",240},{"Thread","_tlab",296},{"Thread","_osthread",624},{"Thread","_handle_area",640},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",240},{"JavaThread","_tlab",296},{"JavaThread","_osthread",624},{"JavaThread","_handle_area",640},{"JavaThread","_stack_base",656},{"JavaThread","_stack_size",664},{"JavaThread","_threadObj",736},{"JavaThread","_anchor",744},{"JavaThread","_thread_state",896},{"JavaThread","_jni_attach_state",936},{"JavaThread","_stack_overflow_state",976},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_16[]{{"Thread",728},{"ThreadShadow",32},{"JavaThread",1304},{"JavaFrameAnchor",32},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",24},{"StackOverflow",40},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_16[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_16[]{{"add_thread",8233312},{"allocate_handle_block",4266224},{"allocate_thread",8233520},{"allocate_thread_object",8234128},{"anchor_walkable",2940208},{"arena_grow",751888},{"array_complete",790432},{"array_restore",791808},{"bytecode_lengths",11847456},{"cache_globals",39632},{"class_add",2086768},{"class_define",7991984},{"class_loader_data_head",11867840},{"class_parse",8008464},{"class_resolve_stream",8010480},{"cleanup_failed",8236464},{"clear_exception",2892432},{"codecache_lock",11994472},{"compilation_lock",11994656},{"compile_jobs",11472360},{"compile_lock",11994632},{"compile_queue_lock",11994640},{"compiler_vtable",10201016},{"create_guards",7669936},{"create_os_thread",6755680},{"current_thread",8275696},{"delete_thread",8263904},{"deoptimize_all_marked",2462032},{"exit_thread",8242736},{"field_enable_guards19",7670576},{"field_enable_guards20",7670576},{"field_special_exit10",8245040},{"field_throw_exception_entry",12047512},{"field_vm_to_java_destroy",1637904},{"handle_mark_destroy",3468944},{"handle_mark_initialize",3469296},{"initialize_tls",8248000},{"interpreter_code",11837952},{"interpreter_entry_table",11837984},{"interpreter_normal_table",12068272},{"interpreter_throw_exception",12047512},{"is_not_compilable",6465616},{"is_not_osr_compilable",6465728},{"is_tls_initialized",8275664},{"java_calls",3714832},{"java_thread_ctor",8230304},{"java_thread_id",3767120},{"java_thread_tid_offset",11915388},{"java_version",11915216},{"jfr_thread_start",3768960},{"klass_allocate",3603296},{"klass_check",3606880},{"klass_initialize",3619264},{"lock",6593840},{"lock_without_safepoint",6594256},{"main_thread_group",8375232},{"malloc",6732272},{"mark_all",2151904},{"mark_for",2153120},{"method_handle_construct",3468800},{"method_handle_destroy",3469056},{"native_to_vm",1373488},{"native_to_vm_ctor",1318208},{"new_string_unicode",3739696},{"nmethod_metadata_do",6623152},{"record_stack",8259392},{"register_stack",8259536},{"remove_guards",7672368},{"set_not_compilable",6479104},{"set_not_osr_compilable",6479264},{"set_thread_status",3766656},{"setup_fpu",39632},{"thread_object",8264384},{"threads_do",8249840},{"threads_lock",11994520},{"tlab_initialize",8271808},{"unlock",6594672},{"unregister_stack",8264640},{"use_compiler",11478316},{"use_tlab",11479863},{"vm_clear_ics_doit",8589888},{"vm_clear_ics_vtable",10373304},{"vm_execute",8595488},{"vm_exited",12145000},{"vm_to_native_ctor",2067184}};
+inline constexpr field_entry fields_16[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoadInfo","_is_hidden",40},{"ClassLoadInfo","_unsafe_anonymous_host",8},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1328},{"ConstMethod","_code_size",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_result_type",38},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",307},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaFrameAnchor","_saved_rbp_address",24},{"JavaThread","_active_handles",240},{"JavaThread","_anchor",744},{"JavaThread","_handle_area",640},{"JavaThread","_jni_attach_state",936},{"JavaThread","_osthread",624},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",280},{"JavaThread","_special_runtime_exit_condition",880},{"JavaThread","_stack_base",656},{"JavaThread","_stack_overflow_state",976},{"JavaThread","_stack_size",664},{"JavaThread","_suspend_flags",232},{"JavaThread","_threadObj",736},{"JavaThread","_thread_state",896},{"JavaThread","_tlab",296},{"JavaThread","_vm_result",840},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",32},{"Method","_code",64},{"Method","_constMethod",8},{"Method","_flags",42},{"Method","_from_interpreted_entry",72},{"Method","_i2i_entry",48},{"Method","_intrinsic_id",40},{"OopHandle","_obj",0},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_active_handles",240},{"Thread","_handle_area",640},{"Thread","_osthread",624},{"Thread","_pending_exception",8},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"Thread","_tlab",296},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",316},{"nmethod","_compile_id",312},{"nmethod","_method",120},{"nmethod","_state",323}};
+inline constexpr size_entry sizes_16[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",48},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",144},{"CompiledMethod",200},{"CompilerThread",1368},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",456},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",5},{"JNIHandleBlock",312},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",32},{"JavaThread",1304},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",200},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",120},{"Mutex",120},{"NMethodClosure",8},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"SafepointMechanism::ThreadData",16},{"StackOverflow",40},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",728},{"Thread::SuspendFlags",0},{"ThreadClosure",8},{"ThreadInVMfromJava",8},{"ThreadInVMfromNative",8},{"ThreadLocalAllocBuffer",128},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",352}};
+inline constexpr enum_entry enums_16[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",36},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoadInfo","storage_size__unsafe_anonymous_host",8},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-2},{"CompLevel","CompLevel_any",-2},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaFrameAnchor","storage_size__saved_rbp_address",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",32},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__special_runtime_exit_condition",4},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",40},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",128},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",64},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",8},{"ObservationABI","anonymous_klass_offset",310},{"ObservationABI","anonymous_klass_width",2},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",1},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",164},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",42},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",128},{"Thread::SuspendFlags","_external_suspend",536870912},{"Thread::SuspendFlags","_obj_deopt",8},{"Thread::SuspendFlags","_trace_flag",4},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_count",9},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_16{
 {4,201,170,174,122,236,61,242,228,159,160,111,169,105,151,101},1,12808192,1153291634,16,
 {0,0,1,0,1,0,0,0,1},
 symbols_16,fields_16,sizes_16,enums_16};
-inline constexpr symbol_entry symbols_17[]{{"java_thread_ctor",8299904},{"allocate_thread",8301920},{"malloc",6781520},{"current_thread",8340032},{"initialize_tls",8315024},{"is_tls_initialized",8340000},{"record_stack",8325344},{"register_stack",8325488},{"unregister_stack",8329280},{"create_os_thread",6802688},{"create_guards",7729760},{"remove_guards",7732192},{"initialize_tlab",8315072},{"tlab_initialize",8336240},{"use_tlab",11675278},{"cache_globals",40704},{"vm_exited",12354904},{"java_version",12118160},{"threads_lock",12201208},{"lock",6639792},{"lock_without_safepoint",6640320},{"unlock",6640752},{"allocate_handle_block",4265744},{"add_thread",8301696},{"main_thread_group",8438928},{"allocate_thread_object",8302224},{"thread_object",8329072},{"set_thread_status",3774160},{"jfr_thread_start",3776496},{"setup_fpu",40704},{"java_thread_id",3774688},{"java_thread_tid_offset",12118336},{"cleanup_failed",8304368},{"exit_thread",8310416},{"delete_thread",8328704},{"clear_exception",2891040},{"native_to_vm",1344032},{"process_safepoint_exit",1332176},{"native_to_vm_ctor",1289968},{"vm_to_native_ctor",2030336},{"anchor_walkable",2943184},{"handle_mark_initialize",3474336},{"handle_mark_destroy",3473984},{"arena_grow",711584},{"method_handle_construct",3473840},{"method_handle_destroy",3474096},{"java_calls",3720256},{"klass_initialize",3623728},{"klass_check",3610656},{"klass_allocate",3606912},{"new_string_unicode",3745984}};
-inline constexpr field_entry fields_17[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",216},{"Thread","_tlab",256},{"Thread","_osthread",560},{"Thread","_handle_area",576},{"Thread","_stack_base",592},{"Thread","_stack_size",600},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",216},{"JavaThread","_tlab",256},{"JavaThread","_osthread",560},{"JavaThread","_handle_area",576},{"JavaThread","_stack_base",592},{"JavaThread","_stack_size",600},{"JavaThread","_threadObj",656},{"JavaThread","_anchor",664},{"JavaThread","_thread_state",832},{"JavaThread","_jni_attach_state",884},{"JavaThread","_stack_overflow_state",944},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_17[]{{"Thread",648},{"ThreadShadow",32},{"JavaThread",1232},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",304},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",40},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",48},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_17[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_17[]{{"add_thread",8301696},{"allocate_handle_block",4265744},{"allocate_thread",8301920},{"allocate_thread_object",8302224},{"anchor_walkable",2943184},{"arena_grow",711584},{"array_complete",750912},{"array_restore",752304},{"bytecode_lengths",12049296},{"cache_globals",40704},{"class_add",2049648},{"class_define",8066160},{"class_loader_data_head",12069616},{"class_resolve_hidden",8082176},{"class_resolve_stream",8082128},{"cleanup_failed",8304368},{"clear_exception",2891040},{"codecache_lock",12201160},{"compilation_lock",12201336},{"compile_jobs",11669576},{"compile_lock",12201312},{"compile_queue_lock",12201320},{"compiler_vtable",9738024},{"create_guards",7729760},{"create_os_thread",6802688},{"current_thread",8340032},{"delete_thread",8328704},{"deoptimize_all_marked",2444480},{"exit_thread",8310416},{"field_enable_guards19",7730400},{"field_enable_guards20",7730400},{"field_process_safepoint_exit19",1332176},{"field_special_exit10",8313008},{"field_throw_exception_entry",12257032},{"field_vm_to_java_destroy",1600624},{"handle_mark_destroy",3473984},{"handle_mark_initialize",3474336},{"initialize_tlab",8315072},{"initialize_tls",8315024},{"interpreter_code",12040512},{"interpreter_entry_table",12040544},{"interpreter_normal_table",12277792},{"interpreter_throw_exception",12257032},{"is_not_compilable",6514576},{"is_not_osr_compilable",6514704},{"is_tls_initialized",8340000},{"java_calls",3720256},{"java_thread_ctor",8299904},{"java_thread_id",3774688},{"java_thread_tid_offset",12118336},{"java_version",12118160},{"jfr_thread_start",3776496},{"klass_allocate",3606912},{"klass_check",3610656},{"klass_initialize",3623728},{"lock",6639792},{"lock_without_safepoint",6640320},{"main_thread_group",8438928},{"malloc",6781520},{"mark_all",2116480},{"mark_for",2117776},{"method_handle_construct",3473840},{"method_handle_destroy",3474096},{"native_to_vm",1344032},{"native_to_vm_ctor",1289968},{"new_string_unicode",3745984},{"nmethod_metadata_do",6669392},{"process_safepoint_exit",1332176},{"record_stack",8325344},{"register_stack",8325488},{"remove_guards",7732192},{"set_not_compilable",6527840},{"set_not_osr_compilable",6528016},{"set_thread_status",3774160},{"setup_fpu",40704},{"thread_object",8329072},{"threads_do",8315824},{"threads_lock",12201208},{"tlab_initialize",8336240},{"unlock",6640752},{"unregister_stack",8329280},{"use_compiler",11676910},{"use_tlab",11675278},{"vm_clear_ics_doit",8652448},{"vm_clear_ics_vtable",10454424},{"vm_execute",8658224},{"vm_exited",12354904},{"vm_to_native_ctor",2030336}};
+inline constexpr field_entry fields_17[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",112},{"CompilerThread","_task",1256},{"ConstMethod","_code_size",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_result_type",30},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",307},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",216},{"JavaThread","_anchor",664},{"JavaThread","_handle_area",576},{"JavaThread","_jni_attach_state",884},{"JavaThread","_osthread",560},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",840},{"JavaThread","_stack_base",592},{"JavaThread","_stack_overflow_state",944},{"JavaThread","_stack_size",600},{"JavaThread","_suspend_flags",816},{"JavaThread","_threadObj",656},{"JavaThread","_thread_state",832},{"JavaThread","_tlab",256},{"JavaThread","_vm_result",752},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",50},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",48},{"OopHandle","_obj",0},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_active_handles",216},{"Thread","_handle_area",576},{"Thread","_osthread",560},{"Thread","_pending_exception",8},{"Thread","_stack_base",592},{"Thread","_stack_size",600},{"Thread","_tlab",256},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",308},{"nmethod","_compile_id",304},{"nmethod","_method",112},{"nmethod","_state",315}};
+inline constexpr size_entry sizes_17[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",144},{"CompiledMethod",192},{"CompilerThread",1296},{"CompilerType",0},{"ConstMethod",48},{"ConstantPool",72},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",456},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",5},{"JNIHandleBlock",304},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1232},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",200},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"SafepointMechanism::ThreadData",16},{"StackOverflow",40},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",648},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",352}};
+inline constexpr enum_entry enums_17[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",36},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",40},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",32},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",1},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",164},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",50},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__active_handles",8},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_count",9},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_17{
 {30,174,66,228,51,42,150,251,153,27,174,79,132,4,159,229},1,13025280,807086503,17,
 {0,0,1,0,1,0,0,0,0},
 symbols_17,fields_17,sizes_17,enums_17};
-inline constexpr symbol_entry symbols_18[]{{"java_thread_ctor",8356992},{"allocate_thread",8358864},{"malloc",6881856},{"current_thread",8396240},{"initialize_tls",8371568},{"is_tls_initialized",8396208},{"record_stack",8382080},{"register_stack",8382224},{"unregister_stack",8386016},{"create_os_thread",6904784},{"create_guards",7810496},{"remove_guards",7812928},{"initialize_tlab",8371616},{"tlab_initialize",8392496},{"use_tlab",11738405},{"cache_globals",61856},{"vm_exited",12469560},{"java_version",12224896},{"threads_lock",12313056},{"lock",6744544},{"lock_without_safepoint",6744976},{"unlock",6745392},{"allocate_handle_block",4379616},{"add_thread",8358656},{"main_thread_group",8495440},{"allocate_thread_object",8359040},{"thread_object",8385808},{"set_thread_status",3899440},{"jfr_thread_start",3901680},{"setup_fpu",61856},{"java_thread_id",3899968},{"java_thread_tid_offset",12225120},{"cleanup_failed",8360912},{"exit_thread",8367248},{"delete_thread",8385440},{"clear_exception",3000016},{"process_safepoint_exit",1204272},{"anchor_walkable",3056928},{"handle_mark_initialize",3603408},{"handle_mark_destroy",3603056},{"arena_grow",764032},{"method_handle_construct",3602912},{"method_handle_destroy",3603168},{"java_calls",3847024},{"klass_initialize",3754368},{"klass_check",3742016},{"klass_allocate",3738384},{"new_string_unicode",3871296}};
-inline constexpr field_entry fields_18[]{{"Thread","_pending_exception",8},{"Thread","_tlab",232},{"Thread","_osthread",528},{"Thread","_handle_area",544},{"Thread","_stack_base",560},{"Thread","_stack_size",568},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",232},{"JavaThread","_osthread",528},{"JavaThread","_handle_area",544},{"JavaThread","_stack_base",560},{"JavaThread","_stack_size",568},{"JavaThread","_threadObj",616},{"JavaThread","_anchor",624},{"JavaThread","_active_handles",768},{"JavaThread","_thread_state",816},{"JavaThread","_jni_attach_state",868},{"JavaThread","_stack_overflow_state",928},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_18[]{{"Thread",608},{"ThreadShadow",32},{"JavaThread",1208},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",304},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",40},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",48},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_18[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_18[]{{"add_thread",8358656},{"allocate_handle_block",4379616},{"allocate_thread",8358864},{"allocate_thread_object",8359040},{"anchor_walkable",3056928},{"arena_grow",764032},{"array_complete",803264},{"array_restore",804576},{"bytecode_lengths",12152544},{"cache_globals",61856},{"class_add",2157104},{"class_define",8137968},{"class_loader_data_head",12172608},{"class_resolve_hidden",8153120},{"class_resolve_stream",8153072},{"cleanup_failed",8360912},{"clear_exception",3000016},{"codecache_lock",12313008},{"compilation_lock",12313176},{"compile_jobs",11723384},{"compile_lock",12313152},{"compile_queue_lock",12313160},{"compiler_vtable",9856968},{"create_guards",7810496},{"create_os_thread",6904784},{"current_thread",8396240},{"delete_thread",8385440},{"deoptimize_all_marked",2536032},{"exit_thread",8367248},{"field_enable_guards19",7811136},{"field_enable_guards20",7811136},{"field_process_safepoint_exit19",1204272},{"field_special_exit10",8369536},{"field_throw_exception_entry",12370632},{"field_vm_to_java_destroy",1693744},{"handle_mark_destroy",3603056},{"handle_mark_initialize",3603408},{"initialize_tlab",8371616},{"initialize_tls",8371568},{"interpreter_code",12142768},{"interpreter_entry_table",12142800},{"interpreter_normal_table",12391392},{"interpreter_throw_exception",12370632},{"is_not_compilable",6618368},{"is_not_osr_compilable",6618496},{"is_tls_initialized",8396208},{"java_calls",3847024},{"java_thread_ctor",8356992},{"java_thread_id",3899968},{"java_thread_tid_offset",12225120},{"java_version",12224896},{"jfr_thread_start",3901680},{"klass_allocate",3738384},{"klass_check",3742016},{"klass_initialize",3754368},{"lock",6744544},{"lock_without_safepoint",6744976},{"main_thread_group",8495440},{"malloc",6881856},{"mark_all",2217120},{"mark_for",2218400},{"method_handle_construct",3602912},{"method_handle_destroy",3603168},{"new_string_unicode",3871296},{"nmethod_metadata_do",6770880},{"process_safepoint_exit",1204272},{"record_stack",8382080},{"register_stack",8382224},{"remove_guards",7812928},{"set_not_compilable",6631776},{"set_not_osr_compilable",6631936},{"set_thread_status",3899440},{"setup_fpu",61856},{"thread_object",8385808},{"threads_do",8372624},{"threads_lock",12313056},{"tlab_initialize",8392496},{"unlock",6745392},{"unregister_stack",8386016},{"use_compiler",11735925},{"use_tlab",11738405},{"vm_clear_ics_doit",8726848},{"vm_clear_ics_vtable",10574768},{"vm_execute",8732880},{"vm_exited",12469560}};
+inline constexpr field_entry fields_18[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",112},{"CompilerThread","_task",1232},{"ConstMethod","_code_size",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_result_type",30},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",291},{"InterpreterCodelet","_bytecode",16},{"InterpreterCodelet","_description",8},{"InterpreterCodelet","_size",0},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",768},{"JavaThread","_anchor",624},{"JavaThread","_handle_area",544},{"JavaThread","_jni_attach_state",868},{"JavaThread","_osthread",528},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",824},{"JavaThread","_stack_base",560},{"JavaThread","_stack_overflow_state",928},{"JavaThread","_stack_size",568},{"JavaThread","_suspend_flags",800},{"JavaThread","_threadObj",616},{"JavaThread","_thread_state",816},{"JavaThread","_tlab",232},{"JavaThread","_vm_result",712},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",50},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",48},{"OopHandle","_obj",0},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",544},{"Thread","_osthread",528},{"Thread","_pending_exception",8},{"Thread","_stack_base",560},{"Thread","_stack_size",568},{"Thread","_tlab",232},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",308},{"nmethod","_compile_id",304},{"nmethod","_method",112},{"nmethod","_state",315}};
+inline constexpr size_entry sizes_18[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",208},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",144},{"CompiledMethod",192},{"CompilerThread",1272},{"CompilerType",0},{"ConstMethod",48},{"ConstantPool",72},{"ConstantPoolCache",32},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",440},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",24},{"JDK_Version",5},{"JNIHandleBlock",304},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1208},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",184},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",48},{"ObservationABI",0},{"OopHandle",8},{"SafepointMechanism::ThreadData",16},{"StackOverflow",40},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",608},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",344}};
+inline constexpr enum_entry enums_18[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",36},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",40},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",32},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",1},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",164},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",50},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_count",9},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_18{
 {74,19,208,125,72,222,92,178,54,189,95,141,72,60,90,42},1,13148160,388940897,18,
 {0,0,1,0,1,0,0,0,1},
 symbols_18,fields_18,sizes_18,enums_18};
-inline constexpr symbol_entry symbols_19[]{{"java_thread_ctor",8704432},{"allocate_thread",8706912},{"malloc",7194016},{"current_thread",8746144},{"initialize_tls",8719744},{"is_tls_initialized",8746112},{"record_stack",8731504},{"register_stack",8731696},{"unregister_stack",8735472},{"create_os_thread",7217360},{"create_guards",8138432},{"remove_guards",8140864},{"initialize_tlab",8719792},{"tlab_initialize",8742544},{"use_tlab",12164001},{"cache_globals",40320},{"vm_exited",12865224},{"java_version",12627232},{"threads_lock",12712008},{"lock",7051296},{"lock_without_safepoint",7051744},{"unlock",7052160},{"allocate_handle_block",4596192},{"add_thread",8706720},{"main_thread_group",8835744},{"allocate_thread_object",8707088},{"thread_object",8735168},{"set_thread_status",4110880},{"jfr_thread_start",4113328},{"setup_fpu",40320},{"next_thread_identifier",8741360},{"java_thread_tid_offset",12627396},{"cleanup_failed",8708544},{"exit_thread",8715104},{"delete_thread",8734560},{"clear_exception",3170896},{"native_to_vm",1488768},{"process_safepoint_exit",1258000},{"anchor_walkable",3231056},{"handle_mark_initialize",3791360},{"handle_mark_destroy",3791008},{"arena_grow",795984},{"method_handle_construct",3790864},{"method_handle_destroy",3791120},{"java_calls",4053280},{"klass_initialize",3948368},{"klass_check",3935488},{"klass_allocate",3931760},{"new_string_unicode",4080192}};
-inline constexpr field_entry fields_19[]{{"Thread","_pending_exception",8},{"Thread","_tlab",240},{"Thread","_osthread",584},{"Thread","_handle_area",600},{"Thread","_stack_base",616},{"Thread","_stack_size",624},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",240},{"JavaThread","_osthread",584},{"JavaThread","_handle_area",600},{"JavaThread","_stack_base",616},{"JavaThread","_stack_size",624},{"JavaThread","_threadObj",672},{"JavaThread","_anchor",704},{"JavaThread","_active_handles",848},{"JavaThread","_thread_state",884},{"JavaThread","_jni_attach_state",932},{"JavaThread","_stack_overflow_state",1000},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_19[]{{"Thread",664},{"ThreadShadow",32},{"JavaThread",1328},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",304},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_19[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_19[]{{"add_thread",8706720},{"allocate_handle_block",4596192},{"allocate_thread",8706912},{"allocate_thread_object",8707088},{"anchor_walkable",3231056},{"arena_grow",795984},{"array_complete",836032},{"array_restore",837344},{"bytecode_lengths",12560624},{"cache_globals",40320},{"class_add",2231824},{"class_define",8478672},{"class_loader_data_head",12578016},{"class_resolve_hidden",8494112},{"class_resolve_stream",8494064},{"cleanup_failed",8708544},{"clear_exception",3170896},{"codecache_lock",12711960},{"compilation_lock",12712128},{"compile_jobs",12156064},{"compile_lock",12712104},{"compile_queue_lock",12712112},{"compiler_vtable",10243096},{"create_guards",8138432},{"create_os_thread",7217360},{"current_thread",8746144},{"delete_thread",8734560},{"deoptimize_all_marked",2658192},{"exit_thread",8715104},{"field_enable_guards19",8139072},{"field_enable_guards20",8139072},{"field_process_safepoint_exit19",1258000},{"field_safepoint_process20",7642352},{"field_special_exit20",8718032},{"field_throw_exception_entry",12767096},{"handle_mark_destroy",3791008},{"handle_mark_initialize",3791360},{"initialize_tlab",8719792},{"initialize_tls",8719744},{"interpreter_code",12547648},{"interpreter_entry_table",12547680},{"interpreter_normal_table",12787856},{"interpreter_throw_exception",12767096},{"is_not_compilable",6923968},{"is_not_osr_compilable",6924096},{"is_tls_initialized",8746112},{"java_calls",4053280},{"java_thread_ctor",8704432},{"java_thread_tid_offset",12627396},{"java_version",12627232},{"jfr_thread_start",4113328},{"klass_allocate",3931760},{"klass_check",3935488},{"klass_initialize",3948368},{"lock",7051296},{"lock_without_safepoint",7051744},{"main_thread_group",8835744},{"malloc",7194016},{"mark_all",2293360},{"mark_for",2294576},{"method_handle_construct",3790864},{"method_handle_destroy",3791120},{"native_to_vm",1488768},{"new_string_unicode",4080192},{"next_thread_identifier",8741360},{"nmethod_metadata_do",7081440},{"process_safepoint_exit",1258000},{"record_stack",8731504},{"register_stack",8731696},{"remove_guards",8140864},{"set_not_compilable",6937424},{"set_not_osr_compilable",6937600},{"set_thread_status",4110880},{"setup_fpu",40320},{"thread_object",8735168},{"threads_do",8721424},{"threads_lock",12712008},{"tlab_initialize",8742544},{"unlock",7052160},{"unregister_stack",8735472},{"use_compiler",12163729},{"use_tlab",12164001},{"vm_clear_ics_doit",9084928},{"vm_clear_ics_vtable",10986184},{"vm_execute",9091008},{"vm_exited",12865224}};
+inline constexpr field_entry fields_19[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",112},{"CompilerThread","_task",1352},{"ConstMethod","_code_size",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_result_type",30},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",291},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",848},{"JavaThread","_anchor",704},{"JavaThread","_handle_area",600},{"JavaThread","_jni_attach_state",932},{"JavaThread","_osthread",584},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",888},{"JavaThread","_stack_base",616},{"JavaThread","_stack_overflow_state",1000},{"JavaThread","_stack_size",624},{"JavaThread","_suspend_flags",880},{"JavaThread","_threadObj",672},{"JavaThread","_thread_state",884},{"JavaThread","_tlab",240},{"JavaThread","_vm_result",792},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",50},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",48},{"OopHandle","_obj",0},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",600},{"Thread","_osthread",584},{"Thread","_pending_exception",8},{"Thread","_stack_base",616},{"Thread","_stack_size",624},{"Thread","_tlab",240},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",312},{"nmethod","_compile_id",308},{"nmethod","_method",112},{"nmethod","_state",319}};
+inline constexpr size_entry sizes_19[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",208},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",144},{"CompiledMethod",192},{"CompilerThread",1392},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",40},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",440},{"InstanceKlass::<unnamed-enum-_misc_rewritten>",0},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",5},{"JNIHandleBlock",304},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1328},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",184},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",32},{"ObservationABI",0},{"OopHandle",8},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",664},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",352}};
+inline constexpr enum_entry enums_19[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",38},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",32},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",1},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",164},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",50},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_count",9},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",4},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_19{
 {199,230,204,177,25,167,172,198,50,107,230,97,244,176,25,204},1,13570048,2439021036,19,
 {0,1,1,0,1,0,0,0,0},
 symbols_19,fields_19,sizes_19,enums_19};
-inline constexpr symbol_entry symbols_20[]{{"java_thread_ctor",4152256},{"allocate_thread",8713296},{"malloc",7041248},{"current_thread",8725424},{"initialize_tls",8713808},{"is_tls_initialized",8725392},{"record_stack",8715488},{"register_stack",8715680},{"unregister_stack",8715872},{"create_os_thread",7064512},{"create_guards",7986352},{"remove_guards",7988768},{"initialize_tlab",8713856},{"tlab_initialize",8721776},{"use_tlab",12268528},{"cache_globals",33056},{"vm_exited",12984256},{"java_version",12734288},{"threads_lock",12814192},{"lock",6896576},{"lock_without_safepoint",6896992},{"unlock",6897408},{"allocate_handle_block",4650496},{"add_thread",8746208},{"main_thread_group",8826224},{"allocate_thread_object",4153648},{"thread_object",4167584},{"set_thread_status",4148896},{"jfr_thread_start",4169168},{"setup_fpu",33056},{"next_thread_identifier",8720592},{"java_thread_tid_offset",12734448},{"cleanup_failed",4154752},{"exit_thread",4156784},{"delete_thread",4167344},{"clear_exception",3209104},{"native_to_vm",1492976},{"native_to_vm_ctor",1435904},{"anchor_walkable",3270480},{"handle_mark_initialize",3833792},{"handle_mark_destroy",3833440},{"arena_grow",806288},{"method_handle_construct",3833296},{"method_handle_destroy",3833552},{"java_calls",4091584},{"klass_initialize",3987008},{"klass_check",3974064},{"klass_allocate",3970400},{"new_string_unicode",4117952}};
-inline constexpr field_entry fields_20[]{{"Thread","_pending_exception",8},{"Thread","_tlab",240},{"Thread","_osthread",584},{"Thread","_handle_area",600},{"Thread","_stack_base",616},{"Thread","_stack_size",624},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",240},{"JavaThread","_osthread",584},{"JavaThread","_handle_area",600},{"JavaThread","_stack_base",616},{"JavaThread","_stack_size",624},{"JavaThread","_threadObj",672},{"JavaThread","_anchor",704},{"JavaThread","_active_handles",848},{"JavaThread","_thread_state",884},{"JavaThread","_jni_attach_state",936},{"JavaThread","_stack_overflow_state",1008},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_20[]{{"Thread",664},{"ThreadShadow",32},{"JavaThread",1344},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_20[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_20[]{{"add_thread",8746208},{"allocate_handle_block",4650496},{"allocate_thread",8713296},{"allocate_thread_object",4153648},{"anchor_walkable",3270480},{"arena_grow",806288},{"array_complete",846512},{"array_restore",847824},{"bytecode_lengths",12667584},{"cache_globals",33056},{"class_add",2264080},{"class_define",8495040},{"class_loader_data_head",12684464},{"class_resolve_hidden",8509632},{"class_resolve_stream",8509584},{"cleanup_failed",4154752},{"clear_exception",3209104},{"codecache_lock",12814160},{"compilation_lock",12814312},{"compile_jobs",12262400},{"compile_lock",12814288},{"compile_queue_lock",12814296},{"compiler_vtable",10249400},{"create_guards",7986352},{"create_os_thread",7064512},{"current_thread",8725424},{"delete_thread",4167344},{"deoptimize_all_marked",2696288},{"exit_thread",4156784},{"field_enable_guards19",7986992},{"field_enable_guards20",7986992},{"field_safepoint_process20",7493008},{"field_special_exit20",4159504},{"field_throw_exception_entry",12885880},{"handle_mark_destroy",3833440},{"handle_mark_initialize",3833792},{"initialize_tlab",8713856},{"initialize_tls",8713808},{"interpreter_code",12654736},{"interpreter_entry_table",12654768},{"interpreter_normal_table",12906640},{"interpreter_throw_exception",12885880},{"is_not_compilable",6769312},{"is_not_osr_compilable",6769456},{"is_tls_initialized",8725392},{"java_calls",4091584},{"java_thread_ctor",4152256},{"java_thread_tid_offset",12734448},{"java_version",12734288},{"jfr_thread_start",4169168},{"klass_allocate",3970400},{"klass_check",3974064},{"klass_initialize",3987008},{"lock",6896576},{"lock_without_safepoint",6896992},{"main_thread_group",8826224},{"malloc",7041248},{"mark_all",2331008},{"mark_for",2332160},{"method_handle_construct",3833296},{"method_handle_destroy",3833552},{"native_to_vm",1492976},{"native_to_vm_ctor",1435904},{"new_string_unicode",4117952},{"next_thread_identifier",8720592},{"nmethod_metadata_do",6925616},{"record_stack",8715488},{"register_stack",8715680},{"remove_guards",7988768},{"set_not_compilable",6781888},{"set_not_osr_compilable",6782064},{"set_thread_status",4148896},{"setup_fpu",33056},{"thread_object",4167584},{"threads_do",8752736},{"threads_lock",12814192},{"tlab_initialize",8721776},{"unlock",6897408},{"unregister_stack",8715872},{"use_compiler",12269666},{"use_tlab",12268528},{"vm_clear_ics_doit",9086048},{"vm_clear_ics_vtable",11001816},{"vm_execute",9091456},{"vm_exited",12984256}};
+inline constexpr field_entry fields_20[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",104},{"CompilerThread","_task",1368},{"ConstMethod","_code_size",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_result_type",30},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",291},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",848},{"JavaThread","_anchor",704},{"JavaThread","_handle_area",600},{"JavaThread","_jni_attach_state",936},{"JavaThread","_osthread",584},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",888},{"JavaThread","_stack_base",616},{"JavaThread","_stack_overflow_state",1008},{"JavaThread","_stack_size",624},{"JavaThread","_suspend_flags",880},{"JavaThread","_threadObj",672},{"JavaThread","_thread_state",884},{"JavaThread","_tlab",240},{"JavaThread","_vm_result",792},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",50},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",48},{"OopHandle","_obj",0},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",600},{"Thread","_osthread",584},{"Thread","_pending_exception",8},{"Thread","_stack_base",616},{"Thread","_stack_size",624},{"Thread","_tlab",240},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",320},{"nmethod","_compile_id",304},{"nmethod","_method",104},{"nmethod","_state",324}};
+inline constexpr size_entry sizes_20[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",208},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",152},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",168},{"CompiledMethod",184},{"CompilerThread",1408},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",48},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",448},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",5},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1344},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",184},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"Method::Flags",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",32},{"ObservationABI",0},{"OopHandle",8},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",664},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",328}};
+inline constexpr enum_entry enums_20[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",39},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",4},{"InstanceKlass::ClassState","fully_initialized",5},{"InstanceKlass::ClassState","initialization_error",6},{"InstanceKlass::ClassState","linked",3},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",2},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"Method::Flags","_dont_inline",4},{"Method::Flags","_force_inline",2},{"Method::Flags","_intrinsic_candidate",32},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","callback_poll_bit",1},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",1},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",164},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4},{"ObservationABI","method_dont_inline_offset",50},{"ObservationABI","method_dont_inline_storage_size",2},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_count",9},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_20{
 {190,9,8,133,209,73,154,229,59,235,195,93,99,103,70,44},1,13692928,989450243,20,
 {0,1,1,0,1,0,0,0,0},
 symbols_20,fields_20,sizes_20,enums_20};
-inline constexpr symbol_entry symbols_21[]{{"java_thread_ctor",4149072},{"malloc",7116944},{"current_thread",8794272},{"initialize_tls",8782192},{"is_tls_initialized",8794240},{"record_stack",8783952},{"register_stack",8784144},{"unregister_stack",8784336},{"create_os_thread",7141904},{"create_guards",8049184},{"remove_guards",8051536},{"initialize_tlab",8782240},{"tlab_initialize",8790368},{"use_tlab",12825964},{"cache_globals",37344},{"vm_exited",13530720},{"java_version",13269856},{"threads_lock",13355032},{"lock",6968944},{"lock_without_safepoint",6969360},{"unlock",6969776},{"allocate_handle_block",4668448},{"add_thread",8815968},{"main_thread_group",8906512},{"allocate_thread_object",4150432},{"thread_object",4165968},{"set_thread_status",4145568},{"jfr_thread_start",4167200},{"setup_fpu",37344},{"next_thread_identifier",8789184},{"java_thread_tid_offset",13270028},{"cleanup_failed",4151376},{"exit_thread",4153168},{"delete_thread",4165712},{"clear_exception",3208624},{"native_to_vm",1478784},{"native_to_vm_ctor",1423760},{"anchor_walkable",3272224},{"handle_mark_initialize",3833104},{"handle_mark_destroy",3832752},{"arena_grow",814240},{"method_handle_construct",3832608},{"method_handle_destroy",3832864},{"java_calls",4090160},{"klass_initialize",3979488},{"klass_check",3965792},{"klass_allocate",3962160},{"new_string_unicode",4117168}};
-inline constexpr field_entry fields_21[]{{"Thread","_pending_exception",8},{"Thread","_tlab",432},{"Thread","_osthread",792},{"Thread","_handle_area",808},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",432},{"JavaThread","_osthread",792},{"JavaThread","_handle_area",808},{"JavaThread","_stack_base",824},{"JavaThread","_stack_size",832},{"JavaThread","_threadObj",896},{"JavaThread","_anchor",928},{"JavaThread","_active_handles",1072},{"JavaThread","_thread_state",1100},{"JavaThread","_jni_attach_state",1152},{"JavaThread","_stack_overflow_state",1224},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_21[]{{"Thread",888},{"ThreadShadow",32},{"JavaThread",1632},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
-inline constexpr enum_entry enums_21[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_21[]{{"add_thread",8815968},{"allocate_handle_block",4668448},{"allocate_thread_object",4150432},{"anchor_walkable",3272224},{"arena_grow",814240},{"array_complete",854352},{"array_restore",855632},{"bytecode_lengths",10466016},{"cache_globals",37344},{"class_add",2249424},{"class_define",8568000},{"class_loader_data_head",13220848},{"class_resolve_stream",8582896},{"cleanup_failed",4151376},{"clear_exception",3208624},{"codecache_lock",13354992},{"compilation_lock",13355152},{"compile_jobs",12819504},{"compile_lock",13355128},{"compile_queue_lock",13355136},{"compiler_vtable",10620824},{"create_guards",8049184},{"create_os_thread",7141904},{"current_thread",8794272},{"delete_thread",4165712},{"deopt_scope_commit",2690192},{"deopt_scope_ctor",2685696},{"deoptimize_all_marked",2688304},{"exit_thread",4153168},{"field_enable_guards19",8049840},{"field_enable_guards20",8049840},{"field_safepoint_process20",7575920},{"field_special_exit20",4155888},{"field_throw_exception_entry",13431864},{"field_vm_to_java_destroy",1735488},{"handle_mark_destroy",3832752},{"handle_mark_initialize",3833104},{"initialize_tlab",8782240},{"initialize_tls",8782192},{"interpreter_code",13194736},{"interpreter_entry_table",13194752},{"interpreter_normal_table",13452624},{"interpreter_throw_exception",13431864},{"is_not_compilable",6844000},{"is_not_osr_compilable",6844144},{"is_tls_initialized",8794240},{"java_calls",4090160},{"java_thread_ctor",4149072},{"java_thread_tid_offset",13270028},{"java_version",13269856},{"jfr_thread_start",4167200},{"klass_allocate",3962160},{"klass_check",3965792},{"klass_initialize",3979488},{"lock",6968944},{"lock_without_safepoint",6969360},{"main_thread_group",8906512},{"malloc",7116944},{"mark_all",2321008},{"mark_for",2322288},{"method_handle_construct",3832608},{"method_handle_destroy",3832864},{"native_to_vm",1478784},{"native_to_vm_ctor",1423760},{"new_string_unicode",4117168},{"next_thread_identifier",8789184},{"nmethod_metadata_do",6997280},{"record_stack",8783952},{"register_stack",8784144},{"remove_guards",8051536},{"set_not_compilable",6856288},{"set_not_osr_compilable",6856544},{"set_thread_status",4145568},{"setup_fpu",37344},{"thread_object",4165968},{"threads_do",8822032},{"threads_lock",13355032},{"tlab_initialize",8790368},{"unlock",6969776},{"unregister_stack",8784336},{"use_compiler",12826687},{"use_tlab",12825964},{"vm_clear_ics_doit",9164688},{"vm_clear_ics_vtable",11439712},{"vm_execute",9170896},{"vm_exited",13530720}};
+inline constexpr field_entry fields_21[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1656},{"ConstMethod","_code_size",34},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_result_type",32},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_length",0},{"ConstantPoolCacheEntry","_f1",8},{"ConstantPoolCacheEntry","_f2",16},{"ConstantPoolCacheEntry","_flags",24},{"ConstantPoolCacheEntry","_indices",0},{"DeoptimizationScope","_required_gen",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",305},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",1072},{"JavaThread","_anchor",928},{"JavaThread","_handle_area",808},{"JavaThread","_jni_attach_state",1152},{"JavaThread","_osthread",792},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",1104},{"JavaThread","_stack_base",824},{"JavaThread","_stack_overflow_state",1224},{"JavaThread","_stack_size",832},{"JavaThread","_suspend_flags",1096},{"JavaThread","_threadObj",896},{"JavaThread","_thread_state",1100},{"JavaThread","_tlab",432},{"JavaThread","_vm_result",1016},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",176},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",48},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",52},{"MethodFlags","_status",0},{"OopHandle","_obj",0},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",808},{"Thread","_osthread",792},{"Thread","_pending_exception",8},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"Thread","_tlab",432},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",336},{"nmethod","_compile_id",316},{"nmethod","_method",120},{"nmethod","_state",340}};
+inline constexpr size_entry sizes_21[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",160},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",168},{"CompiledMethod",200},{"CompilerThread",1696},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",56},{"ConstantPoolCacheEntry",32},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",0},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",0},{"DeoptimizationScope",8},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",464},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",5},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1632},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",200},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"MethodFlags",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",32},{"ObservationABI",0},{"OopHandle",8},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",888},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",352}};
+inline constexpr enum_entry enums_21[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",40},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__length",4},{"ConstantPoolCacheEntry","storage_size__f1",8},{"ConstantPoolCacheEntry","storage_size__f2",8},{"ConstantPoolCacheEntry","storage_size__flags",8},{"ConstantPoolCacheEntry","storage_size__indices",8},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_1_shift",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_mask",255},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","bytecode_2_shift",24},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_bits",16},{"ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>","cp_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","field_index_mask",65535},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_final_shift",22},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","is_volatile_shift",21},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_mask",15},{"ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>","tos_state_shift",28},{"DeoptimizationScope","storage_size__required_gen",8},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",1},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",4},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",4},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"MethodFlags","storage_size__status",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_dont_inline",4096},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_force_inline",2048},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c1_compilable",512},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_compilable",256},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_osr_compilable",1024},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",2},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",176},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4096},{"ObservationABI","method_dont_inline_offset",48},{"ObservationABI","method_dont_inline_storage_size",4},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_cause",9},{"VM_Operation","vtable_count",10},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_21{
 {209,165,57,191,176,68,148,157,51,237,171,93,37,132,91,231},1,14295040,3619660896,21,
 {0,1,1,0,1,0,0,0,0},
 symbols_21,fields_21,sizes_21,enums_21};
-inline constexpr symbol_entry symbols_22[]{{"java_thread_ctor",4162352},{"malloc",7194864},{"current_thread",8883696},{"initialize_tls",8871696},{"is_tls_initialized",8883664},{"record_stack",8873488},{"register_stack",8873696},{"unregister_stack",8873888},{"create_os_thread",7217024},{"create_guards",8131072},{"remove_guards",8133424},{"initialize_tlab",8871744},{"tlab_initialize",8879808},{"use_tlab",12900504},{"cache_globals",41264},{"vm_exited",13668040},{"java_version",13341616},{"threads_lock",13492712},{"lock",7044800},{"lock_without_safepoint",7045216},{"unlock",7045632},{"allocate_handle_block",4705920},{"add_thread",8905648},{"main_thread_group",8997392},{"allocate_thread_object",4163600},{"thread_object",4179648},{"set_thread_status",4159040},{"jfr_thread_start",4180896},{"setup_fpu",41264},{"next_thread_identifier",8878624},{"java_thread_tid_offset",13341792},{"cleanup_failed",4164640},{"exit_thread",4166464},{"delete_thread",4179392},{"clear_exception",3213200},{"native_to_vm",4599856},{"native_to_vm_ctor",4592000},{"anchor_walkable",3277088},{"handle_mark_initialize",3844160},{"handle_mark_destroy",3843808},{"arena_grow",802032},{"method_handle_construct",3843664},{"method_handle_destroy",3843920},{"java_calls",4102864},{"klass_initialize",3990416},{"klass_check",3976944},{"klass_allocate",3972544},{"new_string_unicode",4130032}};
-inline constexpr field_entry fields_22[]{{"Thread","_pending_exception",8},{"Thread","_tlab",432},{"Thread","_osthread",792},{"Thread","_handle_area",808},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",432},{"JavaThread","_osthread",792},{"JavaThread","_handle_area",808},{"JavaThread","_stack_base",824},{"JavaThread","_stack_size",832},{"JavaThread","_threadObj",896},{"JavaThread","_anchor",928},{"JavaThread","_active_handles",1072},{"JavaThread","_thread_state",1108},{"JavaThread","_jni_attach_state",1160},{"JavaThread","_stack_overflow_state",1232},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_22[]{{"Thread",888},{"ThreadShadow",32},{"JavaThread",1640},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
-inline constexpr enum_entry enums_22[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_22[]{{"add_thread",8905648},{"allocate_handle_block",4705920},{"allocate_thread_object",4163600},{"anchor_walkable",3277088},{"arena_grow",802032},{"array_complete",840592},{"array_restore",842320},{"bytecode_lengths",10551904},{"cache_globals",41264},{"class_add",2252432},{"class_define",8653008},{"class_loader_data_head",13292304},{"class_resolve_stream",8667920},{"cleanup_failed",4164640},{"clear_exception",3213200},{"codecache_lock",13492680},{"compilation_lock",13492832},{"compile_jobs",12894448},{"compile_lock",13492808},{"compile_queue_lock",13492816},{"compiler_vtable",10707736},{"create_guards",8131072},{"create_os_thread",7217024},{"current_thread",8883696},{"delete_thread",4179392},{"deopt_scope_commit",2700816},{"deopt_scope_ctor",2696192},{"deoptimize_all_marked",2698768},{"exit_thread",4166464},{"field_enable_guards19",8131728},{"field_enable_guards20",8131728},{"field_safepoint_process20",7664496},{"field_special_exit20",4169216},{"field_throw_exception_entry",13569176},{"field_vm_to_java_destroy",1741088},{"handle_mark_destroy",3843808},{"handle_mark_initialize",3844160},{"initialize_tlab",8871744},{"initialize_tls",8871696},{"interpreter_code",13265952},{"interpreter_entry_table",13265968},{"interpreter_normal_table",13589936},{"interpreter_throw_exception",13569176},{"is_not_compilable",6919712},{"is_not_osr_compilable",6919856},{"is_tls_initialized",8883664},{"java_calls",4102864},{"java_thread_ctor",4162352},{"java_thread_tid_offset",13341792},{"java_version",13341616},{"jfr_thread_start",4180896},{"klass_allocate",3972544},{"klass_check",3976944},{"klass_initialize",3990416},{"lock",7044800},{"lock_without_safepoint",7045216},{"main_thread_group",8997392},{"malloc",7194864},{"mark_all",2323168},{"mark_for",2324448},{"method_handle_construct",3843664},{"method_handle_destroy",3843920},{"native_to_vm",4599856},{"native_to_vm_ctor",4592000},{"new_string_unicode",4130032},{"next_thread_identifier",8878624},{"nmethod_metadata_do",7073296},{"record_stack",8873488},{"register_stack",8873696},{"remove_guards",8133424},{"set_not_compilable",6932096},{"set_not_osr_compilable",6932352},{"set_thread_status",4159040},{"setup_fpu",41264},{"thread_object",4179648},{"threads_do",8911456},{"threads_lock",13492712},{"tlab_initialize",8879808},{"unlock",7045632},{"unregister_stack",8873888},{"use_compiler",12900907},{"use_tlab",12900504},{"vm_clear_ics_doit",9263984},{"vm_clear_ics_vtable",11518160},{"vm_execute",9270240},{"vm_exited",13668040}};
+inline constexpr field_entry fields_22[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"Array<ResolvedFieldEntry>","_data",8},{"Array<ResolvedFieldEntry>","_length",0},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompiledMethod","_method",120},{"CompilerThread","_task",1664},{"ConstMethod","_code_size",34},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_result_type",32},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",0},{"ConstantPoolCache","_resolved_field_entries",40},{"DeoptimizationScope","_required_gen",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",288},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",1072},{"JavaThread","_anchor",928},{"JavaThread","_handle_area",808},{"JavaThread","_jni_attach_state",1160},{"JavaThread","_osthread",792},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",1112},{"JavaThread","_stack_base",824},{"JavaThread","_stack_overflow_state",1232},{"JavaThread","_stack_size",832},{"JavaThread","_suspend_flags",1104},{"JavaThread","_threadObj",896},{"JavaThread","_thread_state",1108},{"JavaThread","_tlab",432},{"JavaThread","_vm_result",1016},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",164},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",48},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",52},{"MethodFlags","_status",0},{"OopHandle","_obj",0},{"ResolvedFieldEntry","_field_holder",0},{"ResolvedFieldEntry","_field_offset",8},{"ResolvedFieldEntry","_flags",17},{"ResolvedFieldEntry","_tos_state",16},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",808},{"Thread","_osthread",792},{"Thread","_pending_exception",8},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"Thread","_tlab",432},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",332},{"nmethod","_compile_id",316},{"nmethod","_method",120},{"nmethod","_state",336}};
+inline constexpr size_entry sizes_22[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"Array<ResolvedFieldEntry>",32},{"ArrayKlass",208},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",160},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",168},{"CompiledMethod",200},{"CompilerThread",1720},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",56},{"DeoptimizationScope",8},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",456},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",20},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1640},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",184},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"MethodFlags",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",32},{"ObservationABI",0},{"OopHandle",8},{"ResolvedFieldEntry",24},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>",0},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",888},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",344}};
+inline constexpr enum_entry enums_22[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",40},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"Array<ResolvedFieldEntry>","storage_size__data",24},{"Array<ResolvedFieldEntry>","storage_size__length",4},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompiledMethod","storage_size__method",8},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__resolved_field_entries",8},{"DeoptimizationScope","storage_size__required_gen",8},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",4},{"InstanceKlass::ClassState","fully_initialized",5},{"InstanceKlass::ClassState","initialization_error",6},{"InstanceKlass::ClassState","linked",3},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",4},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",1},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",4},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"MethodFlags","storage_size__status",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_dont_inline",4096},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_force_inline",2048},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c1_compilable",512},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_compilable",256},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_osr_compilable",1024},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",2},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",164},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4096},{"ObservationABI","method_dont_inline_offset",48},{"ObservationABI","method_dont_inline_storage_size",4},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",7},{"OopHandle","storage_size__obj",8},{"ResolvedFieldEntry","storage_size__field_holder",8},{"ResolvedFieldEntry","storage_size__field_offset",4},{"ResolvedFieldEntry","storage_size__flags",1},{"ResolvedFieldEntry","storage_size__tos_state",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_final_shift",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_volatile_shift",0},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_cause",9},{"VM_Operation","vtable_count",10},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_22{
 {130,229,184,193,178,68,8,21,45,225,100,29,132,24,212,52},1,14430208,132172161,22,
 {0,1,1,0,1,0,0,0,0},
 symbols_22,fields_22,sizes_22,enums_22};
-inline constexpr symbol_entry symbols_23[]{{"java_thread_ctor",4131424},{"malloc",7186256},{"current_thread",8926608},{"initialize_tls",8914640},{"is_tls_initialized",8926576},{"record_stack",8916400},{"register_stack",8916608},{"unregister_stack",8916800},{"create_os_thread",7210544},{"create_guards",8151440},{"remove_guards",8153792},{"initialize_tlab",8914688},{"tlab_initialize",8922720},{"use_tlab",12950680},{"cache_globals",41360},{"vm_exited",13716568},{"java_version",13389968},{"threads_lock",13541328},{"lock",7032464},{"lock_without_safepoint",7033168},{"unlock",7033584},{"allocate_handle_block",4677440},{"add_thread",8946800},{"main_thread_group",9039312},{"allocate_thread_object",4132640},{"thread_object",4149152},{"set_thread_status",4128128},{"jfr_thread_start",4150384},{"setup_fpu",41360},{"next_thread_identifier",8921536},{"java_thread_tid_offset",13390272},{"cleanup_failed",4133568},{"exit_thread",4135392},{"delete_thread",4148896},{"clear_exception",3197488},{"native_to_vm",4571376},{"native_to_vm_ctor",4563520},{"anchor_walkable",3262880},{"handle_mark_initialize",3840288},{"handle_mark_destroy",3839936},{"arena_grow",769136},{"method_handle_construct",3839792},{"method_handle_destroy",3840048},{"java_calls",4070752},{"klass_initialize",3957936},{"klass_check",3944672},{"klass_allocate",3941456},{"new_string_unicode",4098144}};
-inline constexpr field_entry fields_23[]{{"Thread","_pending_exception",8},{"Thread","_tlab",432},{"Thread","_osthread",792},{"Thread","_handle_area",808},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",432},{"JavaThread","_osthread",792},{"JavaThread","_handle_area",808},{"JavaThread","_stack_base",824},{"JavaThread","_stack_size",832},{"JavaThread","_threadObj",896},{"JavaThread","_anchor",928},{"JavaThread","_active_handles",1072},{"JavaThread","_thread_state",1092},{"JavaThread","_jni_attach_state",1144},{"JavaThread","_stack_overflow_state",1224},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_23[]{{"Thread",888},{"ThreadShadow",32},{"JavaThread",1640},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
-inline constexpr enum_entry enums_23[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_23[]{{"add_thread",8946800},{"allocate_handle_block",4677440},{"allocate_thread_object",4132640},{"anchor_walkable",3262880},{"arena_grow",769136},{"array_complete",807936},{"array_restore",809680},{"bytecode_lengths",10612416},{"cache_globals",41360},{"class_add",2239152},{"class_define",8695584},{"class_loader_data_head",13340544},{"class_resolve_stream",8710656},{"cleanup_failed",4133568},{"clear_exception",3197488},{"codecache_lock",13541296},{"compilation_lock",13541448},{"compile_jobs",12944800},{"compile_lock",13541424},{"compile_queue_lock",13541432},{"compiler_vtable",10765624},{"create_guards",8151440},{"create_os_thread",7210544},{"current_thread",8926608},{"delete_thread",4148896},{"deopt_scope_commit",2673584},{"deopt_scope_ctor",2669024},{"deoptimize_all_marked",2671600},{"exit_thread",4135392},{"field_enable_guards19",8152096},{"field_enable_guards20",8152096},{"field_safepoint_process20",7651888},{"field_special_exit20",4138832},{"field_throw_exception_entry",13617720},{"field_vm_to_java_destroy",1727216},{"handle_mark_destroy",3839936},{"handle_mark_initialize",3840288},{"initialize_tlab",8914688},{"initialize_tls",8914640},{"interpreter_code",13314544},{"interpreter_entry_table",13314560},{"interpreter_normal_table",13638480},{"interpreter_throw_exception",13617720},{"is_not_compilable",6907616},{"is_not_osr_compilable",6907760},{"is_tls_initialized",8926576},{"java_calls",4070752},{"java_thread_ctor",4131424},{"java_thread_tid_offset",13390272},{"java_version",13389968},{"jfr_thread_start",4150384},{"klass_allocate",3941456},{"klass_check",3944672},{"klass_initialize",3957936},{"lock",7032464},{"lock_without_safepoint",7033168},{"main_thread_group",9039312},{"malloc",7186256},{"mark_all",2309680},{"mark_for",2310960},{"method_handle_construct",3839792},{"method_handle_destroy",3840048},{"native_to_vm",4571376},{"native_to_vm_ctor",4563520},{"new_string_unicode",4098144},{"next_thread_identifier",8921536},{"nmethod_metadata_do",7063696},{"record_stack",8916400},{"register_stack",8916608},{"remove_guards",8153792},{"set_not_compilable",6919600},{"set_not_osr_compilable",6919856},{"set_thread_status",4128128},{"setup_fpu",41360},{"thread_object",4149152},{"threads_do",8952864},{"threads_lock",13541328},{"tlab_initialize",8922720},{"unlock",7033584},{"unregister_stack",8916800},{"use_compiler",12951065},{"use_tlab",12950680},{"vm_clear_ics_doit",9312016},{"vm_clear_ics_vtable",11578896},{"vm_execute",9318192},{"vm_exited",13716568}};
+inline constexpr field_entry fields_23[]{{"AccessFlags","_flags",0},{"Arena","_hwm",24},{"Arena","_max",32},{"Array<ResolvedFieldEntry>","_data",8},{"Array<ResolvedFieldEntry>","_length",0},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompilerThread","_task",1664},{"ConstMethod","_code_size",34},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_result_type",32},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",0},{"ConstantPoolCache","_resolved_field_entries",40},{"DeoptimizationScope","_required_gen",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",305},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",1072},{"JavaThread","_anchor",928},{"JavaThread","_handle_area",808},{"JavaThread","_jni_attach_state",1144},{"JavaThread","_osthread",792},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",1096},{"JavaThread","_stack_base",824},{"JavaThread","_stack_overflow_state",1224},{"JavaThread","_stack_size",832},{"JavaThread","_suspend_flags",1088},{"JavaThread","_threadObj",896},{"JavaThread","_thread_state",1092},{"JavaThread","_tlab",432},{"JavaThread","_vm_result",1016},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",176},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_name",24},{"Klass","_next_link",144},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",48},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",52},{"MethodFlags","_status",0},{"OopHandle","_obj",0},{"ResolvedFieldEntry","_field_holder",0},{"ResolvedFieldEntry","_field_offset",8},{"ResolvedFieldEntry","_flags",17},{"ResolvedFieldEntry","_tos_state",16},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",808},{"Thread","_osthread",792},{"Thread","_pending_exception",8},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"Thread","_tlab",432},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",208},{"nmethod","_compile_id",204},{"nmethod","_method",72},{"nmethod","_state",212}};
+inline constexpr size_entry sizes_23[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"Array<ResolvedFieldEntry>",32},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",160},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",176},{"CompilerThread",1720},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",56},{"DeoptimizationScope",8},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",464},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",20},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1640},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",200},{"MEMFLAGS",0},{"MetadataClosure",8},{"Method",88},{"MethodFlags",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",32},{"ObservationABI",0},{"OopHandle",8},{"ResolvedFieldEntry",24},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>",0},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",888},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",216}};
+inline constexpr enum_entry enums_23[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",40},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"Array<ResolvedFieldEntry>","storage_size__data",24},{"Array<ResolvedFieldEntry>","storage_size__length",4},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__resolved_field_entries",8},{"DeoptimizationScope","storage_size__required_gen",8},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",4},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",1},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"MEMFLAGS","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",4},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"MethodFlags","storage_size__status",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_dont_inline",4096},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_force_inline",2048},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c1_compilable",512},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_compilable",256},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_osr_compilable",1024},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",2},{"ObservationABI","hidden_klass_mask",67108864},{"ObservationABI","hidden_klass_offset",176},{"ObservationABI","hidden_klass_width",4},{"ObservationABI","method_dont_inline_mask",4096},{"ObservationABI","method_dont_inline_offset",48},{"ObservationABI","method_dont_inline_storage_size",4},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",6},{"OopHandle","storage_size__obj",8},{"ResolvedFieldEntry","storage_size__field_holder",8},{"ResolvedFieldEntry","storage_size__field_offset",4},{"ResolvedFieldEntry","storage_size__flags",1},{"ResolvedFieldEntry","storage_size__tos_state",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_final_shift",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_volatile_shift",0},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_cause",9},{"VM_Operation","vtable_count",10},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_23{
 {134,59,27,180,85,171,205,58,215,1,116,57,184,217,104,185},1,14475264,3970002669,23,
 {0,1,1,0,1,0,1,0,0},
 symbols_23,fields_23,sizes_23,enums_23};
-inline constexpr symbol_entry symbols_24[]{{"create_attaching_thread",4382640},{"malloc",7492192},{"current_thread",9513504},{"initialize_tls",9501552},{"is_tls_initialized",9513472},{"record_stack",9503296},{"register_stack",9503504},{"unregister_stack",9503696},{"create_os_thread",7517008},{"create_guards",8719104},{"remove_guards",8721648},{"initialize_tlab",9501600},{"tlab_initialize",9509600},{"use_tlab",13542200},{"cache_globals",42528},{"vm_exited",14338112},{"java_version",13992656},{"threads_lock",14161752},{"lock",7331664},{"lock_without_safepoint",7332352},{"unlock",7332976},{"allocate_handle_block",4928848},{"add_thread",9533584},{"main_thread_group",9628000},{"allocate_thread_object",4380464},{"thread_object",4398080},{"set_thread_status",4375664},{"jfr_thread_start",4401456},{"setup_fpu",42528},{"next_thread_identifier",9508416},{"java_thread_tid_offset",13992992},{"cleanup_failed",4381472},{"exit_thread",4383744},{"delete_thread",4397792},{"clear_exception",3381888},{"native_to_vm",4818720},{"native_to_vm_ctor",4810624},{"anchor_walkable",3451616},{"handle_mark_initialize",4040592},{"handle_mark_destroy",4040240},{"arena_grow",847504},{"method_handle_construct",4040096},{"method_handle_destroy",4040352},{"java_calls",4317888},{"klass_initialize",4201808},{"klass_check",4188368},{"klass_allocate",4185072},{"new_string_unicode",4345088}};
-inline constexpr field_entry fields_24[]{{"Thread","_pending_exception",8},{"Thread","_tlab",448},{"Thread","_osthread",800},{"Thread","_handle_area",816},{"Thread","_stack_base",832},{"Thread","_stack_size",840},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",448},{"JavaThread","_osthread",800},{"JavaThread","_handle_area",816},{"JavaThread","_stack_base",832},{"JavaThread","_stack_size",840},{"JavaThread","_threadObj",904},{"JavaThread","_anchor",936},{"JavaThread","_active_handles",1080},{"JavaThread","_monitor_owner_id",1096},{"JavaThread","_thread_state",1108},{"JavaThread","_jni_attach_state",1152},{"JavaThread","_stack_overflow_state",1232},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_24[]{{"Thread",896},{"ThreadShadow",32},{"JavaThread",1840},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
-inline constexpr enum_entry enums_24[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_24[]{{"add_thread",9533584},{"allocate_handle_block",4928848},{"allocate_thread_object",4380464},{"anchor_walkable",3451616},{"arena_grow",847504},{"array_complete",886608},{"array_restore",888336},{"bytecode_lengths",11098864},{"cache_globals",42528},{"class_add",2391008},{"class_define",9277488},{"class_loader_data_head",13942768},{"class_resolve_stream",9293152},{"cleanup_failed",4381472},{"clear_exception",3381888},{"codecache_lock",14161712},{"compilation_lock",14161872},{"compile_jobs",13536192},{"compile_lock",14161848},{"compile_queue_lock",14161856},{"compiler_vtable",11257928},{"create_attaching_thread",4382640},{"create_guards",8719104},{"create_os_thread",7517008},{"current_thread",9513504},{"delete_thread",4397792},{"deopt_scope_commit",2846000},{"deopt_scope_ctor",2841440},{"deoptimize_all_marked",2844016},{"exit_thread",4383744},{"field_enable_guards19",8719776},{"field_enable_guards20",8719776},{"field_safepoint_process20",7972112},{"field_special_exit20",4387312},{"field_throw_exception_entry",14239080},{"field_vm_to_java_destroy",1843200},{"handle_mark_destroy",4040240},{"handle_mark_initialize",4040592},{"initialize_tlab",9501600},{"initialize_tls",9501552},{"interpreter_code",13915472},{"interpreter_entry_table",13915488},{"interpreter_normal_table",14259856},{"interpreter_throw_exception",14239080},{"is_not_compilable",7197424},{"is_not_osr_compilable",7197568},{"is_tls_initialized",9513472},{"java_calls",4317888},{"java_thread_tid_offset",13992992},{"java_version",13992656},{"jfr_thread_start",4401456},{"klass_allocate",4185072},{"klass_check",4188368},{"klass_initialize",4201808},{"lock",7331664},{"lock_without_safepoint",7332352},{"main_thread_group",9628000},{"malloc",7492192},{"mark_all",2462448},{"mark_for",2463728},{"method_handle_construct",4040096},{"method_handle_destroy",4040352},{"native_to_vm",4818720},{"native_to_vm_ctor",4810624},{"new_string_unicode",4345088},{"next_thread_identifier",9508416},{"nmethod_metadata_do",7362832},{"record_stack",9503296},{"register_stack",9503504},{"remove_guards",8721648},{"set_not_compilable",7209712},{"set_not_osr_compilable",7209968},{"set_thread_status",4375664},{"setup_fpu",42528},{"thread_object",4398080},{"threads_do",9540192},{"threads_lock",14161752},{"tlab_initialize",9509600},{"unlock",7332976},{"unregister_stack",9503696},{"use_compiler",13544445},{"use_tlab",13542200},{"vm_clear_ics_doit",9913008},{"vm_clear_ics_vtable",12120568},{"vm_execute",9919248},{"vm_exited",14338112}};
+inline constexpr field_entry fields_24[]{{"AccessFlags","_flags",0},{"Arena","_hwm",32},{"Arena","_max",40},{"Array<ResolvedFieldEntry>","_data",8},{"Array<ResolvedFieldEntry>","_length",0},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",8},{"CompilerThread","_task",1864},{"ConstMethod","_code_size",34},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_result_type",32},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_resolved_field_entries",48},{"DeoptimizationScope","_required_gen",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",320},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",1080},{"JavaThread","_anchor",936},{"JavaThread","_handle_area",816},{"JavaThread","_jni_attach_state",1152},{"JavaThread","_monitor_owner_id",1096},{"JavaThread","_osthread",800},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",40},{"JavaThread","_stack_base",832},{"JavaThread","_stack_overflow_state",1232},{"JavaThread","_stack_size",840},{"JavaThread","_suspend_flags",1104},{"JavaThread","_threadObj",904},{"JavaThread","_thread_state",1108},{"JavaThread","_tlab",448},{"JavaThread","_vm_result",1024},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",188},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_misc_flags",204},{"Klass","_name",24},{"Klass","_next_link",144},{"KlassFlags","_flags",0},{"Method","_access_flags",40},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",48},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",52},{"MethodFlags","_status",0},{"OopHandle","_obj",0},{"ResolvedFieldEntry","_field_holder",0},{"ResolvedFieldEntry","_field_offset",8},{"ResolvedFieldEntry","_flags",17},{"ResolvedFieldEntry","_tos_state",16},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",816},{"Thread","_osthread",800},{"Thread","_pending_exception",8},{"Thread","_stack_base",832},{"Thread","_stack_size",840},{"Thread","_tlab",448},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",208},{"nmethod","_compile_id",204},{"nmethod","_method",72},{"nmethod","_state",211}};
+inline constexpr size_entry sizes_24[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",4},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"Array<ResolvedFieldEntry>",32},{"ArrayKlass",240},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",16},{"ClassLoadInfo",32},{"ClassLoaderData",160},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",176},{"CompilerThread",1920},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",64},{"DeoptimizationScope",8},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",480},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",20},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1840},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",216},{"KlassFlags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>",0},{"MemTag",0},{"MetadataClosure",8},{"Method",88},{"MethodFlags",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",40},{"ObservationABI",0},{"OopHandle",8},{"ResolvedFieldEntry",24},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>",0},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",896},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",120},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",216}};
+inline constexpr enum_entry enums_24[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",41},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",4},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"Array<ResolvedFieldEntry>","storage_size__data",24},{"Array<ResolvedFieldEntry>","storage_size__length",4},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__resolved_field_entries",8},{"DeoptimizationScope","storage_size__required_gen",8},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",4},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__monitor_owner_id",8},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",120},{"JavaThread","storage_size__vm_result",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThread::SuspendFlags","_trace_flag",4},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",1},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",4},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__misc_flags",1},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"KlassFlags","storage_size__flags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>","_misc_is_hidden_class",1},{"MemTag","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",4},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",4},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"MethodFlags","storage_size__status",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_dont_inline",4096},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_force_inline",2048},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c1_compilable",512},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_compilable",256},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_osr_compilable",1024},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",2},{"ObservationABI","hidden_klass_mask",1},{"ObservationABI","hidden_klass_offset",204},{"ObservationABI","hidden_klass_width",1},{"ObservationABI","method_dont_inline_mask",4096},{"ObservationABI","method_dont_inline_offset",48},{"ObservationABI","method_dont_inline_storage_size",4},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",6},{"OopHandle","storage_size__obj",8},{"ResolvedFieldEntry","storage_size__field_holder",8},{"ResolvedFieldEntry","storage_size__field_offset",4},{"ResolvedFieldEntry","storage_size__flags",1},{"ResolvedFieldEntry","storage_size__tos_state",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_final_shift",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_volatile_shift",0},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",120},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_cause",9},{"VM_Operation","vtable_count",10},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_24{
 {165,77,242,187,127,109,105,38,14,41,42,211,188,153,210,167},1,15122432,1764072965,24,
 {1,1,1,0,1,1,1,0,0},
 symbols_24,fields_24,sizes_24,enums_24};
-inline constexpr symbol_entry symbols_25[]{{"create_attaching_thread",4775360},{"malloc",7978944},{"current_thread",10090624},{"initialize_tls",10079216},{"is_tls_initialized",10090592},{"record_stack",10080960},{"register_stack",10081168},{"unregister_stack",10081440},{"create_os_thread",8004640},{"create_guards",9242592},{"remove_guards",9245136},{"initialize_tlab",10079264},{"tlab_initialize",10087088},{"use_tlab",14311426},{"cache_globals",44832},{"vm_exited",15105944},{"java_version",14758672},{"threads_lock",14928920},{"lock",7805552},{"lock_without_safepoint",7806256},{"unlock",7806928},{"allocate_handle_block",5345584},{"add_thread",10117216},{"main_thread_group",10229408},{"allocate_thread_object",4773136},{"thread_object",4790736},{"set_thread_status",4767952},{"jfr_thread_start",4793616},{"setup_fpu",44832},{"next_thread_identifier",10085904},{"java_thread_tid_offset",14758964},{"cleanup_failed",4774192},{"exit_thread",4776448},{"delete_thread",4790448},{"clear_exception",3781088},{"native_to_vm",5233856},{"native_to_vm_ctor",2513264},{"anchor_walkable",3852352},{"handle_mark_initialize",4441600},{"handle_mark_destroy",4441248},{"arena_grow",1121120},{"method_handle_construct",4441104},{"method_handle_destroy",4441360},{"java_calls",4708736},{"klass_initialize",4594384},{"klass_check",4580432},{"klass_allocate",4577168},{"new_string_unicode",4736352}};
-inline constexpr field_entry fields_25[]{{"Thread","_pending_exception",8},{"Thread","_tlab",448},{"Thread","_osthread",928},{"Thread","_handle_area",944},{"Thread","_stack_base",960},{"Thread","_stack_size",968},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",448},{"JavaThread","_osthread",928},{"JavaThread","_handle_area",944},{"JavaThread","_stack_base",960},{"JavaThread","_stack_size",968},{"JavaThread","_threadObj",1032},{"JavaThread","_anchor",1064},{"JavaThread","_active_handles",1208},{"JavaThread","_monitor_owner_id",1224},{"JavaThread","_thread_state",1236},{"JavaThread","_jni_attach_state",1280},{"JavaThread","_stack_overflow_state",1360},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",44},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_25[]{{"Thread",1024},{"ThreadShadow",32},{"JavaThread",1968},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",24},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",2},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",112},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
-inline constexpr enum_entry enums_25[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_25[]{{"add_thread",10117216},{"allocate_handle_block",5345584},{"allocate_thread_object",4773136},{"anchor_walkable",3852352},{"arena_grow",1121120},{"array_complete",1161984},{"array_restore",1163712},{"bytecode_lengths",11781168},{"cache_globals",44832},{"class_add",2713088},{"class_define",9861856},{"class_loader_data_head",14708464},{"class_resolve_stream",9877424},{"cleanup_failed",4774192},{"clear_exception",3781088},{"codecache_lock",14928880},{"compilation_lock",14929040},{"compile_jobs",14303104},{"compile_lock",14929016},{"compile_queue_lock",14929024},{"compiler_vtable",11939528},{"create_attaching_thread",4775360},{"create_guards",9242592},{"create_os_thread",8004640},{"current_thread",10090624},{"delete_thread",4790448},{"deopt_scope_commit",3181120},{"deopt_scope_ctor",3176448},{"deoptimize_all_marked",3179024},{"exit_thread",4776448},{"field_enable_guards19",9243264},{"field_enable_guards20",9243264},{"field_safepoint_process20",8470368},{"field_special_exit20",4780016},{"field_throw_exception_entry",15006616},{"field_vm_to_java_destroy",2155328},{"handle_mark_destroy",4441248},{"handle_mark_initialize",4441600},{"initialize_tlab",10079264},{"initialize_tls",10079216},{"interpreter_code",14674688},{"interpreter_entry_table",14674704},{"interpreter_normal_table",15027392},{"interpreter_throw_exception",15006616},{"is_not_compilable",7667456},{"is_not_osr_compilable",7667600},{"is_tls_initialized",10090592},{"java_calls",4708736},{"java_thread_tid_offset",14758964},{"java_version",14758672},{"jfr_thread_start",4793616},{"klass_allocate",4577168},{"klass_check",4580432},{"klass_initialize",4594384},{"lock",7805552},{"lock_without_safepoint",7806256},{"main_thread_group",10229408},{"malloc",7978944},{"mark_all",2783568},{"mark_for",2784848},{"method_handle_construct",4441104},{"method_handle_destroy",4441360},{"native_to_vm",5233856},{"native_to_vm_ctor",2513264},{"new_string_unicode",4736352},{"next_thread_identifier",10085904},{"nmethod_metadata_do",7838304},{"record_stack",10080960},{"register_stack",10081168},{"remove_guards",9245136},{"set_not_compilable",7680016},{"set_not_osr_compilable",7680272},{"set_thread_status",4767952},{"setup_fpu",44832},{"thread_object",4790736},{"threads_do",10124016},{"threads_lock",14928920},{"tlab_initialize",10087088},{"unlock",7806928},{"unregister_stack",10081440},{"use_compiler",14311424},{"use_tlab",14311426},{"vm_clear_ics_doit",10502128},{"vm_clear_ics_vtable",12827080},{"vm_execute",10508272},{"vm_exited",15105944}};
+inline constexpr field_entry fields_25[]{{"AccessFlags","_flags",0},{"Arena","_hwm",32},{"Arena","_max",40},{"Array<ResolvedFieldEntry>","_data",8},{"Array<ResolvedFieldEntry>","_length",0},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",0},{"CompilerThread","_task",1992},{"ConstMethod","_code_size",34},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_result_type",32},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_cache",16},{"ConstantPool","_length",60},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_resolved_field_entries",48},{"DeoptimizationScope","_required_gen",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",304},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",1208},{"JavaThread","_anchor",1064},{"JavaThread","_handle_area",944},{"JavaThread","_jni_attach_state",1280},{"JavaThread","_monitor_owner_id",1224},{"JavaThread","_osthread",928},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",40},{"JavaThread","_stack_base",960},{"JavaThread","_stack_overflow_state",1360},{"JavaThread","_stack_size",968},{"JavaThread","_suspend_flags",1232},{"JavaThread","_threadObj",1032},{"JavaThread","_thread_state",1236},{"JavaThread","_tlab",448},{"JavaThread","_vm_result_oop",1152},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",14},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_misc_flags",16},{"Klass","_name",24},{"Klass","_next_link",144},{"KlassFlags","_flags",0},{"Method","_access_flags",44},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",48},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",52},{"MethodFlags","_status",0},{"OopHandle","_obj",0},{"ResolvedFieldEntry","_field_holder",0},{"ResolvedFieldEntry","_field_offset",8},{"ResolvedFieldEntry","_flags",17},{"ResolvedFieldEntry","_tos_state",16},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",944},{"Thread","_osthread",928},{"Thread","_pending_exception",8},{"Thread","_stack_base",960},{"Thread","_stack_size",968},{"Thread","_tlab",448},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",216},{"nmethod","_compile_id",212},{"nmethod","_method",80},{"nmethod","_state",219}};
+inline constexpr size_entry sizes_25[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",2},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"Array<ResolvedFieldEntry>",32},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",24},{"ClassLoadInfo",32},{"ClassLoaderData",160},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",168},{"CompilerThread",2048},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",72},{"ConstantPoolCache",64},{"DeoptimizationScope",8},{"DispatchTable",20480},{"Handle",8},{"HandleArea",56},{"HandleMark",56},{"InstanceKlass",472},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",20},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1968},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",200},{"KlassFlags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>",0},{"MemTag",0},{"MetadataClosure",8},{"Method",88},{"MethodFlags",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",40},{"ObservationABI",0},{"OopHandle",8},{"ResolvedFieldEntry",24},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>",0},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",1024},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",112},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",224}};
+inline constexpr enum_entry enums_25[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",38},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",2},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"Array<ResolvedFieldEntry>","storage_size__data",24},{"Array<ResolvedFieldEntry>","storage_size__length",4},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__resolved_field_entries",8},{"DeoptimizationScope","storage_size__required_gen",8},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",4},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__monitor_owner_id",8},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",112},{"JavaThread","storage_size__vm_result_oop",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",1},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",2},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__misc_flags",1},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"KlassFlags","storage_size__flags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>","_misc_is_hidden_class",1},{"MemTag","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",2},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",4},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"MethodFlags","storage_size__status",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_dont_inline",4096},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_force_inline",2048},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c1_compilable",512},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_compilable",256},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_osr_compilable",1024},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",2},{"ObservationABI","hidden_klass_mask",1},{"ObservationABI","hidden_klass_offset",16},{"ObservationABI","hidden_klass_width",1},{"ObservationABI","method_dont_inline_mask",4096},{"ObservationABI","method_dont_inline_offset",48},{"ObservationABI","method_dont_inline_storage_size",4},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",6},{"OopHandle","storage_size__obj",8},{"ResolvedFieldEntry","storage_size__field_holder",8},{"ResolvedFieldEntry","storage_size__field_offset",4},{"ResolvedFieldEntry","storage_size__flags",1},{"ResolvedFieldEntry","storage_size__tos_state",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_final_shift",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_volatile_shift",0},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",112},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_cause",9},{"VM_Operation","vtable_count",10},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",6},{"VM_Operation","vtable_name",8},{"VM_Operation","vtable_print_on_error",7},{"VM_Operation","vtable_skip_thread_oop_barriers",5},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_25{
 {63,120,183,198,252,206,242,110,106,141,75,92,188,238,188,109},1,15929344,589636596,25,
 {1,1,1,0,1,1,1,0,0},
 symbols_25,fields_25,sizes_25,enums_25};
-inline constexpr symbol_entry symbols_26[]{{"create_attaching_thread",4876368},{"malloc",8192992},{"current_thread",10384432},{"initialize_tls",10373152},{"is_tls_initialized",10384400},{"record_stack",10374896},{"register_stack",10375104},{"unregister_stack",10375376},{"create_os_thread",8219120},{"create_guards",9445680},{"remove_guards",9448224},{"initialize_tlab",10373200},{"tlab_initialize",10381024},{"use_tlab",14697702},{"cache_globals",45088},{"vm_exited",15523560},{"java_version",15141280},{"threads_lock",15331528},{"lock",8018464},{"lock_without_safepoint",8019168},{"unlock",8019840},{"allocate_handle_block",5457088},{"add_thread",10411008},{"main_thread_group",10526912},{"allocate_thread_object",4874160},{"thread_object",4891632},{"set_thread_status",4869056},{"jfr_thread_start",4894656},{"setup_fpu",45088},{"next_thread_identifier",10379856},{"java_thread_tid_offset",15141476},{"cleanup_failed",4875200},{"exit_thread",4877440},{"delete_thread",4891344},{"clear_exception",3882976},{"native_to_vm",5343728},{"native_to_vm_ctor",2595584},{"anchor_walkable",3956304},{"handle_mark_initialize",4538864},{"handle_mark_destroy",4538512},{"arena_grow",1182304},{"method_handle_construct",4538368},{"method_handle_destroy",4538624},{"java_calls",4808560},{"klass_initialize",4692608},{"klass_check",4678816},{"klass_allocate",4675904},{"new_string_unicode",4836352}};
-inline constexpr field_entry fields_26[]{{"Thread","_pending_exception",8},{"Thread","_tlab",424},{"Thread","_osthread",904},{"Thread","_handle_area",920},{"Thread","_stack_base",936},{"Thread","_stack_size",944},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",424},{"JavaThread","_osthread",904},{"JavaThread","_handle_area",920},{"JavaThread","_stack_base",936},{"JavaThread","_stack_size",944},{"JavaThread","_threadObj",1008},{"JavaThread","_anchor",1040},{"JavaThread","_active_handles",1168},{"JavaThread","_monitor_owner_id",1184},{"JavaThread","_thread_state",1196},{"JavaThread","_jni_attach_state",1248},{"JavaThread","_stack_overflow_state",1328},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",44},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",68},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_26[]{{"Thread",1000},{"ThreadShadow",32},{"JavaThread",1952},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",48},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",24},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",80},{"Symbol",8},{"AccessFlags",2},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",112},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
-inline constexpr enum_entry enums_26[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_26[]{{"add_thread",10411008},{"allocate_handle_block",5457088},{"allocate_thread_object",4874160},{"anchor_walkable",3956304},{"arena_grow",1182304},{"array_complete",1223920},{"array_restore",1225648},{"bytecode_lengths",12129536},{"cache_globals",45088},{"class_add",2795936},{"class_define",10155520},{"class_loader_data_head",15097232},{"class_resolve_hidden",10171120},{"class_resolve_stream",10171072},{"cleanup_failed",4875200},{"clear_exception",3882976},{"codecache_lock",15331488},{"compilation_lock",15331600},{"compile_jobs",14691424},{"compile_lock",15331576},{"compile_queue_lock",15331584},{"compiler_vtable",12291272},{"create_attaching_thread",4876368},{"create_guards",9445680},{"create_os_thread",8219120},{"current_thread",10384432},{"delete_thread",4891344},{"deopt_scope_commit",3272784},{"deopt_scope_ctor",3268128},{"deoptimize_all_marked",3270704},{"exit_thread",4877440},{"field_enable_guards19",9446352},{"field_enable_guards20",9446352},{"field_safepoint_process20",8694992},{"field_special_exit20",4880928},{"field_throw_exception_entry",15423928},{"field_vm_to_java_destroy",2231568},{"handle_mark_destroy",4538512},{"handle_mark_initialize",4538864},{"initialize_tlab",10373200},{"initialize_tls",10373152},{"interpreter_code",15062912},{"interpreter_entry_table",15062928},{"interpreter_normal_table",15444704},{"interpreter_throw_exception",15423928},{"is_not_compilable",7880032},{"is_not_osr_compilable",7880176},{"is_tls_initialized",10384400},{"java_calls",4808560},{"java_thread_tid_offset",15141476},{"java_version",15141280},{"jfr_thread_start",4894656},{"klass_allocate",4675904},{"klass_check",4678816},{"klass_initialize",4692608},{"lock",8018464},{"lock_without_safepoint",8019168},{"main_thread_group",10526912},{"malloc",8192992},{"mark_all",2867840},{"mark_for",2869120},{"method_handle_construct",4538368},{"method_handle_destroy",4538624},{"native_to_vm",5343728},{"native_to_vm_ctor",2595584},{"new_string_unicode",4836352},{"next_thread_identifier",10379856},{"nmethod_metadata_do",8054048},{"record_stack",10374896},{"register_stack",10375104},{"remove_guards",9448224},{"set_not_compilable",7892304},{"set_not_osr_compilable",7892560},{"set_thread_status",4869056},{"setup_fpu",45088},{"thread_object",4891632},{"threads_do",10417744},{"threads_lock",15331528},{"tlab_initialize",10381024},{"unlock",8019840},{"unregister_stack",10375376},{"use_compiler",14698708},{"use_tlab",14697702},{"vm_clear_ics_doit",10807424},{"vm_clear_ics_vtable",13192040},{"vm_execute",10814176},{"vm_exited",15523560}};
+inline constexpr field_entry fields_26[]{{"AccessFlags","_flags",0},{"Arena","_hwm",32},{"Arena","_max",40},{"Array<ResolvedFieldEntry>","_data",8},{"Array<ResolvedFieldEntry>","_length",0},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",0},{"CompilerThread","_task",1976},{"ConstMethod","_code_size",34},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_result_type",32},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_cache",16},{"ConstantPool","_length",68},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_resolved_field_entries",48},{"DeoptimizationScope","_required_gen",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",304},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_alternative_target",120},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",1168},{"JavaThread","_anchor",1040},{"JavaThread","_handle_area",920},{"JavaThread","_jni_attach_state",1248},{"JavaThread","_monitor_owner_id",1184},{"JavaThread","_osthread",904},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",40},{"JavaThread","_stack_base",936},{"JavaThread","_stack_overflow_state",1328},{"JavaThread","_stack_size",944},{"JavaThread","_suspend_flags",1192},{"JavaThread","_threadObj",1008},{"JavaThread","_thread_state",1196},{"JavaThread","_tlab",424},{"JavaThread","_vm_result_oop",1128},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_access_flags",14},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_misc_flags",16},{"Klass","_name",24},{"Klass","_next_link",144},{"KlassFlags","_flags",0},{"Method","_access_flags",44},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",48},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",52},{"MethodFlags","_status",0},{"OopHandle","_obj",0},{"ResolvedFieldEntry","_field_holder",0},{"ResolvedFieldEntry","_field_offset",8},{"ResolvedFieldEntry","_flags",17},{"ResolvedFieldEntry","_tos_state",16},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",920},{"Thread","_osthread",904},{"Thread","_pending_exception",8},{"Thread","_stack_base",936},{"Thread","_stack_size",944},{"Thread","_tlab",424},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",216},{"nmethod","_compile_id",212},{"nmethod","_method",80},{"nmethod","_state",219}};
+inline constexpr size_entry sizes_26[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",2},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"Array<ResolvedFieldEntry>",32},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",24},{"ClassLoadInfo",32},{"ClassLoaderData",160},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",152},{"CompilerThread",2040},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",80},{"ConstantPoolCache",64},{"DeoptimizationScope",8},{"DispatchTable",20480},{"Handle",8},{"HandleArea",48},{"HandleMark",56},{"InstanceKlass",472},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",20},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",128},{"JavaFrameAnchor",24},{"JavaThread",1952},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",200},{"KlassFlags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>",0},{"MemTag",0},{"MetadataClosure",8},{"Method",88},{"MethodFlags",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",40},{"ObservationABI",0},{"OopHandle",8},{"ResolvedFieldEntry",24},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>",0},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",1000},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",112},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",224}};
+inline constexpr enum_entry enums_26[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",39},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",2},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"Array<ResolvedFieldEntry>","storage_size__data",24},{"Array<ResolvedFieldEntry>","storage_size__length",4},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__resolved_field_entries",8},{"DeoptimizationScope","storage_size__required_gen",8},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",4},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__alternative_target",8},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__monitor_owner_id",8},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",112},{"JavaThread","storage_size__vm_result_oop",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",1},{"JavaValue","storage_size__value",8},{"Klass","storage_size__access_flags",2},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__misc_flags",1},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"KlassFlags","storage_size__flags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>","_misc_is_hidden_class",1},{"MemTag","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",2},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",4},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"MethodFlags","storage_size__status",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_dont_inline",4096},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_force_inline",2048},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c1_compilable",512},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_compilable",256},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_osr_compilable",1024},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",2},{"ObservationABI","hidden_klass_mask",1},{"ObservationABI","hidden_klass_offset",16},{"ObservationABI","hidden_klass_width",1},{"ObservationABI","method_dont_inline_mask",4096},{"ObservationABI","method_dont_inline_offset",48},{"ObservationABI","method_dont_inline_storage_size",4},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",6},{"OopHandle","storage_size__obj",8},{"ResolvedFieldEntry","storage_size__field_holder",8},{"ResolvedFieldEntry","storage_size__field_offset",4},{"ResolvedFieldEntry","storage_size__flags",1},{"ResolvedFieldEntry","storage_size__tos_state",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_final_shift",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_volatile_shift",0},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",112},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_cause",10},{"VM_Operation","vtable_count",11},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",7},{"VM_Operation","vtable_is_gc_operation",5},{"VM_Operation","vtable_name",9},{"VM_Operation","vtable_print_on_error",8},{"VM_Operation","vtable_skip_thread_oop_barriers",6},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_26{
 {46,57,219,241,150,66,120,43,8,23,172,20,80,110,248,117},1,16363520,2855910861,26,
 {1,1,1,0,1,1,1,0,0},
 symbols_26,fields_26,sizes_26,enums_26};
-inline constexpr symbol_entry symbols_27[]{{"create_attaching_thread",4962064},{"malloc",7464368},{"current_thread",9637856},{"initialize_tls",9626544},{"is_tls_initialized",9637824},{"record_stack",9628240},{"register_stack",9628448},{"unregister_stack",9628720},{"create_os_thread",7490992},{"create_guards",8657440},{"remove_guards",8659984},{"initialize_tlab",9626592},{"tlab_initialize",9634576},{"use_tlab",13902791},{"cache_globals",37120},{"vm_exited",14694624},{"java_version",14317600},{"threads_lock",14502760},{"lock",7286000},{"lock_without_safepoint",7286704},{"unlock",7287376},{"allocate_handle_block",5553552},{"add_thread",9664864},{"main_thread_group",9781424},{"allocate_thread_object",4960384},{"thread_object",4976544},{"set_thread_status",4955808},{"jfr_thread_start",4979552},{"setup_fpu",37120},{"next_thread_identifier",9633200},{"java_thread_tid_offset",14317796},{"cleanup_failed",4961424},{"exit_thread",4962880},{"delete_thread",4976256},{"clear_exception",3948128},{"native_to_vm",5444320},{"native_to_vm_ctor",2664528},{"anchor_walkable",4022064},{"handle_mark_initialize",4621264},{"handle_mark_destroy",4620896},{"arena_grow",1247376},{"method_handle_construct",4620752},{"method_handle_destroy",4621008},{"java_calls",4895728},{"klass_initialize",4778416},{"klass_check",4764560},{"klass_allocate",4761632},{"new_string_unicode",4922544}};
-inline constexpr field_entry fields_27[]{{"Thread","_pending_exception",8},{"Thread","_tlab",424},{"Thread","_osthread",904},{"Thread","_handle_area",920},{"Thread","_stack_base",936},{"Thread","_stack_size",944},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",424},{"JavaThread","_osthread",904},{"JavaThread","_handle_area",920},{"JavaThread","_stack_base",936},{"JavaThread","_stack_size",944},{"JavaThread","_threadObj",1008},{"JavaThread","_anchor",1040},{"JavaThread","_active_handles",1168},{"JavaThread","_monitor_owner_id",1184},{"JavaThread","_thread_state",1196},{"JavaThread","_jni_attach_state",1248},{"JavaThread","_stack_overflow_state",1256},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",44},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",68},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
-inline constexpr size_entry sizes_27[]{{"Thread",1000},{"ThreadShadow",32},{"JavaThread",1776},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",48},{"JNIHandleBlock",296},{"JavaCallArguments",120},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",24},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",80},{"Symbol",8},{"AccessFlags",2},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",112},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
-inline constexpr enum_entry enums_27[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr symbol_entry symbols_27[]{{"add_thread",9664864},{"allocate_handle_block",5553552},{"allocate_thread_object",4960384},{"anchor_walkable",4022064},{"arena_grow",1247376},{"array_complete",1285392},{"array_restore",1287136},{"bytecode_lengths",11407824},{"cache_globals",37120},{"class_add",2864864},{"class_define",9409104},{"class_loader_data_head",14273088},{"class_resolve_hidden",9424768},{"class_resolve_stream",9424720},{"cleanup_failed",4961424},{"clear_exception",3948128},{"codecache_lock",14502720},{"compilation_lock",14502832},{"compile_jobs",13896504},{"compile_lock",14502808},{"compile_queue_lock",14502816},{"compiler_vtable",11570456},{"create_attaching_thread",4962064},{"create_guards",8657440},{"create_os_thread",7490992},{"current_thread",9637856},{"delete_thread",4976256},{"deopt_scope_commit",3340656},{"deopt_scope_ctor",3336656},{"deoptimize_all_marked",3339200},{"exit_thread",4962880},{"field_enable_guards19",8658112},{"field_enable_guards20",8658112},{"field_safepoint_process20",7980096},{"field_special_exit20",4966160},{"field_throw_exception_entry",14594984},{"field_vm_to_java_destroy",2295872},{"handle_mark_destroy",4620896},{"handle_mark_initialize",4621264},{"initialize_tlab",9626592},{"initialize_tls",9626544},{"interpreter_code",14238784},{"interpreter_entry_table",14238800},{"interpreter_normal_table",14615760},{"interpreter_throw_exception",14594984},{"is_not_compilable",7147792},{"is_not_osr_compilable",7147936},{"is_tls_initialized",9637824},{"java_calls",4895728},{"java_thread_tid_offset",14317796},{"java_version",14317600},{"jfr_thread_start",4979552},{"klass_allocate",4761632},{"klass_check",4764560},{"klass_initialize",4778416},{"lock",7286000},{"lock_without_safepoint",7286704},{"main_thread_group",9781424},{"malloc",7464368},{"mark_all",2940480},{"mark_for",2941760},{"method_handle_construct",4620752},{"method_handle_destroy",4621008},{"native_to_vm",5444320},{"native_to_vm_ctor",2664528},{"new_string_unicode",4922544},{"next_thread_identifier",9633200},{"nmethod_metadata_do",7320208},{"record_stack",9628240},{"register_stack",9628448},{"remove_guards",8659984},{"set_not_compilable",7160416},{"set_not_osr_compilable",7160672},{"set_thread_status",4955808},{"setup_fpu",37120},{"thread_object",4976544},{"threads_do",9671344},{"threads_lock",14502760},{"tlab_initialize",9634576},{"unlock",7287376},{"unregister_stack",9628720},{"use_compiler",13903870},{"use_tlab",13902791},{"vm_clear_ics_doit",10066064},{"vm_clear_ics_vtable",12409000},{"vm_execute",10072048},{"vm_exited",14694624}};
+inline constexpr field_entry fields_27[]{{"AccessFlags","_flags",0},{"Arena","_hwm",32},{"Arena","_max",40},{"Array<ResolvedFieldEntry>","_data",8},{"Array<ResolvedFieldEntry>","_length",0},{"ClassLoadInfo","_is_hidden",24},{"ClassLoaderData","_class_loader",8},{"ClassLoaderData","_deallocate_list",104},{"ClassLoaderData","_klasses",56},{"ClassLoaderData","_next",112},{"CompileTask","_compile_id",0},{"CompilerThread","_task",1800},{"ConstMethod","_code_size",34},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_result_type",32},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_cache",16},{"ConstantPool","_length",68},{"ConstantPool","_pool_holder",24},{"ConstantPoolCache","_constant_pool",8},{"ConstantPoolCache","_resolved_field_entries",48},{"DeoptimizationScope","_required_gen",0},{"DispatchTable","_table",0},{"InstanceKlass","_init_state",304},{"InterpreterCodelet","_bytecode",12},{"InterpreterCodelet","_description",0},{"InterpreterCodelet","_size",8},{"JDK_Version","_major",0},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_size",104},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_value_state_buffer",72},{"JavaFrameAnchor","_last_Java_fp",16},{"JavaFrameAnchor","_last_Java_pc",8},{"JavaFrameAnchor","_last_Java_sp",0},{"JavaThread","_active_handles",1168},{"JavaThread","_anchor",1040},{"JavaThread","_handle_area",920},{"JavaThread","_jni_attach_state",1248},{"JavaThread","_monitor_owner_id",1184},{"JavaThread","_osthread",904},{"JavaThread","_pending_exception",8},{"JavaThread","_poll_data",40},{"JavaThread","_stack_base",936},{"JavaThread","_stack_overflow_state",1256},{"JavaThread","_stack_size",944},{"JavaThread","_suspend_flags",1192},{"JavaThread","_threadObj",1008},{"JavaThread","_thread_state",1196},{"JavaThread","_tlab",424},{"JavaThread","_vm_result_oop",1128},{"JavaValue","_type",0},{"JavaValue","_value",8},{"Klass","_class_loader_data",152},{"Klass","_java_mirror",112},{"Klass","_layout_helper",8},{"Klass","_misc_flags",14},{"Klass","_name",24},{"Klass","_next_link",144},{"KlassFlags","_flags",0},{"Method","_access_flags",44},{"Method","_code",72},{"Method","_constMethod",8},{"Method","_flags",48},{"Method","_from_interpreted_entry",80},{"Method","_i2i_entry",56},{"Method","_intrinsic_id",52},{"MethodFlags","_status",0},{"OopHandle","_obj",0},{"ResolvedFieldEntry","_field_holder",0},{"ResolvedFieldEntry","_field_offset",8},{"ResolvedFieldEntry","_flags",17},{"ResolvedFieldEntry","_tos_state",16},{"SafepointMechanism::ThreadData","_polling_word",0},{"StackOverflow","_stack_guard_state",0},{"StubQueue","_buffer_limit",20},{"StubQueue","_number_of_stubs",32},{"StubQueue","_queue_begin",24},{"StubQueue","_queue_end",28},{"StubQueue","_stub_buffer",8},{"Symbol","_body",6},{"Symbol","_length",4},{"Thread","_handle_area",920},{"Thread","_osthread",904},{"Thread","_pending_exception",8},{"Thread","_stack_base",936},{"Thread","_stack_size",944},{"Thread","_tlab",424},{"ThreadInVMfromJava","_check_asyncs",8},{"ThreadInVMfromJava","_thread",0},{"ThreadShadow","_exception_file",16},{"ThreadShadow","_exception_line",24},{"ThreadShadow","_pending_exception",8},{"VM_Operation","_calling_thread",8},{"methodHandle","_thread",8},{"methodHandle","_value",0},{"nmethod","_comp_level",208},{"nmethod","_compile_id",204},{"nmethod","_method",80},{"nmethod","_state",211}};
+inline constexpr size_entry sizes_27[]{{"AbstractInterpreter::MethodKind",0},{"AccessFlags",2},{"AllocFailStrategy::AllocFailEnum",0},{"Arena",48},{"Array<ResolvedFieldEntry>",32},{"ArrayKlass",224},{"BasicType",0},{"Bytecodes::Code",0},{"Chunk",24},{"ClassLoadInfo",32},{"ClassLoaderData",160},{"CompLevel",0},{"CompileBroker",1},{"CompileBroker::CompilerActivity",0},{"CompileTask",160},{"CompilerThread",1856},{"CompilerType",0},{"ConstMethod",56},{"ConstantPool",80},{"ConstantPoolCache",64},{"DeoptimizationScope",8},{"DispatchTable",20480},{"Handle",8},{"HandleArea",48},{"HandleMark",56},{"InstanceKlass",472},{"InstanceKlass::ClassState",0},{"InterpreterCodelet",16},{"JDK_Version",20},{"JNIHandleBlock",296},{"JVMFlag",24},{"JavaCallArguments",120},{"JavaFrameAnchor",24},{"JavaThread",1776},{"JavaThread::ExitType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::SuspendFlags",0},{"JavaThread::TerminatedTypes",0},{"JavaThreadState",0},{"JavaThreadStatus",0},{"JavaValue",16},{"Klass",200},{"KlassFlags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>",0},{"MemTag",0},{"MetadataClosure",8},{"Method",88},{"MethodFlags",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",0},{"Monitor",64},{"Mutex",64},{"NMethodClosure",8},{"OSThread",40},{"ObservationABI",0},{"OopHandle",8},{"ResolvedFieldEntry",24},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>",0},{"SafepointMechanism::ThreadData",16},{"StackOverflow",56},{"StackOverflow::StackGuardState",0},{"StubQueue",48},{"Symbol",8},{"Thread",1000},{"ThreadClosure",8},{"ThreadInVMfromJava",16},{"ThreadInVMfromNative",16},{"ThreadLocalAllocBuffer",112},{"ThreadShadow",32},{"ThreadToNativeFromVM",8},{"TosState",0},{"VM_ClearICs",24},{"VM_Operation",16},{"java_lang_Thread",1},{"methodHandle",16},{"nmethod",224}};
+inline constexpr enum_entry enums_27[]{{"AbstractInterpreter::MethodKind","number_of_method_entries",39},{"AbstractInterpreter::MethodKind","zerolocals",0},{"AbstractInterpreter::MethodKind","zerolocals_synchronized",1},{"AccessFlags","storage_size__flags",2},{"Arena","storage_size__hwm",8},{"Arena","storage_size__max",8},{"Array<ResolvedFieldEntry>","storage_size__data",24},{"Array<ResolvedFieldEntry>","storage_size__length",4},{"BasicType","T_ARRAY",13},{"BasicType","T_BOOLEAN",4},{"BasicType","T_BYTE",8},{"BasicType","T_CHAR",5},{"BasicType","T_DOUBLE",7},{"BasicType","T_FLOAT",6},{"BasicType","T_INT",10},{"BasicType","T_LONG",11},{"BasicType","T_OBJECT",12},{"BasicType","T_SHORT",9},{"BasicType","T_VOID",14},{"Bytecodes::Code","_fast_binaryswitch",229},{"Bytecodes::Code","_fast_linearswitch",228},{"Bytecodes::Code","_lookupswitch",171},{"Bytecodes::Code","_tableswitch",170},{"Bytecodes::Code","_wide",196},{"Bytecodes::Code","number_of_codes",239},{"ClassLoadInfo","storage_size__is_hidden",1},{"ClassLoaderData","storage_size__class_loader",8},{"ClassLoaderData","storage_size__deallocate_list",8},{"ClassLoaderData","storage_size__klasses",8},{"ClassLoaderData","storage_size__next",8},{"CompLevel","CompLevel_all",-1},{"CompLevel","CompLevel_any",-1},{"CompLevel","CompLevel_full_optimization",4},{"CompLevel","CompLevel_none",0},{"CompLevel","CompLevel_simple",1},{"CompileBroker::CompilerActivity","run_compilation",1},{"CompileBroker::CompilerActivity","shutdown_compilation",2},{"CompileBroker::CompilerActivity","stop_compilation",0},{"CompileTask","storage_size__compile_id",4},{"CompilerThread","storage_size__task",8},{"ConstMethod","storage_size__code_size",2},{"ConstMethod","storage_size__constants",8},{"ConstMethod","storage_size__name_index",2},{"ConstMethod","storage_size__result_type",1},{"ConstMethod","storage_size__signature_index",2},{"ConstMethod","storage_size__size_of_parameters",2},{"ConstantPool","storage_size__cache",8},{"ConstantPool","storage_size__length",4},{"ConstantPool","storage_size__pool_holder",8},{"ConstantPoolCache","storage_size__constant_pool",8},{"ConstantPoolCache","storage_size__resolved_field_entries",8},{"DeoptimizationScope","storage_size__required_gen",8},{"DispatchTable","storage_size__table",20480},{"InstanceKlass","storage_size__init_state",1},{"InstanceKlass::ClassState","allocated",0},{"InstanceKlass::ClassState","being_initialized",3},{"InstanceKlass::ClassState","fully_initialized",4},{"InstanceKlass::ClassState","initialization_error",5},{"InstanceKlass::ClassState","linked",2},{"InstanceKlass::ClassState","loaded",1},{"InterpreterCodelet","storage_size__bytecode",4},{"InterpreterCodelet","storage_size__description",8},{"InterpreterCodelet","storage_size__size",4},{"JDK_Version","storage_size__major",4},{"JVMFlag","storage_size__addr",8},{"JVMFlag","storage_size__name",8},{"JVMFlag","storage_size__type",4},{"JavaCallArguments","storage_size__max_size",4},{"JavaCallArguments","storage_size__size",4},{"JavaCallArguments","storage_size__start_at_zero",1},{"JavaCallArguments","storage_size__value",8},{"JavaCallArguments","storage_size__value_buffer",72},{"JavaCallArguments","storage_size__value_state",8},{"JavaCallArguments","storage_size__value_state_buffer",9},{"JavaFrameAnchor","storage_size__last_Java_fp",8},{"JavaFrameAnchor","storage_size__last_Java_pc",8},{"JavaFrameAnchor","storage_size__last_Java_sp",8},{"JavaThread","storage_size__active_handles",8},{"JavaThread","storage_size__anchor",24},{"JavaThread","storage_size__handle_area",8},{"JavaThread","storage_size__jni_attach_state",4},{"JavaThread","storage_size__monitor_owner_id",8},{"JavaThread","storage_size__osthread",8},{"JavaThread","storage_size__pending_exception",8},{"JavaThread","storage_size__poll_data",16},{"JavaThread","storage_size__stack_base",8},{"JavaThread","storage_size__stack_overflow_state",56},{"JavaThread","storage_size__stack_size",8},{"JavaThread","storage_size__suspend_flags",4},{"JavaThread","storage_size__threadObj",8},{"JavaThread","storage_size__thread_state",4},{"JavaThread","storage_size__tlab",112},{"JavaThread","storage_size__vm_result_oop",8},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::SuspendFlags","_obj_deopt",8},{"JavaThreadState","_thread_in_Java",8},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadStatus","RUNNABLE",5},{"JavaValue","storage_size__type",1},{"JavaValue","storage_size__value",8},{"Klass","storage_size__class_loader_data",8},{"Klass","storage_size__java_mirror",8},{"Klass","storage_size__layout_helper",4},{"Klass","storage_size__misc_flags",1},{"Klass","storage_size__name",8},{"Klass","storage_size__next_link",8},{"KlassFlags","storage_size__flags",1},{"KlassFlags::<unnamed-enum-_misc_is_hidden_class>","_misc_is_hidden_class",1},{"MemTag","mtThread",2},{"MetadataClosure","vtable_count",1},{"MetadataClosure","vtable_do_metadata",0},{"Method","storage_size__access_flags",2},{"Method","storage_size__code",8},{"Method","storage_size__constMethod",8},{"Method","storage_size__flags",4},{"Method","storage_size__from_interpreted_entry",8},{"Method","storage_size__i2i_entry",8},{"Method","storage_size__intrinsic_id",2},{"MethodFlags","storage_size__status",4},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_dont_inline",4096},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_force_inline",2048},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c1_compilable",512},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_compilable",256},{"MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>","_misc_is_not_c2_osr_compilable",1024},{"NMethodClosure","vtable_count",1},{"NMethodClosure","vtable_do_nmethod",0},{"ObservationABI","anonymous_klass_mask",0},{"ObservationABI","anonymous_klass_offset",0},{"ObservationABI","anonymous_klass_width",0},{"ObservationABI","deallocate_list_data_offset",8},{"ObservationABI","deallocate_list_data_width",8},{"ObservationABI","deallocate_list_length_offset",0},{"ObservationABI","deallocate_list_length_width",4},{"ObservationABI","deallocate_list_size",24},{"ObservationABI","deopt_mode",2},{"ObservationABI","hidden_klass_mask",1},{"ObservationABI","hidden_klass_offset",14},{"ObservationABI","hidden_klass_width",1},{"ObservationABI","method_dont_inline_mask",4096},{"ObservationABI","method_dont_inline_offset",48},{"ObservationABI","method_dont_inline_storage_size",4},{"ObservationABI","nmethod_metadata_closure",1},{"ObservationABI","set_not_compilable_old_args",0},{"ObservationABI","thread_is_java_slot",6},{"OopHandle","storage_size__obj",8},{"ResolvedFieldEntry","storage_size__field_holder",8},{"ResolvedFieldEntry","storage_size__field_offset",4},{"ResolvedFieldEntry","storage_size__flags",1},{"ResolvedFieldEntry","storage_size__tos_state",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_final_shift",1},{"ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>","is_volatile_shift",0},{"SafepointMechanism::ThreadData","storage_size__polling_word",8},{"StackOverflow","storage_size__stack_guard_state",4},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"StackOverflow::StackGuardState","stack_guard_yellow_reserved_disabled",2},{"StubQueue","storage_size__buffer_limit",4},{"StubQueue","storage_size__number_of_stubs",4},{"StubQueue","storage_size__queue_begin",4},{"StubQueue","storage_size__queue_end",4},{"StubQueue","storage_size__stub_buffer",8},{"Symbol","storage_size__body",2},{"Symbol","storage_size__length",2},{"Thread","storage_size__handle_area",8},{"Thread","storage_size__osthread",8},{"Thread","storage_size__pending_exception",8},{"Thread","storage_size__stack_base",8},{"Thread","storage_size__stack_size",8},{"Thread","storage_size__tlab",112},{"ThreadClosure","vtable_count",1},{"ThreadClosure","vtable_do_thread",0},{"ThreadInVMfromJava","storage_size__check_asyncs",1},{"ThreadInVMfromJava","storage_size__thread",8},{"ThreadShadow","storage_size__exception_file",8},{"ThreadShadow","storage_size__exception_line",4},{"ThreadShadow","storage_size__pending_exception",8},{"TosState","atos",8},{"TosState","btos",0},{"TosState","ctos",2},{"TosState","dtos",7},{"TosState","ftos",6},{"TosState","ilgl",11},{"TosState","itos",4},{"TosState","ltos",5},{"TosState","stos",3},{"TosState","vtos",9},{"TosState","ztos",1},{"VM_Operation","storage_size__calling_thread",8},{"VM_Operation","vtable_allow_nested_vm_operations",4},{"VM_Operation","vtable_cause",10},{"VM_Operation","vtable_count",11},{"VM_Operation","vtable_doit",0},{"VM_Operation","vtable_doit_epilogue",2},{"VM_Operation","vtable_doit_prologue",1},{"VM_Operation","vtable_evaluate_at_safepoint",7},{"VM_Operation","vtable_is_gc_operation",5},{"VM_Operation","vtable_name",9},{"VM_Operation","vtable_print_on_error",8},{"VM_Operation","vtable_skip_thread_oop_barriers",6},{"VM_Operation","vtable_type",3},{"methodHandle","storage_size__thread",8},{"methodHandle","storage_size__value",8},{"nmethod","storage_size__comp_level",1},{"nmethod","storage_size__compile_id",4},{"nmethod","storage_size__method",8},{"nmethod","storage_size__state",1}};
 inline constexpr profile_entry profile_27{
 {118,213,7,206,75,115,85,235,10,87,180,32,66,75,232,145},1,15519744,4183519753,27,
 {1,1,1,0,1,1,1,0,0},
@@ -10082,7 +10202,53 @@ inline constexpr std::string_view alias_klass_initialize[]{"?initialize@Instance
 inline constexpr std::string_view alias_klass_check[]{"?check_valid_for_instantiation@InstanceKlass@@UEAAX_NPEAVJavaThread@@@Z","?check_valid_for_instantiation@InstanceKlass@@UEAAX_NPEAVThread@@@Z"};
 inline constexpr std::string_view alias_klass_allocate[]{"?allocate_instance@InstanceKlass@@QEAAPEAVinstanceOopDesc@@PEAVJavaThread@@@Z","?allocate_instance@InstanceKlass@@QEAAPEAVinstanceOopDesc@@PEAVThread@@@Z"};
 inline constexpr std::string_view alias_new_string_unicode[]{"?create_from_unicode@java_lang_String@@SA?AVHandle@@PEBGHPEAVJavaThread@@@Z","?create_from_unicode@java_lang_String@@SA?AVHandle@@PEBGHPEAVThread@@@Z","?create_from_unicode@java_lang_String@@SA?AVHandle@@PEAGHPEAVThread@@@Z"};
-inline constexpr function_alias private_function_aliases[]{{"java_thread_ctor",alias_java_thread_ctor},{"create_attaching_thread",alias_create_attaching_thread},{"allocate_thread",alias_allocate_thread},{"malloc",alias_malloc},{"current_thread",alias_current_thread},{"initialize_tls",alias_initialize_tls},{"is_tls_initialized",alias_is_tls_initialized},{"record_stack",alias_record_stack},{"register_stack",alias_register_stack},{"unregister_stack",alias_unregister_stack},{"create_os_thread",alias_create_os_thread},{"create_guards",alias_create_guards},{"remove_guards",alias_remove_guards},{"initialize_tlab",alias_initialize_tlab},{"tlab_initialize",alias_tlab_initialize},{"use_tlab",alias_use_tlab},{"cache_globals",alias_cache_globals},{"vm_exited",alias_vm_exited},{"java_version",alias_java_version},{"threads_lock",alias_threads_lock},{"lock",alias_lock},{"old_lock",alias_old_lock},{"lock_without_safepoint",alias_lock_without_safepoint},{"unlock",alias_unlock},{"allocate_handle_block_legacy",alias_allocate_handle_block_legacy},{"allocate_handle_block",alias_allocate_handle_block},{"add_thread",alias_add_thread},{"main_thread_group",alias_main_thread_group},{"main_thread_group_raw",alias_main_thread_group_raw},{"allocate_thread_object",alias_allocate_thread_object},{"thread_object",alias_thread_object},{"set_thread_status",alias_set_thread_status},{"jfr_thread_start",alias_jfr_thread_start},{"setup_fpu",alias_setup_fpu},{"next_thread_identifier",alias_next_thread_identifier},{"java_thread_id",alias_java_thread_id},{"java_thread_tid_offset",alias_java_thread_tid_offset},{"cleanup_failed",alias_cleanup_failed},{"exit_thread",alias_exit_thread},{"delete_thread",alias_delete_thread},{"clear_exception",alias_clear_exception},{"native_to_vm",alias_native_to_vm},{"vm_to_native",alias_vm_to_native},{"process_safepoint_exit",alias_process_safepoint_exit},{"process_safepoint",alias_process_safepoint},{"native_to_vm_ctor",alias_native_to_vm_ctor},{"vm_to_native_ctor",alias_vm_to_native_ctor},{"anchor_walkable",alias_anchor_walkable},{"handle_mark_initialize",alias_handle_mark_initialize},{"handle_mark_destroy",alias_handle_mark_destroy},{"arena_grow",alias_arena_grow},{"method_handle_construct",alias_method_handle_construct},{"method_handle_destroy",alias_method_handle_destroy},{"java_calls",alias_java_calls},{"klass_initialize",alias_klass_initialize},{"klass_check",alias_klass_check},{"klass_allocate",alias_klass_allocate},{"new_string_unicode",alias_new_string_unicode}};
+inline constexpr std::string_view alias_vm_execute[]{"?execute@VMThread@@SAXPEAVVM_Operation@@@Z"};
+inline constexpr std::string_view alias_mark_all[]{"?mark_all_nmethods_for_deoptimization@CodeCache@@SAXXZ","?mark_all_nmethods_for_deoptimization@CodeCache@@SAXPEAVDeoptimizationScope@@@Z"};
+inline constexpr std::string_view alias_mark_for[]{"?mark_for_deoptimization@CodeCache@@SAHAEAVDepChange@@@Z","?mark_for_deoptimization@CodeCache@@SAHPEAVMethod@@@Z","?mark_for_deoptimization@CodeCache@@CAHAEAVKlassDepChange@@@Z","?mark_for_deoptimization@CodeCache@@SAXPEAVDeoptimizationScope@@PEAVMethod@@@Z"};
+inline constexpr std::string_view alias_deoptimize_all_marked[]{"?deoptimize_all_marked@Deoptimization@@SAXPEAVnmethod@@@Z","?deoptimize_all_marked@Deoptimization@@SAXXZ"};
+inline constexpr std::string_view alias_vm_deoptimize_vtable[]{"??_7VM_Deoptimize@@6B@"};
+inline constexpr std::string_view alias_vm_deoptimize_doit[]{"?doit@VM_Deoptimize@@UEAAXXZ"};
+inline constexpr std::string_view alias_vm_clear_ics_vtable[]{"??_7VM_ClearICs@@6B@"};
+inline constexpr std::string_view alias_vm_clear_ics_doit[]{"?doit@VM_ClearICs@@UEAAXXZ"};
+inline constexpr std::string_view alias_deopt_scope_ctor[]{"??0DeoptimizationScope@@QEAA@XZ"};
+inline constexpr std::string_view alias_deopt_scope_commit[]{"?deoptimize_marked@DeoptimizationScope@@QEAAXXZ"};
+inline constexpr std::string_view alias_compile_jobs[]{"?_should_compile_new_jobs@CompileBroker@@0HC","?_should_compile_new_jobs@CompileBroker@@0JC"};
+inline constexpr std::string_view alias_use_compiler[]{"UseCompiler"};
+inline constexpr std::string_view alias_compile_lock[]{"?Compile_lock@@3PEAVMutex@@EA"};
+inline constexpr std::string_view alias_compile_queue_lock[]{"?MethodCompileQueue_lock@@3PEAVMonitor@@EA"};
+inline constexpr std::string_view alias_compilation_lock[]{"?Compilation_lock@@3PEAVMonitor@@EA"};
+inline constexpr std::string_view alias_codecache_lock[]{"?CodeCache_lock@@3PEAVMutex@@EA","?CodeCache_lock@@3PEAVMonitor@@EA"};
+inline constexpr std::string_view alias_compiler_vtable[]{"??_7CompilerThread@@6B@"};
+inline constexpr std::string_view alias_threads_do[]{"?java_threads_do@Threads@@SAXPEAVThreadClosure@@@Z","?threads_do@Threads@@SAXPEAVThreadClosure@@@Z"};
+inline constexpr std::string_view alias_nmethod_metadata_do[]{"?metadata_do@nmethod@@QEAAXP6AXPEAVMetadata@@@Z@Z","?metadata_do@nmethod@@UEAAXP6AXPEAVMetadata@@@Z@Z","?metadata_do@nmethod@@UEAAXPEAVMetadataClosure@@@Z","?metadata_do@nmethod@@QEAAXPEAVMetadataClosure@@@Z"};
+inline constexpr std::string_view alias_set_not_compilable[]{"?set_not_compilable@Method@@QEAAXH_NPEBD@Z","?set_not_compilable@Method@@QEAAXPEBDH_N@Z"};
+inline constexpr std::string_view alias_set_not_osr_compilable[]{"?set_not_osr_compilable@Method@@QEAAXH_NPEBD@Z","?set_not_osr_compilable@Method@@QEAAXPEBDH_N@Z"};
+inline constexpr std::string_view alias_is_not_compilable[]{"?is_not_compilable@Method@@QEBA_NH@Z"};
+inline constexpr std::string_view alias_is_not_osr_compilable[]{"?is_not_osr_compilable@Method@@QEBA_NH@Z"};
+inline constexpr std::string_view alias_class_add[]{"?add_class@ClassLoaderData@@QEAAXPEAVKlass@@@Z","?add_class@ClassLoaderData@@QEAAXPEAVKlass@@_N@Z"};
+inline constexpr std::string_view alias_class_define[]{"?define_instance_class@SystemDictionary@@KAXVinstanceKlassHandle@@PEAVThread@@@Z","?define_instance_class@SystemDictionary@@KAXPEAVInstanceKlass@@PEAVThread@@@Z","?define_instance_class@SystemDictionary@@CAXPEAVInstanceKlass@@VHandle@@PEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_class_parse[]{"?parse_stream@SystemDictionary@@SAPEAVKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@VKlassHandle@@PEAV?$GrowableArray@VHandle@@@@PEAVThread@@@Z","?parse_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@PEBV2@PEAV?$GrowableArray@VHandle@@@@PEAVThread@@@Z","?parse_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVSymbol@@VHandle@@PEAVClassFileStream@@AEBVClassLoadInfo@@PEAVThread@@@Z"};
+inline constexpr std::string_view alias_class_resolve_stream[]{"?resolve_from_stream@SystemDictionary@@SAPEAVKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@_NPEAVThread@@@Z","?resolve_from_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@PEAVThread@@@Z","?resolve_from_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVClassFileStream@@PEAVSymbol@@VHandle@@AEBVClassLoadInfo@@PEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_class_resolve_hidden[]{"?resolve_hidden_class_from_stream@SystemDictionary@@CAPEAVInstanceKlass@@PEAVClassFileStream@@PEAVSymbol@@VHandle@@AEBVClassLoadInfo@@PEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_array_complete[]{"?complete_create_array_klass@ArrayKlass@@SAXPEAV1@VKlassHandle@@PEAVThread@@@Z","?complete_create_array_klass@ArrayKlass@@SAXPEAV1@PEAVKlass@@PEAVModuleEntry@@PEAVThread@@@Z","?complete_create_array_klass@ArrayKlass@@SAXPEAV1@PEAVKlass@@PEAVModuleEntry@@PEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_array_restore[]{"?restore_unshareable_info@ArrayKlass@@UEAAXPEAVClassLoaderData@@VHandle@@PEAVThread@@@Z","?restore_unshareable_info@ArrayKlass@@QEAAXPEAVClassLoaderData@@VHandle@@PEAVThread@@@Z","?restore_unshareable_info@ArrayKlass@@QEAAXPEAVClassLoaderData@@VHandle@@PEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_interpreter_code[]{"?_code@AbstractInterpreter@@1PEAVStubQueue@@EA"};
+inline constexpr std::string_view alias_field_vm_to_java_destroy[]{"??1ThreadInVMfromJava@@QEAA@XZ"};
+inline constexpr std::string_view alias_field_vm_to_java_transition10[]{"?transition@ThreadStateTransition@@SAXPEAVJavaThread@@W4JavaThreadState@@1@Z"};
+inline constexpr std::string_view alias_field_enable_guards10[]{"?enable_stack_yellow_reserved_zone@JavaThread@@QEAAXXZ"};
+inline constexpr std::string_view alias_field_special_exit10[]{"?handle_special_runtime_exit_condition@JavaThread@@QEAAX_N@Z"};
+inline constexpr std::string_view alias_field_enable_guards19[]{"?enable_stack_yellow_reserved_zone@StackOverflow@@QEAAXXZ"};
+inline constexpr std::string_view alias_field_process_safepoint_exit19[]{"?process_if_requested_with_exit_check@SafepointMechanism@@SAXPEAVJavaThread@@_N@Z"};
+inline constexpr std::string_view alias_field_enable_guards20[]{"?enable_stack_yellow_reserved_zone@StackOverflow@@QEAAXXZ"};
+inline constexpr std::string_view alias_field_safepoint_process20[]{"?process@SafepointMechanism@@CAXPEAVJavaThread@@_N1@Z"};
+inline constexpr std::string_view alias_field_special_exit20[]{"?handle_special_runtime_exit_condition@JavaThread@@QEAAXXZ"};
+inline constexpr std::string_view alias_field_throw_exception_entry[]{"?_throw_exception_entry@TemplateInterpreter@@1PEAEEA"};
+inline constexpr std::string_view alias_interpreter_normal_table[]{"?_normal_table@TemplateInterpreter@@1VDispatchTable@@A"};
+inline constexpr std::string_view alias_interpreter_throw_exception[]{"?_throw_exception_entry@TemplateInterpreter@@1PEAEEA"};
+inline constexpr std::string_view alias_bytecode_lengths[]{"?_lengths@Bytecodes@@0PAEA","?_lengths@Bytecodes@@0QBEB"};
+inline constexpr std::string_view alias_class_loader_data_head[]{"?_head@ClassLoaderDataGraph@@0PEAVClassLoaderData@@EA","?_head@ClassLoaderDataGraph@@0REAVClassLoaderData@@EA"};
+inline constexpr std::string_view alias_interpreter_entry_table[]{"?_entry_table@AbstractInterpreter@@1PAPEAEA"};
+inline constexpr function_alias private_function_aliases[]{{"java_thread_ctor",alias_java_thread_ctor},{"create_attaching_thread",alias_create_attaching_thread},{"allocate_thread",alias_allocate_thread},{"malloc",alias_malloc},{"current_thread",alias_current_thread},{"initialize_tls",alias_initialize_tls},{"is_tls_initialized",alias_is_tls_initialized},{"record_stack",alias_record_stack},{"register_stack",alias_register_stack},{"unregister_stack",alias_unregister_stack},{"create_os_thread",alias_create_os_thread},{"create_guards",alias_create_guards},{"remove_guards",alias_remove_guards},{"initialize_tlab",alias_initialize_tlab},{"tlab_initialize",alias_tlab_initialize},{"use_tlab",alias_use_tlab},{"cache_globals",alias_cache_globals},{"vm_exited",alias_vm_exited},{"java_version",alias_java_version},{"threads_lock",alias_threads_lock},{"lock",alias_lock},{"old_lock",alias_old_lock},{"lock_without_safepoint",alias_lock_without_safepoint},{"unlock",alias_unlock},{"allocate_handle_block_legacy",alias_allocate_handle_block_legacy},{"allocate_handle_block",alias_allocate_handle_block},{"add_thread",alias_add_thread},{"main_thread_group",alias_main_thread_group},{"main_thread_group_raw",alias_main_thread_group_raw},{"allocate_thread_object",alias_allocate_thread_object},{"thread_object",alias_thread_object},{"set_thread_status",alias_set_thread_status},{"jfr_thread_start",alias_jfr_thread_start},{"setup_fpu",alias_setup_fpu},{"next_thread_identifier",alias_next_thread_identifier},{"java_thread_id",alias_java_thread_id},{"java_thread_tid_offset",alias_java_thread_tid_offset},{"cleanup_failed",alias_cleanup_failed},{"exit_thread",alias_exit_thread},{"delete_thread",alias_delete_thread},{"clear_exception",alias_clear_exception},{"native_to_vm",alias_native_to_vm},{"vm_to_native",alias_vm_to_native},{"process_safepoint_exit",alias_process_safepoint_exit},{"process_safepoint",alias_process_safepoint},{"native_to_vm_ctor",alias_native_to_vm_ctor},{"vm_to_native_ctor",alias_vm_to_native_ctor},{"anchor_walkable",alias_anchor_walkable},{"handle_mark_initialize",alias_handle_mark_initialize},{"handle_mark_destroy",alias_handle_mark_destroy},{"arena_grow",alias_arena_grow},{"method_handle_construct",alias_method_handle_construct},{"method_handle_destroy",alias_method_handle_destroy},{"java_calls",alias_java_calls},{"klass_initialize",alias_klass_initialize},{"klass_check",alias_klass_check},{"klass_allocate",alias_klass_allocate},{"new_string_unicode",alias_new_string_unicode},{"vm_execute",alias_vm_execute},{"mark_all",alias_mark_all},{"mark_for",alias_mark_for},{"deoptimize_all_marked",alias_deoptimize_all_marked},{"vm_deoptimize_vtable",alias_vm_deoptimize_vtable},{"vm_deoptimize_doit",alias_vm_deoptimize_doit},{"vm_clear_ics_vtable",alias_vm_clear_ics_vtable},{"vm_clear_ics_doit",alias_vm_clear_ics_doit},{"deopt_scope_ctor",alias_deopt_scope_ctor},{"deopt_scope_commit",alias_deopt_scope_commit},{"compile_jobs",alias_compile_jobs},{"use_compiler",alias_use_compiler},{"compile_lock",alias_compile_lock},{"compile_queue_lock",alias_compile_queue_lock},{"compilation_lock",alias_compilation_lock},{"codecache_lock",alias_codecache_lock},{"compiler_vtable",alias_compiler_vtable},{"threads_do",alias_threads_do},{"nmethod_metadata_do",alias_nmethod_metadata_do},{"set_not_compilable",alias_set_not_compilable},{"set_not_osr_compilable",alias_set_not_osr_compilable},{"is_not_compilable",alias_is_not_compilable},{"is_not_osr_compilable",alias_is_not_osr_compilable},{"class_add",alias_class_add},{"class_define",alias_class_define},{"class_parse",alias_class_parse},{"class_resolve_stream",alias_class_resolve_stream},{"class_resolve_hidden",alias_class_resolve_hidden},{"array_complete",alias_array_complete},{"array_restore",alias_array_restore},{"interpreter_code",alias_interpreter_code},{"field_vm_to_java_destroy",alias_field_vm_to_java_destroy},{"field_vm_to_java_transition10",alias_field_vm_to_java_transition10},{"field_enable_guards10",alias_field_enable_guards10},{"field_special_exit10",alias_field_special_exit10},{"field_enable_guards19",alias_field_enable_guards19},{"field_process_safepoint_exit19",alias_field_process_safepoint_exit19},{"field_enable_guards20",alias_field_enable_guards20},{"field_safepoint_process20",alias_field_safepoint_process20},{"field_special_exit20",alias_field_special_exit20},{"field_throw_exception_entry",alias_field_throw_exception_entry},{"interpreter_normal_table",alias_interpreter_normal_table},{"interpreter_throw_exception",alias_interpreter_throw_exception},{"bytecode_lengths",alias_bytecode_lengths},{"class_loader_data_head",alias_class_loader_data_head},{"interpreter_entry_table",alias_interpreter_entry_table}};
 }
 
 export namespace vmhook::detail::private_native {
@@ -10764,12 +10930,1114 @@ public:
 
 // VMHOOK_NATIVE_RUNTIME_END
 
+// VMHOOK_JIT_BACKEND_BEGIN
+export namespace vmhook::detail::jit_backend
+{
+    namespace pn = vmhook::detail::private_native;
+    using safepoint_callback = void (*)(void*) noexcept;
+    struct configuration final
+    {
+        void (*execute)(void*){};
+        void** operation_vtable{};
+        void (*operation_doit)(void*){};
+        void (*mark_all_plain)(){};
+        void (*mark_all_scope)(void*){};
+        void (*deoptimize)(void*){};
+        void (*scope_construct)(void*){};
+        void (*threads_do)(void*){};
+        void* compiler_vtable{};
+        bool* use_compiler{};
+        std::int32_t* compile_jobs{};
+        void* set_not_compilable{};
+        void* set_not_osr_compilable{};
+        bool (*is_not_compilable)(void*, int){};
+        bool (*is_not_osr_compilable)(void*, int){};
+        void* metadata_do{};
+        std::size_t operation_size{}, operation_slots{}, doit_slot{}, scope_size{};
+        std::size_t task_offset{}, const_method_offset{}, result_type_offset{}, constants_offset{}, holder_offset{}, name_index_offset{}, signature_index_offset{};
+        std::size_t flags_offset{}, flags_width{}, inline_offset{}, inline_width{}, intrinsic_offset{}, intrinsic_width{};
+        std::uint32_t inline_mask{};
+        int all_levels{}, deopt_mode{};
+        bool old_setter_arguments{}, metadata_closure{};
+        std::array<void*, 20> return_entries{};
+        void* normal_method_entry{};
+        void* synchronized_method_entry{};
+        std::size_t i2i_offset{}, from_interpreted_offset{}, method_code_offset{};
+        void* exception_entry{};
+        const std::uint8_t* bytecode_lengths{};
+        void** class_loader_head{};
+        std::size_t cld_klasses{}, cld_next{}, klass_next{}, klass_layout{}, klass_state{}, klass_methods{}, const_method_size{}, code_size_offset{};
+        std::size_t cld_deallocate{}, deallocate_length{}, deallocate_data{};
+        unsigned fast_linear_switch{}, fast_binary_switch{};
+        bool ready{};
+        configuration() noexcept
+        {
+            try
+            {
+                auto& vm{ pn::rt() };
+                if (!vm.ready) { return; }
+                this->execute = vm.fn<void(*)(void*)>("vm_execute");
+                this->deopt_mode = vm.enum_value("ObservationABI", "deopt_mode");
+                const bool legacy{ this->deopt_mode == 0 };
+                this->operation_vtable = static_cast<void**>(vm.function(legacy ? "vm_deoptimize_vtable" : "vm_clear_ics_vtable"));
+                this->operation_doit = vm.fn<void(*)(void*)>(legacy ? "vm_deoptimize_doit" : "vm_clear_ics_doit");
+                this->operation_size = vm.size(legacy ? "VM_Deoptimize" : "VM_ClearICs");
+                this->operation_slots = vm.enum_value("VM_Operation", "vtable_count");
+                this->doit_slot = vm.enum_value("VM_Operation", "vtable_doit");
+                if (this->operation_size > 64 || this->operation_slots > 20 || this->doit_slot >= this->operation_slots
+                    || this->operation_vtable[this->doit_slot] != reinterpret_cast<void*>(this->operation_doit)) { return; }
+                if (this->deopt_mode == 2)
+                {
+                    this->scope_construct = vm.fn<void(*)(void*)>("deopt_scope_ctor");
+                    this->scope_size = vm.size("DeoptimizationScope");
+                    if (this->scope_size > 64) { return; }
+                    this->mark_all_scope = vm.fn<void(*)(void*)>("mark_all");
+                    this->deoptimize = vm.fn<void(*)(void*)>("deopt_scope_commit");
+                }
+                else
+                {
+                    this->mark_all_plain = vm.fn<void(*)()>("mark_all");
+                    this->deoptimize = legacy ? this->operation_doit : vm.fn<void(*)(void*)>("deoptimize_all_marked");
+                }
+                this->threads_do = vm.fn<void(*)(void*)>("threads_do");
+                this->compiler_vtable = vm.function("compiler_vtable");
+                this->use_compiler = static_cast<bool*>(vm.function("use_compiler"));
+                this->compile_jobs = static_cast<std::int32_t*>(vm.function("compile_jobs"));
+                if (reinterpret_cast<std::uintptr_t>(this->compile_jobs) % alignof(std::int32_t) != 0) { return; }
+                this->task_offset = vm.off("CompilerThread", "_task");
+                this->set_not_compilable = vm.function("set_not_compilable");
+                this->set_not_osr_compilable = vm.function("set_not_osr_compilable");
+                this->is_not_compilable = vm.fn<bool(*)(void*,int)>("is_not_compilable");
+                this->is_not_osr_compilable = vm.fn<bool(*)(void*,int)>("is_not_osr_compilable");
+                this->old_setter_arguments = vm.enum_value("ObservationABI", "set_not_compilable_old_args") != 0;
+                this->all_levels = vm.enum_value("CompLevel", "CompLevel_all");
+                this->metadata_do = vm.function("nmethod_metadata_do");
+                this->metadata_closure = vm.enum_value("ObservationABI", "nmethod_metadata_closure") != 0;
+                this->const_method_offset = vm.off("Method", "_constMethod");
+                this->result_type_offset = vm.off("ConstMethod", "_result_type");
+                this->constants_offset = vm.off("ConstMethod", "_constants");
+                this->holder_offset = vm.off("ConstantPool", "_pool_holder");
+                this->name_index_offset = vm.off("ConstMethod", "_name_index");
+                this->signature_index_offset = vm.off("ConstMethod", "_signature_index");
+                this->intrinsic_offset = vm.off("Method", "_intrinsic_id");
+                this->intrinsic_width = vm.enum_value("Method", "storage_size__intrinsic_id");
+                if (this->intrinsic_width != 1 && this->intrinsic_width != 2) { return; }
+                this->i2i_offset = vm.off("Method", "_i2i_entry");
+                this->from_interpreted_offset = vm.off("Method", "_from_interpreted_entry");
+                this->method_code_offset = vm.off("Method", "_code");
+                auto** const method_entries = static_cast<void**>(vm.function("interpreter_entry_table"));
+                const auto normal_kind = vm.enum_value("AbstractInterpreter::MethodKind", "zerolocals");
+                const auto synchronized_kind = vm.enum_value("AbstractInterpreter::MethodKind", "zerolocals_synchronized");
+                const auto method_entry_count = vm.enum_value("AbstractInterpreter::MethodKind", "number_of_method_entries");
+                if (normal_kind < 0 || synchronized_kind < 0 || method_entry_count <= normal_kind
+                    || method_entry_count <= synchronized_kind || method_entry_count > 128) { return; }
+                this->normal_method_entry = method_entries[normal_kind];
+                this->synchronized_method_entry = method_entries[synchronized_kind];
+                if (vm.has_type("MethodFlags"))
+                {
+                    this->flags_offset = vm.off("Method", "_flags") + vm.off("MethodFlags", "_status");
+                    this->flags_width = vm.enum_value("MethodFlags", "storage_size__status");
+                    this->inline_offset = this->flags_offset;
+                    this->inline_width = this->flags_width;
+                    this->inline_mask = vm.enum_value("MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>", "_misc_dont_inline");
+                }
+                else
+                {
+                    this->flags_offset = vm.off("Method", "_access_flags") + vm.off("AccessFlags", "_flags");
+                    this->flags_width = vm.enum_value("AccessFlags", "storage_size__flags");
+                    if (vm.has_field("Method", "_dont_inline"))
+                    {
+                        this->inline_offset = vm.off("Method", "_dont_inline");
+                        this->inline_width = vm.enum_value("Method", "storage_size__dont_inline");
+                        this->inline_mask = 1u << vm.enum_value("Method", "bit_position__dont_inline");
+                    }
+                    else
+                    {
+                        this->inline_offset = vm.off("Method", "_flags");
+                        this->inline_width = vm.enum_value("Method", "storage_size__flags");
+                        this->inline_mask = vm.enum_value("Method::Flags", "_dont_inline");
+                    }
+                }
+                if (this->flags_width != 4 || (this->inline_width != 1 && this->inline_width != 2 && this->inline_width != 4)) { return; }
+                if (vm.size("DispatchTable") != 10 * 256 * sizeof(void*) || vm.off("DispatchTable", "_table") != 0) { return; }
+                auto** const table{ static_cast<void**>(vm.function("interpreter_normal_table")) };
+                const auto entry = [&](const char* state, const unsigned opcode)
+                { return table[vm.enum_value("TosState", state) * 256 + opcode]; };
+                for (const char* type : {"T_BOOLEAN", "T_BYTE", "T_CHAR", "T_SHORT", "T_INT"})
+                { this->return_entries.at(vm.enum_value("BasicType", type)) = entry("itos", 172); }
+                this->return_entries.at(vm.enum_value("BasicType", "T_LONG")) = entry("ltos", 173);
+                this->return_entries.at(vm.enum_value("BasicType", "T_FLOAT")) = entry("ftos", 174);
+                this->return_entries.at(vm.enum_value("BasicType", "T_DOUBLE")) = entry("dtos", 175);
+                this->return_entries.at(vm.enum_value("BasicType", "T_OBJECT")) = entry("atos", 176);
+                this->return_entries.at(vm.enum_value("BasicType", "T_ARRAY")) = entry("atos", 176);
+                this->return_entries.at(vm.enum_value("BasicType", "T_VOID")) = entry("vtos", 177);
+                this->exception_entry = pn::load<void*>(vm.function("interpreter_throw_exception"), 0);
+                this->bytecode_lengths = static_cast<const std::uint8_t*>(vm.function("bytecode_lengths"));
+                this->fast_linear_switch = vm.enum_value("Bytecodes::Code", "_fast_linearswitch");
+                this->fast_binary_switch = vm.enum_value("Bytecodes::Code", "_fast_binaryswitch");
+                this->class_loader_head = static_cast<void**>(vm.function("class_loader_data_head"));
+                this->cld_klasses = vm.off("ClassLoaderData", "_klasses"); this->cld_next = vm.off("ClassLoaderData", "_next");
+                this->cld_deallocate = vm.off("ClassLoaderData", "_deallocate_list");
+                this->deallocate_length = vm.enum_value("ObservationABI", "deallocate_list_length_offset");
+                this->deallocate_data = vm.enum_value("ObservationABI", "deallocate_list_data_offset");
+                const auto deallocate_size = vm.enum_value("ObservationABI", "deallocate_list_size");
+                if (static_cast<std::size_t>(vm.enum_value("ClassLoaderData", "storage_size__deallocate_list")) != sizeof(void*)
+                    || static_cast<std::size_t>(vm.enum_value("ObservationABI", "deallocate_list_length_width")) != sizeof(std::int32_t)
+                    || static_cast<std::size_t>(vm.enum_value("ObservationABI", "deallocate_list_data_width")) != sizeof(void*)
+                    || deallocate_size <= 0 || deallocate_size > 128
+                    || this->deallocate_length + sizeof(std::int32_t) > static_cast<std::size_t>(deallocate_size)
+                    || this->deallocate_data + sizeof(void*) > static_cast<std::size_t>(deallocate_size)) { return; }
+                this->klass_next = vm.off("Klass", "_next_link"); this->klass_layout = vm.off("Klass", "_layout_helper");
+                this->klass_state = vm.off("InstanceKlass", "_init_state");
+                this->klass_methods = vm.field_offset("InstanceKlass", "_methods");
+                this->const_method_size = vm.size("ConstMethod"); this->code_size_offset = vm.off("ConstMethod", "_code_size");
+                if (!this->exception_entry) { return; }
+                const auto* queue = pn::load<void*>(vm.function("interpreter_code"), 0);
+                if (!queue) { return; }
+                const auto begin = pn::load<std::uintptr_t>(queue, vm.off("StubQueue", "_stub_buffer"));
+                const auto limit = pn::load<std::int32_t>(queue, vm.off("StubQueue", "_buffer_limit"));
+                if (!begin || limit <= 0 || limit > 64 * 1024 * 1024) { return; }
+                const auto valid_entry = [&](const void* address) noexcept {
+                    const auto pc = reinterpret_cast<std::uintptr_t>(address);
+                    const auto region = vmhook::os::query_region(address);
+                    return pc >= begin && pc - begin < static_cast<std::uintptr_t>(limit)
+                        && region.committed && region.executable && !region.guarded;
+                };
+                if (!valid_entry(this->exception_entry)) { return; }
+                if (!valid_entry(this->normal_method_entry) || !valid_entry(this->synchronized_method_entry)) { return; }
+                for (const auto code : this->return_entries)
+                { if (code && !valid_entry(code)) { return; } }
+                this->ready = true;
+            }
+            catch (...) {}
+        }
+    };
+    auto config() noexcept -> const configuration& { static const configuration value{}; return value; }
+    inline auto holder_linked(vmhook::hotspot::klass* klass) noexcept -> bool
+    {
+        try {
+            const auto& c = config();
+            return c.ready && klass && pn::load<std::uint8_t>(klass, c.klass_state)
+                >= pn::rt().enum_value("InstanceKlass::ClassState", "linked");
+        } catch (...) { return false; }
+    }
+    inline auto with_vm_state(const safepoint_callback callback, void* const opaque) noexcept -> bool
+    {
+        if (!callback) { return false; }
+        try
+        {
+            auto& vm{ pn::rt() }; if (!vm.ready) { return false; }
+            std::unique_ptr<pn::scoped_attachment> attachment{};
+            void* thread{ vm.current_thread() };
+            if (!thread)
+            {
+                attachment = std::make_unique<pn::scoped_attachment>("VMHook-hook-metadata");
+                if (!attachment->valid()) { return false; }
+                thread = attachment->get();
+            }
+            pn::vm_state_guard guard{ thread }; callback(opaque); return true;
+        }
+        catch (...) { return false; }
+    }
+    inline auto return_handler(vmhook::hotspot::method* const method) noexcept -> void*
+    {
+        const auto& c{ config() };
+        if (!c.ready || !method) { return nullptr; }
+        const auto* cm{ pn::load<void*>(method, c.const_method_offset) };
+        if (!cm) { return nullptr; }
+        const unsigned type{ pn::load<std::uint8_t>(cm, c.result_type_offset) };
+        return type < c.return_entries.size() ? c.return_entries[type] : nullptr;
+    }
+    inline auto throw_handler() noexcept -> void* { return config().exception_entry; }
+    struct operation_payload final
+    {
+        safepoint_callback callback{};
+        void* opaque{};
+        std::array<void*, 21> vtable{};
+        alignas(8) std::array<std::byte, 64> operation{};
+    };
+    inline auto operation_doit(void* const object) noexcept -> void
+    {
+        auto* const payload{ reinterpret_cast<operation_payload*>(static_cast<std::byte*>(object)
+            - std::meta::offset_of(^^operation_payload::operation).bytes) };
+        payload->callback(payload->opaque);
+    }
+    inline auto at_safepoint(const safepoint_callback callback, void* const opaque) noexcept -> bool
+    {
+        if (!callback) { return false; }
+        try
+        {
+            const auto& c{ config() }; if (!c.ready) { return false; }
+            auto& vm{ pn::rt() };
+            std::unique_ptr<pn::scoped_attachment> attachment{};
+            void* thread{ vm.current_thread() };
+            if (!thread)
+            {
+                attachment = std::make_unique<pn::scoped_attachment>("VMHook-VM-operation");
+                if (!attachment->valid()) { return false; }
+                thread = attachment->get();
+            }
+            if (pn::thread_state(thread) != 4 && pn::thread_state(thread) != 6) { return false; }
+            operation_payload payload{};
+            payload.callback = callback; payload.opaque = opaque;
+            std::copy(c.operation_vtable - 1, c.operation_vtable + c.operation_slots, payload.vtable.begin());
+            payload.vtable[c.doit_slot + 1] = reinterpret_cast<void*>(&operation_doit);
+            pn::store<void*>(payload.operation.data(), 0, payload.vtable.data() + 1);
+            pn::vm_state_guard entered{ thread };
+            c.execute(payload.operation.data());
+            return true;
+        }
+        catch (...) { return false; }
+    }
+    template<typename T> inline auto atomic_bits(void* const method, const std::size_t offset, const std::uint32_t mask, const bool set) noexcept -> void
+    {
+        auto& cell{ *reinterpret_cast<T*>(static_cast<std::byte*>(method) + offset) };
+        if (set) { std::atomic_ref<T>{cell}.fetch_or(static_cast<T>(mask), std::memory_order_relaxed); }
+        else { std::atomic_ref<T>{cell}.fetch_and(static_cast<T>(~mask), std::memory_order_relaxed); }
+    }
+    inline auto load_word(const void* const method, const std::size_t offset, const std::size_t width) noexcept -> std::uint32_t
+    {
+        if (width == 1) { return pn::load<std::uint8_t>(method, offset); }
+        if (width == 2) { return pn::load<std::uint16_t>(method, offset); }
+        return pn::load<std::uint32_t>(method, offset);
+    }
+    inline auto inline_bits(void* const method, const std::uint32_t mask, const bool set) noexcept -> void
+    {
+        const auto& c{ config() };
+        if (c.inline_width == 1) { atomic_bits<std::uint8_t>(method, c.inline_offset, mask, set); }
+        else if (c.inline_width == 2) { atomic_bits<std::uint16_t>(method, c.inline_offset, mask, set); }
+        else { atomic_bits<std::uint32_t>(method, c.inline_offset, mask, set); }
+    }
+    inline constexpr unsigned method_reason{1}, field_reason{2};
+    struct method_policy final
+    {
+        vmhook::hotspot::method* method{};
+        const void* const_method{};
+        vmhook::hotspot::klass* field_holder{};
+        std::uint16_t name_index{}, signature_index{};
+        std::shared_ptr<void> field_metadata_pin{};
+        std::uint32_t owned_compile{}, owned_inline{}, original_intrinsic{};
+        void* original_i2i{};
+        std::atomic<unsigned> reasons{};
+        method_policy* next{};
+        bool excluded{}, intrinsic_owned{}, entry_owned{};
+    };
+    // Nodes stay resident so class-definition callbacks need no registry mutex.
+    // A zero-reason node owns no live metadata and is ignored by new lookups.
+    inline std::atomic<method_policy*> policies{};
+    inline std::atomic<bool> field_mode{};
+    inline std::atomic<unsigned> active_class_definitions{};
+    struct class_definition_guard final
+    {
+        class_definition_guard() noexcept
+        { active_class_definitions.fetch_add(1, std::memory_order_acq_rel); }
+        ~class_definition_guard()
+        { active_class_definitions.fetch_sub(1, std::memory_order_acq_rel); }
+        class_definition_guard(const class_definition_guard&) = delete;
+        auto operator=(const class_definition_guard&) -> class_definition_guard& = delete;
+    };
+    inline auto find_policy(vmhook::hotspot::method* const method) noexcept -> method_policy*
+    {
+        const auto& c{ config() };
+        const auto identity{ pn::load<void*>(method, c.const_method_offset) };
+        const auto* const constants{ identity ? pn::load<void*>(identity, c.constants_offset) : nullptr };
+        const auto holder{ constants ? pn::load<void*>(constants, c.holder_offset) : nullptr };
+        for (auto* entry{ policies.load(std::memory_order_acquire) }; entry; entry = entry->next)
+        {
+            if (entry->reasons.load(std::memory_order_acquire) == 0) { continue; }
+            if (entry->method == method && entry->const_method == identity) { return entry; }
+            // Ordinary class linking may replace a JSR method with a shallow
+            // clone and retire the original metadata despite the class mirror
+            // root. Its immutable constant-pool member identity survives that
+            // rewrite. Never dereference the retired Method pointer.
+            if (entry->field_holder == holder && identity
+                && entry->name_index == pn::load<std::uint16_t>(identity, c.name_index_offset)
+                && entry->signature_index == pn::load<std::uint16_t>(identity, c.signature_index_offset))
+            { return entry; }
+        }
+        return nullptr;
+    }
+    inline auto bind_field_identity(method_policy& policy, vmhook::hotspot::klass* const holder) noexcept -> void
+    {
+        const auto& c{ config() };
+        policy.field_holder = holder;
+        policy.name_index = pn::load<std::uint16_t>(policy.const_method, c.name_index_offset);
+        policy.signature_index = pn::load<std::uint16_t>(policy.const_method, c.signature_index_offset);
+    }
+    inline auto current_policy_method(const method_policy& policy) noexcept -> vmhook::hotspot::method*
+    {
+        if (!policy.field_holder) { return policy.method; }
+        const auto& c{ config() };
+        auto* const array{ pn::load<void*>(policy.field_holder, c.klass_methods) };
+        if (!array) { return nullptr; }
+        const auto count{ pn::load<std::int32_t>(array, 0) };
+        if (count < 0 || count > 65535) { return nullptr; }
+        for (std::int32_t index{}; index < count; ++index)
+        {
+            auto* const method{ pn::load<vmhook::hotspot::method*>(array, 8 + sizeof(void*) * static_cast<std::size_t>(index)) };
+            if (!method) { continue; }
+            const auto* const cm{ pn::load<void*>(method, c.const_method_offset) };
+            if (cm && pn::load<std::uint16_t>(cm, c.name_index_offset) == policy.name_index
+                && pn::load<std::uint16_t>(cm, c.signature_index_offset) == policy.signature_index)
+            { return method; }
+        }
+        return nullptr;
+    }
+    inline auto publish_policy(method_policy* const policy) noexcept -> void
+    {
+        auto* previous{ policies.load(std::memory_order_relaxed) };
+        do { policy->next = previous; }
+        while (!policies.compare_exchange_weak(previous, policy, std::memory_order_release, std::memory_order_relaxed));
+    }
+    inline auto suppress_accessor_intrinsic(method_policy& policy) noexcept -> void
+    {
+        if (policy.intrinsic_owned) { return; }
+        const auto& c{ config() };
+        auto* const method{ current_policy_method(policy) };
+        if (!method) { return; }
+        const auto original{ load_word(method, c.intrinsic_offset, c.intrinsic_width) };
+        if (original == 0) { return; }
+        policy.original_intrinsic = original;
+        if (c.intrinsic_width == 1)
+        { std::atomic_ref<std::uint8_t>{*reinterpret_cast<std::uint8_t*>(reinterpret_cast<std::byte*>(method) + c.intrinsic_offset)}.store(0, std::memory_order_release); }
+        else
+        { std::atomic_ref<std::uint16_t>{*reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::byte*>(method) + c.intrinsic_offset)}.store(0, std::memory_order_release); }
+        policy.intrinsic_owned = true;
+    }
+    inline auto normalize_accessor_entry(method_policy& policy) noexcept -> void
+    {
+        if (!policy.intrinsic_owned || policy.entry_owned) { return; }
+        const auto& c = config();
+        auto* const method = current_policy_method(policy);
+        if (!method) { return; }
+        auto* const original = pn::load<void*>(method, c.i2i_offset);
+        // An unlinked method must retain its null entry: the VM's link_method
+        // still has to create its adapters and select the interpreter entry.
+        if (!original) { return; }
+        auto* const normal = (pn::method_access_flags(method) & 0x0020u)
+            ? c.synchronized_method_entry : c.normal_method_entry;
+        if (original == normal) { return; }
+        policy.original_i2i = original;
+        pn::store(method, c.i2i_offset, normal);
+        if (!pn::load<void*>(method, c.method_code_offset)) {
+            pn::store(method, c.from_interpreted_offset, normal);
+        }
+        // For a compiled method, the real deoptimization/clear_code protocol
+        // refreshes its interpreted caller entry from this actual i2i entry.
+        policy.entry_owned = true;
+    }
+    inline auto exclude(method_policy& policy, const bool field_accessor = false) noexcept -> bool
+    {
+        const auto& c{ config() };
+        auto* const method{ current_policy_method(policy) };
+        if (!method) { return false; }
+        const auto before{ load_word(method, c.flags_offset, c.flags_width) };
+        const auto inline_before{ load_word(method, c.inline_offset, c.inline_width) };
+        // Do this first: compiled lambda-form intrinsics can otherwise make
+        // Method::set_not_compilable return early as "always compilable".
+        if (field_accessor) { suppress_accessor_intrinsic(policy); }
+        const auto setter = [&](void* function)
+        {
+            if (c.old_setter_arguments) { reinterpret_cast<void(*)(void*,int,bool,const char*)>(function)(method, c.all_levels, false, "vmhook observer"); }
+            else { reinterpret_cast<void(*)(void*,const char*,int,bool)>(function)(method, "vmhook observer", c.all_levels, false); }
+        };
+        setter(c.set_not_compilable); setter(c.set_not_osr_compilable);
+        policy.owned_compile |= load_word(method, c.flags_offset, c.flags_width) ^ before;
+        inline_bits(method, c.inline_mask, true);
+        policy.owned_inline |= (load_word(method, c.inline_offset, c.inline_width) ^ inline_before) & c.inline_mask;
+        // C2 expands library intrinsics before ordinary inlining policy and can
+        // ignore dont_inline/not-compilable. Every static-field accessor must
+        // execute its bytecodes, including e.g. StringUTF16.getChar/putChar.
+        policy.excluded = true;
+        return c.is_not_compilable(method, c.all_levels) && c.is_not_osr_compilable(method, c.all_levels);
+    }
+    inline auto restore(method_policy& policy) noexcept -> void
+    {
+        if (!policy.excluded) { return; }
+        const auto& c{ config() };
+        auto* const method{ current_policy_method(policy) };
+        if (!method) { policy.excluded = false; policy.intrinsic_owned = false; policy.entry_owned = false; return; }
+        inline_bits(method, policy.owned_inline, false);
+        atomic_bits<std::uint32_t>(method, c.flags_offset, policy.owned_compile, false);
+        if (policy.intrinsic_owned)
+        {
+            if (c.intrinsic_width == 1)
+            {
+                std::uint8_t expected{};
+                (void)std::atomic_ref<std::uint8_t>{*reinterpret_cast<std::uint8_t*>(reinterpret_cast<std::byte*>(method) + c.intrinsic_offset)}.compare_exchange_strong(
+                    expected, static_cast<std::uint8_t>(policy.original_intrinsic), std::memory_order_acq_rel);
+            }
+            else
+            {
+                std::uint16_t expected{};
+                (void)std::atomic_ref<std::uint16_t>{*reinterpret_cast<std::uint16_t*>(reinterpret_cast<std::byte*>(method) + c.intrinsic_offset)}.compare_exchange_strong(
+                    expected, static_cast<std::uint16_t>(policy.original_intrinsic), std::memory_order_acq_rel);
+            }
+            policy.intrinsic_owned = false;
+        }
+        if (policy.entry_owned)
+        {
+            auto* const normal = (pn::method_access_flags(method) & 0x0020u)
+                ? c.synchronized_method_entry : c.normal_method_entry;
+            if (pn::load<void*>(method, c.i2i_offset) == normal)
+            {
+                pn::store(method, c.i2i_offset, policy.original_i2i);
+                if (!pn::load<void*>(method, c.method_code_offset)) {
+                    pn::store(method, c.from_interpreted_offset, policy.original_i2i);
+                }
+            }
+            policy.entry_owned = false;
+        }
+        policy.excluded = false;
+    }
+    inline auto method_is_excluded(vmhook::hotspot::method* const method) noexcept -> bool
+    {
+        const auto& c{ config() };
+        return c.ready && method && c.is_not_compilable(method, c.all_levels) && c.is_not_osr_compilable(method, c.all_levels)
+            && (load_word(method, c.inline_offset, c.inline_width) & c.inline_mask) != 0;
+    }
+    struct compiler_scan final { unsigned active{}, count{}; };
+    inline auto scan_compiler_thread(void* const closure, void* const thread) noexcept -> void
+    {
+        const auto& c{ config() };
+        if (pn::load<void*>(thread, 0) != c.compiler_vtable) { return; }
+        auto& result{ *static_cast<compiler_scan*>(pn::load<void*>(closure, sizeof(void*))) };
+        ++result.count;
+        if (pn::load<void*>(thread, c.task_offset)) { ++result.active; }
+    }
+    inline auto scan_compilers(void* const opaque) noexcept -> void
+    {
+        auto& result{ *static_cast<compiler_scan*>(opaque) }; result = {};
+        void* table[]{ reinterpret_cast<void*>(&scan_compiler_thread) };
+        void* closure[]{ table, &result };
+        config().threads_do(closure);
+    }
+    inline auto deoptimize_all() noexcept -> void
+    {
+        const auto& c{ config() };
+        if (c.deopt_mode == 2)
+        {
+            alignas(8) std::array<std::byte, 64> scope{};
+            c.scope_construct(scope.data()); c.mark_all_scope(scope.data()); c.deoptimize(scope.data());
+        }
+        else
+        {
+            c.mark_all_plain();
+            // The original VM_Deoptimize::doit does not consult object fields.
+            // Supply the actual operation layout and original real vtable.
+            alignas(8) std::array<std::byte, 64> operation{};
+            pn::store<void*>(operation.data(), 0, c.operation_vtable);
+            c.deoptimize(c.deopt_mode == 0 ? operation.data() : nullptr);
+        }
+    }
+    struct metadata_scan final { void* wanted{}; bool found{}; };
+    inline thread_local metadata_scan* plain_metadata_scan{};
+    inline auto metadata_plain(void* const value) noexcept -> void
+    { if (plain_metadata_scan && value == plain_metadata_scan->wanted) { plain_metadata_scan->found = true; } }
+    inline auto metadata_closure(void* const closure, void* const value) noexcept -> void
+    {
+        auto* const scan{ static_cast<metadata_scan*>(pn::load<void*>(closure, sizeof(void*))) };
+        if (value == scan->wanted) { scan->found = true; }
+    }
+    inline auto metadata_contains(void* const nmethod, vmhook::hotspot::method* const method) noexcept -> bool
+    {
+        const auto& c{ config() }; if (!c.ready || !nmethod || !method) { return false; }
+        metadata_scan result{ method };
+        if (c.metadata_closure)
+        {
+            void* table[]{ reinterpret_cast<void*>(&metadata_closure) }; void* closure[]{ table, &result };
+            reinterpret_cast<void(*)(void*,void*)>(c.metadata_do)(nmethod, closure);
+        }
+        else
+        {
+            auto* const previous{ plain_metadata_scan }; plain_metadata_scan = &result;
+            reinterpret_cast<void(*)(void*,void(*)(void*))>(c.metadata_do)(nmethod, &metadata_plain);
+            plain_metadata_scan = previous;
+        }
+        return result.found;
+    }
+    inline std::mutex administration_mutex{};
+    struct vm_state_restore final
+    {
+        void* thread{};
+        bool restore{};
+        ~vm_state_restore() { if (this->restore) { pn::transition_to_vm(this->thread); } }
+    };
+    // These jint states are audited in the exact private data profile, including
+    // the anonymous source enum in Java 8: stop=0, run=1, shutdown=2.
+    inline constexpr std::int32_t compile_jobs_stop{0}, compile_jobs_run{1}, compile_jobs_shutdown{2};
+    struct compilation_pause final
+    {
+        bool original_compiler{}, compiler_owned{}, jobs_owned{}, paused{};
+        std::int32_t original_jobs{};
+    };
+    inline auto stop_new_compile_jobs() noexcept -> void
+    {
+        auto jobs{ std::atomic_ref<std::int32_t>{*config().compile_jobs} };
+        auto state{ jobs.load(std::memory_order_acquire) };
+        // A VM or another owner may have permanently shut the compiler down.
+        // Never replace that state with our temporary stop.
+        while (state == compile_jobs_run
+            && !jobs.compare_exchange_weak(state, compile_jobs_stop,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {}
+    }
+    inline auto pause_compilation(compilation_pause& pause) noexcept -> bool
+    {
+        auto jobs{ std::atomic_ref<std::int32_t>{*config().compile_jobs} };
+        auto state{ jobs.load(std::memory_order_acquire) };
+        if (state < compile_jobs_stop || state > compile_jobs_shutdown) { return false; }
+        while (state == compile_jobs_run)
+        {
+            if (jobs.compare_exchange_weak(state, compile_jobs_stop,
+                std::memory_order_acq_rel, std::memory_order_acquire))
+            { pause.jobs_owned = true; break; }
+        }
+        pause.original_jobs = state;
+        auto compiler{ std::atomic_ref<bool>{*config().use_compiler} };
+        pause.original_compiler = compiler.exchange(false, std::memory_order_acq_rel);
+        pause.compiler_owned = pause.original_compiler;
+        pause.paused = true;
+        return true;
+    }
+    inline auto resume_compilation(compilation_pause& pause) noexcept -> void
+    {
+        if (!pause.paused) { return; }
+        auto jobs{ std::atomic_ref<std::int32_t>{*config().compile_jobs} };
+        if (pause.jobs_owned)
+        {
+            auto expected{ compile_jobs_stop };
+            (void)jobs.compare_exchange_strong(expected, pause.original_jobs,
+                std::memory_order_acq_rel, std::memory_order_acquire);
+        }
+        if (pause.compiler_owned && !(jobs.load(std::memory_order_acquire) == compile_jobs_shutdown
+            && pause.original_jobs != compile_jobs_shutdown))
+        {
+            bool expected{false};
+            (void)std::atomic_ref<bool>{*config().use_compiler}.compare_exchange_strong(
+                expected, pause.original_compiler, std::memory_order_acq_rel, std::memory_order_acquire);
+        }
+        pause.paused = false;
+    }
+    inline auto scan_paused_compilers(void* const opaque) noexcept -> void
+    { stop_new_compile_jobs(); scan_compilers(opaque); }
+    struct install_transaction final
+    {
+        method_policy* policy{};
+        bool (*commit)(void*) noexcept{};
+        void* opaque{};
+        compilation_pause pause{};
+        bool okay{};
+    };
+    inline auto pause_and_exclude(void* const opaque) noexcept -> void
+    {
+        auto& transaction{ *static_cast<install_transaction*>(opaque) };
+        if (!pause_compilation(transaction.pause)) { return; }
+        transaction.okay = transaction.policy->excluded || exclude(*transaction.policy);
+    }
+    inline auto commit_install(void* const opaque) noexcept -> void
+    {
+        auto& transaction{ *static_cast<install_transaction*>(opaque) };
+        deoptimize_all(); transaction.okay = transaction.commit(transaction.opaque);
+        if (!transaction.okay && (transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(*transaction.policy); }
+        resume_compilation(transaction.pause);
+    }
+    inline auto rollback_install(void* const opaque) noexcept -> void
+    {
+        auto& transaction{ *static_cast<install_transaction*>(opaque) };
+        if ((transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(*transaction.policy); }
+        resume_compilation(transaction.pause);
+    }
+    inline auto install_method_policy(vmhook::hotspot::method* const method,
+        bool (*commit)(void*) noexcept, void* const opaque, std::shared_ptr<void>& retained_policy) noexcept -> bool
+    {
+        try
+        {
+            const auto& c{ config() };
+            if (!c.ready || !method || !commit || !return_handler(method)
+                || !vmhook::detail::borrowed_callback_supported()) { return false; }
+            // Intrinsic entry suppression is enabled only after its independent
+            // compiler protocol proof. Ordinary bytecode methods are supported.
+            if (load_word(method, c.intrinsic_offset, c.intrinsic_width) != 0) { return false; }
+            auto& vm{ pn::rt() };
+            const auto thread{ vm.current_thread() };
+            const bool began_in_vm{ thread && pn::thread_state(thread) == 6 };
+            if (began_in_vm) { pn::transition_to_native(thread); }
+            const vm_state_restore state{ thread, began_in_vm };
+            std::lock_guard admin{ administration_mutex };
+            method_policy* policy{ find_policy(method) };
+            const bool existing{ policy != nullptr };
+            std::unique_ptr<method_policy> prepared_policy{};
+            if (!policy)
+            {
+                prepared_policy = std::make_unique<method_policy>();
+                policy = prepared_policy.get();
+                policy->method = method; policy->const_method = pn::load<void*>(method, c.const_method_offset);
+            }
+            // Allocate the shared control block before any policy is published
+            // or flags are changed. An allocation failure cannot leave a live
+            // reason pointing at metadata whose installer root is about to end.
+            retained_policy = std::shared_ptr<void>{policy, [](void*) noexcept {}};
+            policy->reasons.fetch_or(method_reason, std::memory_order_release);
+            if (!existing) { publish_policy(prepared_policy.release()); }
+            install_transaction transaction{ policy, commit, opaque };
+            bool okay{ at_safepoint(&pause_and_exclude, &transaction) && transaction.okay };
+            compiler_scan scan{};
+            if (okay)
+            {
+                for (unsigned attempt{}; attempt < 3000; ++attempt)
+                {
+                    if (!at_safepoint(&scan_paused_compilers, &scan)) { okay = false; break; }
+                    if (scan.active == 0) { break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+                    if (attempt == 2999) { okay = false; }
+                }
+            }
+            if (okay) { okay = at_safepoint(&commit_install, &transaction) && transaction.okay; }
+            if (!okay)
+            {
+                if (!at_safepoint(&rollback_install, &transaction))
+                {
+                    // Never leave an internal temporary VM compiler pause behind
+                    // if a VM operation fails before entering its callback.
+                    resume_compilation(transaction.pause);
+                }
+                retained_policy.reset(); return false;
+            }
+            return true;
+        }
+        catch (...) { return false; }
+    }
+    inline auto release_method_policy_at_safepoint(const std::shared_ptr<void>& opaque) noexcept -> void
+    {
+        if (!opaque) { return; }
+        auto& policy{ *static_cast<method_policy*>(opaque.get()) };
+        if ((policy.reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(policy); }
+    }
+
+    inline auto has_static_field_bytecodes(vmhook::hotspot::method* const method) noexcept -> bool
+    {
+        const auto& c{ config() };
+        const auto* cm{ pn::load<void*>(method, c.const_method_offset) };
+        if (!cm) { return false; }
+        const std::size_t size{ pn::load<std::uint16_t>(cm, c.code_size_offset) };
+        const auto* code{ static_cast<const std::uint8_t*>(cm) + c.const_method_size };
+        const auto signed_word = [&](const std::size_t at) noexcept -> std::int32_t
+        {
+            const std::uint32_t bits{ (std::uint32_t{code[at]} << 24) | (std::uint32_t{code[at+1]} << 16)
+                | (std::uint32_t{code[at+2]} << 8) | std::uint32_t{code[at+3]} };
+            return std::bit_cast<std::int32_t>(bits);
+        };
+        for (std::size_t bci{}; bci < size;)
+        {
+            const unsigned opcode{ code[bci] };
+            if (opcode == 178 || opcode == 179) { return true; }
+            std::size_t length{ c.bytecode_lengths[opcode] & 15u };
+            if (opcode == 196)
+            {
+                if (bci + 1 >= size) { return true; }
+                length = c.bytecode_lengths[code[bci+1]] >> 4;
+            }
+            else if (opcode == 170 || opcode == 171 || opcode == c.fast_linear_switch || opcode == c.fast_binary_switch)
+            {
+                const std::size_t aligned{ (bci + 4) & ~std::size_t{3} };
+                if (aligned > size || size - aligned < 8) { return true; }
+                if (opcode == 170)
+                {
+                    if (size - aligned < 12) { return true; }
+                    const std::int64_t count{ std::int64_t{signed_word(aligned+8)} - signed_word(aligned+4) + 1 };
+                    if (count < 0 || static_cast<std::uint64_t>(count) > (size - aligned - 12) / 4) { return true; }
+                    length = aligned - bci + 12 + static_cast<std::size_t>(count) * 4;
+                }
+                else
+                {
+                    const auto count{ signed_word(aligned+4) };
+                    if (count < 0 || static_cast<std::size_t>(count) > (size - aligned - 8) / 8) { return true; }
+                    length = aligned - bci + 8 + static_cast<std::size_t>(count) * 8;
+                }
+            }
+            // Unknown, breakpoint or malformed bytecodes are conservatively
+            // interpreted. No operand byte can be mistaken for a field opcode.
+            if (length == 0 || length > size - bci) { return true; }
+            bci += length;
+        }
+        return false;
+    }
+    inline auto include_field_policy(method_policy* const policy) noexcept -> void
+    {
+        if (auto* const existing{ find_policy(policy->method) })
+        {
+            existing->owned_compile |= policy->owned_compile;
+            existing->owned_inline |= policy->owned_inline;
+            if (policy->intrinsic_owned && !existing->intrinsic_owned)
+            {
+                existing->original_intrinsic = policy->original_intrinsic;
+                existing->intrinsic_owned = true;
+            }
+            if (policy->entry_owned && !existing->entry_owned)
+            {
+                existing->original_i2i = policy->original_i2i;
+                existing->entry_owned = true;
+            }
+            if (!existing->field_holder && policy->field_holder)
+            {
+                existing->field_holder = policy->field_holder;
+                existing->name_index = policy->name_index;
+                existing->signature_index = policy->signature_index;
+            }
+            if (!existing->field_metadata_pin) { existing->field_metadata_pin = std::move(policy->field_metadata_pin); }
+            existing->reasons.fetch_or(field_reason, std::memory_order_release);
+            delete policy;
+        }
+        else
+        {
+            policy->reasons.store(field_reason, std::memory_order_release); publish_policy(policy);
+        }
+    }
+    struct class_lifetime_flags final
+    {
+        struct field final { std::size_t offset{}, width{}; std::uint32_t mask{}; };
+        field anonymous{}, hidden{};
+        std::uint8_t loaded{}, linked{};
+        bool ready{};
+        class_lifetime_flags() noexcept
+        {
+            try
+            {
+                auto& vm{ pn::rt() };
+                const auto read = [&](const char* offset, const char* width, const char* mask)
+                {
+                    field value{ static_cast<std::size_t>(vm.enum_value("ObservationABI", offset)),
+                        static_cast<std::size_t>(vm.enum_value("ObservationABI", width)),
+                        static_cast<std::uint32_t>(vm.enum_value("ObservationABI", mask)) };
+                    if ((value.width != 0 && value.width != 1 && value.width != 2 && value.width != 4)
+                        || ((value.width == 0) != (value.mask == 0))) { throw std::runtime_error("Unsupported class lifetime flags"); }
+                    return value;
+                };
+                anonymous = read("anonymous_klass_offset", "anonymous_klass_width", "anonymous_klass_mask");
+                hidden = read("hidden_klass_offset", "hidden_klass_width", "hidden_klass_mask");
+                const auto loaded_state = vm.enum_value("InstanceKlass::ClassState", "loaded");
+                const auto linked_state = vm.enum_value("InstanceKlass::ClassState", "linked");
+                const auto initializing_state = vm.enum_value("InstanceKlass::ClassState", "being_initialized");
+                if (loaded_state <= 0 || linked_state <= loaded_state
+                    || initializing_state <= linked_state
+                    || initializing_state > std::numeric_limits<std::uint8_t>::max())
+                { throw std::runtime_error("Unsupported class state ordering"); }
+                loaded = static_cast<std::uint8_t>(loaded_state);
+                linked = static_cast<std::uint8_t>(linked_state);
+                ready = vm.ready && (anonymous.mask || hidden.mask);
+            }
+            catch (...) {}
+        }
+    };
+    auto lifetime_flags() noexcept -> const class_lifetime_flags&
+    { static const class_lifetime_flags value{}; return value; }
+    inline auto transient_class_metadata(const void* const klass) noexcept -> bool
+    {
+        const auto state{ pn::load<std::uint8_t>(klass, config().klass_state) };
+        if (state == 0) { return true; }
+        const auto& flags{ lifetime_flags() };
+        if (state >= flags.linked) { return false; }
+        // Java20 and Java22 insert being_linked between loaded and linked.
+        // Defer those in-progress rewrites before retaining Method metadata.
+        if (state > flags.loaded) { return true; }
+        const auto matches = [&](const class_lifetime_flags::field& field)
+        { return field.mask && (load_word(klass, field.offset, field.width) & field.mask) != 0; };
+        // Hidden/anonymous classes enter the hierarchy in loaded state before
+        // mandatory linking. A failed link can explicitly free their metadata
+        // even while their mirror is rooted. Ordinary accepted lazy classes
+        // can stay loaded indefinitely and must remain eligible.
+        return matches(flags.anonymous) || matches(flags.hidden);
+    }
+    inline auto collect_field_policies(void* const opaque) noexcept -> void
+    {
+        auto& okay{ *static_cast<bool*>(opaque) };
+        try
+        {
+            const auto& c{ config() };
+            for (auto* cld{ *c.class_loader_head }; cld; cld = pn::load<void*>(cld, c.cld_next))
+            {
+                for (auto* klass{ static_cast<vmhook::hotspot::klass*>(pn::load<void*>(cld, c.cld_klasses)) };
+                    klass; klass = static_cast<vmhook::hotspot::klass*>(pn::load<void*>(klass, c.klass_next)))
+                {
+                    if (pn::load<std::int32_t>(klass, c.klass_layout) < 0 || transient_class_metadata(klass)) { continue; }
+                    vmhook::hotspot::method** methods{}; std::int32_t count{};
+                    if (!vmhook::hotspot::safe_klass_methods(klass, methods, count)) { continue; }
+                    std::shared_ptr<void> pin{};
+                    for (std::int32_t index{}; index < count; ++index)
+                    {
+                        auto* const method{ methods[index] };
+                        if (!method || !has_static_field_bytecodes(method)) { continue; }
+                        if (auto* const existing{ find_policy(method) })
+                        {
+                            if (!existing->field_metadata_pin)
+                            {
+                                if (!pin) { pin = vmhook::detail::retain_hook_klass(klass); }
+                                if (!pin) { okay = false; return; }
+                                existing->field_metadata_pin = pin;
+                            }
+                            if (!method_is_excluded(method))
+                            {
+                                if (!exclude(*existing, true)) { okay = false; return; }
+                            }
+                            else { suppress_accessor_intrinsic(*existing); }
+                            existing->reasons.fetch_or(field_reason, std::memory_order_release); continue;
+                        }
+                        if (!pin) { pin = vmhook::detail::retain_hook_klass(klass); }
+                        if (!pin) { okay = false; return; }
+                        auto policy{ std::make_unique<method_policy>() };
+                        policy->method = method; policy->const_method = pn::load<void*>(method, c.const_method_offset);
+                        policy->field_metadata_pin = pin;
+                        bind_field_identity(*policy, klass);
+                        if (!exclude(*policy, true)) { restore(*policy); okay = false; return; }
+                        include_field_policy(policy.release());
+                    }
+                }
+            }
+        }
+        catch (...) { okay = false; }
+    }
+    struct field_transaction final
+    {
+        compilation_pause pause{};
+        bool paused{}, complete{};
+    };
+    inline auto pause_for_fields(void* const opaque) noexcept -> void
+    {
+        auto& transaction{ *static_cast<field_transaction*>(opaque) };
+        transaction.paused = pause_compilation(transaction.pause);
+        if (!transaction.paused) { return; }
+        field_mode.store(true, std::memory_order_release);
+    }
+    // Called at the final real safepoint, without C++ allocation, root creation
+    // or registry locks. The graph cannot change between this verification and
+    // deoptimization/compiler resumption. Definitions that entered the original
+    // function before our detour existed are covered by this graph scan too.
+    inline auto field_graph_ready() noexcept -> bool
+    {
+        if (active_class_definitions.load(std::memory_order_acquire) != 0) { return false; }
+        const auto& c{ config() };
+        for (auto* cld{ *c.class_loader_head }; cld; cld = pn::load<void*>(cld, c.cld_next))
+        {
+            for (auto* klass{ pn::load<void*>(cld, c.cld_klasses) }; klass; klass = pn::load<void*>(klass, c.klass_next))
+            {
+                if (pn::load<std::int32_t>(klass, c.klass_layout) < 0) { continue; }
+                // A scratch or still-linking hidden class can be explicitly
+                // freed after a failed definition despite its mirror root.
+                if (transient_class_metadata(klass))
+                {
+                    // JFR's initial schema transformation leaves its discarded
+                    // allocated InstanceKlass on this CLD until a later cleanup
+                    // safepoint. Only a queued Klass is known to be retired;
+                    // never skip an in-progress definition based on state alone.
+                    const auto* retired = pn::load<void*>(cld, c.cld_deallocate);
+                    bool queued{};
+                    if (retired)
+                    {
+                        const auto count = pn::load<std::int32_t>(retired, c.deallocate_length);
+                        const auto* data = pn::load<void**>(retired, c.deallocate_data);
+                        if (count < 0 || count > 1048576 || (count && !data)) { return false; }
+                        for (std::int32_t index{}; index < count; ++index)
+                        { if (data[index] == klass) { queued = true; break; } }
+                    }
+                    if (queued) { continue; }
+                    return false;
+                }
+                auto* const array{ pn::load<void*>(klass, c.klass_methods) };
+                if (!array) { return false; }
+                const auto count{ pn::load<std::int32_t>(array, 0) };
+                if (count < 0 || count > 65535) { return false; }
+                for (std::int32_t index{}; index < count; ++index)
+                {
+                    auto* const method{ pn::load<vmhook::hotspot::method*>(array, 8 + sizeof(void*) * static_cast<std::size_t>(index)) };
+                    if (method && has_static_field_bytecodes(method)
+                        && (!method_is_excluded(method) || load_word(method, c.intrinsic_offset, c.intrinsic_width) != 0))
+                    { return false; }
+                }
+            }
+        }
+        return true;
+    }
+    inline auto finish_fields(void* const opaque) noexcept -> void
+    {
+        auto& transaction{ *static_cast<field_transaction*>(opaque) };
+        stop_new_compile_jobs();
+        compiler_scan scan{}; scan_compilers(&scan);
+        if (scan.active != 0 || !field_graph_ready()) { return; }
+        for (auto* policy = policies.load(std::memory_order_acquire); policy; policy = policy->next)
+        {
+            if ((policy->reasons.load(std::memory_order_acquire) & field_reason) != 0) {
+                normalize_accessor_entry(*policy);
+            }
+        }
+        deoptimize_all();
+        resume_compilation(transaction.pause);
+        transaction.paused = false; transaction.complete = true;
+    }
+    inline auto restore_fields_at_safepoint(void*) noexcept -> void
+    {
+        field_mode.store(false, std::memory_order_release);
+        for (auto* policy{ policies.load(std::memory_order_acquire) }; policy; policy = policy->next)
+        {
+            const auto reasons{ policy->reasons.load() };
+            if ((reasons & field_reason) != 0 && (policy->reasons.fetch_and(~field_reason) & ~field_reason) == 0) { restore(*policy); }
+        }
+    }
+    inline auto release_field_pins() noexcept -> void
+    {
+        for (auto* policy{ policies.load(std::memory_order_acquire) }; policy; policy = policy->next)
+        { if ((policy->reasons.load() & field_reason) == 0) { policy->field_metadata_pin.reset(); } }
+    }
+    inline auto acquire_field_interpretation() noexcept -> bool
+    {
+        try
+        {
+            const auto& c{ config() };
+            if (!c.ready || !lifetime_flags().ready || !vmhook::detail::borrowed_callback_supported() || !vmhook::detail::prepare_hook_roots()
+                || !vmhook::detail::ensure_class_events_installed()) { return false; }
+            auto& vm{ pn::rt() }; const auto thread{ vm.current_thread() };
+            const bool began_in_vm{ thread && pn::thread_state(thread) == 6 };
+            if (began_in_vm) { pn::transition_to_native(thread); }
+            const vm_state_restore state{thread,began_in_vm};
+            std::lock_guard admin{ administration_mutex };
+            if (field_mode.load()) { return true; }
+            field_transaction transaction{};
+            bool okay{ at_safepoint(&pause_for_fields, &transaction) && transaction.paused };
+            const auto deadline{ std::chrono::steady_clock::now() + std::chrono::seconds{30} };
+            while (okay && !transaction.complete && std::chrono::steady_clock::now() < deadline)
+            {
+                // Root tokens, containers and new policy nodes are prepared on
+                // this mutator outside the safepoint while compiler jobs stay
+                // paused. Class-definition guards prepare their own new nodes.
+                okay = with_vm_state(&collect_field_policies, &okay) && okay;
+                compiler_scan scan{};
+                while (okay)
+                {
+                    if (!at_safepoint(&scan_paused_compilers, &scan)) { okay = false; break; }
+                    if (scan.active == 0) { break; }
+                    if (std::chrono::steady_clock::now() >= deadline) { okay = false; break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+                }
+                if (okay) { okay = at_safepoint(&finish_fields, &transaction); }
+                if (okay && !transaction.complete) { std::this_thread::sleep_for(std::chrono::milliseconds{10}); }
+            }
+            okay = okay && transaction.complete;
+            if (!okay)
+            {
+                (void)at_safepoint(&restore_fields_at_safepoint, nullptr);
+                resume_compilation(transaction.pause);
+                release_field_pins();
+            }
+            return okay;
+        }
+        catch (...) { return false; }
+    }
+    inline auto release_field_interpretation() noexcept -> void
+    {
+        try
+        {
+            {
+                std::lock_guard admin{ administration_mutex };
+                if (field_mode.load() && at_safepoint(&restore_fields_at_safepoint, nullptr)) { release_field_pins(); }
+            }
+            vmhook::detail::flush_hook_roots();
+        }
+        catch (...) {}
+    }
+    struct provisional_class final
+    {
+        vmhook::hotspot::klass* klass{};
+        std::vector<std::unique_ptr<method_policy>> methods{};
+    };
+    auto pending_class_records() -> std::vector<provisional_class>&
+    {
+        static thread_local std::vector<provisional_class> value{};
+        return value;
+    }
+}
+export namespace vmhook::detail
+{
+    inline auto prepare_class_hooks(vmhook::hotspot::klass* const klass) noexcept -> bool
+    {
+        using namespace jit_backend;
+        if (!klass || !field_mode.load(std::memory_order_acquire)) { return true; }
+        provisional_class pending{}; pending.klass = klass;
+        try
+        {
+            vmhook::hotspot::method** methods{}; std::int32_t count{};
+            if (!vmhook::hotspot::safe_klass_methods(klass, methods, count)) { return true; }
+            auto& records{ pending_class_records() };
+            records.reserve(records.size() + 1);
+            pending.methods.reserve(static_cast<std::size_t>(count));
+            std::shared_ptr<void> pin{};
+            for (std::int32_t index{}; index < count; ++index)
+            {
+                auto* const method{ methods[index] }; if (!method || !has_static_field_bytecodes(method)) { continue; }
+                if (!pin) { pin = retain_hook_klass(klass); }
+                if (!pin) { return false; }
+                auto policy{ std::make_unique<method_policy>() };
+                policy->method = method; policy->const_method = pn::load<void*>(method, config().const_method_offset);
+                policy->field_metadata_pin = pin;
+                bind_field_identity(*policy, klass);
+                pending.methods.push_back(std::move(policy));
+            }
+            // Everything that can allocate is ready before the first flag or
+            // intrinsic ID changes. Publication below uses reserved storage.
+            for (auto& policy : pending.methods)
+            {
+                if (!exclude(*policy, true))
+                {
+                    for (auto& rollback : pending.methods) { restore(*rollback); }
+                    return false;
+                }
+                normalize_accessor_entry(*policy);
+            }
+            records.push_back(std::move(pending));
+            return true;
+        }
+        catch (...)
+        {
+            for (auto& policy : pending.methods) { restore(*policy); }
+            return false;
+        }
+    }
+    inline auto finish_class_hooks(vmhook::hotspot::klass* const klass, const bool success) noexcept -> void
+    {
+        using namespace jit_backend;
+        auto& pending_classes{ pending_class_records() };
+        for (std::size_t index{pending_classes.size()}; index > 0; --index)
+        {
+            if (pending_classes[index-1].klass != klass) { continue; }
+            auto pending{ std::move(pending_classes[index-1]) };
+            pending_classes.erase(pending_classes.begin() + static_cast<std::ptrdiff_t>(index-1));
+            if (!success)
+            {
+                // The caller can immediately free rejected scratch metadata.
+                // Release its mirror roots in this VM-state critical section.
+                for (auto& policy : pending.methods) { restore(*policy); }
+                return;
+            }
+            for (auto& policy : pending.methods)
+            {
+                if (field_mode.load(std::memory_order_acquire)) { include_field_policy(policy.release()); }
+                else { restore(*policy); }
+            }
+            return;
+        }
+        // Definition can have begun before activation of the field policy.
+        if (success && field_mode.load(std::memory_order_acquire))
+        {
+            if (!prepare_class_hooks(klass))
+            { fail_class_hook_preparation(pn::rt().current_thread()); return; }
+            if (!pending_classes.empty() && pending_classes.back().klass == klass) { finish_class_hooks(klass, true); }
+        }
+    }
+}
+// VMHOOK_JIT_BACKEND_END
+
+
 // VMHOOK_NATIVE_FACADE_BEGIN
 export namespace vmhook::detail::native_backend
 {
-    struct root_ticket;
-    using root = std::shared_ptr<root_ticket>;
-
     struct context_lifetime final
     {
         std::atomic<bool> alive{ false };
@@ -10835,14 +12103,7 @@ export namespace vmhook::detail::native_backend
         catch (...) { return false; }
     }
 
-    class operation final
-    {
-        std::shared_ptr<context_lifetime> context_{};
-        void* thread_{};
-        bool entered_{};
-        bool valid_{};
-    public:
-        operation() noexcept
+    inline operation::operation() noexcept
         {
             this->context_ = active_context_lifetime();
             if (!this->context_ || this->context_->temporary_depth != 0) { return; }
@@ -10871,16 +12132,11 @@ export namespace vmhook::detail::native_backend
                 this->context_.reset();
             }
         }
-        ~operation()
+    inline operation::~operation()
         {
             if (this->valid_) { --this->context_->operation_depth; }
             if (this->entered_) { vmhook::detail::private_native::transition_to_native(this->thread_); }
         }
-        operation(const operation&) = delete;
-        auto operator=(const operation&) -> operation& = delete;
-        [[nodiscard]] auto valid() const noexcept -> bool { return this->valid_; }
-        explicit operator bool() const noexcept { return this->valid_; }
-    };
 
     struct root_ticket final
     {
@@ -11377,6 +12633,362 @@ export namespace vmhook
 }
 
 // VMHOOK_NATIVE_FACADE_END
+
+// VMHOOK_BORROWED_CALLBACK_BEGIN
+export namespace vmhook::detail::callback_backend
+{
+    namespace pn = vmhook::detail::private_native;
+    namespace nb = vmhook::detail::native_backend;
+
+    inline auto supported() noexcept -> bool
+    {
+        try
+        {
+            auto& runtime{ pn::rt() };
+            if (!runtime.ready || runtime.uses_external_symbols()) { return false; }
+            bool exact{};
+            for (const auto* profile : pn::all_profiles)
+            { if (profile == runtime.profile) { exact = true; break; } }
+            const auto anchor_size{ runtime.size("JavaFrameAnchor") };
+            const bool saved_rbp{ runtime.has_field("JavaFrameAnchor", "_saved_rbp_address") };
+            if (!exact || (anchor_size != 24 && anchor_size != 32)
+                || runtime.off("JavaFrameAnchor", "_last_Java_sp") != 0
+                || runtime.off("JavaFrameAnchor", "_last_Java_pc") != 8
+                || runtime.off("JavaFrameAnchor", "_last_Java_fp") != 16
+                || runtime.off("ThreadInVMfromJava", "_thread") != 0
+                || runtime.size("ThreadInVMfromJava") > 16) { return false; }
+            if (saved_rbp != (anchor_size == 32)
+                || (saved_rbp && (runtime.off("JavaFrameAnchor", "_saved_rbp_address") != 24
+                    || runtime.enum_value("JavaFrameAnchor", "storage_size__saved_rbp_address") != 8)))
+            { return false; }
+            if (runtime.has_field("ThreadInVMfromJava", "_check_asyncs")
+                && runtime.off("ThreadInVMfromJava", "_check_asyncs") != 8) { return false; }
+            if (!runtime.has_field("JavaThread", "_vm_result")
+                && !runtime.has_field("JavaThread", "_vm_result_oop")) { return false; }
+            if (runtime.has_function("field_vm_to_java_destroy")) { return true; }
+            if (runtime.has_function("field_vm_to_java_transition10"))
+            {
+                (void)runtime.off("JavaThread", "_stack_guard_state");
+                (void)runtime.off("JavaThread", "_special_runtime_exit_condition");
+                (void)runtime.off("JavaThread", "_suspend_flags");
+                (void)runtime.enum_value("JavaThread::StackGuardState", "stack_guard_yellow_reserved_disabled");
+                (void)runtime.enum_value("Thread::SuspendFlags", "_external_suspend");
+                (void)runtime.enum_value("Thread::SuspendFlags", "_trace_flag");
+                return runtime.has_function("field_enable_guards10")
+                    && runtime.has_function("field_special_exit10");
+            }
+            (void)runtime.off("JavaThread", "_stack_overflow_state");
+            (void)runtime.off("StackOverflow", "_stack_guard_state");
+            (void)runtime.enum_value("StackOverflow::StackGuardState", "stack_guard_yellow_reserved_disabled");
+            if (runtime.has_function("field_process_safepoint_exit19"))
+            { return runtime.has_function("field_enable_guards19"); }
+            (void)runtime.off("JavaThread", "_poll_data");
+            (void)runtime.off("SafepointMechanism::ThreadData", "_polling_word");
+            (void)runtime.off("JavaThread", "_suspend_flags");
+            (void)runtime.enum_value("JavaThread::SuspendFlags", "_trace_flag");
+            (void)runtime.enum_value("JavaThread::SuspendFlags", "_obj_deopt");
+            (void)runtime.enum_value("ObservationABI", "callback_poll_bit");
+            return runtime.has_function("field_enable_guards20")
+                && runtime.has_function("field_safepoint_process20")
+                && runtime.has_function("field_special_exit20");
+        }
+        catch (...) { return false; }
+    }
+
+    class vm_to_java_protocol final
+    {
+        void* thread_{};
+        alignas(8) std::array<std::byte, 16> transition_{};
+    public:
+        explicit vm_to_java_protocol(void* const thread) : thread_{ thread }
+        {
+            auto& runtime{ pn::rt() };
+            if (!supported() || runtime.current_thread() != thread || pn::thread_state(thread) != 8)
+            { throw vmhook::exception{ "Callback requires its own JavaThread and an audited transition profile" }; }
+            pn::store<void*>(this->transition_.data(), runtime.off("ThreadInVMfromJava", "_thread"), thread);
+            if (runtime.has_field("ThreadInVMfromJava", "_check_asyncs"))
+            { pn::store<bool>(this->transition_.data(), runtime.off("ThreadInVMfromJava", "_check_asyncs"), true); }
+        }
+
+        auto return_to_java() -> void
+        {
+            auto& runtime{ pn::rt() };
+            if (runtime.has_function("field_vm_to_java_destroy"))
+            {
+                runtime.fn<void(*)(void*)>("field_vm_to_java_destroy")(this->transition_.data());
+                return;
+            }
+            if (runtime.has_function("field_vm_to_java_transition10"))
+            {
+                if (pn::load<int>(this->thread_, runtime.off("JavaThread", "_stack_guard_state"))
+                    == runtime.enum_value("JavaThread::StackGuardState", "stack_guard_yellow_reserved_disabled"))
+                { runtime.fn<void(*)(void*)>("field_enable_guards10")(this->thread_); }
+                runtime.fn<void(*)(void*, int, int)>("field_vm_to_java_transition10")(this->thread_, 6, 8);
+                // Exact JDK10 private destructor constituents, audited in the
+                // built-in image: async exception or trace/suspend exit request.
+                if (pn::load<int>(this->thread_, runtime.off("JavaThread", "_special_runtime_exit_condition")) != 0
+                    || (pn::load<unsigned>(this->thread_, runtime.off("JavaThread", "_suspend_flags"))
+                        & static_cast<unsigned>(runtime.enum_value("Thread::SuspendFlags", "_external_suspend")
+                            | runtime.enum_value("Thread::SuspendFlags", "_trace_flag"))))
+                { runtime.fn<void(*)(void*, bool)>("field_special_exit10")(this->thread_, true); }
+                return;
+            }
+            auto* const overflow{ static_cast<std::byte*>(this->thread_)
+                + runtime.off("JavaThread", "_stack_overflow_state") };
+            if (pn::load<int>(overflow, runtime.off("StackOverflow", "_stack_guard_state"))
+                == runtime.enum_value("StackOverflow::StackGuardState", "stack_guard_yellow_reserved_disabled"))
+            {
+                runtime.fn<void(*)(void*)>(runtime.has_function("field_process_safepoint_exit19")
+                    ? "field_enable_guards19" : "field_enable_guards20")(overflow);
+            }
+            if (runtime.has_function("field_process_safepoint_exit19"))
+            { runtime.fn<void(*)(void*, bool)>("field_process_safepoint_exit19")(this->thread_, true); }
+            else
+            {
+                const auto poll{ runtime.off("JavaThread", "_poll_data")
+                    + runtime.off("SafepointMechanism::ThreadData", "_polling_word") };
+                if (pn::load<std::uint64_t>(this->thread_, poll)
+                    & static_cast<std::uint64_t>(runtime.enum_value("ObservationABI", "callback_poll_bit")))
+                { runtime.fn<void(*)(void*, bool, bool)>("field_safepoint_process20")(this->thread_, true, true); }
+                if (pn::load<unsigned>(this->thread_, runtime.off("JavaThread", "_suspend_flags"))
+                    & static_cast<unsigned>(runtime.enum_value("JavaThread::SuspendFlags", "_trace_flag")
+                        | runtime.enum_value("JavaThread::SuspendFlags", "_obj_deopt")))
+                { runtime.fn<void(*)(void*)>("field_special_exit20")(this->thread_); }
+            }
+            pn::store<int>(this->thread_, runtime.off("JavaThread", "_thread_state"), 8);
+        }
+    };
+
+    class borrowed_context;
+    inline thread_local borrowed_context* current{};
+
+    class borrowed_context final
+    {
+        void* thread_{};
+        vm_to_java_protocol protocol_;
+        std::byte* anchor_{};
+        std::array<std::byte, 32> old_anchor_{};
+        std::size_t anchor_size_{};
+        std::size_t result_offset_{};
+        std::optional<pn::detail::handle_mark> auxiliary_roots_{};
+        void** old_result_{};
+        std::shared_ptr<nb::context_lifetime> context_{};
+        nb::context_lifetime* previous_context_{};
+        pn::root_slot_provider previous_provider_{};
+        borrowed_context* previous_callback_{};
+        nb::root outgoing_{};
+        vmhook::hotspot::return_slot* outgoing_slot_{};
+        std::vector<std::pair<void*, nb::root>> snapshots_{};
+        bool entered_{};
+        bool published_{};
+
+        auto close() noexcept -> void
+        {
+            if (!this->entered_) { return; }
+            try
+            {
+                if (pn::thread_state(this->thread_) == 4) { pn::transition_to_vm(this->thread_); }
+                if (pn::thread_state(this->thread_) != 6) { std::terminate(); }
+                // This thread root remains scanned during the VM-to-Java
+                // transition after the callback session's roots are retired.
+                void* const result{ this->outgoing_slot_
+                    ? this->outgoing_ ? this->outgoing_->resolve_under_vm() : nullptr
+                    : this->old_result_ ? pn::detail::resolve_root(this->old_result_)
+                        : pn::load<void*>(this->thread_, this->result_offset_) };
+                pn::store<void*>(this->thread_, this->result_offset_, result);
+                if (this->context_)
+                {
+                    this->context_->alive.store(false, std::memory_order_release);
+                    this->context_->session.reset();
+                    this->context_->self_keepalive.reset();
+                }
+                if (this->published_)
+                {
+                    nb::current_context_lifetime() = this->previous_context_;
+                    pn::root_reuse_callback() = this->previous_provider_;
+                    current = this->previous_callback_;
+                }
+                this->snapshots_.clear();
+                this->context_.reset();
+                this->protocol_.return_to_java();
+                if (this->outgoing_slot_)
+                {
+                    void* const relocated{ pn::load<void*>(this->thread_, this->result_offset_) };
+                    std::memcpy(&this->outgoing_slot_->retval, &relocated, sizeof(relocated));
+                    pn::store<void*>(this->thread_, this->result_offset_, pn::detail::resolve_root(this->old_result_));
+                }
+                // HandleMark performs arena rollback and unlinks itself. The
+                // session already retired later chunks while still in VM state.
+                // No safepoint-capable VM operation occurs before interpreter
+                // execution resumes with the relocated return in its TOS state.
+                this->auxiliary_roots_.reset();
+                pn::store<void*>(this->anchor_, 0, nullptr);
+                std::atomic_thread_fence(std::memory_order_release);
+                std::memcpy(this->anchor_ + 8, this->old_anchor_.data() + 8, this->anchor_size_ - 8);
+                std::atomic_thread_fence(std::memory_order_release);
+                std::memcpy(this->anchor_, this->old_anchor_.data(), 8);
+                this->entered_ = false;
+            }
+            catch (...) { std::terminate(); }
+        }
+    public:
+        borrowed_context(void* const thread, const vmhook::hotspot::detour_java_anchor_t anchor)
+            : thread_{ thread }, protocol_{ thread }
+        {
+            if (!anchor.valid || !anchor.last_java_sp || !anchor.last_java_fp || !anchor.last_java_pc)
+            { throw vmhook::exception{ "No complete interrupted interpreter anchor" }; }
+            auto& runtime{ pn::rt() };
+            this->anchor_ = static_cast<std::byte*>(thread) + runtime.off("JavaThread", "_anchor");
+            this->anchor_size_ = runtime.size("JavaFrameAnchor");
+            this->result_offset_ = runtime.off("JavaThread", runtime.has_field("JavaThread", "_vm_result")
+                ? "_vm_result" : "_vm_result_oop");
+            std::memcpy(this->old_anchor_.data(), this->anchor_, this->anchor_size_);
+            this->previous_context_ = nb::current_context_lifetime();
+            this->previous_provider_ = pn::root_reuse_callback();
+            this->previous_callback_ = current;
+            pn::store<void*>(this->anchor_, 0, nullptr);
+            pn::store<void*>(this->anchor_, 8, anchor.last_java_pc);
+            pn::store<void*>(this->anchor_, 16, anchor.last_java_fp);
+            // JDK16 alone also records a saved RBP register location. Its VM
+            // walker must use our interpreter frame's FP, not a saved location
+            // from the interrupted anchor. Preserve it for the final restore.
+            if (this->anchor_size_ == 32) { pn::store<void*>(this->anchor_, 24, nullptr); }
+            std::atomic_thread_fence(std::memory_order_release);
+            pn::store<void*>(this->anchor_, 0, anchor.last_java_sp);
+            // Exact transition_from_java constituent: Java state never waits
+            // before entering VM. The published interpreter frame is walkable.
+            pn::store<int>(thread, runtime.off("JavaThread", "_thread_state"), 6);
+            this->entered_ = true;
+            try
+            {
+                this->auxiliary_roots_.emplace(thread);
+                this->old_result_ = pn::detail::root_oop(thread, pn::load<void*>(thread, this->result_offset_));
+                if (pn::load<void*>(thread, this->result_offset_) && !this->old_result_)
+                { throw vmhook::exception{ "Cannot retain interrupted VM result" }; }
+                this->context_ = std::make_shared<nb::context_lifetime>();
+                this->context_->thread = thread;
+                this->context_->owner_id = vmhook::windows::GetCurrentThreadId();
+                this->context_->session = std::make_unique<pn::java_session>(thread);
+                this->context_->previous_provider = this->previous_provider_;
+                this->context_->self_keepalive = this->context_;
+                this->context_->alive.store(true, std::memory_order_release);
+                nb::current_context_lifetime() = this->context_.get();
+                pn::root_reuse_callback() = &nb::reuse_root_slot;
+                current = this;
+                this->published_ = true;
+                pn::transition_to_native(thread);
+            }
+            catch (...) { this->close(); throw; }
+        }
+        ~borrowed_context() { this->close(); }
+        borrowed_context(const borrowed_context&) = delete;
+        auto operator=(const borrowed_context&) -> borrowed_context& = delete;
+
+        auto track_snapshot(void* const snapshot, const nb::root& root) -> void
+        {
+            if (!snapshot || !root || !root->valid()) { return; }
+            for (const auto& entry : this->snapshots_)
+            { if (entry.first == snapshot && entry.second == root) { return; } }
+            this->snapshots_.emplace_back(snapshot, root);
+        }
+        auto root_from_snapshot(void* const snapshot) noexcept -> nb::root
+        {
+            nb::operation access{};
+            if (!access) { return {}; }
+            nb::root result{};
+            void* identity{};
+            for (const auto& entry : this->snapshots_)
+            {
+                if (entry.first != snapshot || !entry.second || !entry.second->valid()) { continue; }
+                void* const resolved{ entry.second->resolve_under_vm() };
+                if (!resolved || (result && resolved != identity))
+                {
+                    // Moving GC may reuse an old address for another object.
+                    // A raw snapshot with two live identities is ambiguous.
+                    return {};
+                }
+                result = entry.second;
+                identity = resolved;
+            }
+            return result;
+        }
+        auto reference_return(nb::root outgoing, vmhook::hotspot::return_slot* const slot) noexcept -> bool
+        {
+            if (!slot || (outgoing && !outgoing->valid())) { return false; }
+            auto* const frame{ vmhook::hotspot::current_interpreter_frame };
+            auto* const method{ frame ? frame->get_method() : nullptr };
+            if (!method) { return false; }
+            try
+            {
+                const auto signature{ method->get_signature() };
+                const auto end{ signature.find(')') };
+                if (end == std::string::npos || end + 1 == signature.size()
+                    || (signature[end + 1] != 'L' && signature[end + 1] != '[')) { return false; }
+                this->outgoing_ = std::move(outgoing);
+                this->outgoing_slot_ = slot;
+                slot->cancel = true;
+                slot->retval = 0;
+                return true;
+            }
+            catch (...) { return false; }
+        }
+    };
+}
+
+export namespace vmhook::detail
+{
+    inline auto borrowed_callback_supported() noexcept -> bool
+    { return callback_backend::supported(); }
+
+    inline auto execute_borrowed_callback(hotspot::java_thread* const thread,
+        const hotspot::detour_java_anchor_t anchor, const borrowed_callback invoke,
+        void* const opaque) noexcept -> bool
+    {
+        if (!invoke) { return false; }
+        try
+        {
+            const hotspot::current_thread_guard thread_guard{ thread };
+            const hotspot::detour_anchor_guard anchor_guard{ anchor };
+            const bool method_frame{ hotspot::current_interpreter_frame == anchor.last_java_fp };
+            const hotspot::interpreter_locals_guard locals_guard{
+                method_frame ? hotspot::current_interpreter_frame : nullptr,
+                method_frame ? hotspot::current_interpreter_locals : nullptr };
+            callback_backend::borrowed_context context{ thread, anchor };
+            try { invoke(opaque); return true; }
+            catch (...) { return false; }
+        }
+        catch (...) { return false; }
+    }
+
+    inline auto track_callback_oop_snapshot(void* const snapshot,
+        const native_backend::root& root) noexcept -> void
+    {
+        if (!callback_backend::current) { return; }
+        try { callback_backend::current->track_snapshot(snapshot, root); } catch (...) {}
+    }
+    inline auto resolve_callback_oop_snapshot(void* const snapshot) noexcept -> void*
+    {
+        if (!snapshot) { return nullptr; }
+        if (!callback_backend::current) { return nullptr; }
+        const auto root{ callback_backend::current->root_from_snapshot(snapshot) };
+        return root ? root->resolve_under_vm() : nullptr;
+    }
+    inline auto set_callback_reference(hotspot::return_slot* const slot,
+        const native_backend::root& root) noexcept -> bool
+    {
+        native_backend::operation access{};
+        return access && callback_backend::current
+            && callback_backend::current->reference_return(root, slot);
+    }
+    inline auto set_callback_reference_snapshot(hotspot::return_slot* const slot,
+        void* const snapshot) noexcept -> bool
+    {
+        if (!callback_backend::current || !snapshot) { return false; }
+        const auto root{ callback_backend::current->root_from_snapshot(snapshot) };
+        return root && set_callback_reference(slot, root);
+    }
+}
+// VMHOOK_BORROWED_CALLBACK_END
 
 
 export namespace vmhook
@@ -13509,8 +15121,8 @@ export namespace vmhook
             @details
             For instance fields this is `decoded_object + field_offset`; for
             static fields it is `java.lang.Class mirror + field_offset`.
-            Exposed so that watch_static_field can install a hardware
-            breakpoint on the slot; most code should prefer get()/set().
+            This transient heap address is for diagnostics and can move at the
+            next collection. Use get()/set() for rooted field access.
         */
         auto raw_address() const noexcept -> void*
         {
@@ -17044,6 +18656,7 @@ export namespace vmhook
             {
                 if (!this->native_root_->valid()) { return nullptr; }
                 this->instance = this->native_root_->resolve_under_vm();
+                vmhook::detail::track_callback_oop_snapshot(this->instance, this->native_root_);
             }
             return this->instance;
         }
@@ -18023,6 +19636,12 @@ export namespace vmhook
         for existing wrappers. vmhook::any_object navigates an unregistered
         object through its live Java class.
     */
+    inline auto return_value::set(const vmhook::object_base& value) noexcept -> void
+    {
+        if (const auto root{ value.get_native_root() })
+        { (void)vmhook::detail::set_callback_reference(this->return_slot, root); }
+    }
+
     template<typename derived>
     class object : public object_base
     {
@@ -20089,391 +21708,122 @@ export namespace vmhook
     }
 
     // -------------------------------------------------------------------------
-    // Background watchers (definitions).  Declared above as part of the
-    // public API; defined here so the lambda bodies see the complete
-    // `vmhook::object_base` type.
+    // Static field hooks and class notifications. Definitions appear here
+    // so their callback types see the complete `vmhook::object_base` type.
     // -------------------------------------------------------------------------
+
+    // The value of a READ starts at zero: observation does not read the heap.
+    // set() supplies a read result or changes the pending write; prevent() skips
+    // the access. A prevented READ without set() returns its Java zero value.
+    namespace detail { struct field_event_transport; }
+    template<typename field_type>
+    class field_access
+    {
+        static_assert(!std::is_reference_v<field_type>,"field_access requires a value type.");
+        friend struct detail::field_event_transport;
+        bool write_{};
+        field_type value_{};
+        bool prevented_{};
+        bool replaced_{};
+        explicit field_access(const bool write, const field_type value) noexcept
+            : write_{write}, value_{value} {}
+    public:
+        [[nodiscard]] auto is_read() const noexcept -> bool { return !this->write_; }
+        [[nodiscard]] auto is_write() const noexcept -> bool { return this->write_; }
+        [[nodiscard]] auto value() const noexcept -> field_type { return this->value_; }
+        auto set(const field_type value) noexcept -> void
+        { this->value_ = value; this->replaced_ = true; }
+        auto prevent() noexcept -> void { this->prevented_ = true; }
+    };
 
     namespace detail
     {
-        using dr_callback_t = std::function<void(const void*)>;
-        struct dr_configuration
-        {
-            std::uint64_t address{};
-            std::uint64_t bits{};
-            dr_configuration* previous{};
-        };
-        struct dr_slot
-        {
-            std::shared_ptr<dr_callback_t> callback{}; // protected by dr_mutex
-            std::atomic<dr_configuration*> configuration{};
-            std::atomic_bool in_use{ false };
-            std::atomic_bool notifying{ false };
-        };
-        inline std::mutex dr_mutex{};
-        inline dr_slot dr_slots[4]{};
-        inline vmhook::windows::PVOID dr_veh_handle{};
-
-        inline auto dr_mask(const int slot) noexcept -> std::uint64_t
-        { return (std::uint64_t{3} << (slot * 2)) | (std::uint64_t{15} << (16 + slot * 4)); }
-        inline auto dr_address(vmhook::windows::CONTEXT& context, const int slot) noexcept
-            -> vmhook::windows::DWORD64&
-        {
-            switch (slot)
-            { case 0: return context.Dr0; case 1: return context.Dr1;
-              case 2: return context.Dr2; default: return context.Dr3; }
-        }
-        inline auto find_free_slot() noexcept -> int
-        {
-            for (int index{}; index < 4; ++index)
-            { if (!dr_slots[index].in_use.load(std::memory_order_acquire)) { return index; } }
-            return -1;
-        }
-        inline auto refresh_thread_drs(const int slot, const std::uint64_t address,
-            const std::uint64_t bits) noexcept -> vmhook::os::detail_dr::thread_update_result
-        {
-            if (slot < 0 || slot >= 4) { return {}; }
-            return vmhook::os::detail_dr::for_each_thread([&](vmhook::windows::HANDLE thread) noexcept -> bool
-            {
-                vmhook::windows::CONTEXT context{};
-                context.ContextFlags = vmhook::windows::context_debug_registers;
-                if (!vmhook::windows::GetThreadContext(thread, &context)) { return false; }
-                // Never overwrite a debugger's or another DLL's occupied slot.
-                if ((context.Dr7 & (std::uint64_t{3} << (slot * 2))) != 0) { return false; }
-                dr_address(context, slot) = address;
-                const auto mask{ dr_mask(slot) };
-                context.Dr7 = (context.Dr7 & ~mask) | (bits & mask);
-                return vmhook::windows::SetThreadContext(thread, &context) != false;
-            });
-        }
-        inline auto clear_thread_drs(const int slot) noexcept -> vmhook::os::detail_dr::thread_update_result
-        {
-            if (slot < 0 || slot >= 4) { return {}; }
-            const auto* const installed{ dr_slots[slot].configuration.load(std::memory_order_acquire) };
-            if (!installed) { return {}; }
-            return vmhook::os::detail_dr::for_each_thread([&](vmhook::windows::HANDLE thread) noexcept -> bool
-            {
-                vmhook::windows::CONTEXT context{};
-                context.ContextFlags = vmhook::windows::context_debug_registers;
-                if (!vmhook::windows::GetThreadContext(thread, &context)) { return false; }
-                const auto mask{ dr_mask(slot) };
-                // Clear only the exact configuration installed by this watch.
-                if (dr_address(context, slot) != installed->address
-                    || (context.Dr7 & mask) != (installed->bits & mask)) { return true; }
-                dr_address(context, slot) = 0;
-                context.Dr7 &= ~mask;
-                context.Dr6 &= ~(std::uint64_t{1} << slot);
-                return vmhook::windows::SetThreadContext(thread, &context) != false;
-            });
-        }
-
-        inline auto dr_exception_handler(vmhook::windows::EXCEPTION_POINTERS* const exception) noexcept
-            -> vmhook::windows::LONG
-        {
-            if (!exception || !exception->ExceptionRecord || !exception->ContextRecord
-                || exception->ExceptionRecord->ExceptionCode != vmhook::windows::exception_single_step)
-            { return vmhook::windows::exception_continue_search; }
-            auto& context{ *exception->ContextRecord };
-            const auto status{ context.Dr6 };
-            std::uint64_t owned{};
-            std::array<std::shared_ptr<dr_callback_t>, 4> callbacks{};
-            std::array<const void*, 4> addresses{};
-            {
-                std::unique_lock<std::mutex> lock{ dr_mutex, std::try_to_lock };
-                for (int slot{}; slot < 4; ++slot)
-                {
-                    const auto bit{ std::uint64_t{1} << slot };
-                    if ((status & bit) == 0) { continue; }
-                    const auto mask{ dr_mask(slot) };
-                    auto* const active{ dr_slots[slot].configuration.load(std::memory_order_acquire) };
-                    auto* matching{ active };
-                    while (matching && (matching->address != dr_address(context, slot)
-                        || (matching->bits & mask) != (context.Dr7 & mask)))
-                    { matching = matching->previous; }
-                    if (!matching) { continue; }
-                    owned |= bit;
-                    if (matching == active && dr_slots[slot].in_use.load(std::memory_order_acquire)
-                        && dr_slots[slot].notifying.load(std::memory_order_acquire))
-                    {
-                        if (lock.owns_lock())
-                        { callbacks[slot] = dr_slots[slot].callback; addresses[slot] = reinterpret_cast<const void*>(matching->address); }
-                    }
-                    else
-                    {
-                        // An exception already in flight can restore an older
-                        // debug-register snapshot. Disable that retired watch
-                        // in its actual exception context before continuing.
-                        dr_address(context, slot) = 0;
-                        context.Dr7 &= ~mask;
-                    }
-                }
-            }
-            if (!owned) { return vmhook::windows::exception_continue_search; }
-            context.Dr6 &= ~owned;
-            for (int slot{}; slot < 4; ++slot)
-            {
-                if (callbacks[slot]) { try { (*callbacks[slot])(addresses[slot]); } catch (...) {} }
-            }
-            // Preserve foreign breakpoints, single stepping (BS), debug-register
-            // access traps (BD), and task-switch traps (BT) for their handler.
-            constexpr std::uint64_t meaningful_status{ 0xfu | (1u << 13) | (1u << 14) | (1u << 15) };
-            return (context.Dr6 & meaningful_status) != 0
-                ? vmhook::windows::exception_continue_search : vmhook::windows::exception_continue_execution;
-        }
-        inline auto ensure_dr_handler_installed() noexcept -> bool
-        {
-            if (!dr_veh_handle)
-            { dr_veh_handle = vmhook::windows::AddVectoredExceptionHandler(1, &dr_exception_handler); }
-            // Keep the VEH resident: failed cleanup and already queued traps
-            // still need handling after their user watch has been stopped.
-            return dr_veh_handle != nullptr;
-        }
+        template<class wrapper_type, typename field_type, typename callback_type>
+        inline auto install_field_hook(std::string_view, callback_type) -> std::uint64_t;
+        inline auto remove_field_hook_id(std::uint64_t) noexcept -> bool;
+        inline auto shutdown_field_hooks() noexcept -> void;
     }
+    template<class wrapper_type, typename field_type, typename callback_type>
+    inline auto hook_field(std::string_view field_name, callback_type callback) -> bool;
+    template<class wrapper_type>
+    inline auto unhook_field(std::string_view field_name) noexcept -> bool;
 
-    // A hardware watch covers existing other threads and the current static
-    // mirror address. New threads and a relocated mirror require a new watch.
-    // Native notification callbacks must remain short and must not call Java.
+    // Compatibility observer: one synchronous notification before each write.
+    // The first argument is zero; the second is the pending value, before store.
     template<class wrapper_type, typename field_type, typename callback_type>
     inline auto watch_static_field(std::string_view field_name, callback_type on_change) -> watch_handle
     {
-        static_assert(std::is_arithmetic_v<field_type>
-            && (sizeof(field_type) == 1 || sizeof(field_type) == 2
-                || sizeof(field_type) == 4 || sizeof(field_type) == 8),
-            "Hardware field watches require a primitive Java field type of 1, 2, 4, or 8 bytes.");
-        const auto proxy{ vmhook::object_base::get_field(std::type_index{ typeid(wrapper_type) }, field_name) };
-        if (!proxy || !proxy->is_static()) { return {}; }
-        const auto signature{ proxy->signature() };
-        const std::size_t width{ signature == "Z" || signature == "B" ? 1u
-            : signature == "C" || signature == "S" ? 2u
-            : signature == "I" || signature == "F" ? 4u
-            : signature == "J" || signature == "D" ? 8u : 0u };
-        void* const address{ proxy->raw_address() };
-        if (!address || width != sizeof(field_type)
-            || reinterpret_cast<std::uintptr_t>(address) % width != 0) { return {}; }
-        auto callback{ std::make_shared<detail::dr_callback_t>(
-            [on_change = std::move(on_change), view = *proxy, address](const void*) mutable
-            {
-                // Data breakpoints trap after the write. Ignore stale mirror
-                // addresses rather than reporting a different object's memory.
-                if (view.raw_address() != address) { return; }
-                field_type current{};
-                if (vmhook::os::safe_read(&current, address, sizeof(current)))
-                { on_change(field_type{}, current); }
-            }) };
         auto block{ std::make_shared<watch_handle::control_block>() };
-        auto configuration{ std::make_unique<detail::dr_configuration>() };
-        std::lock_guard<std::mutex> lock{ detail::dr_mutex };
-        const int slot{ detail::find_free_slot() };
-        if (slot < 0 || !detail::ensure_dr_handler_installed()) { return {}; }
-        constexpr auto length{ sizeof(field_type) == 1 ? vmhook::os::data_breakpoint_length::one_byte
-            : sizeof(field_type) == 2 ? vmhook::os::data_breakpoint_length::two_bytes
-            : sizeof(field_type) == 4 ? vmhook::os::data_breakpoint_length::four_bytes
-            : vmhook::os::data_breakpoint_length::eight_bytes };
-        const auto bits{ vmhook::os::detail_dr::build_dr7(slot, vmhook::os::data_breakpoint_kind::write, length) };
-        const auto installer{ vmhook::windows::GetCurrentThreadId() };
-        block->on_stop = [slot, installer]() noexcept
-        {
-            detail::dr_slots[slot].notifying.store(false, std::memory_order_release);
-            // A trap callback cannot block a Java-state writer on a native
-            // installer mutex. Deferred cleanup keeps ownership and the VEH.
-            std::unique_lock<std::mutex> stop_lock{ detail::dr_mutex, std::try_to_lock };
-            if (!stop_lock.owns_lock()) { return; }
-            // Drop the callback first. Residual or queued breakpoints remain
-            // owned but never invoke user code after subsequent handler entry.
-            detail::dr_slots[slot].callback.reset();
-            const auto cleared{ detail::clear_thread_drs(slot) };
-            if (cleared.complete() && vmhook::windows::GetCurrentThreadId() == installer)
-            { detail::dr_slots[slot].in_use.store(false, std::memory_order_release); }
-            // Other stop callers can themselves still carry this watch's DR.
-            // Reserve that slot and keep the VEH until process exit.
-        };
-        configuration->address = reinterpret_cast<std::uint64_t>(address);
-        configuration->bits = bits;
-        configuration->previous = detail::dr_slots[slot].configuration.load(std::memory_order_relaxed);
-        detail::dr_slots[slot].configuration.store(configuration.release(), std::memory_order_release);
-        // Retain the immutable ownership history for already queued exceptions.
-        // It costs one small record per installation and contains no callback.
-        detail::dr_slots[slot].callback = std::move(callback);
-        detail::dr_slots[slot].notifying.store(true, std::memory_order_release);
-        detail::dr_slots[slot].in_use.store(true, std::memory_order_release);
-        const auto armed{ detail::refresh_thread_drs(slot, reinterpret_cast<std::uint64_t>(address), bits) };
-        if (!armed.complete() || armed.applied == 0)
-        {
-            detail::dr_slots[slot].notifying.store(false, std::memory_order_release);
-            detail::dr_slots[slot].callback.reset();
-            const auto cleared{ detail::clear_thread_drs(slot) };
-            if (cleared.complete()) { detail::dr_slots[slot].in_use.store(false, std::memory_order_release); }
-            return {};
-        }
+        const auto id{ detail::install_field_hook<wrapper_type, field_type>(field_name,
+            [callback = std::move(on_change)](field_access<field_type>& event) mutable
+            {
+                if (event.is_write()) { callback(field_type{}, event.value()); }
+            }) };
+        if (!id) { return {}; }
+        block->on_stop = [id]() noexcept { detail::remove_field_hook_id(id); };
         return watch_handle{ std::move(block) };
     }
 
-    /*
-        @brief Registry that owns the class-load callbacks installed by
-               on_class_loaded.  Lives inside namespace detail because it
-               is implementation-only; users get the class name through
-               the on_class_loaded callback.
-    */
+    using class_observer_id = std::uint64_t;
+
+    enum class class_load_phase : std::uint8_t
+    {
+        instance_loaded,
+        array_created,
+        archived_array_restored
+    };
+
+    // Borrowed metadata and references, valid only during this notification.
+    // The CLD is the actual defining CLD, including weak hidden class holders.
+    struct class_load_event final
+    {
+        vmhook::hotspot::klass* klass{};
+        vmhook::hotspot::class_loader_data* defining_loader_data{};
+        vmhook::oop_t defining_loader_oop{};
+        std::string_view internal_name{};
+        class_load_phase phase{};
+    };
+
     namespace detail
     {
-        using class_load_callback_t = std::function<void(const std::string&)>;
-        inline std::mutex                                          class_load_mutex{};
-        inline std::vector<std::shared_ptr<class_load_callback_t>> class_load_callbacks{};
-        inline bool                                                class_load_hook_installed{ false };
-
-        // Internal C++ wrapper for java.lang.ClassLoader used only by the
-        // class-load hook.  Not exposed publicly; users see the class
-        // name string in the callback.
-        class class_loader_wrapper : public vmhook::object<class_loader_wrapper>
-        {
-        public:
-            explicit class_loader_wrapper(vmhook::oop_t oop) noexcept
-                : vmhook::object<class_loader_wrapper>{ oop }
-            {
-            }
-        };
+        inline auto add_class_observer(std::function<void(const class_load_event&)> callback)
+            -> class_observer_id;
+        inline auto erase_class_observer(class_observer_id id) noexcept -> bool;
+        inline auto disable_class_observers() noexcept -> void;
+        inline auto class_event_notification_active() noexcept -> bool;
+        inline auto ensure_class_events_installed() noexcept -> bool;
     }
 
-    /*
-        @brief Registers a callback fired whenever java.lang.ClassLoader
-               defines a new class.
-        @details
-        Installs an interpreter hook on the Java method
-        `java.lang.ClassLoader::defineClass(String, byte[], int, int,
-        ProtectionDomain)` and dispatches the callback with the internal
-        class name read from the call's first argument.  This is
-        Observes this Java overload's interpreted invocations without polling.
-        Native, abstract, unresolved or unsupported entries yield an inert handle.
-
-        Limitations:
-          - Only catches classes defined through ClassLoader.defineClass.
-            Bootstrap-loaded classes (java.*, javax.*, sun.*) are not
-            reported because they bypass the Java-side defineClass entry.
-          - The (String, ByteBuffer, ProtectionDomain) overload of
-            defineClass is not yet hooked.
-          - Compiled and inlined invocations bypass the interpreter observer.
-
-        Exception safety: noexcept boundary — callback exceptions are caught
-            and logged through log_line().
-        Thread safety: the callback runs on the Java thread that triggered
-            the class definition.
-
-        Example:
-            auto handle{ vmhook::on_class_loaded(
-                [](const std::string& internal_name)
-                {
-                    std::println("loaded: {}", internal_name);
-                }) };
-
-        @tparam callback_type Callable invoked as `void(const std::string&)`.
-                              Argument is the JVM-style `/`-separated name.
-    */
+    // Persistent, synchronous native notification; discarding the returned ID
+    // keeps the observer installed. Zero means this exact JVM could not be
+    // observed safely. Previously loaded classes are not replayed.
+    //
+    // Notifications cover successful ordinary, bootstrap and hidden/anonymous
+    // definitions, new arrays and archived array restoration on the audited
+    // Windows x64 HotSpot images. Failed definitions do not notify.
+    //
+    // The callback runs in VM state on the class-loading thread and must be
+    // short: no blocking, Java calls, VM operations, hook installation or raw
+    // reference retention. Callback exceptions are swallowed. Removal disables
+    // subsequent callback entries; an already entered callback may complete.
     template<typename callback_type>
-    inline auto on_class_loaded(callback_type on_load) -> watch_handle
+    inline auto on_class_loaded(callback_type on_load) -> class_observer_id
     {
-        auto cb{ std::make_shared<detail::class_load_callback_t>(std::move(on_load)) };
-
-        {
-            std::lock_guard<std::mutex> guard{ detail::class_load_mutex };
-            detail::class_load_callbacks.push_back(cb);
-
-            if (!detail::class_load_hook_installed)
+        static_assert(std::is_invocable_v<callback_type&, const class_load_event&>
+            || std::is_invocable_v<callback_type&, std::string_view>,
+            "A class observer accepts const class_load_event& or std::string_view.");
+        return detail::add_class_observer(
+            [callback = std::move(on_load)](const class_load_event& event) mutable
             {
-                if (vmhook::detail::registered_class_name<detail::class_loader_wrapper>().empty())
-                {
-                    vmhook::register_class<detail::class_loader_wrapper>("java/lang/ClassLoader");
-                }
+                if constexpr (std::is_invocable_v<callback_type&, const class_load_event&>)
+                { std::invoke(callback, event); }
+                else { std::invoke(callback, event.internal_name); }
+            });
+    }
 
-                auto define_class_detour = [](
-                    vmhook::return_value& /*ret*/,
-                    const std::unique_ptr<detail::class_loader_wrapper>& /*self*/,
-                    const std::string& name,
-                    vmhook::oop_t /*bytes*/,
-                    std::int32_t /*offset*/,
-                    std::int32_t /*length*/,
-                    vmhook::oop_t /*protection_domain*/)
-                {
-                    std::vector<std::shared_ptr<detail::class_load_callback_t>> snapshot;
-                    {
-                        std::lock_guard<std::mutex> guard2{ detail::class_load_mutex };
-                        snapshot = detail::class_load_callbacks;
-                    }
-                    std::string internal_name{ name };
-                    std::replace(internal_name.begin(), internal_name.end(), '.', '/');
-                    for (auto& callback : snapshot)
-                    {
-                        if (!callback) { continue; }
-                        try
-                        {
-                            (*callback)(internal_name);
-                        }
-                        catch (const std::exception& ex)
-                        {
-                            ::vmhook::detail::log_line("{} on_class_loaded callback: {}",
-                                       vmhook::error_tag, ex.what());
-                        }
-                    }
-                };
-                const bool installed = vmhook::hook<detail::class_loader_wrapper>(
-                    "defineClass",
-                    "(Ljava/lang/String;[BIILjava/security/ProtectionDomain;)Ljava/lang/Class;",
-                    define_class_detour);
-
-                if (installed)
-                {
-                    detail::class_load_hook_installed = true;
-                }
-                else
-                {
-                    ::vmhook::detail::log_line("{} on_class_loaded: ClassLoader.defineClass hook installation failed",
-                               vmhook::error_tag);
-                }
-            }
-        }
-
-        // If the defineClass hook never armed (e.g. no JVM in-process, or the
-        // method couldn't be resolved), this watcher can never fire.  Match
-        // watch_static_field's contract: return an inert handle whose
-        // running() == false, and drop the callback we optimistically pushed
-        // so it doesn't linger in the registry.  Without this, a caller has no
-        // way to tell a working watcher from a dead one — the exact
-        // method-vs-field-style inconsistency we want to avoid.
-        {
-            std::lock_guard<std::mutex> guard{ detail::class_load_mutex };
-            if (!detail::class_load_hook_installed)
-            {
-                detail::class_load_callbacks.erase(
-                    std::remove(detail::class_load_callbacks.begin(),
-                                detail::class_load_callbacks.end(), cb),
-                    detail::class_load_callbacks.end());
-                return watch_handle{};
-            }
-        }
-
-        auto block{ std::make_shared<watch_handle::control_block>() };
-        block->on_stop = [cb]() noexcept
-        {
-            try
-            {
-                std::lock_guard<std::mutex> guard{ detail::class_load_mutex };
-                detail::class_load_callbacks.erase(
-                    std::remove(detail::class_load_callbacks.begin(),
-                                detail::class_load_callbacks.end(), cb),
-                    detail::class_load_callbacks.end());
-            }
-            catch (const std::exception& ex)
-            {
-                ::vmhook::detail::log_line("{} on_class_loaded on_stop: failed to erase callback: {} - swallowed.",
-                           vmhook::error_tag, ex.what());
-            }
-            catch (...)
-            {
-                ::vmhook::detail::log_line("{} on_class_loaded on_stop: unknown exception while erasing callback - "
-                           "swallowed.", vmhook::error_tag);
-            }
-        };
-
-        return watch_handle{ std::move(block) };
+    inline auto remove_class_observer(const class_observer_id id) noexcept -> bool
+    {
+        return detail::erase_class_observer(id);
     }
 
     /*
@@ -20658,11 +22008,7 @@ export namespace vmhook
         // instead of trusting a latch left true while the detour was torn down.
         inline auto reset_watcher_latches() noexcept -> void
         {
-            {
-                std::lock_guard<std::mutex> guard{ class_load_mutex };
-                class_load_hook_installed = false;
-                class_load_callbacks.clear();
-            }
+            vmhook::detail::disable_class_observers();
             {
                 std::lock_guard<std::mutex> guard{ exception_mutex };
                 exception_hook_installed = false;
@@ -23186,6 +24532,13 @@ namespace hotspot
         vmhook::detail::native_backend::root native_root_{};
     };
 
+    template<typename wrapper_type>
+    inline auto return_value::set(const vmhook::borrowed<wrapper_type>& value) noexcept -> void
+    {
+        if (const auto root{ value.get_native_root() })
+        { (void)vmhook::detail::set_callback_reference(this->return_slot, root); }
+    }
+
     /*
         @brief Out-of-line definition of object<derived>::self().
         @details
@@ -24049,3 +25402,1309 @@ namespace std
         }
     };
 }
+
+// Native class observation: resident detours and immutable callbacks.
+export namespace vmhook::detail {
+    auto prepare_class_hooks(vmhook::hotspot::klass* klass) noexcept -> bool;
+    auto finish_class_hooks(vmhook::hotspot::klass* klass,bool success) noexcept -> void;
+}
+export namespace vmhook::detail::class_events {
+// Executable memory, function table and the containing DLL remain resident.
+// Removing a subscription never removes an entry detour or frees its code.
+class native_entry_hook {
+    std::byte* target_{};
+    std::byte* code_{};
+    std::size_t stolen_{};
+    std::array<std::byte, 32> original_{};
+    std::array<std::byte, 32> patch_{};
+    vmhook::windows::RUNTIME_FUNCTION* table_{};
+    struct unwind_operation { unsigned char end{}, kind{}, info{}; std::uint32_t extra{}; bool large{}; };
+
+    static auto prefix_unwind(std::span<const std::byte> input,
+        std::span<std::byte> unwind,std::array<std::size_t,2>& calls,std::size_t& call_count) noexcept -> std::size_t {
+        std::array<unwind_operation, 12> ops{};
+        std::size_t cursor{}, count{}, stack{}, anchor_stack{};bool anchor_valid{};
+        struct saved { std::size_t op; std::int64_t displacement; };
+        std::array<saved, 8> saves{}; std::size_t save_count{};
+        const auto byte=[&](std::size_t i){return std::to_integer<unsigned>(input[i]);};
+        const auto nonvolatile=[](unsigned reg){return reg==3 || reg==5 || reg==6 || reg==7 || reg>=12;};
+        while(cursor<5 && cursor+5<=input.size()) {
+            const auto start=cursor;
+            unsigned reg{};
+            if(byte(cursor)==0x4c && byte(cursor+1)==0x8b && byte(cursor+2)==0xdc) {
+                cursor+=3;
+            } else if(byte(cursor)==0x48 && byte(cursor+1)==0x8b && byte(cursor+2)==0xc4) {
+                anchor_stack=stack;anchor_valid=true;cursor+=3;
+            } else if((byte(cursor)==0x48 || byte(cursor)==0x4c) && byte(cursor+1)==0x89 && (byte(cursor+2)&0xc7)==0x40 && anchor_valid) {
+                reg=((byte(cursor+2)>>3)&7)+(byte(cursor)==0x4c?8:0);
+                const auto displacement=static_cast<std::int8_t>(byte(cursor+3));cursor+=4;
+                if(nonvolatile(reg)) {
+                    saves[save_count++]={count,static_cast<std::int64_t>(displacement)-static_cast<std::int64_t>(anchor_stack)};
+                    ops[count++]={static_cast<unsigned char>(cursor),4,static_cast<unsigned char>(reg),0,true};
+                }
+            } else if(byte(cursor)==0x40 && byte(cursor+1)>=0x50 && byte(cursor+1)<=0x57) {
+                reg=byte(cursor+1)-0x50;if(!nonvolatile(reg))return 0;cursor+=2;
+                ops[count++]={static_cast<unsigned char>(cursor),0,static_cast<unsigned char>(reg)};stack+=8;
+            } else if(byte(cursor)==0x41 && byte(cursor+1)>=0x50 && byte(cursor+1)<=0x57) {
+                reg=8+byte(cursor+1)-0x50;if(!nonvolatile(reg))return 0;cursor+=2;
+                ops[count++]={static_cast<unsigned char>(cursor),0,static_cast<unsigned char>(reg)};stack+=8;
+            } else if(byte(cursor)>=0x50 && byte(cursor)<=0x57) {
+                reg=byte(cursor)-0x50;if(!nonvolatile(reg))return 0;cursor+=1;
+                ops[count++]={static_cast<unsigned char>(cursor),0,static_cast<unsigned char>(reg)};stack+=8;
+            } else if(byte(cursor)==0x48 && byte(cursor+1)==0x83 && byte(cursor+2)==0xec) {
+                const auto amount=byte(cursor+3);
+                if(!amount || amount>=128 || amount%8)return 0;
+                cursor+=4;stack+=amount;
+                ops[count++]={static_cast<unsigned char>(cursor),2,static_cast<unsigned char>(amount/8-1)};
+            } else if(byte(cursor)==0x48 && byte(cursor+1)==0x81 && byte(cursor+2)==0xec) {
+                std::uint32_t amount{};std::memcpy(&amount,input.data()+cursor+3,4);
+                if(!amount || amount%8 || amount>0x100000)return 0;
+                cursor+=7;stack+=amount;
+                if(amount<=524280)ops[count++]={static_cast<unsigned char>(cursor),1,0,amount/8,true};
+                else ops[count++]={static_cast<unsigned char>(cursor),1,1,amount,true};
+            } else if((byte(cursor)==0x48 || byte(cursor)==0x4c) && byte(cursor+1)==0x89
+                      && (byte(cursor+2)&0xc7)==0x44 && byte(cursor+3)==0x24) {
+                reg=((byte(cursor+2)>>3)&7)+(byte(cursor)==0x4c?8:0);
+                const auto displacement=static_cast<std::int8_t>(byte(cursor+4));cursor+=5;
+                if(nonvolatile(reg)) {
+                    saves[save_count++]={count,static_cast<std::int64_t>(displacement)-static_cast<std::int64_t>(stack)};
+                    ops[count++]={static_cast<unsigned char>(cursor),4,static_cast<unsigned char>(reg),0,true};
+                }
+            } else if((byte(cursor)==0xe8 || byte(cursor)==0xe9) && call_count<calls.size()) {
+                calls[call_count++]=cursor;cursor+=5;
+            } else return 0;
+            if(cursor==start || count==ops.size())return 0;
+        }
+        if(cursor<5)return 0;
+        for(std::size_t i{};i<save_count;++i) {
+            // RSP-relative stores precede stack growth in the accepted prefix.
+            const auto offset=saves[i].displacement+static_cast<std::int64_t>(stack);
+            if(offset<0 || offset%8 || offset/8>65535)return 0;
+            ops[saves[i].op].extra=static_cast<unsigned short>(offset/8);
+        }
+        std::size_t slots{};for(std::size_t i{};i<count;++i)slots+=ops[i].large ? (ops[i].kind==1 && ops[i].info==1?3:2) : 1;
+        if(4+slots*2>unwind.size())return 0;
+        unwind[0]=std::byte{1};unwind[1]=static_cast<std::byte>(cursor);
+        unwind[2]=static_cast<std::byte>(slots);unwind[3]=std::byte{};
+        std::size_t out=4;
+        for(std::size_t i=count;i>0;--i) {
+            const auto& op=ops[i-1];unwind[out++]=static_cast<std::byte>(op.end);
+            unwind[out++]=static_cast<std::byte>((op.info<<4)|op.kind);
+            if(op.large){const auto bytes=op.kind==1 && op.info==1?4u:2u;std::memcpy(unwind.data()+out,&op.extra,bytes);out+=bytes;}
+        }
+        return cursor;
+    }
+    static auto continuation_jump(std::byte* destination, const void* address) noexcept -> void {
+        destination[0]=std::byte{0x49};destination[1]=std::byte{0xba};
+        std::memcpy(destination+2,&address,8);
+        destination[10]=std::byte{0x41};destination[11]=std::byte{0xff};destination[12]=std::byte{0xe2};
+    }
+    static auto absolute_jump(std::byte* destination, const void* address) noexcept -> void {
+        const std::array<unsigned char,6> opcode{0xff,0x25,0,0,0,0};
+        std::memcpy(destination,opcode.data(),6);std::memcpy(destination+6,&address,8);
+    }
+    static auto exchange(std::byte* target, std::span<const std::byte> expected,
+        std::span<const std::byte> replacement) noexcept -> bool {
+        if(expected.size()!=replacement.size() || expected.empty() || expected.size()>32)return false;
+        std::lock_guard lock{vmhook::hotspot::g_code_patch_mutex};
+        vmhook::hotspot::code_patch_threads paused{};
+        if(!paused.permits(target,replacement.size()))return false;
+        std::array<std::byte,32> current{};
+        if(!vmhook::os::safe_read(current.data(),target,expected.size())
+           || std::memcmp(current.data(),expected.data(),expected.size()))return false;
+        vmhook::windows::DWORD old{};
+        if(!vmhook::windows::VirtualProtect(target,replacement.size(),vmhook::windows::page_execute_readwrite,&old))return false;
+        vmhook::windows::SIZE_T written{};
+        const bool changed=vmhook::windows::WriteProcessMemory(vmhook::windows::GetCurrentProcess(),target,replacement.data(),replacement.size(),&written)
+                            && written==replacement.size();
+        if(!changed) {
+            vmhook::windows::SIZE_T restored{};
+            if(!vmhook::windows::WriteProcessMemory(vmhook::windows::GetCurrentProcess(),target,expected.data(),expected.size(),&restored)
+               || restored!=expected.size())vmhook::windows::TerminateProcess(vmhook::windows::GetCurrentProcess(),vmhook::windows::error_write_fault);
+        }
+        vmhook::windows::FlushInstructionCache(vmhook::windows::GetCurrentProcess(),target,replacement.size());
+        vmhook::windows::DWORD ignored{};vmhook::windows::VirtualProtect(target,replacement.size(),old,&ignored);
+        return changed;
+    }
+public:
+    static auto audited_prefix_length(std::span<const std::byte> bytes) noexcept -> std::size_t {
+        if(bytes.size()<16)return 0;
+        std::array<std::byte,64> unwind{};std::array<std::size_t,2> calls{};std::size_t count{};
+        return prefix_unwind(bytes,unwind,calls,count);
+    }
+    native_entry_hook()=default;
+    native_entry_hook(const native_entry_hook&)=delete;
+    auto operator=(const native_entry_hook&)->native_entry_hook& = delete;
+    // expected is exact-image evidence, validated by the caller's DLL identity.
+    auto install(void* target, const void* detour, std::span<const std::byte> expected) noexcept -> bool {
+        if(code_ || !target || !detour || expected.size()<5 || expected.size()>original_.size())return false;
+        std::array<std::byte,64> unwind{};
+        std::array<std::byte,32> prefix{};std::memcpy(prefix.data(),expected.data(),expected.size());
+        std::array<std::size_t,2> calls{};std::size_t call_count{};
+        const auto stolen=prefix_unwind(prefix,unwind,calls,call_count);
+        if(stolen!=expected.size())return false;
+        std::array<std::byte,32> actual{};
+        if(!vmhook::os::safe_read(actual.data(),target,stolen) || std::memcmp(actual.data(),expected.data(),stolen))return false;
+        auto* memory=reinterpret_cast<std::byte*>(vmhook::hotspot::allocate_nearby_memory(reinterpret_cast<unsigned char*>(target),4096));
+        if(!memory)return false;
+        const auto delta=reinterpret_cast<std::intptr_t>(memory+32)-(reinterpret_cast<std::intptr_t>(target)+5);
+        if(delta<std::numeric_limits<std::int32_t>::min() || delta>std::numeric_limits<std::int32_t>::max()){vmhook::os::release(memory,4096);return false;}
+        std::memcpy(memory,expected.data(),stolen);
+        for(std::size_t i{};i<call_count;++i) {
+            const auto offset=calls[i];std::int32_t relative{};std::memcpy(&relative,expected.data()+offset+1,4);
+            const auto callee=reinterpret_cast<std::intptr_t>(target)+static_cast<std::intptr_t>(offset)+5+relative;
+            const auto moved=callee-(reinterpret_cast<std::intptr_t>(memory)+static_cast<std::intptr_t>(offset)+5);
+            if(moved<std::numeric_limits<std::int32_t>::min() || moved>std::numeric_limits<std::int32_t>::max()){vmhook::os::release(memory,4096);return false;}
+            relative=static_cast<std::int32_t>(moved);std::memcpy(memory+offset+1,&relative,4);
+        }
+        continuation_jump(memory+stolen,static_cast<std::byte*>(target)+stolen);
+        absolute_jump(memory+32,detour);
+        std::memcpy(memory+64,unwind.data(),unwind.size());
+        auto* table=reinterpret_cast<vmhook::windows::RUNTIME_FUNCTION*>(memory+128);
+        *table={0,static_cast<vmhook::windows::DWORD>(stolen+13),64};
+        // The relay contains no stack effects; include an empty unwind entry.
+        memory[192]=std::byte{1};*reinterpret_cast<vmhook::windows::RUNTIME_FUNCTION*>(memory+140)={32,46,192};
+        if(!vmhook::windows::RtlAddFunctionTable(table,2,reinterpret_cast<vmhook::windows::DWORD64>(memory))){vmhook::os::release(memory,4096);return false;}
+        vmhook::windows::DWORD ignored{};
+        if(!vmhook::windows::VirtualProtect(memory,4096,vmhook::windows::page_execute_read,&ignored)
+           || !vmhook::windows::FlushInstructionCache(vmhook::windows::GetCurrentProcess(),memory,4096)){
+            vmhook::windows::RtlDeleteFunctionTable(table);vmhook::os::release(memory,4096);return false;
+        }
+        std::memcpy(original_.data(),expected.data(),stolen);
+        patch_.fill(std::byte{0x90});patch_[0]=std::byte{0xe9};const auto rel=static_cast<std::int32_t>(delta);
+        std::memcpy(patch_.data()+1,&rel,4);
+        // Publish the original before the entry can execute the detour.
+        target_=static_cast<std::byte*>(target);code_=memory;stolen_=stolen;table_=table;
+        if(!exchange(target_,{original_.data(),stolen_},{patch_.data(),stolen_})) {
+            code_=nullptr;target_=nullptr;stolen_=0;table_=nullptr;
+            vmhook::windows::RtlDeleteFunctionTable(table);vmhook::os::release(memory,4096);return false;
+        }
+        return true;
+    }
+    [[nodiscard]] auto original()const noexcept -> void* {return code_;}
+    [[nodiscard]] auto matches()const noexcept -> bool {
+        std::array<std::byte,32> current{};
+        return code_ && vmhook::os::safe_read(current.data(),target_,stolen_)
+               && !std::memcmp(current.data(),patch_.data(),stolen_);
+    }
+};
+}
+
+export namespace vmhook::detail::class_events {
+using phase=vmhook::class_load_phase;
+using event=vmhook::class_load_event;
+using class_observer_id=vmhook::class_observer_id;
+struct observer_profile {int feature{};bool hidden_helper{};std::size_t hidden_offset{},anonymous_host_offset{};};
+class observer {
+public:
+    struct callback_node {
+        std::function<void(const event&)> callback;
+        class_observer_id id{};
+        callback_node* previous{};
+        std::atomic_bool enabled{true};
+    };
+private:
+    inline static std::atomic<callback_node*> callbacks_{};
+    inline static std::mutex setup_mutex_{};
+    inline static std::vector<std::unique_ptr<callback_node>> retained_callbacks_{};
+    inline static std::array<native_entry_hook,4> hooks_{};
+    inline static bool installed_{};
+    inline static class_observer_id next_id_{1};
+    inline static observer_profile profile_storage_{};
+    inline static const observer_profile* selected_profile_{&profile_storage_};
+    struct archived_slot {std::atomic<void*> klass;std::atomic_bool delivered;};
+    inline static std::array<archived_slot,65536> archived_{};
+    inline static std::atomic_bool archive_table_full_{};
+    static auto archive_slot(void* klass,bool create) noexcept -> archived_slot* {
+        const auto hash=(reinterpret_cast<std::uintptr_t>(klass)>>3)*0x9e3779b97f4a7c15ull;
+        for(std::size_t n{};n<archived_.size();++n) {
+            auto& slot=archived_[(hash+n)&(archived_.size()-1)];
+            auto* value=slot.klass.load(std::memory_order_acquire);
+            if(value==klass)return &slot;
+            if(!value) {
+                if(!create)return nullptr;
+                if(slot.klass.compare_exchange_strong(value,klass,std::memory_order_acq_rel))return &slot;
+                if(value==klass)return &slot;
+            }
+        }
+        archive_table_full_.store(true,std::memory_order_release);return nullptr;
+    }
+    inline static std::size_t name_offset_{},loader_offset_{},cld_loader_offset_{},mirror_offset_{},symbol_body_{},symbol_length_{};
+    inline static bool combined_symbol_length_{};
+    inline static thread_local unsigned callback_depth_{};
+    template<class T> static auto read(const void* base,std::size_t offset) noexcept -> T {
+        T result{};std::memcpy(&result,static_cast<const std::byte*>(base)+offset,sizeof result);return result;
+    }
+    static auto emit(void* klass,phase point) noexcept -> void {
+        if(!klass || callback_depth_)return;
+        auto* const symbol=read<void*>(klass,name_offset_);
+        auto* const cld=read<void*>(klass,loader_offset_);
+        if(!symbol || !cld)return;
+        const auto length=combined_symbol_length_ ? read<std::uint32_t>(symbol,symbol_length_)>>16
+                                                  : read<std::uint16_t>(symbol,symbol_length_);
+        if(!length)return;
+        void* loader{};
+        if(selected_profile_->feature<10)loader=read<void*>(cld,cld_loader_offset_);
+        else {auto* const slot=read<void**>(cld,cld_loader_offset_);loader=slot?*slot:nullptr;}
+        const event value{static_cast<vmhook::hotspot::klass*>(klass),static_cast<vmhook::hotspot::class_loader_data*>(cld),loader,
+                          {static_cast<const char*>(symbol)+symbol_body_,length},point};
+        ++callback_depth_;
+        // No registry mutex, shared_ptr lock, allocation, snapshot copy or VM call.
+        // Nodes remain resident; stop merely disables one atomic flag.
+        for(auto* node=callbacks_.load(std::memory_order_acquire);node;node=node->previous) {
+            if(!node->enabled.load(std::memory_order_acquire))continue;
+            try{node->callback(value);}catch(...){}
+        }
+        --callback_depth_;
+    }
+    static auto instance_define(void* klass,void* loader,void* thread) -> void {
+        const vmhook::detail::jit_backend::class_definition_guard defining{};
+        if(!vmhook::detail::prepare_class_hooks(static_cast<vmhook::hotspot::klass*>(klass))) {
+            vmhook::detail::fail_class_hook_preparation(thread);
+            vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),false);return;
+        }
+        reinterpret_cast<void(*)(void*,void*,void*)>(hooks_[0].original())(klass,loader,thread);
+        const bool success=!vmhook::detail::private_native::pending_exception(thread);
+        vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),success);
+        if(success && !vmhook::detail::private_native::pending_exception(thread))emit(klass,phase::instance_loaded);
+    }
+    static auto hidden_stream(void* stream,void* name,void* loader,const void* info,void* thread) -> void* {
+        const vmhook::detail::jit_backend::class_definition_guard defining{};
+        const bool hidden=selected_profile_->hidden_helper || read<bool>(info,selected_profile_->hidden_offset);
+        auto* klass=reinterpret_cast<void*(*)(void*,void*,void*,const void*,void*)>(hooks_[1].original())(stream,name,loader,info,thread);
+        if(hidden && klass && !vmhook::detail::private_native::pending_exception(thread)) {
+            if(!vmhook::detail::prepare_class_hooks(static_cast<vmhook::hotspot::klass*>(klass))) {
+                vmhook::detail::fail_class_hook_preparation(thread);
+                vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),false);return nullptr;
+            }
+            vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),true);
+            emit(klass,phase::instance_loaded);
+        }
+        return klass;
+    }
+    static auto instance_define_legacy(void* klass,void* thread) -> void {
+        const vmhook::detail::jit_backend::class_definition_guard defining{};
+        if(!vmhook::detail::prepare_class_hooks(static_cast<vmhook::hotspot::klass*>(klass))) {
+            vmhook::detail::fail_class_hook_preparation(thread);
+            vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),false);return;
+        }
+        reinterpret_cast<void(*)(void*,void*)>(hooks_[0].original())(klass,thread);
+        const bool success=!vmhook::detail::private_native::pending_exception(thread);
+        vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),success);
+        if(success && !vmhook::detail::private_native::pending_exception(thread))emit(klass,phase::instance_loaded);
+    }
+    static auto anonymous_parse(void* name,void* loader,void* protection,void* stream,void* host,void* patches,void* thread) -> void* {
+        const vmhook::detail::jit_backend::class_definition_guard defining{};
+        auto* klass=reinterpret_cast<void*(*)(void*,void*,void*,void*,void*,void*,void*)>(hooks_[1].original())(name,loader,protection,stream,host,patches,thread);
+        if(host && klass && !vmhook::detail::private_native::pending_exception(thread)) {
+            if(!vmhook::detail::prepare_class_hooks(static_cast<vmhook::hotspot::klass*>(klass))) {
+                vmhook::detail::fail_class_hook_preparation(thread);
+                vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),false);return nullptr;
+            }
+            vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),true);
+            emit(klass,phase::instance_loaded);
+        }
+        return klass;
+    }
+    static auto hidden_parse_info(void* name,void* loader,void* stream,const void* info,void* thread) -> void* {
+        const vmhook::detail::jit_backend::class_definition_guard defining{};
+        const bool hidden=read<bool>(info,selected_profile_->hidden_offset)
+                          || read<void*>(info,selected_profile_->anonymous_host_offset)!=nullptr;
+        auto* klass=reinterpret_cast<void*(*)(void*,void*,void*,const void*,void*)>(hooks_[1].original())(name,loader,stream,info,thread);
+        if(hidden && klass && !vmhook::detail::private_native::pending_exception(thread)) {
+            if(!vmhook::detail::prepare_class_hooks(static_cast<vmhook::hotspot::klass*>(klass))) {
+                vmhook::detail::fail_class_hook_preparation(thread);
+                vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),false);return nullptr;
+            }
+            vmhook::detail::finish_class_hooks(static_cast<vmhook::hotspot::klass*>(klass),true);
+            emit(klass,phase::instance_loaded);
+        }
+        return klass;
+    }
+    static auto array_complete_legacy(void* klass,void* super,void* thread) -> void {
+        reinterpret_cast<void(*)(void*,void*,void*)>(hooks_[2].original())(klass,super,thread);
+        if(!vmhook::detail::private_native::pending_exception(thread))emit(klass,phase::array_created);
+    }
+    static auto array_complete(void* klass,void* super,void* module,void* thread) -> void {
+        reinterpret_cast<void(*)(void*,void*,void*,void*)>(hooks_[2].original())(klass,super,module,thread);
+        if(!vmhook::detail::private_native::pending_exception(thread))emit(klass,phase::array_created);
+    }
+    static auto array_restore(void* klass,void* cld,void* protection_domain,void* thread) -> void {
+        const auto mirror=[&]{
+            auto* value=read<void*>(klass,mirror_offset_);
+            return selected_profile_->feature<10?value:(value?*static_cast<void**>(value):nullptr);
+        };
+        const bool had_mirror=mirror()!=nullptr;
+        auto* slot=archive_slot(klass,!had_mirror);
+        reinterpret_cast<void(*)(void*,void*,void*,void*)>(hooks_[3].original())(klass,cld,protection_domain,thread);
+        if(slot && !vmhook::detail::private_native::pending_exception(thread) && mirror()!=nullptr
+           && !slot->delivered.exchange(true,std::memory_order_acq_rel))emit(klass,phase::archived_array_restored);
+    }
+public:
+    // Call setup from a native thread, outside any notification. The supplied
+    // profile is only accepted with a matching built-in exact DLL identity.
+    // A matching external PDB alone is not sufficient observer ABI evidence.
+    static auto ensure_installed() -> bool {
+        if(callback_depth_)return false;
+        auto& runtime=vmhook::detail::private_native::rt();
+        if(!runtime.ready || runtime.uses_external_symbols() || !vmhook::vm_capabilities().supported)return false;
+        vmhook::windows::HMODULE pinned{};
+        if(!vmhook::windows::GetModuleHandleExW(vmhook::windows::module_handle_from_address|vmhook::windows::module_handle_pin,
+                              reinterpret_cast<const wchar_t*>(&instance_define),&pinned))return false;
+        observer_profile candidate{};candidate.feature=runtime.profile->java_feature;
+        candidate.hidden_helper=runtime.has_function("class_resolve_hidden");
+        const std::string_view secondary=candidate.feature<=16?"class_parse":
+            candidate.hidden_helper?"class_resolve_hidden":"class_resolve_stream";
+        const std::array<std::string_view,4> aliases{"class_define",secondary,"array_complete","array_restore"};
+        for(const auto name:aliases)if(!runtime.has_function(name))return false;
+        if(candidate.feature>=15 && !candidate.hidden_helper) {
+            candidate.hidden_offset=runtime.off("ClassLoadInfo","_is_hidden");
+            if(candidate.feature<=16)candidate.anonymous_host_offset=runtime.off("ClassLoadInfo","_unsafe_anonymous_host");
+        }
+        const auto* profile=&candidate;
+        std::lock_guard lock{setup_mutex_};
+        if(!installed_) {
+            profile_storage_=candidate;selected_profile_=&profile_storage_;
+            name_offset_=runtime.field_offset("Klass","_name");
+            const auto loader_field=runtime.try_field_offset("Klass","_class_loader_data");
+            loader_offset_=loader_field.first?loader_field.second:runtime.field_offset("InstanceKlass","_class_loader_data");
+            mirror_offset_=runtime.field_offset("Klass","_java_mirror");
+            cld_loader_offset_=runtime.field_offset("ClassLoaderData","_class_loader");
+            symbol_body_=runtime.off("Symbol","_body");
+            combined_symbol_length_=runtime.has_field("Symbol","_length_and_refcount");
+            symbol_length_=runtime.off("Symbol",combined_symbol_length_?"_length_and_refcount":"_length");
+            const std::array<const void*,4> detours{
+                profile->feature<=16?reinterpret_cast<const void*>(&instance_define_legacy):reinterpret_cast<const void*>(&instance_define),
+                profile->feature<=14?reinterpret_cast<const void*>(&anonymous_parse):
+                    profile->feature<=16?reinterpret_cast<const void*>(&hidden_parse_info):reinterpret_cast<const void*>(&hidden_stream),
+                profile->feature==8?reinterpret_cast<const void*>(&array_complete_legacy):reinterpret_cast<const void*>(&array_complete),
+                reinterpret_cast<const void*>(&array_restore)};
+            for(std::size_t i{};i<4;++i) {
+                if(hooks_[i].original())continue;
+                auto* target=runtime.function(aliases[i]);
+                std::array<std::byte,32> expected{};
+                if(!vmhook::os::safe_read(expected.data(),target,expected.size()))return false;
+                const auto length=native_entry_hook::audited_prefix_length(expected);
+                if(!length)return false;
+                // Audited relative CALL/tail-JMP thunks must stay in this JVM.
+                // This also refuses a competing foreign entry redirect.
+                for(std::size_t offset{};offset<length;) {
+                    const auto opcode=std::to_integer<unsigned>(expected[offset]);
+                    if(opcode==0xe8 || opcode==0xe9) {
+                        std::int32_t displacement{};std::memcpy(&displacement,expected.data()+offset+1,4);
+                        const auto destination=reinterpret_cast<std::intptr_t>(target)+static_cast<std::intptr_t>(offset)+5+displacement;
+                        if(destination<static_cast<std::intptr_t>(runtime.base)
+                           || destination>=static_cast<std::intptr_t>(runtime.base+runtime.image_size))return false;
+                        offset+=5;
+                    } else if(opcode==0x48 && std::to_integer<unsigned>(expected[offset+1])==0x81)offset+=7;
+                    else if(opcode==0x48 && std::to_integer<unsigned>(expected[offset+1])==0x83)offset+=4;
+                    else if(opcode==0x48 && std::to_integer<unsigned>(expected[offset+1])==0x8b)offset+=3;
+                    else if(opcode==0x4c && std::to_integer<unsigned>(expected[offset+1])==0x8b)offset+=3;
+                    else if((opcode==0x48 || opcode==0x4c) && std::to_integer<unsigned>(expected[offset+1])==0x89)
+                        offset+=std::to_integer<unsigned>(expected[offset+3])==0x24?5:4;
+                    else offset+=opcode==0x40 || opcode==0x41?2:1;
+                }
+                if(!hooks_[i].install(target,detours[i],{expected.data(),length}))return false;
+            }
+            installed_=true;
+        }
+        return true;
+    }
+    static auto subscribe(std::function<void(const event&)> callback) -> class_observer_id {
+        if(!callback || !ensure_installed())return 0;
+        std::lock_guard lock{setup_mutex_};
+        auto node=std::make_unique<callback_node>();node->callback=std::move(callback);
+        node->id=next_id_++;node->previous=callbacks_.load(std::memory_order_relaxed);auto* result=node.get();
+        retained_callbacks_.push_back(std::move(node));callbacks_.store(result,std::memory_order_release);
+        return result->id;
+    }
+    static auto remove(class_observer_id id) noexcept -> bool {
+        for(auto* node=callbacks_.load(std::memory_order_acquire);node;node=node->previous) {
+            if(node->id==id)return node->enabled.exchange(false,std::memory_order_acq_rel);
+        }
+        return false;
+    }
+    static auto remove_all() noexcept -> void {
+        for(auto* node=callbacks_.load(std::memory_order_acquire);node;node=node->previous)
+            node->enabled.store(false,std::memory_order_release);
+    }
+    static auto archive_capacity_exceeded() noexcept -> bool {return archive_table_full_.load(std::memory_order_acquire);}
+    static auto notifying() noexcept -> bool {return callback_depth_!=0;}
+};
+}
+
+export namespace vmhook::detail {
+    inline auto add_class_observer(std::function<void(const vmhook::class_load_event&)> callback)
+        -> vmhook::class_observer_id {
+        try{return class_events::observer::subscribe(std::move(callback));}catch(...){return 0;}
+    }
+    inline auto erase_class_observer(vmhook::class_observer_id id) noexcept -> bool {
+        return class_events::observer::remove(id);
+    }
+    inline auto disable_class_observers() noexcept -> void {class_events::observer::remove_all();}
+    inline auto class_event_notification_active() noexcept -> bool {return class_events::observer::notifying();}
+    inline auto ensure_class_events_installed() noexcept -> bool {
+        try{return class_events::observer::ensure_installed();}catch(...){return false;}
+    }
+}
+
+// Synchronous static getstatic/putstatic interception. Code and registry readers
+// remain resident while a JVM thread may still be inside a generated stub.
+export namespace vmhook::detail
+{
+    using borrowed_callback = void(*)(void*);
+    inline auto borrowed_callback_supported() noexcept -> bool;
+    inline auto execute_borrowed_callback(hotspot::java_thread*, hotspot::detour_java_anchor_t,
+                                         borrowed_callback, void*) noexcept -> bool;
+    inline auto retain_hook_klass(hotspot::klass*) noexcept -> std::shared_ptr<void>;
+    inline auto prepare_hook_roots() noexcept -> bool;
+}
+export namespace vmhook::detail::jit_backend
+{
+    inline auto at_safepoint(void (*)(void*) noexcept, void*) noexcept -> bool;
+    inline auto acquire_field_interpretation() noexcept -> bool;
+    inline auto release_field_interpretation() noexcept -> void;
+}
+export namespace vmhook::detail::field_backend
+{
+    namespace pn = vmhook::detail::private_native;
+    enum class action : std::uint64_t { allow, read_result, skip_write, replace_write, throw_pending };
+    struct packet
+    {
+        bool write{};
+        char descriptor{};
+        std::uint64_t bits{};
+        action result{action::allow};
+    };
+    struct scratch_frame
+    {
+        std::uint64_t result{}, bits{}, width{}, reserved{};
+        std::array<std::byte,96> vectors{};
+        std::uint64_t rbp{}, r11{}, r10{}, r9{}, r8{}, rdx{}, rcx{}, rax{}, flags{};
+    };
+    static_assert(sizeof(scratch_frame)==200);
+    struct site
+    {
+        std::uint8_t* patch{};
+        std::uint8_t* dispatch{};
+        std::uint8_t* generated{};
+        bool write{};
+        std::array<std::uint8_t,8> original{};
+        std::array<std::uint8_t,8> replacement{};
+        std::size_t patch_size{};
+        std::uint8_t bcp_displacement{}, locals_displacement{};
+        bool relative_locals{};
+    };
+    struct binding
+    {
+        std::uint64_t id{};
+        hotspot::klass* holder{};
+        std::uint32_t offset{};
+        char descriptor{};
+        std::type_index wrapper{typeid(void)};
+        std::string name{};
+        std::shared_ptr<void> metadata_root{};
+        std::function<void(packet&)> invoke{};
+    };
+    struct snapshot { std::vector<std::shared_ptr<binding>> fields{}; };
+    inline std::mutex writer_mutex{};
+    inline std::atomic<const snapshot*> published{};
+    inline std::atomic<std::size_t> readers{};
+    inline std::atomic<bool> retired_possible{};
+    inline std::vector<std::unique_ptr<snapshot>> snapshots{};
+    inline std::uint64_t next_id{1};
+    inline site read_site{}, write_site{};
+    inline bool installed{}, interpretation_owned{}, resolved_entries{};
+    inline std::size_t cache_size{}, holder_offset{}, offset_offset{}, pending_offset{};
+    inline void* throw_entry{};
+
+    struct reader final
+    {
+        const snapshot* view{};
+        bool held{true};
+        reader() noexcept
+        { readers.fetch_add(1,std::memory_order_seq_cst); this->view=published.load(std::memory_order_seq_cst); }
+        auto release() noexcept -> void
+        { if(this->held) { this->held=false; readers.fetch_sub(1,std::memory_order_seq_cst); } }
+        ~reader() { this->release(); }
+        reader(const reader&)=delete;
+        auto operator=(const reader&) -> reader& = delete;
+    };
+    // Retired callbacks/root tokens are destroyed outside the registry mutex.
+    inline auto collect_locked(std::vector<std::unique_ptr<snapshot>>& retired) noexcept -> void
+    {
+        if(readers.load(std::memory_order_seq_cst)!=0) { return; }
+        const auto* current=published.load(std::memory_order_seq_cst);
+        for(auto& old:snapshots) { if(old.get()!=current) { retired.push_back(std::move(old)); } }
+        std::erase_if(snapshots,[](const auto& old){return !old;});
+        retired_possible.store(false,std::memory_order_release);
+    }
+    inline auto publish_locked(std::unique_ptr<snapshot> next) noexcept -> void
+    {
+        const auto* current=next.get();
+        if(next) { snapshots.push_back(std::move(next)); }
+        published.store(current,std::memory_order_seq_cst);
+        retired_possible.store(true,std::memory_order_release);
+    }
+    inline auto collect_native() noexcept -> void
+    {
+        if(!retired_possible.load(std::memory_order_acquire)) { return; }
+        try
+        {
+            std::vector<std::unique_ptr<snapshot>> retired{};
+            {
+                std::lock_guard lock{writer_mutex};
+                retired.reserve(snapshots.size());
+                collect_locked(retired);
+            }
+            retired.clear();
+            vmhook::detail::flush_hook_roots();
+        }
+        catch(...) {}
+    }
+    struct invocation { const std::shared_ptr<binding>* selected{}; reader* hazard{}; packet event{}; };
+    inline auto invoke_user(void* opaque) -> void
+    {
+        auto& call=*static_cast<invocation*>(opaque);
+        // Copy ownership only after entering native state. Registry mutations
+        // may now reclaim the snapshot; captured objects retire in native state.
+        const auto selected=*call.selected;
+        call.hazard->release();
+        collect_native();
+        selected->invoke(call.event);
+    }
+    inline auto bridge(void* frame, void* thread, scratch_frame* scratch, site* current) noexcept -> void
+    {
+        scratch->result=static_cast<std::uint64_t>(action::allow);
+        reader selected_view{};
+        if(!selected_view.view) { return; }
+        const auto* entry=reinterpret_cast<const std::byte*>(scratch->rcx)
+            +(resolved_entries?0:cache_size+scratch->rdx*8);
+        const auto holder=pn::load<void*>(entry,holder_offset);
+        const auto offset=resolved_entries?pn::load<std::uint32_t>(entry,offset_offset)
+            :pn::load<std::uint64_t>(entry,offset_offset);
+        const std::shared_ptr<binding>* selected{};
+        for(const auto& candidate:selected_view.view->fields)
+        { if(candidate->holder==holder&&candidate->offset==offset) { selected=&candidate; break; } }
+        if(!selected) { return; }
+        const auto descriptor=(*selected)->descriptor;
+        invocation call{selected,&selected_view,{current->write,descriptor}};
+        auto* java_sp=reinterpret_cast<std::byte*>(scratch)+sizeof(*scratch);
+        if(current->write) { std::memcpy(&call.event.bits,java_sp,sizeof(call.event.bits)); }
+        const hotspot::detour_java_anchor_t anchor{java_sp,frame,current->patch,true};
+        if(vmhook::detail::execute_borrowed_callback(static_cast<hotspot::java_thread*>(thread),
+            anchor,&invoke_user,&call))
+        {
+            scratch->result=static_cast<std::uint64_t>(call.event.result);
+            scratch->bits=call.event.bits;
+            scratch->width=descriptor=='J'||descriptor=='D'?16:8;
+        }
+        // VM->Java may itself deliver an asynchronous exception. The original
+        // operand stack is still intact; the throw path consumes no field value.
+        if(pn::load<void*>(thread,pending_offset))
+        { scratch->result=static_cast<std::uint64_t>(action::throw_pending); }
+    }
+    struct assembler
+    {
+        std::vector<std::uint8_t> data{};
+        auto emit(std::initializer_list<std::uint8_t> bytes) -> void
+        { this->data.insert(this->data.end(),bytes); }
+        template<class T> auto value(const T value) -> void
+        { const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value); this->data.insert(this->data.end(),bytes,bytes+sizeof value); }
+        auto branch(std::initializer_list<std::uint8_t> operation) -> std::size_t
+        { this->emit(operation); const auto at=this->data.size(); this->value<std::int32_t>(0); return at; }
+        auto label(const std::size_t at) -> void
+        { const auto displacement=static_cast<std::int32_t>(this->data.size()-at-4); std::memcpy(this->data.data()+at,&displacement,4); }
+        auto jump(const void* target) -> void
+        { this->emit({0xff,0x25,0,0,0,0}); this->value(target); }
+    };
+    inline auto restore(assembler& code,const site& current) -> void
+    {
+        code.emit({0x48,0x83,0xc4,0x20});
+        for(std::uint8_t index{};index<6;++index)
+        { code.emit({0xf3,0x0f,0x6f,static_cast<std::uint8_t>(0x44+index*8),0x24,static_cast<std::uint8_t>(index*16)}); }
+        code.emit({0x48,0x83,0xc4,0x60,0x5d,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x9d});
+        code.emit({0x4c,0x8b,0x6d,current.bcp_displacement,0x4c,0x8b,0x75,current.locals_displacement});
+        if(current.relative_locals) { code.emit({0x4e,0x8d,0x74,0xf5,0}); }
+    }
+    inline auto prepare_stub(site& current) -> void
+    {
+        using namespace vmhook::windows;
+        assembler code{};
+        code.emit({0x4c,0x89,0x6d,current.bcp_displacement});
+        code.emit({0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x55,0x48,0x83,0xec,0x60});
+        for(std::uint8_t index{};index<6;++index)
+        { code.emit({0xf3,0x0f,0x7f,static_cast<std::uint8_t>(0x44+index*8),0x24,static_cast<std::uint8_t>(index*16)}); }
+        code.emit({0x48,0x83,0xec,0x20});
+        code.emit({0x48,0x89,0xe9,0x4c,0x89,0xfa,0x4c,0x8d,0x04,0x24,0x49,0xb9}); code.value(&current);
+        code.emit({0x48,0x89,0xe5,0x48,0x83,0xe4,0xf0,0x48,0x83,0xec,0x20,0x48,0xb8}); code.value(&bridge);
+        code.emit({0xff,0xd0,0x48,0x89,0xec});
+        code.emit({0x48,0x83,0x3c,0x24,0x04}); const auto pending=code.branch({0x0f,0x84});
+        if(current.write)
+        {
+            code.emit({0x48,0x83,0x3c,0x24,0x03}); const auto unchanged=code.branch({0x0f,0x85});
+            // Primitive replacement occupies the existing Java stack slot. The
+            // original field template applies truncation and collector barriers.
+            code.emit({0x48,0x8b,0x44,0x24,0x08,0x48,0x89,0x84,0x24,0xc8,0,0,0});
+            code.emit({0x48,0xc7,0x04,0x24,0,0,0,0}); code.label(unchanged);
+        }
+        code.emit({0x48,0x83,0x3c,0x24,0}); const auto handled=code.branch({0x0f,0x85});
+        restore(code,current);
+        code.data.insert(code.data.end(),current.original.begin(),current.original.begin()+current.patch_size);
+        code.jump(current.patch+current.patch_size);
+        code.label(handled);
+        code.emit({0x48,0x83,0x7c,0x24,0x10,0x10}); const auto wide=code.branch({0x0f,0x84});
+        if(current.write)
+        {
+            restore(code,current); code.emit({0x48,0x83,0xc4,0x08});
+            code.emit({0xf0,0x83,0x04,0x24,0}); code.jump(current.dispatch);
+        }
+        else
+        {
+            code.emit({0x48,0x8b,0x44,0x24,0x08,0x48,0x89,0x84,0x24,0xb8,0,0,0});
+            restore(code,current); code.emit({0x50}); code.jump(current.dispatch);
+        }
+        code.label(wide);
+        if(current.write)
+        {
+            restore(code,current); code.emit({0x48,0x83,0xc4,0x10});
+            code.emit({0xf0,0x83,0x04,0x24,0}); code.jump(current.dispatch);
+        }
+        else
+        {
+            code.emit({0x48,0x8b,0x44,0x24,0x08,0x48,0x89,0x84,0x24,0xb8,0,0,0});
+            restore(code,current); code.emit({0x48,0x83,0xec,0x10,0x48,0x89,0x04,0x24,0x48,0xc7,0x44,0x24,0x08,0,0,0,0});
+            code.jump(current.dispatch);
+        }
+        code.label(pending); restore(code,current);
+        code.emit({0x49,0x8b,0x87}); code.value(static_cast<std::uint32_t>(pending_offset));
+        code.emit({0x49,0xc7,0x87}); code.value(static_cast<std::uint32_t>(pending_offset)); code.value<std::uint32_t>(0);
+        code.jump(throw_entry);
+        current.generated=hotspot::allocate_nearby_memory(current.patch,code.data.size());
+        if(!current.generated) { throw std::runtime_error("Static field ASM allocation failed"); }
+        std::memcpy(current.generated,code.data.data(),code.data.size());
+        DWORD protection{};
+        if(!VirtualProtect(current.generated,code.data.size(),page_execute_read,&protection)
+            ||!FlushInstructionCache(GetCurrentProcess(),current.generated,code.data.size()))
+        { throw std::runtime_error("Static field ASM publication failed"); }
+        const auto distance=reinterpret_cast<std::intptr_t>(current.generated)-reinterpret_cast<std::intptr_t>(current.patch+5);
+        if(distance<std::numeric_limits<std::int32_t>::min()||distance>std::numeric_limits<std::int32_t>::max())
+        { throw std::runtime_error("Static field ASM branch out of range"); }
+        current.replacement={0xe9,0,0,0,0,0x90,0x90,0x90};
+        const auto displacement=static_cast<std::int32_t>(distance);
+        std::memcpy(current.replacement.data()+1,&displacement,4);
+    }
+    struct patch_transaction { bool success{}; };
+    inline auto patch_at_safepoint(void* opaque) noexcept -> void
+    {
+        using namespace vmhook::windows;
+        auto& transaction=*static_cast<patch_transaction*>(opaque);
+        const std::array<site*,2> targets{&read_site,&write_site};
+        std::array<DWORD,2> protections{};
+        for(const auto* target:targets)
+        { if(std::memcmp(target->patch,target->original.data(),target->patch_size)) { return; } }
+        std::size_t writable{};
+        for(;writable<targets.size();++writable)
+        {
+            const auto* target=targets[writable];
+            if(!VirtualProtect(target->patch,target->patch_size,page_execute_readwrite,&protections[writable])) { break; }
+        }
+        if(writable==targets.size())
+        {
+            for(const auto* target:targets) { std::memcpy(target->patch,target->replacement.data(),target->patch_size); }
+            transaction.success=true;
+            for(const auto* target:targets)
+            { if(!FlushInstructionCache(GetCurrentProcess(),target->patch,target->patch_size)) { transaction.success=false; } }
+            if(!transaction.success)
+            {
+                for(const auto* target:targets)
+                {
+                    std::memcpy(target->patch,target->original.data(),target->patch_size);
+                    FlushInstructionCache(GetCurrentProcess(),target->patch,target->patch_size);
+                }
+            }
+        }
+        while(writable)
+        {
+            const auto index=--writable; const auto* target=targets[index]; DWORD ignored{};
+            VirtualProtect(target->patch,target->patch_size,protections[index],&ignored);
+        }
+    }
+    inline auto vm_offset(const char* owner,const char* member) -> std::size_t
+    {
+        auto& runtime=pn::rt();
+        const auto* entry=hotspot::iterate_struct_entries(owner,member);
+        if(entry)
+        {
+            if(runtime.has_field(owner,member)&&runtime.off(owner,member)!=entry->offset)
+            { throw std::runtime_error("Static field VMStruct/PDB layout disagreement"); }
+            return entry->offset;
+        }
+        return runtime.off(owner,member);
+    }
+    inline auto find_site(unsigned opcode,bool write) -> site {
+      const auto* code=vmhook::hotspot::iterate_struct_entries("AbstractInterpreter","_code");
+      if (!code||!code->address)throw std::runtime_error("Interpreter code queue missing");
+      auto* queue=pn::load<void*>(code->address,0);
+      auto* buffer=pn::load<std::uint8_t*>(queue,vm_offset("StubQueue","_stub_buffer"));
+      const int limit=pn::load<int>(queue,vm_offset("StubQueue","_buffer_limit"));
+      const int end=pn::load<int>(queue,vm_offset("StubQueue","_queue_end"));
+      int index=pn::load<int>(queue,vm_offset("StubQueue","_queue_begin"));
+      const int count=pn::load<int>(queue,vm_offset("StubQueue","_number_of_stubs"));
+      if (!buffer||limit<=0||limit>16*1024*1024||count<=0||count>4096)throw std::runtime_error("Interpreter queue bounds invalid");
+      for(int visited=0;visited<count;++visited) {
+        if(index<0||index>=limit)throw std::runtime_error("Interpreter codelet index invalid");
+        auto* stub=buffer+index;
+        const int size=pn::load<int>(stub,vm_offset("InterpreterCodelet","_size"));
+        if(size<16||size>limit-index)throw std::runtime_error("Interpreter codelet size invalid");
+        if(pn::load<int>(stub,vm_offset("InterpreterCodelet","_bytecode"))==static_cast<int>(opcode)) {
+          site found;found.write=write;
+          std::array<std::uint8_t, 9> signature{};
+          std::size_t signature_size{};
+          if(!resolved_entries) {
+            const auto f2=cache_size+offset_offset;
+            const auto flags=cache_size+vm_offset("ConstantPoolCacheEntry","_flags");
+            if(f2>127||flags>127)throw std::runtime_error("CP cache displacement unsupported");
+            signature={0x48,0x8b,0x5c,0xd1,static_cast<std::uint8_t>(f2),0x8b,0x44,0xd1,static_cast<std::uint8_t>(flags)};
+            signature_size=9;
+            found.patch_size=5;
+          } else {
+            const auto flags=vm_offset("ResolvedFieldEntry","_flags");
+            if(offset_offset>127||flags>127)throw std::runtime_error("Resolved field displacement unsupported");
+            signature={0x8b,0x59,static_cast<std::uint8_t>(offset_offset),0x0f,0xb6,static_cast<std::uint8_t>(write?0x41:0x51),static_cast<std::uint8_t>(flags)};
+            signature_size=7;
+            found.patch_size=7;
+          }
+          for(int at=static_cast<int>(pn::rt().size("InterpreterCodelet"));at+static_cast<int>(signature_size)<=size;++at) {
+            if(!std::memcmp(stub+at,signature.data(),signature_size)) {
+              if(found.patch)throw std::runtime_error("Ambiguous static-field metadata injection");
+              found.patch=stub+at;
+              std::memcpy(found.original.data(),found.patch,found.patch_size);
+            }
+          }
+          if(!found.patch&&resolved_entries) {
+            const auto flags=vm_offset("ResolvedFieldEntry","_flags");
+            signature={0x48,0x63,0x59,static_cast<std::uint8_t>(offset_offset),0x0f,0xb6,static_cast<std::uint8_t>(write?0x41:0x51),static_cast<std::uint8_t>(flags)};
+            signature_size=8;
+            found.patch_size=8;
+            for(int at=static_cast<int>(pn::rt().size("InterpreterCodelet"));at+static_cast<int>(signature_size)<=size;++at) {
+              if(!std::memcmp(stub+at,signature.data(),signature_size)) {
+                if(found.patch)throw std::runtime_error("Ambiguous static-field metadata injection");
+                found.patch=stub+at;std::memcpy(found.original.data(),found.patch,found.patch_size);
+              }
+            }
+          }
+          if(!found.patch) { throw std::runtime_error("Static-field metadata injection signature missing"); }
+          for(auto* at=stub+pn::rt().size("InterpreterCodelet");at+4<found.patch;++at) {
+            if(at[0]==0x4c&&at[1]==0x89&&at[2]==0x6d)found.bcp_displacement=at[3];
+            if(at[0]==0x4c&&at[1]==0x8b&&at[2]==0x75) {
+              found.locals_displacement=at[3];
+              constexpr std::array<std::uint8_t,5> lea{0x4e,0x8d,0x74,0xf5,0};
+              found.relative_locals=at+9<=found.patch&&!std::memcmp(at+4,lea.data(),lea.size());
+            }
+          }
+          if(!found.bcp_displacement||!found.locals_displacement)throw std::runtime_error("Interpreter bcp/locals restoration signature missing");
+          std::uint8_t* core{};
+          constexpr std::array<std::uint8_t,5> index_load{0x41,0x0f,0xb7,0x55,0x01};
+          for(auto* at=stub+pn::rt().size("InterpreterCodelet");at+9<found.patch;++at) {
+            if(std::memcmp(at,index_load.data(),index_load.size()))continue;
+            const auto cache_disp=static_cast<std::uint8_t>(found.bcp_displacement+16);
+            if(resolved_entries) {
+              if(at>=stub+20&&at[-4]==0x48&&at[-3]==0x8b&&at[-2]==0x4d&&at[-1]==cache_disp){core=at-4;break;}
+            } else if(at[5]==0x48&&at[6]==0x8b&&at[7]==0x4d&&at[8]==cache_disp){core=at;break;}
+          }
+          if(!core)throw std::runtime_error("Interpreter field template entry is not verified");
+          for(auto* at=core;at<found.patch;) {
+            const auto length=vmhook::hotspot::interpreter_instruction_size(at,static_cast<std::size_t>(found.patch-at));
+            if(!length)throw std::runtime_error("Field injection is not on a decoded instruction boundary");
+            at+=length;
+          }
+          constexpr std::array<std::uint8_t,9> dispatch{0x41,0x0f,0xb6,0x5d,0x03,0x49,0x83,0xc5,0x03};
+          for(auto* at=found.patch+found.patch_size;at+dispatch.size()<=stub+size;++at) {
+            if(!std::memcmp(at,dispatch.data(),dispatch.size())) {
+              if(found.dispatch)throw std::runtime_error("Ambiguous static-field dispatch epilog");
+              found.dispatch=at;
+            }
+          }
+          if(!found.dispatch)throw std::runtime_error("Static-field dispatch epilog missing");
+          return found;
+        }
+        index+=size;if(index==limit&&end<limit)index=0;
+      }
+      throw std::runtime_error("Static-field interpreter codelet missing");
+    }
+    inline auto prepare_sites() -> void
+    {
+        auto& runtime=pn::rt();
+        if(!runtime.ready||!vmhook::detail::borrowed_callback_supported())
+        { throw std::runtime_error("Static field callback lifecycle unavailable"); }
+        resolved_entries=runtime.profile->java_feature>=22;
+        if(resolved_entries)
+        {
+            holder_offset=vm_offset("ResolvedFieldEntry","_field_holder");
+            offset_offset=vm_offset("ResolvedFieldEntry","_field_offset");
+        }
+        else
+        {
+            cache_size=runtime.type_size("ConstantPoolCache");
+            if(runtime.has_type("ConstantPoolCache")&&runtime.size("ConstantPoolCache")!=cache_size)
+            { throw std::runtime_error("Constant pool cache size disagreement"); }
+            holder_offset=vm_offset("ConstantPoolCacheEntry","_f1");
+            offset_offset=vm_offset("ConstantPoolCacheEntry","_f2");
+        }
+        if(runtime.size("InterpreterCodelet")<16||runtime.size("InterpreterCodelet")>256)
+        { throw std::runtime_error("Unsupported interpreter codelet header"); }
+        pending_offset=runtime.off("JavaThread","_pending_exception");
+        if(pending_offset>std::numeric_limits<std::int32_t>::max())
+        { throw std::runtime_error("Unsupported pending exception displacement"); }
+        throw_entry=pn::load<void*>(runtime.function("field_throw_exception_entry"),0);
+        const auto* code=hotspot::iterate_struct_entries("AbstractInterpreter","_code");
+        if(!code||!code->address) { throw std::runtime_error("Interpreter code queue missing"); }
+        auto* queue=pn::load<void*>(code->address,0);
+        const auto begin=pn::load<std::uintptr_t>(queue,vm_offset("StubQueue","_stub_buffer"));
+        const auto limit=pn::load<int>(queue,vm_offset("StubQueue","_buffer_limit"));
+        const auto target=reinterpret_cast<std::uintptr_t>(throw_entry);
+        if(limit<=0||limit>16*1024*1024||target<begin||target-begin>=static_cast<std::size_t>(limit))
+        { throw std::runtime_error("Interpreter throw continuation outside verified code queue"); }
+        read_site=find_site(178,false); write_site=find_site(179,true);
+        prepare_stub(read_site); prepare_stub(write_site);
+    }
+    inline auto add(std::shared_ptr<binding> added) -> std::uint64_t
+    {
+        auto* caller=pn::rt().current_thread();
+        if(caller&&pn::thread_state(caller)!=4)
+        { throw std::runtime_error("Static field hook administration requires native thread state"); }
+        std::vector<std::unique_ptr<snapshot>> retired{};
+        std::lock_guard lock{writer_mutex};
+        if(hotspot::g_shutdown_requested.load(std::memory_order_acquire)) { return 0; }
+        const auto* current=published.load(std::memory_order_seq_cst);
+        if(current)
+        {
+            for(const auto& previous:current->fields)
+            { if(previous->holder==added->holder&&previous->offset==added->offset) { return 0; } }
+        }
+        auto next=std::make_unique<snapshot>();
+        if(current) { next->fields=current->fields; }
+        added->id=next_id++;
+        next->fields.push_back(added);
+        snapshots.reserve(snapshots.size()+1);
+        retired.reserve(snapshots.size()+1);
+        const bool first=!current||current->fields.empty();
+        if(installed&&(std::memcmp(read_site.patch,read_site.replacement.data(),read_site.patch_size)
+            ||std::memcmp(write_site.patch,write_site.replacement.data(),write_site.patch_size)))
+        { throw std::runtime_error("Installed static field ASM was changed by another writer"); }
+        if(!installed) { prepare_sites(); }
+        if(first)
+        {
+            if(!jit_backend::acquire_field_interpretation()) { return 0; }
+            interpretation_owned=true;
+        }
+        if(!installed)
+        {
+            patch_transaction transaction{};
+            if(!jit_backend::at_safepoint(&patch_at_safepoint,&transaction)||!transaction.success)
+            {
+                if(first) { jit_backend::release_field_interpretation(); interpretation_owned=false; }
+                return 0;
+            }
+            installed=true;
+        }
+        publish_locked(std::move(next));
+        collect_locked(retired);
+        return added->id;
+    }
+    template<typename predicate_type>
+    inline auto remove(predicate_type predicate) noexcept -> bool
+    {
+        try
+        {
+            if(!published.load(std::memory_order_seq_cst)) { return false; }
+            auto* caller=pn::rt().current_thread();
+            if(caller&&pn::thread_state(caller)!=4) { return false; }
+            std::vector<std::unique_ptr<snapshot>> retired{};
+            bool removed{};
+            {
+                std::lock_guard lock{writer_mutex};
+                const auto* current=published.load(std::memory_order_seq_cst);
+                if(!current) { return false; }
+                auto next=std::make_unique<snapshot>();
+                next->fields.reserve(current->fields.size());
+                for(const auto& existing:current->fields)
+                {
+                    if(predicate(*existing)) { removed=true; }
+                    else { next->fields.push_back(existing); }
+                }
+                if(!removed) { return false; }
+                snapshots.reserve(snapshots.size()+1);
+                retired.reserve(snapshots.size()+1);
+                const bool last=next->fields.empty();
+                publish_locked(last?nullptr:std::move(next));
+                collect_locked(retired);
+                if(last&&interpretation_owned)
+                { jit_backend::release_field_interpretation(); interpretation_owned=false; }
+            }
+            retired.clear();
+            vmhook::detail::flush_hook_roots();
+            return removed;
+        }
+        catch(const std::exception& error)
+        { vmhook::detail::log_line("{} static field hook removal: {}",vmhook::error_tag,error.what()); return false; }
+        catch(...) { return false; }
+    }
+}
+export namespace vmhook::detail
+{
+    struct field_event_transport
+    {
+        template<typename value_type,typename callback_type>
+        static auto deliver(callback_type& callback,field_backend::packet& packet) -> void
+        {
+            value_type incoming{};
+            if(packet.write)
+            {
+                if constexpr(std::is_same_v<value_type,bool>) { incoming=(packet.bits&1)!=0; }
+                else { std::memcpy(&incoming,&packet.bits,sizeof incoming); }
+            }
+            field_access<value_type> event{packet.write,incoming};
+            callback(event);
+            if(packet.write)
+            {
+                packet.result=event.prevented_?field_backend::action::skip_write
+                    :event.replaced_?field_backend::action::replace_write:field_backend::action::allow;
+            }
+            else
+            { packet.result=event.prevented_||event.replaced_?field_backend::action::read_result:field_backend::action::allow; }
+            if(packet.result==field_backend::action::read_result||packet.result==field_backend::action::replace_write)
+            {
+                const auto result=event.replaced_?event.value_:value_type{};
+                packet.bits=0;
+                if constexpr(std::is_integral_v<value_type>&&sizeof(value_type)<4)
+                {
+                    if(packet.descriptor=='B') { packet.bits=static_cast<std::uint64_t>(static_cast<std::int8_t>(result)); }
+                    else if(packet.descriptor=='S') { packet.bits=static_cast<std::uint64_t>(static_cast<std::int16_t>(result)); }
+                    else { packet.bits=static_cast<std::uint64_t>(result); }
+                }
+                else { std::memcpy(&packet.bits,&result,sizeof result); }
+            }
+        }
+    };
+    template<class wrapper_type,typename field_type,typename callback_type>
+    inline auto install_field_hook(std::string_view name,callback_type callback) -> std::uint64_t
+    {
+        if constexpr(!std::is_arithmetic_v<field_type>
+            ||(sizeof(field_type)!=1&&sizeof(field_type)!=2&&sizeof(field_type)!=4&&sizeof(field_type)!=8)
+            ||!std::is_same_v<field_type,std::remove_cvref_t<field_type>>)
+        { return 0; }
+        else
+        {
+            static_assert(std::is_invocable_v<callback_type&,field_access<field_type>&>,
+                "hook_field callback must accept field_access<FieldType>&.");
+            try
+            {
+                std::unique_ptr<native_thread_context> installer{};
+                if(!native_backend::active())
+                {
+                    installer=std::make_unique<native_thread_context>("VMHook-field-install");
+                    if(!installer->valid()) { return 0; }
+                }
+                auto* caller=private_native::rt().current_thread();
+                if(!caller||private_native::thread_state(caller)!=4) { return 0; }
+                if(!prepare_hook_roots()) { return 0; }
+                auto added=std::make_shared<field_backend::binding>();
+                added->wrapper=std::type_index{typeid(wrapper_type)};
+                added->name=name;
+                added->invoke=[callback=std::make_shared<callback_type>(std::move(callback))]
+                    (field_backend::packet& event) mutable
+                { field_event_transport::deliver<field_type>(*callback,event); };
+                {
+                    native_backend::operation access{};
+                    if(!access) { return 0; }
+                    const auto class_name=registered_class_name<wrapper_type>();
+                    auto* klass=vmhook::find_class(class_name);
+                    if(!klass) { return 0; }
+                    const auto field=vmhook::find_field(klass,name);
+                    if(!field||!field->is_static||field->signature!=jvm_descriptor_for_arg<field_type>()) { return 0; }
+                    added->holder=field->declaring_klass?field->declaring_klass:klass;
+                    added->offset=field->offset;
+                    added->descriptor=field->signature.front();
+                    added->metadata_root=retain_hook_klass(added->holder);
+                    if(!added->metadata_root) { return 0; }
+                }
+                const auto id=field_backend::add(std::move(added));
+                flush_hook_roots();
+                return id;
+            }
+            catch(const std::exception& error)
+            { vmhook::detail::log_line("{} hook_field('{}'): {}",vmhook::error_tag,name,error.what()); return 0; }
+            catch(...) { return 0; }
+        }
+    }
+    inline auto remove_field_hook_id(const std::uint64_t id) noexcept -> bool
+    { return field_backend::remove([id](const auto& candidate){return candidate.id==id;}); }
+    inline auto shutdown_field_hooks() noexcept -> void
+    {
+        std::vector<std::unique_ptr<field_backend::snapshot>> retired{};
+        try
+        {
+            auto* caller=private_native::rt().current_thread();
+            if(caller&&private_native::thread_state(caller)!=4) { return; }
+            std::lock_guard lock{field_backend::writer_mutex};
+            field_backend::published.store(nullptr,std::memory_order_seq_cst);
+            field_backend::retired_possible.store(true,std::memory_order_release);
+            if(field_backend::readers.load(std::memory_order_seq_cst)==0)
+            { retired.swap(field_backend::snapshots); field_backend::retired_possible.store(false,std::memory_order_release); }
+            if(field_backend::interpretation_owned)
+            { jit_backend::release_field_interpretation(); field_backend::interpretation_owned=false; }
+        }
+        catch(...) {}
+        retired.clear();
+        flush_hook_roots();
+    }
+}
+export namespace vmhook
+{
+    // Covers Java getstatic/putstatic bytecodes, including previously compiled
+    // and inlined accessors after the JIT installation transaction. Compile-time
+    // constants, reflection, Unsafe and VM-native accesses have no such bytecode.
+    // Callback runs synchronously on the executing JavaThread, in native state;
+    // Java wrappers may reenter with a temporary rooted context. References are
+    // rejected until their replacement/collector protocol is implemented.
+    template<class wrapper_type,typename field_type,typename callback_type>
+    inline auto hook_field(std::string_view name,callback_type callback) -> bool
+    { return detail::install_field_hook<wrapper_type,field_type>(name,std::move(callback))!=0; }
+    template<class wrapper_type>
+    inline auto unhook_field(std::string_view name) noexcept -> bool
+    {
+        const auto wrapper=std::type_index{typeid(wrapper_type)};
+        return detail::field_backend::remove([&](const auto& candidate)
+            {return candidate.wrapper==wrapper&&candidate.name==name;});
+    }
+}
+
+
+// VMHOOK_PERSISTENT_ROOTS_BEGIN
+export namespace vmhook::detail::persistent_hook_roots {
+namespace pn = vmhook::detail::private_native;
+inline bool is_java_thread(void* current) noexcept {
+    if (!current) { return false; }
+    try {
+        const auto& runtime = pn::rt();
+        if (!runtime.ready || runtime.uses_external_symbols()) { return false; }
+        const auto slot = runtime.enum_value("ObservationABI", "thread_is_java_slot");
+        if (slot < 0 || slot > 128) { return false; }
+        const auto table = reinterpret_cast<std::uintptr_t>(pn::load<void*>(current, 0));
+        const auto displacement = static_cast<std::size_t>(slot) * sizeof(void*);
+        if (table < runtime.base || table - runtime.base > runtime.image_size
+            || displacement + sizeof(void*) > runtime.image_size - (table - runtime.base)) { return false; }
+        const auto entry = pn::load<std::uintptr_t>(reinterpret_cast<void*>(table), displacement);
+        if (entry < runtime.base || entry - runtime.base >= runtime.image_size) { return false; }
+        // This exact virtual predicate is audited as a non-safepoint getter.
+        return reinterpret_cast<bool(*)(void*)>(entry)(current);
+    } catch (...) { return false; }
+}
+class keeper;
+inline std::atomic<keeper*> prepared_keeper{};
+struct ticket {
+    keeper* owner{};
+    void** slot{};
+    ~ticket();
+};
+
+// The parked daemon owns a permanent, scanned HandleArea. Other mutators may
+// change that area only while in VM state and within a non-safepoint critical
+// section. A stop-the-world root scan therefore cannot overlap these writes.
+class keeper final {
+    std::mutex initialization_mutex_;
+    std::condition_variable initialized_;
+    std::atomic<unsigned> status_{};
+    void* thread_{};
+    void** failure_exception_root_{};
+    std::mutex slots_mutex_;
+    std::vector<void**> released_;
+    std::vector<void**> free_;
+
+    void run() noexcept {
+        try {
+            pn::scoped_attachment attachment{"VMHook-persistent-roots"};
+            if (!attachment.valid()) { throw std::runtime_error("Root keeper attachment failed"); }
+            pn::java_session permanent_roots{attachment.get()};
+            {
+                pn::vm_state_guard access{attachment.get()};
+                auto* const klass = vmhook::find_class("java/lang/OutOfMemoryError");
+                vmhook::hotspot::method** methods{};
+                std::int32_t count{};
+                vmhook::hotspot::method* constructor{};
+                if (klass && vmhook::hotspot::safe_klass_methods(klass, methods, count)) {
+                    for (std::int32_t index{}; index < count; ++index) {
+                        auto* const candidate = methods[index];
+                        if (candidate && candidate->get_name() == "<init>"
+                            && candidate->get_signature() == "()V") { constructor = candidate; break; }
+                    }
+                }
+                failure_exception_root_ = permanent_roots.construct(klass, constructor);
+                if (!failure_exception_root_ || pn::pending_exception(attachment.get())) {
+                    throw std::runtime_error("Cannot prepare the rooted class-policy failure exception");
+                }
+            }
+            {
+                std::lock_guard lock{initialization_mutex_};
+                thread_ = attachment.get();
+                status_.store(1, std::memory_order_release);
+            }
+            initialized_.notify_all();
+            // After preparing its failure exception, this daemon stays parked.
+            // It never services Java-call requests.
+            // Both its attachment and permanent HandleMark live until process exit.
+            std::unique_lock lock{initialization_mutex_};
+            initialized_.wait(lock, [] { return false; });
+        } catch (...) {
+            { std::lock_guard lock{initialization_mutex_}; status_.store(2, std::memory_order_release); }
+            initialized_.notify_all();
+        }
+    }
+    bool writer_in_vm() const noexcept {
+        try {
+            auto* current = pn::rt().current_thread();
+            return status_.load(std::memory_order_acquire) == 1 && is_java_thread(current)
+                && pn::thread_state(current) == 6;
+        } catch (...) { return false; }
+    }
+    void drain_locked() {
+        while (!released_.empty()) {
+            auto** slot = released_.back();
+            free_.push_back(slot);
+            pn::store<void*>(slot, 0, nullptr);
+            released_.pop_back();
+        }
+    }
+public:
+    keeper() {
+        vmhook::windows::HMODULE resident{};
+        if (!vmhook::windows::GetModuleHandleExW(
+                vmhook::windows::module_handle_from_address | vmhook::windows::module_handle_pin,
+                reinterpret_cast<const wchar_t*>(&instance), &resident)) {
+            status_.store(2, std::memory_order_release);
+            return;
+        }
+        std::thread([this] { run(); }).detach();
+    }
+    static keeper& instance() {
+        // The parked thread and the injecting DLL intentionally remain resident.
+        static keeper* value = new keeper;
+        return *value;
+    }
+    bool ready() const noexcept { return status_.load(std::memory_order_acquire) == 1; }
+    void fail_class_preparation(void* thread) const noexcept {
+        try {
+            if (!ready() || !thread || thread != pn::rt().current_thread()
+                || !is_java_thread(thread) || pn::thread_state(thread) != 6
+                || pn::pending_exception(thread)) { return; }
+            // Both threads' HandleAreas are GC-scanned. The current VM-state
+            // mutator cannot cross a safepoint between resolving and publishing
+            // this oop. This failure path allocates nothing and calls no Java.
+            auto* const exception = pn::load<void*>(failure_exception_root_, 0);
+            pn::store(thread, pn::rt().off("JavaThread", "_pending_exception"), exception);
+            const auto origin = std::source_location::current();
+            pn::store(thread, pn::rt().off("ThreadShadow", "_exception_file"), origin.file_name());
+            pn::store(thread, pn::rt().off("ThreadShadow", "_exception_line"),
+                static_cast<std::int32_t>(origin.line()));
+        } catch (...) {}
+    }
+    bool await_ready() {
+        std::unique_lock lock{initialization_mutex_};
+        initialized_.wait(lock, [this] { return status_.load(std::memory_order_acquire) != 0; });
+        return ready();
+    }
+    std::shared_ptr<void> retain(void* oop) noexcept {
+        if (!oop || !writer_in_vm()) { return {}; }
+        try {
+            auto result = std::make_shared<ticket>();
+            // Arena::grow is OS allocation, not Java allocation; the whole
+            // mutation must stay in VM state without a safepoint or Java call.
+            std::lock_guard lock{slots_mutex_};
+            drain_locked();
+            void** slot{};
+            if (!free_.empty()) { slot = free_.back(); free_.pop_back(); pn::store(slot, 0, oop); }
+            else { slot = pn::detail::root_oop(thread_, oop); }
+            if (!slot) { return {}; }
+            result->owner = this;
+            result->slot = slot;
+            return result;
+        } catch (...) { return {}; }
+    }
+    void release(void** slot) noexcept {
+        if (!slot) { return; }
+        try {
+            std::lock_guard lock{slots_mutex_};
+            if (writer_in_vm()) { pn::store<void*>(slot, 0, nullptr); free_.push_back(slot); }
+            else { released_.push_back(slot); }
+        } catch (...) { /* Retain the root if C++ bookkeeping cannot grow. */ }
+    }
+    void drain() noexcept {
+        if (!writer_in_vm()) { return; }
+        try { std::lock_guard lock{slots_mutex_}; drain_locked(); } catch (...) {}
+    }
+};
+inline ticket::~ticket() { if (owner) { owner->release(slot); } }
+
+inline bool prepare() noexcept {
+    try {
+        auto& runtime = pn::rt();
+        if (!runtime.ready || runtime.uses_external_symbols() || !vmhook::vm_capabilities().supported) { return false; }
+        const auto flags = vmhook::detail::read_gc_flags();
+        if (!flags.resolved || flags.use_z || flags.use_shenandoah || flags.use_epsilon
+            || flags.use_serial || (runtime.profile->java_feature == 8 ? !flags.use_parallel : !flags.use_g1)) { return false; }
+        if (auto* current = runtime.current_thread(); current && (!is_java_thread(current) || pn::thread_state(current) != 4)) { return false; }
+        auto& pool = keeper::instance();
+        if (!pool.await_ready()) { return false; }
+        prepared_keeper.store(&pool, std::memory_order_release);
+        return true;
+    } catch (...) { return false; }
+}
+inline std::shared_ptr<void> retain_klass(vmhook::hotspot::klass* klass) noexcept {
+    if (!klass) { return {}; }
+    try {
+        auto* current = pn::rt().current_thread();
+        auto* pool = prepared_keeper.load(std::memory_order_acquire);
+        if (!pool || !is_java_thread(current) || pn::thread_state(current) != 6) { return {}; }
+        return pool->retain(klass->get_java_mirror());
+    } catch (...) { return {}; }
+}
+inline void drain() noexcept {
+    if (auto* pool = prepared_keeper.load(std::memory_order_acquire)) { pool->drain(); }
+}
+}
+
+export namespace vmhook::detail {
+    inline auto fail_class_hook_preparation(void* thread) noexcept -> void {
+        if (auto* pool = persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)) {
+            pool->fail_class_preparation(thread);
+        }
+    }
+    inline auto prepare_hook_roots() noexcept -> bool {
+        return persistent_hook_roots::prepare();
+    }
+    inline auto retain_hook_klass(vmhook::hotspot::klass* klass) noexcept -> std::shared_ptr<void> {
+        return persistent_hook_roots::retain_klass(klass);
+    }
+    inline auto flush_hook_roots() noexcept -> void {
+        if (!persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)) { return; }
+        try {
+            auto& runtime = private_native::rt();
+            if (runtime.has_function("vm_exited") && private_native::load<bool>(runtime.function("vm_exited"),0)) { return; }
+            std::unique_ptr<private_native::scoped_attachment> attachment;
+            auto* thread = runtime.current_thread();
+            if (!thread) {
+                attachment = std::make_unique<private_native::scoped_attachment>("VMHook-root-release");
+                if (!attachment->valid()) { return; }
+                thread = attachment->get();
+            }
+            if (!persistent_hook_roots::is_java_thread(thread)) { return; }
+            const auto state = private_native::thread_state(thread);
+            if (state != 4 && state != 6) { return; }
+            private_native::vm_state_guard access{thread};
+            persistent_hook_roots::drain();
+        } catch (...) {}
+    }
+}
+// VMHOOK_PERSISTENT_ROOTS_END

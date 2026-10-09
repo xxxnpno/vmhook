@@ -2,8 +2,8 @@
 
 VMHook is a C++ library for an injected DLL in a **running Windows x64 HotSpot
 JVM**. Write a small C++ wrapper resembling a Java class, then access its fields,
-call its methods, create objects, or install interpreter hooks. VMHook calls no
-JNI or JVMTI API and requires no JVM launch arguments.
+call its methods, create objects, or hook methods and static field accesses.
+VMHook calls no JNI or JVMTI API and requires no JVM launch arguments.
 
 Java calls and construction can run immediately on the DLL's own OS thread.
 Create a `vmhook::native_thread_context`, then use the same wrapper API. No Java
@@ -17,8 +17,9 @@ hook or dispatch queue is needed for this route.
 Both interfaces target **Windows x64 only** and share the same implementation.
 The supported Java range is **8–27**. Private HotSpot ABIs differ between builds:
 native contexts require an exact built-in image profile or a matching full PDB
-that passes the symbol and layout checks. OpenJ9 and arbitrary vendor builds
-are not covered by a Java-version number alone. See
+that passes the symbol and layout checks. Method hooks, field hooks and class
+notifications currently require a built-in profile. OpenJ9 and arbitrary vendor
+builds are not covered by a Java-version number alone. See
 [native threads and compatibility](docs/native-threads.md).
 
 ## Wrap a Java class
@@ -180,7 +181,8 @@ pointer: do not save or dereference raw heap addresses across GC.
 
 Hooks have explicit persistent lifetime. A callback receives
 `vmhook::return_value&`, followed by the receiver for an instance method and
-then the Java arguments:
+then the Java arguments. Register and remove hooks on a DLL worker, outside
+`DllMain`:
 
 ```cpp
 auto add_hook(vmhook::return_value& result,
@@ -198,15 +200,91 @@ const bool installed = vmhook::hook<Counter>("add", "(I)I", &add_hook);
 
 `result.set_arg(0, value)` replaces the first Java argument, excluding the
 receiver. `cancel()` skips a void method and `set(value)` forces a return.
-`vmhook::shutdown_hooks()` removes callbacks and attempts to restore the
-patched entries. There are no scoped hooks.
+An untouched result lets the original method run. There are no scoped hooks.
 
-VMHook observes HotSpot's shared **interpreter entry stubs**. It leaves
-bytecode, JIT flags and compiled method entries untouched. Compiled or inlined
-calls can bypass hooks; installation does not promise interception of every
-execution. Unsupported stub layouts and foreign patches are refused. Retired
-trampolines remain allocated because VMHook cannot prove that every JVM thread
-has left them; keep the DLL loaded.
+The declaring Java class must already be loaded and linked. Hook registration
+does not load, link or initialize it; a class that is only loaded is refused.
+
+Installation handles a method that has already compiled or been inlined: it
+temporarily pauses compiler dispatch, drains existing compilation tasks,
+performs real HotSpot deoptimization at a VM safepoint, then publishes an ASM
+interpreter stub and its callback. The target stays excluded from compilation
+and inlining while hooked. Unrelated methods can compile again after the
+installation finishes. No JVM launch flags are required.
+
+Method and field callbacks run synchronously on the executing Java thread, in
+native state. They can use the wrapper API to call Java or create objects;
+their temporary roots survive GC until the callback returns. Ordinary Java
+bytecode methods are supported; native, abstract, constructor, class-initializer
+methods and methods with an active HotSpot intrinsic ID are refused. See
+[hooks and notifications](docs/hooks.md)
+for the installation cost, callback lifetime and failure boundaries.
+
+## Hook a static field
+
+Register a callback before Java reads or writes a static primitive field:
+
+```cpp
+const bool installed = vmhook::hook_field<Counter, std::int32_t>("total",
+    [](vmhook::field_access<std::int32_t>& event)
+    {
+        if (event.is_write() && event.value() < 0)
+        {
+            event.prevent(); // Skip this write.
+        }
+        else if (event.is_read())
+        {
+            event.set(42);   // Supply this read's result without reading the field.
+        }
+    });
+
+// Later:
+vmhook::unhook_field<Counter>("total");
+```
+
+The callback is reached through generated ASM stubs in HotSpot's `getstatic`
+and `putstatic` templates. It uses no polling or debug-register watchpoint.
+Previously compiled accessors are deoptimized, and methods containing static
+field bytecodes remain interpreted while any field hook is active, including
+methods in newly loaded classes. This also suppresses accessor intrinsics that
+would bypass those bytecodes. Other methods can continue to compile. Removing
+the last field hook restores VMHook's owned exclusions and accessor entries.
+
+All eight Java primitive types are supported. Reference fields are refused.
+Compile-time constants and accesses through reflection, Unsafe or native VM
+code do not execute these bytecodes and are outside this hook's scope.
+
+## Observe new classes
+
+```cpp
+static std::atomic<std::uint64_t> counter_definitions{};
+const auto observer = vmhook::on_class_loaded(
+    [](const vmhook::class_load_event& event) noexcept
+    {
+        if (event.internal_name == "example/Counter")
+        {
+            counter_definitions.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+// Later:
+vmhook::remove_class_observer(observer);
+```
+
+A nonzero ID means registration succeeded; ignoring it keeps the callback
+installed. Notifications follow successful definitions, including bootstrap,
+ByteBuffer and hidden/anonymous paths, and new or restored array classes.
+Failed definitions do not notify, and already-loaded classes are not replayed.
+`event.defining_loader_data` distinguishes same-name classes from different
+defining loaders. The callback runs in VM state on the loading thread and must
+stay short: do not block, call Java or install hooks from it. Event metadata is
+borrowed for that callback only.
+
+`vmhook::shutdown_hooks()` disables method, field, class and exception
+callbacks and restores owned method compilation flags and entry patches where
+possible. A callback already entered may finish afterward. Retired native
+stubs and class-observer captures remain resident; keep the DLL loaded for the
+JVM's lifetime.
 
 `vmhook::dispatch` remains available for work that should execute on an existing
 Java thread. That optional route needs an installed hook the application keeps
@@ -286,43 +364,45 @@ stores require Epsilon until a write-barrier backend exists; primitive stores
 use a separate path. Typed reference operations require verified compressed
 oops.
 
-Native-context object and String allocation uses VM routines, including on
-Java 27 with default compact headers. Raw array allocation and the older
-Java-callback TLAB assembly paths have narrower layout/allocation requirements.
+Native-context and method-callback object and String allocation uses VM routines,
+including on Java 27 with default compact headers. Raw array allocation has
+narrower layout/allocation requirements.
 Class lookup requires an already-loaded class and can be ambiguous across
 class loaders. The library does not establish safety during concurrent JVM
 shutdown or arbitrary unloading of cached metadata.
 
 [Native-thread documentation](docs/native-threads.md) records the private ABI
 checks, root lifetimes, reproducible runtime tests and exact build scope.
-The [profile manifest](data/native_profiles.json) identifies the built-in
-images. Both interfaces passed all **20 native-thread checks on each Java major
-8–27**, with the JVMs launched normally:
+The [profile manifest](data/native_profiles.json) identifies the built-in images.
+The current source and frozen probe DLLs passed these complete matrices under
+**Wine 10.0**, with ordinary JVM launches and default collectors:
 
-| Interface | Compiler | Wine 10.0 | Native Windows CI |
+| Interface | Compiler | Direct native calls, Java 8–27 | JIT/field/class/callback fixtures, Java 8–27 |
 | --- | --- | --- | --- |
-| C++23 header | MinGW-w64 G++ 14.2 | 400/400 checks passed | 400/400 checks passed |
-| C++23 header | Windows G++ 16.2 | 400/400 checks passed | Public runtime matrix not run |
-| C++26 module | Windows G++ 16.2 | 400/400 checks passed | 400/400 checks passed |
+| C++23 header | MinGW-w64 G++ 14.2 | 20/20 JVMs; 400/400 assertions | 80/80 cases; 940/940 assertions |
+| C++26 module | Windows G++ 16.2 | 20/20 JVMs; 400/400 assertions | 80/80 cases; 940/940 assertions |
 
-Both G++ 16.2 interfaces also passed **360/360 checks each under Wine 10.0** with
-matching-PDB resolution explicitly selected on Java 8 and 11–27. The seven header/source
-checks and six module executable suites passed, as did the README's reflection
-example. The tests include idle GC with moving collectors, actual compiled methods, same-thread
-execution and repeated/concurrent attachment without installing hooks.
+Each observation matrix runs four fixtures per Java major. Its 47 strict
+assertions cover actual compilation and inlining, deoptimization, future
+compilation, all eight primitive field types, new definitions and removal.
+Every callback fixture additionally completes 24 nested calls and rooted
+object returns while independent GC progresses. Source and DLL hashes are
+checked before and after the run. The G++ 14.2 build passed **8/8 CTest suites**. The combined G++ 16.2 header/module build passed **15/15 CTest suites**.
 
-At [commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c),
-both the [push run](https://github.com/xxxnpno/vmhook/actions/runs/37995958477) and
-[PR run](https://github.com/xxxnpno/vmhook/actions/runs/37995966320) of the
-[Windows CI workflow](.github/workflows/build.yml) passed **53/53 jobs** each:
-52 jobs on native Windows Server 2025 and one profile-reproduction job on Ubuntu.
-Each run passed all 40 native-thread jobs across Java 8–27 and both interfaces,
-plus all 10 interpreter/dispatch runtime jobs on Java 8/17/21/25/27. Native
-Windows builds passed 7/7 G++ 14.2 header suites and 13/13 G++ 16.2 combined
-header/module suites. These finite results cover the manifest's exact Windows
-x64 builds and default collectors; they do not establish every vendor/collector
-combination. The G++ 16.2 header's full public runtime matrix and explicit-PDB
-validation remain Wine-only results.
+Native Windows CI for this observation backend is **pending**. The
+[workflow](.github/workflows/build.yml) runs both interfaces on all 20 profiled
+JVMs; the Wine results above are identified separately.
+
+The older direct-native implementation at
+[commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c)
+passed two native Windows runs with **53/53 jobs each**:
+[push](https://github.com/xxxnpno/vmhook/actions/runs/37995958477) and
+[PR](https://github.com/xxxnpno/vmhook/actions/runs/37995966320).
+Those runs precede the new JIT/field/class backend. Earlier G++ 16.2 header and
+explicit-PDB matrices remain historical Wine results, detailed in the
+[native-thread guide](docs/native-threads.md#reproduce-the-public-wrapper-tests).
+These finite results concern the exact images and tested collectors, not every
+vendor/collector combination. See [hook fixtures](docs/hooks.md) for reproduction.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for validation expectations and
 [CHANGELOG.md](CHANGELOG.md) for migration notes.

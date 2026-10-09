@@ -27,6 +27,9 @@ STANDARD_HEADERS = (
 
 # Runtime cache owners have one definition in the C++26 module object.
 MODULE_CACHE_FUNCTIONS = (
+    "config",
+    "lifetime_flags",
+    "pending_class_records",
     "array_layout",
     "c2i_state",
     "call_handle_pool",

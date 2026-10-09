@@ -50,7 +50,36 @@
         "use_tlab": 9045822,
         "main_thread_group_raw": 9565176,
         "lock_without_safepoint": 5366928,
-        "allocate_handle_block_legacy": 3614784
+        "allocate_handle_block_legacy": 3614784,
+        "vm_execute": 6642960,
+        "mark_all": 1883424,
+        "vm_deoptimize_vtable": 7518504,
+        "vm_deoptimize_doit": 6646432,
+        "compile_jobs": 8997776,
+        "use_compiler": 9001764,
+        "compile_lock": 9440816,
+        "codecache_lock": 9440648,
+        "compiler_vtable": 7951024,
+        "set_not_compilable": 5262512,
+        "set_not_osr_compilable": 5262672,
+        "is_not_compilable": 5252576,
+        "is_not_osr_compilable": 5252704,
+        "class_add": 1769808,
+        "class_resolve_stream": 6269696,
+        "field_vm_to_java_destroy": 1423632,
+        "class_define": 6254480,
+        "class_parse": 6268576,
+        "array_complete": 732912,
+        "array_restore": 734592,
+        "interpreter_code": 9337280,
+        "field_throw_exception_entry": 9481432,
+        "interpreter_throw_exception": 9481432,
+        "interpreter_normal_table": 9502192,
+        "threads_do": 6419520,
+        "nmethod_metadata_do": 5393008,
+        "bytecode_lengths": 9345776,
+        "class_loader_data_head": 9364920,
+        "interpreter_entry_table": 9337312
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -68,17 +97,35 @@
           "size": 72,
           "members": {
             "_pool_holder": 24,
-            "_length": 60
+            "_length": 60,
+            "_cache": 16
           },
-          "enums": {}
+          "enums": {
+            "storage_size__length": 4,
+            "storage_size__pool_holder": 8,
+            "storage_size__cache": 8
+          }
         },
         "Method": {
           "size": 80,
           "members": {
             "_constMethod": 8,
-            "_access_flags": 32
+            "_access_flags": 32,
+            "_flags": 42,
+            "_intrinsic_id": 40,
+            "_code": 64,
+            "_i2i_entry": 48,
+            "_from_interpreted_entry": 72
           },
-          "enums": {}
+          "enums": {
+            "storage_size__access_flags": 4,
+            "storage_size__constMethod": 8,
+            "storage_size__flags": 2,
+            "storage_size__intrinsic_id": 2,
+            "storage_size__code": 8,
+            "storage_size__i2i_entry": 8,
+            "storage_size__from_interpreted_entry": 8
+          }
         },
         "ConstMethod": {
           "size": 56,
@@ -86,9 +133,18 @@
             "_constants": 8,
             "_name_index": 42,
             "_signature_index": 44,
-            "_size_of_parameters": 52
+            "_size_of_parameters": 52,
+            "_code_size": 40,
+            "_result_type": 38
           },
-          "enums": {}
+          "enums": {
+            "storage_size__constants": 8,
+            "storage_size__name_index": 2,
+            "storage_size__signature_index": 2,
+            "storage_size__size_of_parameters": 2,
+            "storage_size__code_size": 2,
+            "storage_size__result_type": 1
+          }
         },
         "Symbol": {
           "size": 8,
@@ -109,7 +165,10 @@
             "_hwm": 24,
             "_max": 32
           },
-          "enums": {}
+          "enums": {
+            "storage_size__hwm": 8,
+            "storage_size__max": 8
+          }
         },
         "Chunk": {
           "size": 16,
@@ -119,9 +178,15 @@
         "ThreadShadow": {
           "size": 32,
           "members": {
-            "_pending_exception": 8
+            "_pending_exception": 8,
+            "_exception_file": 16,
+            "_exception_line": 24
           },
-          "enums": {}
+          "enums": {
+            "storage_size__pending_exception": 8,
+            "storage_size__exception_file": 8,
+            "storage_size__exception_line": 4
+          }
         },
         "Thread": {
           "size": 424,
@@ -131,7 +196,9 @@
             "_pending_exception": 8,
             "_handle_area": 280
           },
-          "enums": {}
+          "enums": {
+            "storage_size__active_handles": 8
+          }
         },
         "JavaThread": {
           "size": 960,
@@ -147,9 +214,20 @@
             "_stack_base": 296,
             "_stack_size": 304,
             "_jni_attach_state": 632,
-            "_stack_guard_state": 672
+            "_stack_guard_state": 672,
+            "_special_runtime_exit_condition": 576,
+            "_suspend_flags": 48,
+            "_vm_result": 536
           },
-          "enums": {}
+          "enums": {
+            "storage_size__osthread": 8,
+            "storage_size__stack_base": 8,
+            "storage_size__threadObj": 8,
+            "storage_size__thread_state": 4,
+            "storage_size__special_runtime_exit_condition": 4,
+            "storage_size__suspend_flags": 4,
+            "storage_size__vm_result": 8
+          }
         },
         "OSThread": {
           "size": 48,
@@ -158,8 +236,16 @@
         },
         "JavaFrameAnchor": {
           "size": 24,
-          "members": {},
-          "enums": {}
+          "members": {
+            "_last_Java_sp": 0,
+            "_last_Java_pc": 8,
+            "_last_Java_fp": 16
+          },
+          "enums": {
+            "storage_size__last_Java_sp": 8,
+            "storage_size__last_Java_pc": 8,
+            "storage_size__last_Java_fp": 8
+          }
         },
         "JNIHandleBlock": {
           "size": 312,
@@ -173,14 +259,19 @@
             "_name": 8,
             "_addr": 16
           },
-          "enums": {}
+          "enums": {
+            "storage_size__name": 8,
+            "storage_size__type": 8
+          }
         },
         "JDK_Version": {
           "size": 7,
           "members": {
             "_major": 0
           },
-          "enums": {}
+          "enums": {
+            "storage_size__major": 1
+          }
         },
         "JavaThreadState": {
           "size": 4,
@@ -193,13 +284,35 @@
         },
         "AccessFlags": {
           "size": 4,
-          "members": {},
-          "enums": {}
+          "members": {
+            "_flags": 0
+          },
+          "enums": {
+            "storage_size__flags": 4
+          }
         },
         "BasicType": {
           "size": 4,
           "members": {},
-          "enums": {}
+          "enums": {
+            "T_BOOLEAN": 4,
+            "T_CHAR": 5,
+            "T_FLOAT": 6,
+            "T_DOUBLE": 7,
+            "T_BYTE": 8,
+            "T_SHORT": 9,
+            "T_INT": 10,
+            "T_LONG": 11,
+            "T_OBJECT": 12,
+            "T_ARRAY": 13,
+            "T_VOID": 14,
+            "T_ADDRESS": 15,
+            "T_NARROWOOP": 16,
+            "T_METADATA": 17,
+            "T_NARROWKLASS": 18,
+            "T_CONFLICT": 19,
+            "T_ILLEGAL": 99
+          }
         },
         "Handle": {
           "size": 8,
@@ -264,7 +377,8 @@
           "size": 4,
           "members": {},
           "enums": {
-            "stack_guard_enabled": 3
+            "stack_guard_enabled": 3,
+            "stack_guard_yellow_reserved_disabled": 2
           }
         },
         "JavaThread::JNIAttachStates": {
@@ -300,6 +414,374 @@
           "size": 4,
           "members": {},
           "enums": {}
+        },
+        "CompilerThread": {
+          "size": 1016,
+          "members": {
+            "_task": 984
+          },
+          "enums": {
+            "storage_size__task": 8
+          }
+        },
+        "CompileTask": {
+          "size": 128,
+          "members": {
+            "_compile_id": 8
+          },
+          "enums": {
+            "storage_size__compile_id": 4
+          }
+        },
+        "Klass": {
+          "size": 192,
+          "members": {
+            "_name": 16,
+            "_java_mirror": 104,
+            "_layout_helper": 8,
+            "_access_flags": 156,
+            "_class_loader_data": 144,
+            "_next_link": 136
+          },
+          "enums": {
+            "storage_size__name": 8,
+            "storage_size__java_mirror": 8,
+            "storage_size__layout_helper": 4,
+            "storage_size__access_flags": 4,
+            "storage_size__class_loader_data": 8,
+            "storage_size__next_link": 8
+          }
+        },
+        "InstanceKlass": {
+          "size": 432,
+          "members": {
+            "_init_state": 362,
+            "_misc_flags": 274
+          },
+          "enums": {
+            "storage_size__init_state": 1,
+            "storage_size__misc_flags": 2
+          }
+        },
+        "ArrayKlass": {
+          "size": 216,
+          "members": {},
+          "enums": {}
+        },
+        "ClassLoaderData": {
+          "size": 96,
+          "members": {
+            "_class_loader": 0,
+            "_klasses": 48,
+            "_next": 88,
+            "_deallocate_list": 80
+          },
+          "enums": {
+            "storage_size__class_loader": 8,
+            "storage_size__klasses": 8,
+            "storage_size__next": 8,
+            "storage_size__deallocate_list": 8
+          }
+        },
+        "ConstantPoolCache": {
+          "size": 16,
+          "members": {
+            "_length": 0,
+            "_constant_pool": 8
+          },
+          "enums": {
+            "storage_size__length": 4,
+            "storage_size__constant_pool": 8
+          }
+        },
+        "ConstantPoolCacheEntry": {
+          "size": 32,
+          "members": {
+            "_indices": 0,
+            "_f1": 8,
+            "_f2": 16,
+            "_flags": 24
+          },
+          "enums": {
+            "storage_size__indices": 8,
+            "storage_size__f1": 8,
+            "storage_size__f2": 8,
+            "storage_size__flags": 8
+          }
+        },
+        "StubQueue": {
+          "size": 48,
+          "members": {
+            "_stub_buffer": 8,
+            "_buffer_limit": 20,
+            "_queue_begin": 24,
+            "_queue_end": 28,
+            "_number_of_stubs": 32
+          },
+          "enums": {
+            "storage_size__stub_buffer": 8,
+            "storage_size__buffer_limit": 4,
+            "storage_size__queue_begin": 4,
+            "storage_size__queue_end": 4,
+            "storage_size__number_of_stubs": 4
+          }
+        },
+        "InterpreterCodelet": {
+          "size": 24,
+          "members": {
+            "_size": 0,
+            "_bytecode": 16,
+            "_description": 8
+          },
+          "enums": {
+            "storage_size__size": 4,
+            "storage_size__bytecode": 4,
+            "storage_size__description": 8
+          }
+        },
+        "CompiledMethod": {
+          "size": 208,
+          "members": {
+            "_method": 120
+          },
+          "enums": {
+            "storage_size__method": 8
+          }
+        },
+        "nmethod": {
+          "size": 368,
+          "members": {
+            "_comp_level": 336,
+            "_compile_id": 332,
+            "_state": 342,
+            "_method": 120
+          },
+          "enums": {
+            "storage_size__comp_level": 4,
+            "storage_size__compile_id": 4,
+            "storage_size__state": 1,
+            "storage_size__method": 8
+          }
+        },
+        "KlassHandle": {
+          "size": 8,
+          "members": {
+            "_value": 0
+          },
+          "enums": {
+            "storage_size__value": 8
+          }
+        },
+        "instanceKlassHandle": {
+          "size": 8,
+          "members": {
+            "_value": 0
+          },
+          "enums": {
+            "storage_size__value": 8
+          }
+        },
+        "ThreadInVMfromJava": {
+          "size": 8,
+          "members": {
+            "_thread": 0
+          },
+          "enums": {
+            "storage_size__thread": 8
+          }
+        },
+        "ThreadClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_thread": 0,
+            "vtable_count": 1
+          }
+        },
+        "VM_Operation": {
+          "size": 40,
+          "members": {
+            "_calling_thread": 8,
+            "_priority": 16,
+            "_timestamp": 20,
+            "_next": 24,
+            "_prev": 32
+          },
+          "enums": {
+            "vtable_~VM_Operation": 0,
+            "vtable_doit": 1,
+            "vtable_doit_prologue": 2,
+            "vtable_doit_epilogue": 3,
+            "vtable_is_methodCompiler": 4,
+            "vtable_type": 5,
+            "vtable_evaluation_mode": 6,
+            "vtable_allow_nested_vm_operations": 7,
+            "vtable_is_cheap_allocated": 8,
+            "vtable_oops_do": 9,
+            "vtable_evaluate_at_safepoint": 10,
+            "vtable_evaluate_concurrently": 11,
+            "vtable_print_on_error": 12,
+            "vtable_count": 13,
+            "storage_size__calling_thread": 8,
+            "storage_size__priority": 4,
+            "storage_size__timestamp": 4,
+            "storage_size__next": 8,
+            "storage_size__prev": 8
+          }
+        },
+        "VM_Deoptimize": {
+          "size": 40,
+          "members": {},
+          "enums": {}
+        },
+        "CompLevel": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "CompLevel_all": -2,
+            "CompLevel_any": -2,
+            "CompLevel_none": 0,
+            "CompLevel_simple": 1,
+            "CompLevel_full_optimization": 4
+          }
+        },
+        "Method::Flags": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "_dont_inline": 4,
+            "_force_inline": 2,
+            "_intrinsic_candidate": 64
+          }
+        },
+        "TosState": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "btos": 0,
+            "ztos": 1,
+            "ctos": 2,
+            "stos": 3,
+            "itos": 4,
+            "ltos": 5,
+            "ftos": 6,
+            "dtos": 7,
+            "atos": 8,
+            "vtos": 9,
+            "ilgl": 11
+          }
+        },
+        "ObservationABI": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "set_not_compilable_old_args": 1,
+            "nmethod_metadata_closure": 0,
+            "deopt_mode": 0,
+            "method_dont_inline_mask": 4,
+            "method_dont_inline_offset": 42,
+            "method_dont_inline_storage_size": 2,
+            "thread_is_java_slot": 4,
+            "anonymous_klass_offset": 274,
+            "anonymous_klass_width": 2,
+            "anonymous_klass_mask": 32,
+            "hidden_klass_offset": 0,
+            "hidden_klass_width": 0,
+            "hidden_klass_mask": 0,
+            "deallocate_list_size": 32,
+            "deallocate_list_data_offset": 24,
+            "deallocate_list_data_width": 8,
+            "deallocate_list_length_offset": 0,
+            "deallocate_list_length_width": 4
+          }
+        },
+        "DispatchTable": {
+          "size": 20480,
+          "members": {
+            "_table": 0
+          },
+          "enums": {
+            "storage_size__table": 20480
+          }
+        },
+        "Thread::SuspendFlags": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "_external_suspend": 536870912,
+            "_deopt_suspend": 268435456
+          }
+        },
+        "InstanceKlass::ClassState": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "allocated": 0,
+            "loaded": 1,
+            "linked": 2,
+            "being_initialized": 3,
+            "fully_initialized": 4,
+            "initialization_error": 5
+          }
+        },
+        "Bytecodes::Code": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "_tableswitch": 170,
+            "_lookupswitch": 171,
+            "_fast_linearswitch": 228,
+            "_fast_binaryswitch": 229,
+            "_wide": 196,
+            "number_of_codes": 239
+          }
+        },
+        "CompileBroker::<unnamed-enum-stop_compilation>": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "stop_compilation": 0,
+            "run_compilation": 1,
+            "shutdown_compilaton": 2
+          }
+        },
+        "AbstractInterpreter::MethodKind": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "zerolocals": 0,
+            "zerolocals_synchronized": 1,
+            "native": 2,
+            "native_synchronized": 3,
+            "empty": 4,
+            "accessor": 5,
+            "abstract": 6,
+            "method_handle_invoke_FIRST": 7,
+            "method_handle_invoke_LAST": 12,
+            "java_lang_math_sin": 13,
+            "java_lang_math_cos": 14,
+            "java_lang_math_tan": 15,
+            "java_lang_math_abs": 16,
+            "java_lang_math_sqrt": 17,
+            "java_lang_math_log": 18,
+            "java_lang_math_log10": 19,
+            "java_lang_math_pow": 20,
+            "java_lang_math_exp": 21,
+            "java_lang_math_fmaF": 22,
+            "java_lang_math_fmaD": 23,
+            "java_lang_ref_reference_get": 24,
+            "java_util_zip_CRC32_update": 25,
+            "java_util_zip_CRC32_updateBytes": 26,
+            "java_util_zip_CRC32_updateByteBuffer": 27,
+            "java_util_zip_CRC32C_updateBytes": 28,
+            "java_util_zip_CRC32C_updateDirectByteBuffer": 29,
+            "java_lang_Float_intBitsToFloat": 30,
+            "java_lang_Float_floatToRawIntBits": 31,
+            "java_lang_Double_longBitsToDouble": 32,
+            "java_lang_Double_doubleToRawLongBits": 33,
+            "number_of_method_entries": 34,
+            "invalid": -1
+          }
         }
       },
       "code_prefixes": {
@@ -337,7 +819,36 @@
         "new_string_unicode": "48895c240848896c2410565741564883",
         "tlab_initialize": "48895c2408574883ec2033ff488bd948",
         "lock_without_safepoint": "48895c2408574883ec208b15248c4000",
-        "allocate_handle_block_legacy": "40574883ec204885c97416488b794048"
+        "allocate_handle_block_legacy": "40574883ec204885c97416488b794048",
+        "vm_execute": "48895c24184889742420574156415748",
+        "mark_all": "40534883ec60488b1d5b5073004885db",
+        "vm_deoptimize_vtable": "803b420800000000",
+        "vm_deoptimize_doit": "48895c240848896c2410488974241848",
+        "compile_jobs": "0100000000000000",
+        "use_compiler": "0101010114000000",
+        "compile_lock": "0000000000000000",
+        "codecache_lock": "0000000000000000",
+        "compiler_vtable": "60e02b0800000000",
+        "set_not_compilable": "48895c2408574883ec300fb741288bda",
+        "set_not_osr_compilable": "48895c2408574883ec304c894c242045",
+        "is_not_compilable": "488b41184885c0740a6683780e007603",
+        "is_not_osr_compilable": "48895c2408574883ec208bda488bf9e8",
+        "class_add": "4053565741564883ec38488b5918410f",
+        "class_resolve_stream": "4c894424184889542410535657415641",
+        "field_vm_to_java_destroy": "48895c2408574883ec20488bd9488b09",
+        "class_define": "48894c24085553565741544155415648",
+        "class_parse": "48895c240848897424204c8944241848",
+        "array_complete": "48895c240848896c2410488974241857",
+        "array_restore": "4883ec28e8073038004883c428c3cccc",
+        "interpreter_code": "0000000000000000",
+        "field_throw_exception_entry": "0000000000000000",
+        "interpreter_throw_exception": "0000000000000000",
+        "interpreter_normal_table": "0000000000000000",
+        "threads_do": "48895c2408574883ec20488b1d47f52f",
+        "nmethod_metadata_do": "48895c2408488974241048897c24184c",
+        "bytecode_lengths": "00000000000000000000000000000000",
+        "class_loader_data_head": "0000000000000000",
+        "interpreter_entry_table": "00000000000000000000000000000000"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -353,7 +864,20 @@
           "Thread records NMT stack and destructor releases it",
           "Failure cleanup destroys the JavaThread itself",
           "TLAB initialization is conditional and accepts TLAB subobject",
-          "Universe thread-group and JavaThread object accessors are inline"
+          "Universe thread-group and JavaThread object accessors are inline",
+          "Observation aliases are private Windows x64 functions or explicitly typed data/vtables; registration/JNI/JVMTI/WhiteBox bodies are offline provenance only and are never called.",
+          "VM_Operation has a virtual destructor at slot0, doit at slot1, 13 vtable entries and size40; genuine VM_Deoptimize supplies the remaining protocol.",
+          "Method set_not_compilable and set_not_osr_compilable use (this,int,bool,const char*); intrinsic_id/flags are uint16 at40/42. Dont-inline bit is4.",
+          "CompileBroker compiler activity is an int32 scalar: stop0/run1/shutdown2; UseCompiler is a bool scalar. CompilerThread::_task is audited from constructor stores and CompilerThread size is VMType-exported.",
+          "KlassHandle/instanceKlassHandle are trivial size8 metadata wrappers with _value0; Windows x64 by-value arguments contain raw metadata pointer bits.",
+          "Klass::_class_loader_data uses144; Java9 exports this inherited common-base field under InstanceKlass. Post class observer targets are define_instance_class/anonymous parse_stream/array completion/array CDS restoration.",
+          "ThreadClosure is size8 with do_thread at slot0; CompLevel_all=-2 for these AOT-enabled exact builds.",
+          "Interpreter codelets and cache fields come from offline exported VMStructs/VMTypes; no JVMTI event entry is invoked.",
+          "ThreadInVMfromJava size8 destructor15b910 includes reguard, VM-to-Java transition and async special-exit processing.",
+          "AbstractInterpreter::_entry_table normal index0/synchronized index1 are proven by the first two MethodKind source enumerators and distinct generate_all codelets. Unique normal/synchronized codelet names lead to generation with synchronized=false/true and exact RIP-relative load/store of table[0]/[1]. No JNI/JVMTI/WhiteBox code is called.",
+          "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
+          "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
+          "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body."
         ],
         "source_hashes": {
           "9-javaCalls.cpp": "974c9324fd5af15c2e743010e2e40a28f308464ae22d7941f3fb42a8048a8706",
@@ -365,7 +889,389 @@
           "9-interfaceSupport.hpp": "2672c874062b2eb0042c45063b3628f474c16429a7bf161afa2ed54288f00ece",
           "9-allocation.hpp": "44a6c60aff1bac43456be7d3a1bb18dd1933d4fcf1978ae96a563e7b32a6dca9",
           "9-javaClasses.cpp": "eee00d8efe9152db0374786c0a84c26cc45d4570e844969477211b8f80fd7ae5",
-          "9-thread.hpp": "77a881c75e0f643f83a2a14eeeb10fea41c020337052d360bd10aac27945c1d9"
+          "9-thread.hpp": "77a881c75e0f643f83a2a14eeeb10fea41c020337052d360bd10aac27945c1d9",
+          "observation/9/classfile/classLoaderData.cpp": "2446688f51ad65f1118d76effe74a4f062d5004a9eb5fb6825dad483cd291ea1",
+          "observation/9/classfile/systemDictionary.cpp": "eb82aad292afa19980d96afdf9702b474155e47a22c9a0f39cd1b65def9d5005",
+          "observation/9/code/codeCache.cpp": "7a320b2460f70c8a51b659765585b0ebdf06813f477d6b2cf544a215732b198d",
+          "observation/9/code/nmethod.cpp": "ac509448a515fbf7847b1005c4ab650cf0b19587103a65d59cf706bc9a91600f",
+          "observation/9/code/nmethod.hpp": "59c564e64fc47d238902ed9ba520eb8aede3ce130f85a2b6c225e2667e4236a8",
+          "observation/9/compiler/compileBroker.cpp": "dc16a9d309647a21dfdb09cb9286601636f585ab5b8c3b9c3fee893092a33d9b",
+          "observation/9/compiler/compileBroker.hpp": "a5e0b2701f436613188420eaa9bf13a62d16987bd6121bae2e80157007e8a340",
+          "observation/9/interpreter/interpreter.hpp": "96abfa8068bca11f457d53ecb63c123bb7a3a24544eb8040071a14b2f69242f7",
+          "observation/9/memory/iterator.hpp": "61a9df5436017759629b97d038a55588365b357fd21fc824f4716e102fa1d4c5",
+          "observation/9/oops/klass.hpp": "ac0cdf1f549ba678b26428b46c81e3e896cb9bab7800ca1024881be91efc55f2",
+          "observation/9/oops/method.cpp": "fafb2f4767d5bab852dbe480d33d57983d5054778b50023a5b08f2226f46a20d",
+          "observation/9/oops/method.hpp": "2baed20cfc97565382974c698692108819881fcc4a26bcd83101c18303b3bfe8",
+          "observation/9/prims/whitebox.cpp": "b9b13eb638fabeece59854781e9c5b6d138958a735e14d5cdb8a87b8926b5cec",
+          "observation/9/runtime/deoptimization.cpp": "5c32ba71b8f358c56e06d93b42ec66044010f95224244f1e6f2d2d63246ca174",
+          "observation/9/runtime/mutexLocker.cpp": "5965c6056cf5cacdcce1d5a0052b5e54423f7e103ccca763f9ab07138e06b5ab",
+          "observation/9/runtime/vmThread.cpp": "c73b759834c023050e6ae049a0c4b8fa858754112d27136dcdf5fc870e0324d0",
+          "observation/9/runtime/vm_operations.cpp": "ac7ca01811389221f9a6e83112c61616e1df8f1ff067d591170503088f42b754",
+          "observation/9/runtime/vm_operations.hpp": "327cc6a630226f88e561a04a0103cfaf03fc9c36faecfe16050f798f7296ffbf",
+          "observation/9/utilities/globalDefinitions.hpp": "c0e6148cd7cf13a8e4c07d26ee26dac804288d7a1b7a2601d591feed53611800",
+          "observation/9/interpreter/templateInterpreterGenerator.cpp": "eeef8ccde964f5014bcb8c1e03985620a56dfa23d48c3fc88ad4e94d5fbd0ca1",
+          "observation/9/cpu/x86/templateInterpreterGenerator_x86.cpp": "c39ef1743e32ee11d5e86af7195b99a4ca128883856e37eec7bcd13b7e133127",
+          "observation/9/interpreter/bytecodes.hpp": "b933afbbe7f0e5819a62b23411d9ea101fd104426fb2a6bb945f811c5d043d0a",
+          "observation/9/interpreter/bytecodes.cpp": "f103db65df14bd99894e700fadf3dd6748fdb374b0d3526692b5151b4cf83942",
+          "observation/9/oops/instanceKlass.hpp": "b94807c5a879befeacf8bfda4269ded37bf82199daa3bae610dceac4ab69e1a0",
+          "observation/9/oops/constMethod.hpp": "94f2ad0cf2082e3ffc3dd0fb87cf758d023c5e8aa016dc48bd51fbae04840192",
+          "observation/9/oops/constMethod.cpp": "c44a012fe1aae4f2fc9aefc52aa9f952bdbb7346979bb6de6fed956dd88f783a",
+          "intrinsic/9/exact9-abstractInterpreter.hpp": "51d1f81b3f821e2bca2931bc797d5cdc337d093be3fd4f3b09767e32b3b104db",
+          "intrinsic/9/exact9-templateInterpreterGenerator.cpp": "eeef8ccde964f5014bcb8c1e03985620a56dfa23d48c3fc88ad4e94d5fbd0ca1",
+          "intrinsic/9/exact9-vmSymbols.hpp": "e6251dc9f5f077f323a9b386235e3b38c23dbe7365575e48b400d7902b4e0c32",
+          "deallocate/9/utilities/growableArray.hpp": "782d7e8c28d1724e41fdef3c567e255d5c5c4ec3012d104a2d79825adfd68af9",
+          "deallocate/9/classfile/classLoaderData.hpp": "d3a857ef01cbc6b3b539951f342bdd5a9eb6fc8e9c812c43ecff1c8abfe4ff25",
+          "deallocate/9/classfile/classLoaderData.cpp": "2446688f51ad65f1118d76effe74a4f062d5004a9eb5fb6825dad483cd291ea1"
+        },
+        "observation_entrypoints": {
+          "vm_execute": {
+            "rva": 6642960,
+            "kind": "function",
+            "signature": "static void VMThread::execute(VM_Operation*)"
+          },
+          "mark_all": {
+            "rva": 1883424,
+            "kind": "function",
+            "signature": "static void CodeCache::mark_all_nmethods_for_deoptimization()"
+          },
+          "vm_deoptimize_vtable": {
+            "rva": 7518504,
+            "kind": "vtable",
+            "signature": "const VM_Deoptimize virtual function table"
+          },
+          "vm_deoptimize_doit": {
+            "rva": 6646432,
+            "kind": "function",
+            "signature": "virtual void VM_Deoptimize::doit()"
+          },
+          "compile_jobs": {
+            "rva": 8997776,
+            "kind": "data",
+            "signature": "static volatile jint CompileBroker::_should_compile_new_jobs"
+          },
+          "use_compiler": {
+            "rva": 9001764,
+            "kind": "data",
+            "signature": "bool UseCompiler"
+          },
+          "compile_lock": {
+            "rva": 9440816,
+            "kind": "data",
+            "signature": "Mutex* Compile_lock"
+          },
+          "codecache_lock": {
+            "rva": 9440648,
+            "kind": "data",
+            "signature": "Monitor* CodeCache_lock"
+          },
+          "compiler_vtable": {
+            "rva": 7951024,
+            "kind": "vtable",
+            "signature": "const CompilerThread virtual function table"
+          },
+          "set_not_compilable": {
+            "rva": 5262512,
+            "kind": "function",
+            "signature": "void Method::set_not_compilable(int,bool,const char*)"
+          },
+          "set_not_osr_compilable": {
+            "rva": 5262672,
+            "kind": "function",
+            "signature": "void Method::set_not_osr_compilable(int,bool,const char*)"
+          },
+          "is_not_compilable": {
+            "rva": 5252576,
+            "kind": "function",
+            "signature": "bool Method::is_not_compilable(int) const"
+          },
+          "is_not_osr_compilable": {
+            "rva": 5252704,
+            "kind": "function",
+            "signature": "bool Method::is_not_osr_compilable(int) const"
+          },
+          "class_add": {
+            "rva": 1769808,
+            "kind": "function",
+            "signature": "void ClassLoaderData::add_class(Klass*,bool)"
+          },
+          "class_resolve_stream": {
+            "rva": 6269696,
+            "kind": "function",
+            "signature": "static Klass* SystemDictionary::resolve_from_stream(Symbol*,Handle,Handle,ClassFileStream*,Thread*)"
+          },
+          "field_vm_to_java_destroy": {
+            "rva": 1423632,
+            "kind": "function",
+            "signature": "void ThreadInVMfromJava::~ThreadInVMfromJava()"
+          },
+          "class_define": {
+            "rva": 6254480,
+            "kind": "function",
+            "signature": "static void SystemDictionary::define_instance_class(instanceKlassHandle, Thread*)"
+          },
+          "class_parse": {
+            "rva": 6268576,
+            "kind": "function",
+            "signature": "static Klass* SystemDictionary::parse_stream(Symbol*, Handle, Handle, ClassFileStream*, const InstanceKlass*, GrowableArray<Handle>*, Thread*)"
+          },
+          "array_complete": {
+            "rva": 732912,
+            "kind": "function",
+            "signature": "static void ArrayKlass::complete_create_array_klass(ArrayKlass*, KlassHandle, ModuleEntry*, Thread*)"
+          },
+          "array_restore": {
+            "rva": 734592,
+            "kind": "function",
+            "signature": "void ArrayKlass::restore_unshareable_info(ClassLoaderData*, Handle, Thread*)"
+          },
+          "interpreter_code": {
+            "rva": 9337280,
+            "kind": "data",
+            "signature": "static StubQueue* AbstractInterpreter::_code"
+          },
+          "field_throw_exception_entry": {
+            "rva": 9481432,
+            "kind": "data",
+            "signature": "static address TemplateInterpreter::_throw_exception_entry",
+            "address_store_rva": 6299723,
+            "address_store_bytes": "488905868c3000",
+            "proof": "generate_throw_exception assigns second pc() after restore_bcp/restore_locals/reinit_heapbase, matching exact-source order and RIP-relative store."
+          },
+          "interpreter_normal_table": {
+            "rva": 9502192,
+            "kind": "data",
+            "signature": "static DispatchTable TemplateInterpreter::_normal_table",
+            "address_reference_rva": 6284621,
+            "address_reference_bytes": "488d0d9c183100",
+            "set_entry_rva": 6278272,
+            "set_entry_bytes": "498b004c63ca4a8904c9498b40084a8984c900080000498b40104a8984c900100000498b40184a8984c900180000498b40404a8984c900400000498b40204a8984c900200000498b40284a8984c900280000498b40304a8984c900300000498b40384a8984c900380000498b40484a8984c900480000c3",
+            "proof": "set_entry_points passes this table then set_entry stores ten addresses with bytecode*8 and state*0x800; active-table initialization copies0xa0 blocks of0x80 bytes."
+          },
+          "threads_do": {
+            "rva": 6419520,
+            "kind": "function",
+            "signature": "static void Threads::threads_do(ThreadClosure*)",
+            "proof": "Exact-source iteration: JavaThreads then VMThread, heap GC threads and WatcherThread;9 linkednext424,10 SMR ThreadsList array."
+          },
+          "nmethod_metadata_do": {
+            "rva": 5393008,
+            "kind": "function",
+            "signature": "virtual void nmethod::metadata_do(void(*)(Metadata*))",
+            "proof": "Exported nmethod vtable slot67(Java9)/68(Java10); verified-entry/state checks, RelocIterator immediate metadata, metadata section offset300/308 bounded by scopes_data_begin128, then Method120, invoking callback R14."
+          },
+          "bytecode_lengths": {
+            "rva": 9345776,
+            "kind": "data",
+            "signature": "static u_char Bytecodes::_lengths[number_of_codes]",
+            "address_store_rva": 1034006,
+            "address_store_bytes": "46889432f09a8e00",
+            "proof": "Bytecodes::def discovered via fast_igetfield name and opcode208 initialization; strlen(format)&15 OR strlen(wide_format)<<4 stored in exact image-relative byte array."
+          },
+          "class_loader_data_head": {
+            "rva": 9364920,
+            "kind": "data",
+            "signature": "static ClassLoaderData* ClassLoaderDataGraph::_head",
+            "proof": "Offline exported VMStruct static field address."
+          }
+        },
+        "thread_is_java_slot_proof": {
+          "Thread": {
+            "vtable_rva": 7949928,
+            "slot": 4,
+            "predicate_rva": 6454592,
+            "bytes": "32c0c3",
+            "result": false
+          },
+          "JavaThread": {
+            "vtable_rva": 7950656,
+            "slot": 4,
+            "predicate_rva": 61104,
+            "bytes": "b001c3",
+            "result": true
+          },
+          "CompilerThread": {
+            "vtable_rva": 7951024,
+            "slot": 4,
+            "predicate_rva": 61104,
+            "bytes": "b001c3",
+            "result": true
+          },
+          "VMThread": {
+            "vtable_rva": 8069624,
+            "slot": 4,
+            "predicate_rva": 6454592,
+            "bytes": "32c0c3",
+            "result": false
+          }
+        },
+        "member_layout_proofs": {
+          "ConstMethod": {
+            "_result_type": {
+              "offset": 38,
+              "storage_size": 1,
+              "rva": 5257150,
+              "bytes": "488b48080fb645df884126",
+              "function": "Method::make_method_handle_intrinsic",
+              "proof": "Method::_constMethod at8 then ResultTypeFinder result byte is stored as AL at ConstMethod+0x26; exact source declares u1 _result_type after exported u2 _flags at36 and before exported _code_size at40."
+            }
+          },
+          "InstanceKlass": {
+            "_misc_flags": {
+              "offset": 274,
+              "storage_size": 2,
+              "rva": 3219233,
+              "bytes": "0fb78f1201000089879c00000048837e200074066683c920eb08b8dfff00006623c866898f12010000",
+              "proof": "Exact constructor loads the VMStruct-published uint16 misc-flags cell, sets ORcx0x20 for the anonymous class host, and writes the same uint16 cell."
+            }
+          },
+          "ThreadShadow": {
+            "_exception_file": {
+              "offset": 16,
+              "storage_size": 8,
+              "rva": 2661856,
+              "bytes": "488951084c89411044894918c3",
+              "function": "ThreadShadow::set_pending_exception",
+              "proof": "Exact unique setter stores pending_exception pointer at8, exception_file pointer at16 and exception_line dword at24, matching the tagged ThreadShadow declaration."
+            },
+            "_exception_line": {
+              "offset": 24,
+              "storage_size": 4,
+              "rva": 2661856,
+              "bytes": "488951084c89411044894918c3",
+              "function": "ThreadShadow::set_pending_exception",
+              "proof": "Exact unique setter stores pending_exception pointer at8, exception_file pointer at16 and exception_line dword at24, matching the tagged ThreadShadow declaration."
+            }
+          },
+          "ClassLoaderData": {
+            "_deallocate_list": {
+              "offset": 80,
+              "storage_size": 8,
+              "rva": 1770413,
+              "bytes": "49897650",
+              "function": "ClassLoaderData::add_to_deallocate_list",
+              "proof": "Exact tagged source allocates GrowableArray<Metadata*>(100,true) and appends missing metadata; the native body allocates32, constructs length0/capacity100/payload24, stores the pointer in this exact CLD cell, then searches/appends Metadata* elements. The separately identified free_deallocate_list reads the same cell."
+            }
+          }
+        },
+        "data_layout_proofs": {
+          "interpreter_entry_table": [
+            {
+              "label": "normal_load",
+              "rva": 6281195,
+              "bytes": "488b05eea12e00",
+              "target_rva": 9337312
+            },
+            {
+              "label": "normal_store",
+              "rva": 6281219,
+              "bytes": "488905d6a12e00",
+              "target_rva": 9337312
+            },
+            {
+              "label": "synchronized_load",
+              "rva": 6281263,
+              "bytes": "488b05b2a12e00",
+              "target_rva": 9337320
+            },
+            {
+              "label": "synchronized_store",
+              "rva": 6281290,
+              "bytes": "48890597a12e00",
+              "target_rva": 9337320
+            }
+          ]
+        },
+        "anonymous_klass_predicate": {
+          "kind": "VMStruct+source+constructor",
+          "member_owner": "InstanceKlass",
+          "member": "_misc_flags",
+          "source_tag": "jdk-9+181",
+          "instructions": [
+            {
+              "rva": 3219233,
+              "bytes": "0fb78f12010000",
+              "mnemonic": "movzx",
+              "operands": "ecx, word ptr [rdi + 0x112]"
+            },
+            {
+              "rva": 3219240,
+              "bytes": "89879c000000",
+              "mnemonic": "mov",
+              "operands": "dword ptr [rdi + 0x9c], eax"
+            },
+            {
+              "rva": 3219246,
+              "bytes": "48837e2000",
+              "mnemonic": "cmp",
+              "operands": "qword ptr [rsi + 0x20], 0"
+            },
+            {
+              "rva": 3219251,
+              "bytes": "7406",
+              "mnemonic": "je",
+              "operands": "0x311f3b"
+            },
+            {
+              "rva": 3219253,
+              "bytes": "6683c920",
+              "mnemonic": "or",
+              "operands": "cx, 0x20"
+            },
+            {
+              "rva": 3219257,
+              "bytes": "eb08",
+              "mnemonic": "jmp",
+              "operands": "0x311f43"
+            },
+            {
+              "rva": 3219259,
+              "bytes": "b8dfff0000",
+              "mnemonic": "mov",
+              "operands": "eax, 0xffdf"
+            },
+            {
+              "rva": 3219264,
+              "bytes": "6623c8",
+              "mnemonic": "and",
+              "operands": "cx, ax"
+            },
+            {
+              "rva": 3219267,
+              "bytes": "66898f12010000",
+              "mnemonic": "mov",
+              "operands": "word ptr [rdi + 0x112], cx"
+            }
+          ]
+        },
+        "derived_layout_proofs": {
+          "ObservationABI": [
+            {
+              "rva": 1770306,
+              "bytes": "33ff49397e5075678d57028d4f20448d4701e88764efff",
+              "enums": {
+                "deallocate_list_size": 32
+              },
+              "proof": "XOR EDI,EDI establishes zero, then LEA ECX,[RDI+0x20] passes32 to the exact ResourceObj allocation call; source constructs GrowableArray<Metadata*>(100,true)."
+            },
+            {
+              "rva": 1772032,
+              "bytes": "8b30ffce4863ee",
+              "enums": {
+                "deallocate_list_length_offset": 0,
+                "deallocate_list_length_width": 4
+              },
+              "proof": "Free-list reverse traversal loads length from array+0 using MOV ESI,dword ptr[RAX], decrements, sign-extends the starting index and skips negative lengths."
+            },
+            {
+              "rva": 1772064,
+              "bytes": "488b4750488b5818488b1ceb",
+              "enums": {
+                "deallocate_list_data_offset": 24,
+                "deallocate_list_data_width": 8
+              },
+              "proof": "Free-list loop loads exact CLD pointer then MOV RBX,qword ptr[RAX+24] payload and reads Metadata* at payload+index*8."
+            }
+          ]
         }
       }
     },
@@ -418,7 +1324,38 @@
         "use_tlab": 9218979,
         "main_thread_group_raw": 9807752,
         "lock_without_safepoint": 5433168,
-        "allocate_handle_block_legacy": 3749792
+        "allocate_handle_block_legacy": 3749792,
+        "vm_execute": 6756288,
+        "mark_all": 1963088,
+        "vm_deoptimize_vtable": 7511248,
+        "vm_deoptimize_doit": 6759920,
+        "compile_jobs": 9215424,
+        "use_compiler": 9219556,
+        "compile_lock": 9682936,
+        "codecache_lock": 9682760,
+        "compiler_vtable": 8132064,
+        "set_not_compilable": 5332176,
+        "set_not_osr_compilable": 5332336,
+        "is_not_compilable": 5322240,
+        "is_not_osr_compilable": 5322368,
+        "class_add": 1833840,
+        "class_resolve_stream": 6367808,
+        "field_vm_to_java_transition10": 1513056,
+        "field_enable_guards10": 6507200,
+        "field_special_exit10": 6511024,
+        "class_define": 6350816,
+        "class_parse": 6366640,
+        "array_complete": 808144,
+        "array_restore": 810224,
+        "interpreter_code": 9577600,
+        "field_throw_exception_entry": 9724440,
+        "interpreter_throw_exception": 9724440,
+        "interpreter_normal_table": 9745200,
+        "threads_do": 6529760,
+        "nmethod_metadata_do": 5459392,
+        "bytecode_lengths": 9586800,
+        "class_loader_data_head": 9606128,
+        "interpreter_entry_table": 9577632
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -436,17 +1373,35 @@
           "size": 64,
           "members": {
             "_pool_holder": 24,
-            "_length": 52
+            "_length": 52,
+            "_cache": 16
           },
-          "enums": {}
+          "enums": {
+            "storage_size__length": 4,
+            "storage_size__pool_holder": 8,
+            "storage_size__cache": 8
+          }
         },
         "Method": {
           "size": 88,
           "members": {
             "_constMethod": 8,
-            "_access_flags": 32
+            "_access_flags": 32,
+            "_flags": 42,
+            "_intrinsic_id": 40,
+            "_code": 64,
+            "_i2i_entry": 48,
+            "_from_interpreted_entry": 72
           },
-          "enums": {}
+          "enums": {
+            "storage_size__access_flags": 4,
+            "storage_size__constMethod": 8,
+            "storage_size__flags": 2,
+            "storage_size__intrinsic_id": 2,
+            "storage_size__code": 8,
+            "storage_size__i2i_entry": 8,
+            "storage_size__from_interpreted_entry": 8
+          }
         },
         "ConstMethod": {
           "size": 56,
@@ -454,9 +1409,18 @@
             "_constants": 8,
             "_name_index": 42,
             "_signature_index": 44,
-            "_size_of_parameters": 52
+            "_size_of_parameters": 52,
+            "_code_size": 40,
+            "_result_type": 38
           },
-          "enums": {}
+          "enums": {
+            "storage_size__constants": 8,
+            "storage_size__name_index": 2,
+            "storage_size__signature_index": 2,
+            "storage_size__size_of_parameters": 2,
+            "storage_size__code_size": 2,
+            "storage_size__result_type": 1
+          }
         },
         "Symbol": {
           "size": 8,
@@ -482,9 +1446,15 @@
         "ThreadShadow": {
           "size": 32,
           "members": {
-            "_pending_exception": 8
+            "_pending_exception": 8,
+            "_exception_file": 16,
+            "_exception_line": 24
           },
-          "enums": {}
+          "enums": {
+            "storage_size__pending_exception": 8,
+            "storage_size__exception_file": 8,
+            "storage_size__exception_line": 4
+          }
         },
         "Thread": {
           "size": 456,
@@ -494,7 +1464,9 @@
             "_pending_exception": 8,
             "_handle_area": 312
           },
-          "enums": {}
+          "enums": {
+            "storage_size__active_handles": 8
+          }
         },
         "JavaThread": {
           "size": 1016,
@@ -510,9 +1482,20 @@
             "_stack_base": 328,
             "_stack_size": 336,
             "_jni_attach_state": 672,
-            "_stack_guard_state": 712
+            "_stack_guard_state": 712,
+            "_special_runtime_exit_condition": 616,
+            "_suspend_flags": 72,
+            "_vm_result": 576
           },
-          "enums": {}
+          "enums": {
+            "storage_size__osthread": 8,
+            "storage_size__stack_base": 8,
+            "storage_size__threadObj": 8,
+            "storage_size__thread_state": 4,
+            "storage_size__special_runtime_exit_condition": 4,
+            "storage_size__suspend_flags": 4,
+            "storage_size__vm_result": 8
+          }
         },
         "OSThread": {
           "size": 48,
@@ -521,8 +1504,16 @@
         },
         "JavaFrameAnchor": {
           "size": 24,
-          "members": {},
-          "enums": {}
+          "members": {
+            "_last_Java_sp": 0,
+            "_last_Java_pc": 8,
+            "_last_Java_fp": 16
+          },
+          "enums": {
+            "storage_size__last_Java_sp": 8,
+            "storage_size__last_Java_pc": 8,
+            "storage_size__last_Java_fp": 8
+          }
         },
         "JNIHandleBlock": {
           "size": 312,
@@ -536,14 +1527,19 @@
             "_name": 8,
             "_addr": 16
           },
-          "enums": {}
+          "enums": {
+            "storage_size__name": 8,
+            "storage_size__type": 8
+          }
         },
         "JDK_Version": {
           "size": 7,
           "members": {
             "_major": 0
           },
-          "enums": {}
+          "enums": {
+            "storage_size__major": 1
+          }
         },
         "JavaThreadState": {
           "size": 4,
@@ -556,13 +1552,35 @@
         },
         "AccessFlags": {
           "size": 4,
-          "members": {},
-          "enums": {}
+          "members": {
+            "_flags": 0
+          },
+          "enums": {
+            "storage_size__flags": 4
+          }
         },
         "BasicType": {
           "size": 4,
           "members": {},
-          "enums": {}
+          "enums": {
+            "T_BOOLEAN": 4,
+            "T_CHAR": 5,
+            "T_FLOAT": 6,
+            "T_DOUBLE": 7,
+            "T_BYTE": 8,
+            "T_SHORT": 9,
+            "T_INT": 10,
+            "T_LONG": 11,
+            "T_OBJECT": 12,
+            "T_ARRAY": 13,
+            "T_VOID": 14,
+            "T_ADDRESS": 15,
+            "T_NARROWOOP": 16,
+            "T_METADATA": 17,
+            "T_NARROWKLASS": 18,
+            "T_CONFLICT": 19,
+            "T_ILLEGAL": 99
+          }
         },
         "JavaThread::TerminatedTypes": {
           "size": 4,
@@ -632,7 +1650,8 @@
           "size": 4,
           "members": {},
           "enums": {
-            "stack_guard_enabled": 3
+            "stack_guard_enabled": 3,
+            "stack_guard_yellow_reserved_disabled": 2
           }
         },
         "JavaThread::JNIAttachStates": {
@@ -663,6 +1682,378 @@
           "size": 4,
           "members": {},
           "enums": {}
+        },
+        "CompilerThread": {
+          "size": 1072,
+          "members": {
+            "_task": 1040
+          },
+          "enums": {
+            "storage_size__task": 8
+          }
+        },
+        "CompileTask": {
+          "size": 128,
+          "members": {
+            "_compile_id": 8
+          },
+          "enums": {
+            "storage_size__compile_id": 4
+          }
+        },
+        "Klass": {
+          "size": 192,
+          "members": {
+            "_name": 16,
+            "_class_loader_data": 144,
+            "_java_mirror": 104,
+            "_layout_helper": 8,
+            "_access_flags": 156,
+            "_next_link": 136
+          },
+          "enums": {
+            "storage_size__name": 8,
+            "storage_size__class_loader_data": 8,
+            "storage_size__layout_helper": 4,
+            "storage_size__access_flags": 4,
+            "storage_size__next_link": 8
+          }
+        },
+        "InstanceKlass": {
+          "size": 424,
+          "members": {
+            "_init_state": 354,
+            "_misc_flags": 274
+          },
+          "enums": {
+            "storage_size__init_state": 1,
+            "storage_size__misc_flags": 2
+          }
+        },
+        "ArrayKlass": {
+          "size": 216,
+          "members": {},
+          "enums": {}
+        },
+        "ClassLoaderData": {
+          "size": 120,
+          "members": {
+            "_class_loader": 0,
+            "_klasses": 56,
+            "_next": 112,
+            "_deallocate_list": 104
+          },
+          "enums": {
+            "storage_size__class_loader": 8,
+            "storage_size__klasses": 8,
+            "storage_size__next": 8,
+            "storage_size__deallocate_list": 8
+          }
+        },
+        "OopHandle": {
+          "size": 8,
+          "members": {},
+          "enums": {}
+        },
+        "ConstantPoolCache": {
+          "size": 32,
+          "members": {
+            "_length": 0,
+            "_constant_pool": 8
+          },
+          "enums": {
+            "storage_size__length": 4,
+            "storage_size__constant_pool": 8
+          }
+        },
+        "ConstantPoolCacheEntry": {
+          "size": 32,
+          "members": {
+            "_indices": 0,
+            "_f1": 8,
+            "_f2": 16,
+            "_flags": 24
+          },
+          "enums": {
+            "storage_size__indices": 8,
+            "storage_size__f1": 8,
+            "storage_size__f2": 8,
+            "storage_size__flags": 8
+          }
+        },
+        "StubQueue": {
+          "size": 48,
+          "members": {
+            "_stub_buffer": 8,
+            "_buffer_limit": 20,
+            "_queue_begin": 24,
+            "_queue_end": 28,
+            "_number_of_stubs": 32
+          },
+          "enums": {
+            "storage_size__stub_buffer": 8,
+            "storage_size__buffer_limit": 4,
+            "storage_size__queue_begin": 4,
+            "storage_size__queue_end": 4,
+            "storage_size__number_of_stubs": 4
+          }
+        },
+        "InterpreterCodelet": {
+          "size": 24,
+          "members": {
+            "_size": 0,
+            "_bytecode": 16,
+            "_description": 8
+          },
+          "enums": {
+            "storage_size__size": 4,
+            "storage_size__bytecode": 4,
+            "storage_size__description": 8
+          }
+        },
+        "CompiledMethod": {
+          "size": 208,
+          "members": {
+            "_method": 120
+          },
+          "enums": {
+            "storage_size__method": 8
+          }
+        },
+        "nmethod": {
+          "size": 376,
+          "members": {
+            "_comp_level": 344,
+            "_compile_id": 340,
+            "_state": 350,
+            "_method": 120
+          },
+          "enums": {
+            "storage_size__comp_level": 4,
+            "storage_size__compile_id": 4,
+            "storage_size__method": 8
+          }
+        },
+        "KlassHandle": {
+          "size": 8,
+          "members": {
+            "_value": 0
+          },
+          "enums": {
+            "storage_size__value": 8
+          }
+        },
+        "instanceKlassHandle": {
+          "size": 8,
+          "members": {
+            "_value": 0
+          },
+          "enums": {
+            "storage_size__value": 8
+          }
+        },
+        "ThreadInVMfromJava": {
+          "size": 8,
+          "members": {
+            "_thread": 0
+          },
+          "enums": {
+            "storage_size__thread": 8
+          }
+        },
+        "ThreadClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_thread": 0,
+            "vtable_count": 1
+          }
+        },
+        "VM_Operation": {
+          "size": 40,
+          "members": {
+            "_calling_thread": 8,
+            "_priority": 16,
+            "_timestamp": 20,
+            "_next": 24,
+            "_prev": 32
+          },
+          "enums": {
+            "vtable_~VM_Operation": 0,
+            "vtable_doit": 1,
+            "vtable_doit_prologue": 2,
+            "vtable_doit_epilogue": 3,
+            "vtable_is_methodCompiler": 4,
+            "vtable_type": 5,
+            "vtable_evaluation_mode": 6,
+            "vtable_allow_nested_vm_operations": 7,
+            "vtable_is_cheap_allocated": 8,
+            "vtable_oops_do": 9,
+            "vtable_evaluate_at_safepoint": 10,
+            "vtable_evaluate_concurrently": 11,
+            "vtable_print_on_error": 12,
+            "vtable_count": 13,
+            "storage_size__calling_thread": 8,
+            "storage_size__priority": 4,
+            "storage_size__timestamp": 4,
+            "storage_size__next": 8,
+            "storage_size__prev": 8
+          }
+        },
+        "VM_Deoptimize": {
+          "size": 40,
+          "members": {},
+          "enums": {}
+        },
+        "CompLevel": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "CompLevel_all": -2,
+            "CompLevel_any": -2,
+            "CompLevel_none": 0,
+            "CompLevel_simple": 1,
+            "CompLevel_full_optimization": 4
+          }
+        },
+        "CompileBroker::CompilerActivity": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "stop_compilation": 0,
+            "run_compilation": 1,
+            "shutdown_compilation": 2
+          }
+        },
+        "Method::Flags": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "_dont_inline": 4,
+            "_force_inline": 2,
+            "_intrinsic_candidate": 64
+          }
+        },
+        "TosState": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "btos": 0,
+            "ztos": 1,
+            "ctos": 2,
+            "stos": 3,
+            "itos": 4,
+            "ltos": 5,
+            "ftos": 6,
+            "dtos": 7,
+            "atos": 8,
+            "vtos": 9,
+            "ilgl": 11
+          }
+        },
+        "ObservationABI": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "set_not_compilable_old_args": 1,
+            "nmethod_metadata_closure": 0,
+            "deopt_mode": 0,
+            "method_dont_inline_mask": 4,
+            "method_dont_inline_offset": 42,
+            "method_dont_inline_storage_size": 2,
+            "thread_is_java_slot": 4,
+            "anonymous_klass_offset": 274,
+            "anonymous_klass_width": 2,
+            "anonymous_klass_mask": 32,
+            "hidden_klass_offset": 0,
+            "hidden_klass_width": 0,
+            "hidden_klass_mask": 0,
+            "deallocate_list_size": 32,
+            "deallocate_list_data_offset": 24,
+            "deallocate_list_data_width": 8,
+            "deallocate_list_length_offset": 0,
+            "deallocate_list_length_width": 4
+          }
+        },
+        "DispatchTable": {
+          "size": 20480,
+          "members": {
+            "_table": 0
+          },
+          "enums": {
+            "storage_size__table": 20480
+          }
+        },
+        "Thread::SuspendFlags": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "_external_suspend": 536870912,
+            "_deopt_suspend": 268435456,
+            "_trace_flag": 4
+          }
+        },
+        "InstanceKlass::ClassState": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "allocated": 0,
+            "loaded": 1,
+            "linked": 2,
+            "being_initialized": 3,
+            "fully_initialized": 4,
+            "initialization_error": 5
+          }
+        },
+        "Bytecodes::Code": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "_tableswitch": 170,
+            "_lookupswitch": 171,
+            "_fast_linearswitch": 228,
+            "_fast_binaryswitch": 229,
+            "_wide": 196,
+            "number_of_codes": 239
+          }
+        },
+        "AbstractInterpreter::MethodKind": {
+          "size": 0,
+          "members": {},
+          "enums": {
+            "zerolocals": 0,
+            "zerolocals_synchronized": 1,
+            "native": 2,
+            "native_synchronized": 3,
+            "empty": 4,
+            "accessor": 5,
+            "abstract": 6,
+            "method_handle_invoke_FIRST": 7,
+            "method_handle_invoke_LAST": 12,
+            "java_lang_math_sin": 13,
+            "java_lang_math_cos": 14,
+            "java_lang_math_tan": 15,
+            "java_lang_math_abs": 16,
+            "java_lang_math_sqrt": 17,
+            "java_lang_math_log": 18,
+            "java_lang_math_log10": 19,
+            "java_lang_math_pow": 20,
+            "java_lang_math_exp": 21,
+            "java_lang_math_fmaF": 22,
+            "java_lang_math_fmaD": 23,
+            "java_lang_ref_reference_get": 24,
+            "java_util_zip_CRC32_update": 25,
+            "java_util_zip_CRC32_updateBytes": 26,
+            "java_util_zip_CRC32_updateByteBuffer": 27,
+            "java_util_zip_CRC32C_updateBytes": 28,
+            "java_util_zip_CRC32C_updateDirectByteBuffer": 29,
+            "java_lang_Float_intBitsToFloat": 30,
+            "java_lang_Float_floatToRawIntBits": 31,
+            "java_lang_Double_longBitsToDouble": 32,
+            "java_lang_Double_doubleToRawLongBits": 33,
+            "number_of_method_entries": 34,
+            "invalid": -1
+          }
         }
       },
       "code_prefixes": {
@@ -700,7 +2091,38 @@
         "new_string_unicode": "48895c241048896c2418564156415748",
         "tlab_initialize": "48895c2408574883ec2033ff488bd948",
         "lock_without_safepoint": "48895c2408574883ec208b15bc3e4300",
-        "allocate_handle_block_legacy": "40574883ec204885c97416488b795848"
+        "allocate_handle_block_legacy": "40574883ec204885c97416488b795848",
+        "vm_execute": "40535657415641574881ec9001000048",
+        "mark_all": "40534883ec60488b1debca75004885db",
+        "vm_deoptimize_vtable": "9049410800000000",
+        "vm_deoptimize_doit": "48895c240848896c2410488974241848",
+        "compile_jobs": "0100000000000000",
+        "use_compiler": "0101010114000000",
+        "compile_lock": "0000000000000000",
+        "codecache_lock": "0000000000000000",
+        "compiler_vtable": "30d24e0800000000",
+        "set_not_compilable": "48895c2408574883ec300fb741288bda",
+        "set_not_osr_compilable": "48895c2408574883ec304c894c242045",
+        "is_not_compilable": "488b41184885c0740a66837816007603",
+        "is_not_osr_compilable": "48895c2408574883ec208bda488bf9e8",
+        "class_add": "4053565741564883ec38488b5918410f",
+        "class_resolve_stream": "488bc44c894018488950105556415641",
+        "field_vm_to_java_transition10": "48895c2408574883ec208d4201418bf8",
+        "field_enable_guards10": "48895c2408574883ec20488b81480100",
+        "field_special_exit10": "48895c240848896c2410488974241857",
+        "class_define": "4055535657415541564157488d6c24d0",
+        "class_parse": "488bc44c8948204c8940184889501048",
+        "array_complete": "48895c240848896c2410488974241857",
+        "array_restore": "48895c240848897424104c8944241857",
+        "interpreter_code": "0000000000000000",
+        "field_throw_exception_entry": "0000000000000000",
+        "interpreter_throw_exception": "0000000000000000",
+        "interpreter_normal_table": "0000000000000000",
+        "threads_do": "48895c24084889742410574883ec2048",
+        "nmethod_metadata_do": "48895c2408488974241048897c24184c",
+        "bytecode_lengths": "00000000000000000000000000000000",
+        "class_loader_data_head": "0000000000000000",
+        "interpreter_entry_table": "00000000000000000000000000000000"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -716,7 +2138,20 @@
           "Thread records NMT stack and destructor releases it",
           "Failure cleanup destroys the JavaThread itself",
           "TLAB initialization is conditional and accepts TLAB subobject",
-          "Universe thread-group and JavaThread object accessors are inline"
+          "Universe thread-group and JavaThread object accessors are inline",
+          "Observation aliases are private Windows x64 functions or explicitly typed data/vtables; registration/JNI/JVMTI/WhiteBox bodies are offline provenance only and are never called.",
+          "VM_Operation has a virtual destructor at slot0, doit at slot1, 13 vtable entries and size40; genuine VM_Deoptimize supplies the remaining protocol.",
+          "Method set_not_compilable and set_not_osr_compilable use (this,int,bool,const char*); intrinsic_id/flags are uint16 at40/42. Dont-inline bit is4.",
+          "CompileBroker compiler activity is an int32 scalar: stop0/run1/shutdown2; UseCompiler is a bool scalar. CompilerThread::_task is audited from constructor stores and CompilerThread size is VMType-exported.",
+          "KlassHandle/instanceKlassHandle are trivial size8 metadata wrappers with _value0; Windows x64 by-value arguments contain raw metadata pointer bits.",
+          "Klass::_class_loader_data uses144; Java9 exports this inherited common-base field under InstanceKlass. Post class observer targets are define_instance_class/anonymous parse_stream/array completion/array CDS restoration.",
+          "ThreadClosure is size8 with do_thread at slot0; CompLevel_all=-2 for these AOT-enabled exact builds.",
+          "Interpreter codelets and cache fields come from offline exported VMStructs/VMTypes; no JVMTI event entry is invoked.",
+          "ThreadInVMfromJava size8 destructor is inlined: guard state712==2 enables guards; transition(thread,6,8) then special-exit condition at616 or suspend_flags72 mask0x20000004 calls handle_special_runtime_exit_condition(true).",
+          "AbstractInterpreter::_entry_table normal index0/synchronized index1 are proven by the first two MethodKind source enumerators and distinct generate_all codelets. Unique normal/synchronized codelet names lead to generation with synchronized=false/true and exact RIP-relative load/store of table[0]/[1]. No JNI/JVMTI/WhiteBox code is called.",
+          "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
+          "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
+          "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body."
         ],
         "source_hashes": {
           "10-handles.cpp": "42c41ba4b1387e23cf36dbda4162e6accbd23581690a7e8ac67202b476e9bc5f",
@@ -729,9 +2164,429 @@
           "10-javaClasses.cpp": "60f7ebead1be30e198e409ed366dcf18eb5dffdd224b2be99d64b692951731d6",
           "10-javaCalls.cpp": "ed7fe87a23af7840e63435e447ebd09da511b1becc19ccb4c554da1ae0506999",
           "10-thread.cpp": "f105a26d4bb8a52d94550c745bebba3e56e2303b8c079bb16c03c26d57fea66c",
-          "10-allocation.hpp": "f85c6606fa60c78290712703d19a178ee48dd91852dceb921e82bf3abc856a9f"
+          "10-allocation.hpp": "f85c6606fa60c78290712703d19a178ee48dd91852dceb921e82bf3abc856a9f",
+          "observation/10/classfile/classLoaderData.cpp": "1a29d8ace762a2c8dd8556adf7d44f26dfc794316602b134ef21a05b8e9ec286",
+          "observation/10/classfile/systemDictionary.cpp": "b19d635cdc9d9670c2adf96cc05eb7b08b2505603bf780c5907a3c63ec4fdb72",
+          "observation/10/code/codeCache.cpp": "821a5bbd4a264b96d0bf92efdb69f013b1c4c7e96125ae512ef1ba2ccf15ef17",
+          "observation/10/code/nmethod.cpp": "ab7cbe204c020ff4cfe545a883a5c89c4f8bd60a577a3a01af56f2df30ee0155",
+          "observation/10/code/nmethod.hpp": "56d0d2074242871d9b445cf53e0eeac9af919aebf7ba6283874836f3e8d8c8c9",
+          "observation/10/compiler/compileBroker.cpp": "4be3c7a0cf8d21510f0055dd28e17ed072c0cf3982ef18cd9b25e2ea33bfc872",
+          "observation/10/compiler/compileBroker.hpp": "5fc06e987b9d7af053ad7d215ea272f1526b1e95d275de885daab48268df53af",
+          "observation/10/interpreter/interpreter.hpp": "240ec178432c3eeae21297529b72a8001be516b076d7e7655666c08b6789fb4b",
+          "observation/10/memory/iterator.hpp": "d28705d8009afe8ae888d773ba3fb8a6c17fb7fa2940de975aa502153202880a",
+          "observation/10/oops/klass.hpp": "99adcc9ebf0a312cc3f17446dd261feb20a6c135b46e00429dbc017bf712050e",
+          "observation/10/oops/method.cpp": "2a680d7ea48ea46d6a1c760bbf215dbf4750896e6fd1e15ed7499057c961b49a",
+          "observation/10/oops/method.hpp": "2a4d9eb179b07ecf9a9a98783623115b30ec80d274562b3ef8c8e0ff3f39ee26",
+          "observation/10/prims/whitebox.cpp": "dc83079591d39ead6231ab6ddabae771a001c23e46bd11e209d6868ff9e26f4b",
+          "observation/10/runtime/deoptimization.cpp": "232c93e21aabc78462b5ce2f541c0ee6b604f2d10092182483330e4db5c6b984",
+          "observation/10/runtime/mutexLocker.cpp": "cfd6185d2e6fb1163b904eae8a60fabc9bcb6ddd2513e8cddc8389bd037d81a5",
+          "observation/10/runtime/vmThread.cpp": "e924377393b26220658cf70b47b5ac6f4a92b819139b2c2ce32519db746dab3e",
+          "observation/10/runtime/vm_operations.cpp": "3ff8ad15af96dcf845a708601be10ce6f1a813259be40b7b64cdbce50460c045",
+          "observation/10/runtime/vm_operations.hpp": "f4aa07830360aeb84cbf8e069b9a57d7d1a9e7b10a7d116784a4d5cc54cc001c",
+          "observation/10/utilities/globalDefinitions.hpp": "73f1343917e056dd92ffbfd028d87ad8fd03058258a817e1a926240b36c3d128",
+          "observation/10/interpreter/templateInterpreterGenerator.cpp": "f507b49e56308f4fce55ad92e91a2a35347803fbbffc5fdc0d54310d8b06cdc4",
+          "observation/10/cpu/x86/templateInterpreterGenerator_x86.cpp": "24926224578a9008fd0615e60a07df736d22725d9b4ae813b01d40eaefdff31c",
+          "observation/10/interpreter/bytecodes.hpp": "b933afbbe7f0e5819a62b23411d9ea101fd104426fb2a6bb945f811c5d043d0a",
+          "observation/10/interpreter/bytecodes.cpp": "99a085cfea6e1e6228c36a1fcb19d20d89f0fbb4fd81a9fe4134133191daf096",
+          "observation/10/oops/instanceKlass.hpp": "5ad96c36dfcbac1aaced3203d70a4ff09cae7b32937ea1c0008709c774f50457",
+          "observation/10/oops/constMethod.hpp": "0de717cebbcfa8782a3c6262d0dab1dcf71b0e8885ecdb31cb71f6e0177592fb",
+          "observation/10/oops/constMethod.cpp": "fe3769f8ad8f17bba585c349385356853fab0f7f910dfb2a9123095ff5d38c82",
+          "intrinsic/10/exact10-templateInterpreterGenerator.cpp": "f507b49e56308f4fce55ad92e91a2a35347803fbbffc5fdc0d54310d8b06cdc4",
+          "intrinsic/10/exact10-vmSymbols.hpp": "ee609bdbf0aaa60477c24e5d1b9de3b74b1f9b36dc97dd3bf852de9a27c5ba72",
+          "intrinsic/10/exact10-abstractInterpreter.hpp": "a47d0352ea165e602d71bbc0e9cf1c88782458a9e9463875f6d76bfbdb673ab9",
+          "deallocate/10/utilities/growableArray.hpp": "ef87744831f9c6ee53c5a29d8ceaf1651823a263d13bb1b6ada3c5a738f9c150",
+          "deallocate/10/classfile/classLoaderData.hpp": "0f9bf6c64f6ab0f2247dd4729d5b22364086d60b8a0517456850a417a9c15e7b",
+          "deallocate/10/classfile/classLoaderData.cpp": "1a29d8ace762a2c8dd8556adf7d44f26dfc794316602b134ef21a05b8e9ec286"
+        },
+        "observation_entrypoints": {
+          "vm_execute": {
+            "rva": 6756288,
+            "kind": "function",
+            "signature": "static void VMThread::execute(VM_Operation*)"
+          },
+          "mark_all": {
+            "rva": 1963088,
+            "kind": "function",
+            "signature": "static void CodeCache::mark_all_nmethods_for_deoptimization()"
+          },
+          "vm_deoptimize_vtable": {
+            "rva": 7511248,
+            "kind": "vtable",
+            "signature": "const VM_Deoptimize virtual function table"
+          },
+          "vm_deoptimize_doit": {
+            "rva": 6759920,
+            "kind": "function",
+            "signature": "virtual void VM_Deoptimize::doit()"
+          },
+          "compile_jobs": {
+            "rva": 9215424,
+            "kind": "data",
+            "signature": "static volatile jint CompileBroker::_should_compile_new_jobs"
+          },
+          "use_compiler": {
+            "rva": 9219556,
+            "kind": "data",
+            "signature": "bool UseCompiler"
+          },
+          "compile_lock": {
+            "rva": 9682936,
+            "kind": "data",
+            "signature": "Mutex* Compile_lock"
+          },
+          "codecache_lock": {
+            "rva": 9682760,
+            "kind": "data",
+            "signature": "Monitor* CodeCache_lock"
+          },
+          "compiler_vtable": {
+            "rva": 8132064,
+            "kind": "vtable",
+            "signature": "const CompilerThread virtual function table"
+          },
+          "set_not_compilable": {
+            "rva": 5332176,
+            "kind": "function",
+            "signature": "void Method::set_not_compilable(int,bool,const char*)"
+          },
+          "set_not_osr_compilable": {
+            "rva": 5332336,
+            "kind": "function",
+            "signature": "void Method::set_not_osr_compilable(int,bool,const char*)"
+          },
+          "is_not_compilable": {
+            "rva": 5322240,
+            "kind": "function",
+            "signature": "bool Method::is_not_compilable(int) const"
+          },
+          "is_not_osr_compilable": {
+            "rva": 5322368,
+            "kind": "function",
+            "signature": "bool Method::is_not_osr_compilable(int) const"
+          },
+          "class_add": {
+            "rva": 1833840,
+            "kind": "function",
+            "signature": "void ClassLoaderData::add_class(Klass*,bool)"
+          },
+          "class_resolve_stream": {
+            "rva": 6367808,
+            "kind": "function",
+            "signature": "static InstanceKlass* SystemDictionary::resolve_from_stream(Symbol*,Handle,Handle,ClassFileStream*,Thread*)"
+          },
+          "field_vm_to_java_transition10": {
+            "rva": 1513056,
+            "kind": "function",
+            "signature": "static void ThreadStateTransition::transition(JavaThread*,JavaThreadState,JavaThreadState)"
+          },
+          "field_enable_guards10": {
+            "rva": 6507200,
+            "kind": "function",
+            "signature": "void JavaThread::enable_stack_yellow_reserved_zone()"
+          },
+          "field_special_exit10": {
+            "rva": 6511024,
+            "kind": "function",
+            "signature": "void JavaThread::handle_special_runtime_exit_condition(bool)"
+          },
+          "class_define": {
+            "rva": 6350816,
+            "kind": "function",
+            "signature": "static void SystemDictionary::define_instance_class(InstanceKlass*, Thread*)"
+          },
+          "class_parse": {
+            "rva": 6366640,
+            "kind": "function",
+            "signature": "static InstanceKlass* SystemDictionary::parse_stream(Symbol*, Handle, Handle, ClassFileStream*, const InstanceKlass*, GrowableArray<Handle>*, Thread*)"
+          },
+          "array_complete": {
+            "rva": 808144,
+            "kind": "function",
+            "signature": "static void ArrayKlass::complete_create_array_klass(ArrayKlass*, Klass*, ModuleEntry*, Thread*)"
+          },
+          "array_restore": {
+            "rva": 810224,
+            "kind": "function",
+            "signature": "void ArrayKlass::restore_unshareable_info(ClassLoaderData*, Handle, Thread*)"
+          },
+          "interpreter_code": {
+            "rva": 9577600,
+            "kind": "data",
+            "signature": "static StubQueue* AbstractInterpreter::_code"
+          },
+          "field_throw_exception_entry": {
+            "rva": 9724440,
+            "kind": "data",
+            "signature": "static address TemplateInterpreter::_throw_exception_entry",
+            "address_store_rva": 6408203,
+            "address_store_bytes": "488905069a3200",
+            "proof": "generate_throw_exception assigns second pc() after restore_bcp/restore_locals/reinit_heapbase, matching exact-source order and RIP-relative store."
+          },
+          "interpreter_normal_table": {
+            "rva": 9745200,
+            "kind": "data",
+            "signature": "static DispatchTable TemplateInterpreter::_normal_table",
+            "address_reference_rva": 6393165,
+            "address_reference_bytes": "488d0ddc253300",
+            "set_entry_rva": 6387136,
+            "set_entry_bytes": "498b004c63ca4a8904c9498b40084a8984c900080000498b40104a8984c900100000498b40184a8984c900180000498b40404a8984c900400000498b40204a8984c900200000498b40284a8984c900280000498b40304a8984c900300000498b40384a8984c900380000498b40484a8984c900480000c3",
+            "proof": "set_entry_points passes this table then set_entry stores ten addresses with bytecode*8 and state*0x800; active-table initialization copies0xa0 blocks of0x80 bytes."
+          },
+          "threads_do": {
+            "rva": 6529760,
+            "kind": "function",
+            "signature": "static void Threads::threads_do(ThreadClosure*)",
+            "proof": "Exact-source iteration: JavaThreads then VMThread, heap GC threads and WatcherThread;9 linkednext424,10 SMR ThreadsList array."
+          },
+          "nmethod_metadata_do": {
+            "rva": 5459392,
+            "kind": "function",
+            "signature": "virtual void nmethod::metadata_do(void(*)(Metadata*))",
+            "proof": "Exported nmethod vtable slot67(Java9)/68(Java10); verified-entry/state checks, RelocIterator immediate metadata, metadata section offset300/308 bounded by scopes_data_begin128, then Method120, invoking callback R14."
+          },
+          "bytecode_lengths": {
+            "rva": 9586800,
+            "kind": "data",
+            "signature": "static u_char Bytecodes::_lengths[number_of_codes]",
+            "address_store_rva": 1107862,
+            "address_store_bytes": "4688943270489200",
+            "proof": "Bytecodes::def discovered via fast_igetfield name and opcode208 initialization; strlen(format)&15 OR strlen(wide_format)<<4 stored in exact image-relative byte array."
+          },
+          "class_loader_data_head": {
+            "rva": 9606128,
+            "kind": "data",
+            "signature": "static ClassLoaderData* ClassLoaderDataGraph::_head",
+            "proof": "Offline exported VMStruct static field address."
+          }
+        },
+        "thread_is_java_slot_proof": {
+          "Thread": {
+            "vtable_rva": 8130904,
+            "slot": 4,
+            "predicate_rva": 1569296,
+            "bytes": "32c0c3",
+            "result": false
+          },
+          "JavaThread": {
+            "vtable_rva": 8131680,
+            "slot": 4,
+            "predicate_rva": 1714496,
+            "bytes": "b001c3",
+            "result": true
+          },
+          "CompilerThread": {
+            "vtable_rva": 8132064,
+            "slot": 4,
+            "predicate_rva": 1714496,
+            "bytes": "b001c3",
+            "result": true
+          },
+          "VMThread": {
+            "vtable_rva": 8252312,
+            "slot": 4,
+            "predicate_rva": 1569296,
+            "bytes": "32c0c3",
+            "result": false
+          }
+        },
+        "member_layout_proofs": {
+          "ConstMethod": {
+            "_result_type": {
+              "offset": 38,
+              "storage_size": 1,
+              "rva": 5326555,
+              "bytes": "488b48080fb645e7884126",
+              "function": "Method::make_method_handle_intrinsic",
+              "proof": "Method::_constMethod at8 then ResultTypeFinder result byte is stored as AL at ConstMethod+0x26; exact source declares u1 _result_type after exported u2 _flags at36 and before exported _code_size at40."
+            }
+          },
+          "InstanceKlass": {
+            "_misc_flags": {
+              "offset": 274,
+              "storage_size": 2,
+              "rva": 3398641,
+              "bytes": "0fb78f1201000089879c00000048837e200074066683c920eb08b8dfff00006623c866898f12010000",
+              "proof": "Exact constructor loads the VMStruct-published uint16 misc-flags cell, sets ORcx0x20 for the anonymous class host, and writes the same uint16 cell."
+            }
+          },
+          "ThreadShadow": {
+            "_exception_file": {
+              "offset": 16,
+              "storage_size": 8,
+              "rva": 2780672,
+              "bytes": "488951084c89411044894918c3",
+              "function": "ThreadShadow::set_pending_exception",
+              "proof": "Exact unique setter stores pending_exception pointer at8, exception_file pointer at16 and exception_line dword at24, matching the tagged ThreadShadow declaration."
+            },
+            "_exception_line": {
+              "offset": 24,
+              "storage_size": 4,
+              "rva": 2780672,
+              "bytes": "488951084c89411044894918c3",
+              "function": "ThreadShadow::set_pending_exception",
+              "proof": "Exact unique setter stores pending_exception pointer at8, exception_file pointer at16 and exception_line dword at24, matching the tagged ThreadShadow declaration."
+            }
+          },
+          "ClassLoaderData": {
+            "_deallocate_list": {
+              "offset": 104,
+              "storage_size": 8,
+              "rva": 1834461,
+              "bytes": "49897668",
+              "function": "ClassLoaderData::add_to_deallocate_list",
+              "proof": "Exact tagged source allocates GrowableArray<Metadata*>(100,true) and appends missing metadata; the native body allocates32, constructs length0/capacity100/payload24, stores the pointer in this exact CLD cell, then searches/appends Metadata* elements. The separately identified free_deallocate_list reads the same cell."
+            }
+          }
+        },
+        "data_layout_proofs": {
+          "interpreter_entry_table": [
+            {
+              "label": "normal_load",
+              "rva": 6389291,
+              "bytes": "488b056ea63000",
+              "target_rva": 9577632
+            },
+            {
+              "label": "normal_store",
+              "rva": 6389315,
+              "bytes": "48890556a63000",
+              "target_rva": 9577632
+            },
+            {
+              "label": "synchronized_load",
+              "rva": 6389359,
+              "bytes": "488b0532a63000",
+              "target_rva": 9577640
+            },
+            {
+              "label": "synchronized_store",
+              "rva": 6389387,
+              "bytes": "48890516a63000",
+              "target_rva": 9577640
+            }
+          ]
+        },
+        "anonymous_klass_predicate": {
+          "kind": "VMStruct+source+constructor",
+          "member_owner": "InstanceKlass",
+          "member": "_misc_flags",
+          "source_tag": "jdk-10.0.2+13",
+          "instructions": [
+            {
+              "rva": 3398641,
+              "bytes": "0fb78f12010000",
+              "mnemonic": "movzx",
+              "operands": "ecx, word ptr [rdi + 0x112]"
+            },
+            {
+              "rva": 3398648,
+              "bytes": "89879c000000",
+              "mnemonic": "mov",
+              "operands": "dword ptr [rdi + 0x9c], eax"
+            },
+            {
+              "rva": 3398654,
+              "bytes": "48837e2000",
+              "mnemonic": "cmp",
+              "operands": "qword ptr [rsi + 0x20], 0"
+            },
+            {
+              "rva": 3398659,
+              "bytes": "7406",
+              "mnemonic": "je",
+              "operands": "0x33dc0b"
+            },
+            {
+              "rva": 3398661,
+              "bytes": "6683c920",
+              "mnemonic": "or",
+              "operands": "cx, 0x20"
+            },
+            {
+              "rva": 3398665,
+              "bytes": "eb08",
+              "mnemonic": "jmp",
+              "operands": "0x33dc13"
+            },
+            {
+              "rva": 3398667,
+              "bytes": "b8dfff0000",
+              "mnemonic": "mov",
+              "operands": "eax, 0xffdf"
+            },
+            {
+              "rva": 3398672,
+              "bytes": "6623c8",
+              "mnemonic": "and",
+              "operands": "cx, ax"
+            },
+            {
+              "rva": 3398675,
+              "bytes": "66898f12010000",
+              "mnemonic": "mov",
+              "operands": "word ptr [rdi + 0x112], cx"
+            }
+          ]
+        },
+        "derived_layout_proofs": {
+          "ObservationABI": [
+            {
+              "rva": 1834354,
+              "bytes": "33ff49397e6875678d57028d4f20448d4701e8471defff",
+              "enums": {
+                "deallocate_list_size": 32
+              },
+              "proof": "XOR EDI,EDI establishes zero, then LEA ECX,[RDI+0x20] passes32 to the exact ResourceObj allocation call; source constructs GrowableArray<Metadata*>(100,true)."
+            },
+            {
+              "rva": 1836576,
+              "bytes": "8b30ffce4863ee",
+              "enums": {
+                "deallocate_list_length_offset": 0,
+                "deallocate_list_length_width": 4
+              },
+              "proof": "Free-list reverse traversal loads length from array+0 using MOV ESI,dword ptr[RAX], decrements, sign-extends the starting index and skips negative lengths."
+            },
+            {
+              "rva": 1836608,
+              "bytes": "488b4768488b5818488b1ceb",
+              "enums": {
+                "deallocate_list_data_offset": 24,
+                "deallocate_list_data_width": 8
+              },
+              "proof": "Free-list loop loads exact CLD pointer then MOV RBX,qword ptr[RAX+24] payload and reads Metadata* at payload+index*8."
+            }
+          ]
         }
       }
+    }
+  ],
+  "source_audits": [
+    {
+      "identity": {
+        "age": 1,
+        "guid": "aeaac904-ec7a-f23d-e49f-a06fa9699765",
+        "image_size": 12808192,
+        "java_feature": 16,
+        "machine": 34404,
+        "pe_timestamp": 1153291634,
+        "sha256": "71b15624e2299fbdbd2468d2c91a39fd28a7de595f90f0d2f71072fded5d2c29"
+      },
+      "source_repository": "https://github.com/adoptium/jdk16u",
+      "source_commit": "7f47ea5697d1",
+      "source_tag": "jdk-16.0.2+7",
+      "source_sha256": {
+        "src/hotspot/cpu/x86/javaFrameAnchor_x86.hpp": "8facb94a8a4d39a86e5fc5459564575134e33bc8ea74ec427a12b4bba696c259",
+        "src/hotspot/cpu/x86/frame_x86.cpp": "e88e1e3c9c0bae0de87876ef28cd1dec61d14cadb114b34b488743588a5d66d1",
+        "src/hotspot/cpu/x86/macroAssembler_x86.cpp": "addcd9e453459c60b10e9797ed661394b59eea8724f6b9c0645312dab0e40bb6"
+      },
+      "subject": "JavaFrameAnchor x86 saved RBP lifecycle",
+      "layout_source": "Matching publisher full PDB: JavaFrameAnchor size32, _saved_rbp_address offset24 storage_size8.",
+      "source_facts": [
+        "javaFrameAnchor_x86.hpp declares _saved_rbp_address as a volatile intptr_t**; clear() clears it and copy() preserves it.",
+        "frame_x86.cpp sender_for_entry_frame() uses saved_rbp_address() to update the saved-link register map when the address is non-null.",
+        "macroAssembler_x86.cpp reset_last_Java_frame() clears saved_rbp_address together with the last Java SP, FP and PC."
+      ]
     }
   ]
 }

@@ -114,7 +114,7 @@ jobs:
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.probe }}
           --metadata-only
-      - name: Verify hooks and queued native callbacks
+      - name: Verify method hooks and explicit callback dispatch
         if: ${{ !cancelled() }}
         shell: pwsh
         run: >-
@@ -145,8 +145,12 @@ jobs:
         include:
           - toolchain: header
             probe: vmhook_native_probe.dll
+            observation_probe: vmhook_observation_probe.dll
+            callback_probe: vmhook_callback_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
+            observation_probe: vmhook_module_observation_probe.dll
+            callback_probe: vmhook_module_callback_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -172,6 +176,24 @@ jobs:
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.probe }}
           --native-threads
+      - name: Verify method hooks, field stubs, class notifications and rooted callbacks
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: >-
+          python tools/run_observation_fixture.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.observation_probe }}
+          --callback-probe runtime-binaries/${{ matrix.callback_probe }}
+          --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: observation-${{ matrix.java }}-${{ matrix.toolchain }}
+          path: observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   private_profile_reproduction:
     runs-on: ubuntu-latest

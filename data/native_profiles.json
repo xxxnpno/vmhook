@@ -563,6 +563,170 @@
       "?create_from_unicode@java_lang_String@@SA?AVHandle@@PEBGHPEAVJavaThread@@@Z",
       "?create_from_unicode@java_lang_String@@SA?AVHandle@@PEBGHPEAVThread@@@Z",
       "?create_from_unicode@java_lang_String@@SA?AVHandle@@PEAGHPEAVThread@@@Z"
+    ],
+    "vm_execute": [
+      "?execute@VMThread@@SAXPEAVVM_Operation@@@Z"
+    ],
+    "mark_all": [
+      "?mark_all_nmethods_for_deoptimization@CodeCache@@SAXXZ",
+      "?mark_all_nmethods_for_deoptimization@CodeCache@@SAXPEAVDeoptimizationScope@@@Z"
+    ],
+    "mark_for": [
+      "?mark_for_deoptimization@CodeCache@@SAHAEAVDepChange@@@Z",
+      "?mark_for_deoptimization@CodeCache@@SAHPEAVMethod@@@Z",
+      "?mark_for_deoptimization@CodeCache@@CAHAEAVKlassDepChange@@@Z",
+      "?mark_for_deoptimization@CodeCache@@SAXPEAVDeoptimizationScope@@PEAVMethod@@@Z"
+    ],
+    "deoptimize_all_marked": [
+      "?deoptimize_all_marked@Deoptimization@@SAXPEAVnmethod@@@Z",
+      "?deoptimize_all_marked@Deoptimization@@SAXXZ"
+    ],
+    "vm_deoptimize_vtable": [
+      "??_7VM_Deoptimize@@6B@"
+    ],
+    "vm_deoptimize_doit": [
+      "?doit@VM_Deoptimize@@UEAAXXZ"
+    ],
+    "vm_clear_ics_vtable": [
+      "??_7VM_ClearICs@@6B@"
+    ],
+    "vm_clear_ics_doit": [
+      "?doit@VM_ClearICs@@UEAAXXZ"
+    ],
+    "deopt_scope_ctor": [
+      "??0DeoptimizationScope@@QEAA@XZ"
+    ],
+    "deopt_scope_commit": [
+      "?deoptimize_marked@DeoptimizationScope@@QEAAXXZ"
+    ],
+    "compile_jobs": [
+      "?_should_compile_new_jobs@CompileBroker@@0HC",
+      "?_should_compile_new_jobs@CompileBroker@@0JC"
+    ],
+    "use_compiler": [
+      "UseCompiler"
+    ],
+    "compile_lock": [
+      "?Compile_lock@@3PEAVMutex@@EA"
+    ],
+    "compile_queue_lock": [
+      "?MethodCompileQueue_lock@@3PEAVMonitor@@EA"
+    ],
+    "compilation_lock": [
+      "?Compilation_lock@@3PEAVMonitor@@EA"
+    ],
+    "codecache_lock": [
+      "?CodeCache_lock@@3PEAVMutex@@EA",
+      "?CodeCache_lock@@3PEAVMonitor@@EA"
+    ],
+    "compiler_vtable": [
+      "??_7CompilerThread@@6B@"
+    ],
+    "threads_do": [
+      "?java_threads_do@Threads@@SAXPEAVThreadClosure@@@Z",
+      "?threads_do@Threads@@SAXPEAVThreadClosure@@@Z"
+    ],
+    "nmethod_metadata_do": [
+      "?metadata_do@nmethod@@QEAAXP6AXPEAVMetadata@@@Z@Z",
+      "?metadata_do@nmethod@@UEAAXP6AXPEAVMetadata@@@Z@Z",
+      "?metadata_do@nmethod@@UEAAXPEAVMetadataClosure@@@Z",
+      "?metadata_do@nmethod@@QEAAXPEAVMetadataClosure@@@Z"
+    ],
+    "set_not_compilable": [
+      "?set_not_compilable@Method@@QEAAXH_NPEBD@Z",
+      "?set_not_compilable@Method@@QEAAXPEBDH_N@Z"
+    ],
+    "set_not_osr_compilable": [
+      "?set_not_osr_compilable@Method@@QEAAXH_NPEBD@Z",
+      "?set_not_osr_compilable@Method@@QEAAXPEBDH_N@Z"
+    ],
+    "is_not_compilable": [
+      "?is_not_compilable@Method@@QEBA_NH@Z"
+    ],
+    "is_not_osr_compilable": [
+      "?is_not_osr_compilable@Method@@QEBA_NH@Z"
+    ],
+    "class_add": [
+      "?add_class@ClassLoaderData@@QEAAXPEAVKlass@@@Z",
+      "?add_class@ClassLoaderData@@QEAAXPEAVKlass@@_N@Z"
+    ],
+    "class_define": [
+      "?define_instance_class@SystemDictionary@@KAXVinstanceKlassHandle@@PEAVThread@@@Z",
+      "?define_instance_class@SystemDictionary@@KAXPEAVInstanceKlass@@PEAVThread@@@Z",
+      "?define_instance_class@SystemDictionary@@CAXPEAVInstanceKlass@@VHandle@@PEAVJavaThread@@@Z"
+    ],
+    "class_parse": [
+      "?parse_stream@SystemDictionary@@SAPEAVKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@VKlassHandle@@PEAV?$GrowableArray@VHandle@@@@PEAVThread@@@Z",
+      "?parse_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@PEBV2@PEAV?$GrowableArray@VHandle@@@@PEAVThread@@@Z",
+      "?parse_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVSymbol@@VHandle@@PEAVClassFileStream@@AEBVClassLoadInfo@@PEAVThread@@@Z"
+    ],
+    "class_resolve_stream": [
+      "?resolve_from_stream@SystemDictionary@@SAPEAVKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@_NPEAVThread@@@Z",
+      "?resolve_from_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVSymbol@@VHandle@@1PEAVClassFileStream@@PEAVThread@@@Z",
+      "?resolve_from_stream@SystemDictionary@@SAPEAVInstanceKlass@@PEAVClassFileStream@@PEAVSymbol@@VHandle@@AEBVClassLoadInfo@@PEAVJavaThread@@@Z"
+    ],
+    "class_resolve_hidden": [
+      "?resolve_hidden_class_from_stream@SystemDictionary@@CAPEAVInstanceKlass@@PEAVClassFileStream@@PEAVSymbol@@VHandle@@AEBVClassLoadInfo@@PEAVJavaThread@@@Z"
+    ],
+    "array_complete": [
+      "?complete_create_array_klass@ArrayKlass@@SAXPEAV1@VKlassHandle@@PEAVThread@@@Z",
+      "?complete_create_array_klass@ArrayKlass@@SAXPEAV1@PEAVKlass@@PEAVModuleEntry@@PEAVThread@@@Z",
+      "?complete_create_array_klass@ArrayKlass@@SAXPEAV1@PEAVKlass@@PEAVModuleEntry@@PEAVJavaThread@@@Z"
+    ],
+    "array_restore": [
+      "?restore_unshareable_info@ArrayKlass@@UEAAXPEAVClassLoaderData@@VHandle@@PEAVThread@@@Z",
+      "?restore_unshareable_info@ArrayKlass@@QEAAXPEAVClassLoaderData@@VHandle@@PEAVThread@@@Z",
+      "?restore_unshareable_info@ArrayKlass@@QEAAXPEAVClassLoaderData@@VHandle@@PEAVJavaThread@@@Z"
+    ],
+    "interpreter_code": [
+      "?_code@AbstractInterpreter@@1PEAVStubQueue@@EA"
+    ],
+    "field_vm_to_java_destroy": [
+      "??1ThreadInVMfromJava@@QEAA@XZ"
+    ],
+    "field_vm_to_java_transition10": [
+      "?transition@ThreadStateTransition@@SAXPEAVJavaThread@@W4JavaThreadState@@1@Z"
+    ],
+    "field_enable_guards10": [
+      "?enable_stack_yellow_reserved_zone@JavaThread@@QEAAXXZ"
+    ],
+    "field_special_exit10": [
+      "?handle_special_runtime_exit_condition@JavaThread@@QEAAX_N@Z"
+    ],
+    "field_enable_guards19": [
+      "?enable_stack_yellow_reserved_zone@StackOverflow@@QEAAXXZ"
+    ],
+    "field_process_safepoint_exit19": [
+      "?process_if_requested_with_exit_check@SafepointMechanism@@SAXPEAVJavaThread@@_N@Z"
+    ],
+    "field_enable_guards20": [
+      "?enable_stack_yellow_reserved_zone@StackOverflow@@QEAAXXZ"
+    ],
+    "field_safepoint_process20": [
+      "?process@SafepointMechanism@@CAXPEAVJavaThread@@_N1@Z"
+    ],
+    "field_special_exit20": [
+      "?handle_special_runtime_exit_condition@JavaThread@@QEAAXXZ"
+    ],
+    "field_throw_exception_entry": [
+      "?_throw_exception_entry@TemplateInterpreter@@1PEAEEA"
+    ],
+    "interpreter_normal_table": [
+      "?_normal_table@TemplateInterpreter@@1VDispatchTable@@A"
+    ],
+    "interpreter_throw_exception": [
+      "?_throw_exception_entry@TemplateInterpreter@@1PEAEEA"
+    ],
+    "bytecode_lengths": [
+      "?_lengths@Bytecodes@@0PAEA",
+      "?_lengths@Bytecodes@@0QBEB"
+    ],
+    "class_loader_data_head": [
+      "?_head@ClassLoaderDataGraph@@0PEAVClassLoaderData@@EA",
+      "?_head@ClassLoaderDataGraph@@0REAVClassLoaderData@@EA"
+    ],
+    "interpreter_entry_table": [
+      "?_entry_table@AbstractInterpreter@@1PAPEAEA"
     ]
   },
   "profile_types": [
@@ -606,7 +770,57 @@
     "ThreadLocalAllocBuffer",
     "ThreadInVMfromNative",
     "ThreadToNativeFromVM",
-    "JDK_Version"
+    "JDK_Version",
+    "VM_Operation",
+    "VM_Deoptimize",
+    "VM_ClearICs",
+    "DeoptimizationScope",
+    "MethodFlags",
+    "Method::Flags",
+    "MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>",
+    "CompilerThread",
+    "CompileTask",
+    "CompileBroker",
+    "CompileBroker::CompilerActivity",
+    "CompLevel",
+    "CompilerType",
+    "ThreadClosure",
+    "MetadataClosure",
+    "NMethodClosure",
+    "Klass",
+    "InstanceKlass",
+    "ArrayKlass",
+    "ClassLoaderData",
+    "OopHandle",
+    "KlassHandle",
+    "instanceKlassHandle",
+    "ClassLoadInfo",
+    "KlassFlags",
+    "KlassFlags::<unnamed-enum-_misc_is_hidden_class>",
+    "ConstantPoolCache",
+    "ConstantPoolCacheEntry",
+    "ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>",
+    "ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>",
+    "ResolvedFieldEntry",
+    "ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>",
+    "Array<ResolvedFieldEntry>",
+    "StubQueue",
+    "InterpreterCodelet",
+    "TosState",
+    "ThreadInVMfromJava",
+    "SafepointMechanism::ThreadData",
+    "CompiledMethod",
+    "nmethod",
+    "NMethodIterator",
+    "ObservationABI",
+    "DispatchTable",
+    "Thread::SuspendFlags",
+    "JavaThread::SuspendFlags",
+    "InstanceKlass::ClassState",
+    "Bytecodes::Code",
+    "CompileBroker::<unnamed-enum-stop_compilation>",
+    "AbstractInterpreter::MethodKind",
+    "InstanceKlass::<unnamed-enum-_misc_rewritten>"
   ],
   "required_fields": {
     "JavaThread": [
@@ -623,7 +837,12 @@
       "_stack_size",
       "_threadObj",
       "_thread_state",
-      "_tlab"
+      "_tlab",
+      "_poll_data",
+      "_suspend_flags",
+      "_special_runtime_exit_condition",
+      "_vm_result",
+      "_vm_result_oop"
     ],
     "Thread": [
       "_active_handles",
@@ -635,7 +854,9 @@
       "_tlab"
     ],
     "ThreadShadow": [
-      "_pending_exception"
+      "_pending_exception",
+      "_exception_file",
+      "_exception_line"
     ],
     "Arena": [
       "_hwm",
@@ -643,17 +864,26 @@
     ],
     "Method": [
       "_access_flags",
-      "_constMethod"
+      "_constMethod",
+      "_flags",
+      "_dont_inline",
+      "_intrinsic_id",
+      "_code",
+      "_i2i_entry",
+      "_from_interpreted_entry"
     ],
     "ConstMethod": [
       "_constants",
       "_name_index",
       "_signature_index",
-      "_size_of_parameters"
+      "_size_of_parameters",
+      "_code_size",
+      "_result_type"
     ],
     "ConstantPool": [
       "_length",
-      "_pool_holder"
+      "_pool_holder",
+      "_cache"
     ],
     "Symbol": [
       "_body",
@@ -693,6 +923,120 @@
       "_addr",
       "_name",
       "_type"
+    ],
+    "VM_Operation": [
+      "_calling_thread",
+      "_next",
+      "_prev",
+      "_priority",
+      "_timestamp"
+    ],
+    "DeoptimizationScope": [
+      "_required_gen"
+    ],
+    "MethodFlags": [
+      "_status"
+    ],
+    "AccessFlags": [
+      "_flags"
+    ],
+    "CompilerThread": [
+      "_task"
+    ],
+    "CompileTask": [
+      "_compile_id"
+    ],
+    "Klass": [
+      "_name",
+      "_class_loader_data",
+      "_java_mirror",
+      "_layout_helper",
+      "_access_flags",
+      "_misc_flags",
+      "_next_link"
+    ],
+    "InstanceKlass": [
+      "_init_state"
+    ],
+    "ClassLoaderData": [
+      "_class_loader",
+      "_klasses",
+      "_next",
+      "_deallocate_list"
+    ],
+    "OopHandle": [
+      "_obj"
+    ],
+    "KlassHandle": [
+      "_value"
+    ],
+    "instanceKlassHandle": [
+      "_value"
+    ],
+    "ClassLoadInfo": [
+      "_is_hidden",
+      "_unsafe_anonymous_host"
+    ],
+    "KlassFlags": [
+      "_flags"
+    ],
+    "ConstantPoolCache": [
+      "_length",
+      "_constant_pool",
+      "_resolved_field_entries"
+    ],
+    "ConstantPoolCacheEntry": [
+      "_indices",
+      "_f1",
+      "_f2",
+      "_flags"
+    ],
+    "ResolvedFieldEntry": [
+      "_field_holder",
+      "_field_offset",
+      "_flags",
+      "_tos_state"
+    ],
+    "Array<ResolvedFieldEntry>": [
+      "_length",
+      "_data"
+    ],
+    "StubQueue": [
+      "_stub_buffer",
+      "_buffer_limit",
+      "_queue_begin",
+      "_queue_end",
+      "_number_of_stubs"
+    ],
+    "InterpreterCodelet": [
+      "_size",
+      "_bytecode",
+      "_description"
+    ],
+    "ThreadInVMfromJava": [
+      "_thread",
+      "_check_asyncs"
+    ],
+    "JavaFrameAnchor": [
+      "_last_Java_sp",
+      "_last_Java_pc",
+      "_last_Java_fp",
+      "_saved_rbp_address"
+    ],
+    "SafepointMechanism::ThreadData": [
+      "_polling_word"
+    ],
+    "CompiledMethod": [
+      "_method"
+    ],
+    "nmethod": [
+      "_method",
+      "_comp_level",
+      "_compile_id",
+      "_state"
+    ],
+    "DispatchTable": [
+      "_table"
     ]
   },
   "required_enums": {
@@ -706,10 +1050,12 @@
       "mtThread"
     ],
     "JavaThread::StackGuardState": [
-      "stack_guard_enabled"
+      "stack_guard_enabled",
+      "stack_guard_yellow_reserved_disabled"
     ],
     "StackOverflow::StackGuardState": [
-      "stack_guard_enabled"
+      "stack_guard_enabled",
+      "stack_guard_yellow_reserved_disabled"
     ],
     "JavaThread::JNIAttachStates": [
       "_attached_via_jni",
@@ -727,6 +1073,518 @@
     ],
     "JavaThreadStatus": [
       "RUNNABLE"
+    ],
+    "VM_Operation": [
+      "vtable_count",
+      "vtable_doit",
+      "vtable_doit_prologue",
+      "vtable_doit_epilogue",
+      "vtable_type",
+      "vtable_evaluation_mode",
+      "vtable_allow_nested_vm_operations",
+      "vtable_evaluate_at_safepoint",
+      "vtable_evaluate_concurrently",
+      "vtable_cause",
+      "vtable_~VM_Operation",
+      "vtable_is_methodCompiler",
+      "vtable_is_cheap_allocated",
+      "vtable_oops_do",
+      "vtable_print_on_error",
+      "vtable_name",
+      "vtable_skip_thread_oop_barriers",
+      "vtable_is_gc_operation",
+      "vtable___vecDelDtor",
+      "storage_size__calling_thread",
+      "storage_size__next",
+      "storage_size__prev",
+      "storage_size__priority",
+      "storage_size__timestamp"
+    ],
+    "DeoptimizationScope": [
+      "storage_size__required_gen"
+    ],
+    "Method": [
+      "storage_size__flags",
+      "storage_size__dont_inline",
+      "storage_size__intrinsic_id",
+      "storage_size__code",
+      "bit_position__dont_inline",
+      "bit_length__dont_inline",
+      "storage_size__access_flags",
+      "storage_size__constMethod",
+      "storage_size__i2i_entry",
+      "storage_size__from_interpreted_entry"
+    ],
+    "MethodFlags": [
+      "storage_size__status"
+    ],
+    "AccessFlags": [
+      "storage_size__flags"
+    ],
+    "CompilerThread": [
+      "storage_size__task"
+    ],
+    "CompileTask": [
+      "storage_size__compile_id"
+    ],
+    "Klass": [
+      "storage_size__name",
+      "storage_size__class_loader_data",
+      "storage_size__java_mirror",
+      "storage_size__layout_helper",
+      "storage_size__access_flags",
+      "storage_size__misc_flags",
+      "storage_size__next_link"
+    ],
+    "InstanceKlass": [
+      "storage_size__init_state"
+    ],
+    "ClassLoaderData": [
+      "storage_size__class_loader",
+      "storage_size__klasses",
+      "storage_size__next",
+      "storage_size__deallocate_list"
+    ],
+    "OopHandle": [
+      "storage_size__obj"
+    ],
+    "KlassHandle": [
+      "storage_size__value"
+    ],
+    "instanceKlassHandle": [
+      "storage_size__value"
+    ],
+    "ClassLoadInfo": [
+      "storage_size__is_hidden",
+      "storage_size__unsafe_anonymous_host"
+    ],
+    "KlassFlags": [
+      "storage_size__flags"
+    ],
+    "ConstantPool": [
+      "storage_size__length",
+      "storage_size__pool_holder",
+      "storage_size__cache"
+    ],
+    "ConstantPoolCache": [
+      "storage_size__length",
+      "storage_size__constant_pool",
+      "storage_size__resolved_field_entries"
+    ],
+    "ConstantPoolCacheEntry": [
+      "storage_size__indices",
+      "storage_size__f1",
+      "storage_size__f2",
+      "storage_size__flags"
+    ],
+    "ResolvedFieldEntry": [
+      "storage_size__field_holder",
+      "storage_size__field_offset",
+      "storage_size__flags",
+      "storage_size__tos_state"
+    ],
+    "Array<ResolvedFieldEntry>": [
+      "storage_size__length",
+      "storage_size__data"
+    ],
+    "StubQueue": [
+      "storage_size__stub_buffer",
+      "storage_size__buffer_limit",
+      "storage_size__queue_begin",
+      "storage_size__queue_end",
+      "storage_size__number_of_stubs"
+    ],
+    "InterpreterCodelet": [
+      "storage_size__size",
+      "storage_size__bytecode",
+      "storage_size__description"
+    ],
+    "ThreadInVMfromJava": [
+      "storage_size__thread",
+      "storage_size__check_asyncs"
+    ],
+    "JavaFrameAnchor": [
+      "storage_size__last_Java_sp",
+      "storage_size__last_Java_pc",
+      "storage_size__last_Java_fp",
+      "storage_size__saved_rbp_address"
+    ],
+    "JavaThread": [
+      "storage_size__poll_data",
+      "storage_size__suspend_flags",
+      "storage_size__special_runtime_exit_condition",
+      "storage_size__vm_result",
+      "storage_size__vm_result_oop",
+      "storage_size__active_handles",
+      "storage_size__anchor",
+      "storage_size__handle_area",
+      "storage_size__jni_attach_state",
+      "storage_size__monitor_owner_id",
+      "storage_size__osthread",
+      "storage_size__pending_exception",
+      "storage_size__stack_base",
+      "storage_size__stack_guard_state",
+      "storage_size__stack_overflow_state",
+      "storage_size__stack_size",
+      "storage_size__threadObj",
+      "storage_size__thread_state",
+      "storage_size__tlab"
+    ],
+    "SafepointMechanism::ThreadData": [
+      "storage_size__polling_word"
+    ],
+    "CompiledMethod": [
+      "storage_size__method"
+    ],
+    "nmethod": [
+      "storage_size__method",
+      "storage_size__comp_level",
+      "storage_size__compile_id",
+      "storage_size__state"
+    ],
+    "ThreadClosure": [
+      "vtable_count",
+      "vtable_do_thread"
+    ],
+    "MetadataClosure": [
+      "vtable_count",
+      "vtable_do_metadata"
+    ],
+    "NMethodClosure": [
+      "vtable_count",
+      "vtable_do_nmethod"
+    ],
+    "CompLevel": [
+      "CompLevel_all",
+      "CompLevel_any",
+      "CompLevel_none",
+      "CompLevel_simple",
+      "CompLevel_full_optimization"
+    ],
+    "CompileBroker::CompilerActivity": [
+      "stop_compilation",
+      "run_compilation",
+      "shutdown_compilation",
+      "shutdown_compilaton"
+    ],
+    "Method::Flags": [
+      "_dont_inline",
+      "_force_inline",
+      "_intrinsic_candidate"
+    ],
+    "MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>": [
+      "_misc_is_not_c2_compilable",
+      "_misc_is_not_c1_compilable",
+      "_misc_is_not_c2_osr_compilable",
+      "_misc_force_inline",
+      "_misc_dont_inline"
+    ],
+    "KlassFlags::<unnamed-enum-_misc_is_hidden_class>": [
+      "_misc_is_hidden_class"
+    ],
+    "TosState": [
+      "btos",
+      "ztos",
+      "ctos",
+      "stos",
+      "itos",
+      "ltos",
+      "ftos",
+      "dtos",
+      "atos",
+      "vtos",
+      "ilgl"
+    ],
+    "ConstantPoolCacheEntry::<unnamed-enum-cp_index_bits>": [
+      "cp_index_bits",
+      "cp_index_mask",
+      "bytecode_1_shift",
+      "bytecode_2_shift",
+      "bytecode_1_mask",
+      "bytecode_2_mask"
+    ],
+    "ConstantPoolCacheEntry::<unnamed-enum-tos_state_bits>": [
+      "tos_state_shift",
+      "tos_state_mask",
+      "is_volatile_shift",
+      "is_final_shift",
+      "field_index_mask"
+    ],
+    "ResolvedFieldEntry::<unnamed-enum-is_volatile_shift>": [
+      "is_volatile_shift",
+      "is_final_shift"
+    ],
+    "DispatchTable": [
+      "storage_size__table"
+    ],
+    "ObservationABI": [
+      "set_not_compilable_old_args",
+      "nmethod_metadata_closure",
+      "deopt_mode",
+      "method_dont_inline_mask",
+      "method_dont_inline_offset",
+      "method_dont_inline_storage_size",
+      "callback_poll_bit",
+      "thread_is_java_slot",
+      "anonymous_klass_offset",
+      "anonymous_klass_width",
+      "anonymous_klass_mask",
+      "hidden_klass_offset",
+      "hidden_klass_width",
+      "hidden_klass_mask",
+      "deallocate_list_size",
+      "deallocate_list_data_offset",
+      "deallocate_list_data_width",
+      "deallocate_list_length_offset",
+      "deallocate_list_length_width"
+    ],
+    "Thread::SuspendFlags": [
+      "_external_suspend",
+      "_deopt_suspend",
+      "_trace_flag",
+      "_obj_deopt"
+    ],
+    "JavaThread::SuspendFlags": [
+      "_external_suspend",
+      "_deopt_suspend",
+      "_trace_flag",
+      "_obj_deopt"
+    ],
+    "InstanceKlass::ClassState": [
+      "allocated",
+      "loaded",
+      "linked",
+      "being_initialized",
+      "fully_initialized",
+      "initialization_error"
+    ],
+    "Thread": [
+      "storage_size__active_handles",
+      "storage_size__handle_area",
+      "storage_size__osthread",
+      "storage_size__pending_exception",
+      "storage_size__stack_base",
+      "storage_size__stack_size",
+      "storage_size__tlab"
+    ],
+    "ThreadShadow": [
+      "storage_size__pending_exception",
+      "storage_size__exception_file",
+      "storage_size__exception_line"
+    ],
+    "Arena": [
+      "storage_size__hwm",
+      "storage_size__max"
+    ],
+    "ConstMethod": [
+      "storage_size__constants",
+      "storage_size__name_index",
+      "storage_size__signature_index",
+      "storage_size__size_of_parameters",
+      "storage_size__code_size",
+      "storage_size__result_type"
+    ],
+    "Symbol": [
+      "storage_size__body",
+      "storage_size__length",
+      "storage_size__length_and_refcount"
+    ],
+    "JDK_Version": [
+      "storage_size__major"
+    ],
+    "StackOverflow": [
+      "storage_size__stack_guard_state"
+    ],
+    "JavaValue": [
+      "storage_size__type",
+      "storage_size__value"
+    ],
+    "methodHandle": [
+      "storage_size__thread",
+      "storage_size__value"
+    ],
+    "JavaCallArguments": [
+      "storage_size__alternative_target",
+      "storage_size__max_size",
+      "storage_size__size",
+      "storage_size__start_at_zero",
+      "storage_size__value",
+      "storage_size__value_buffer",
+      "storage_size__value_state",
+      "storage_size__value_state_buffer"
+    ],
+    "JVMFlag": [
+      "storage_size__addr",
+      "storage_size__name",
+      "storage_size__type"
+    ],
+    "Flag": [
+      "storage_size__addr",
+      "storage_size__name",
+      "storage_size__type"
+    ],
+    "Bytecodes::Code": [
+      "_tableswitch",
+      "_lookupswitch",
+      "_fast_linearswitch",
+      "_fast_binaryswitch",
+      "_wide",
+      "number_of_codes"
+    ],
+    "CompileBroker::<unnamed-enum-stop_compilation>": [
+      "stop_compilation",
+      "run_compilation",
+      "shutdown_compilaton"
+    ],
+    "AbstractInterpreter::MethodKind": [
+      "zerolocals",
+      "zerolocals_synchronized",
+      "number_of_method_entries"
+    ],
+    "BasicType": [
+      "T_BOOLEAN",
+      "T_BYTE",
+      "T_CHAR",
+      "T_SHORT",
+      "T_INT",
+      "T_LONG",
+      "T_FLOAT",
+      "T_DOUBLE",
+      "T_OBJECT",
+      "T_ARRAY",
+      "T_VOID"
     ]
+  },
+  "alias_kinds": {
+    "vm_execute": "function",
+    "mark_all": "function",
+    "mark_for": "function",
+    "deoptimize_all_marked": "function",
+    "vm_deoptimize_vtable": "vtable",
+    "vm_deoptimize_doit": "function",
+    "vm_clear_ics_vtable": "vtable",
+    "vm_clear_ics_doit": "function",
+    "deopt_scope_ctor": "function",
+    "deopt_scope_commit": "function",
+    "compile_jobs": "data",
+    "use_compiler": "data",
+    "compile_lock": "data",
+    "compile_queue_lock": "data",
+    "compilation_lock": "data",
+    "codecache_lock": "data",
+    "compiler_vtable": "vtable",
+    "threads_do": "function",
+    "nmethod_metadata_do": "function",
+    "set_not_compilable": "function",
+    "set_not_osr_compilable": "function",
+    "is_not_compilable": "function",
+    "is_not_osr_compilable": "function",
+    "class_add": "function",
+    "class_define": "function",
+    "class_parse": "function",
+    "class_resolve_stream": "function",
+    "class_resolve_hidden": "function",
+    "array_complete": "function",
+    "array_restore": "function",
+    "interpreter_code": "data",
+    "field_vm_to_java_destroy": "function",
+    "field_vm_to_java_transition10": "function",
+    "field_enable_guards10": "function",
+    "field_special_exit10": "function",
+    "field_enable_guards19": "function",
+    "field_process_safepoint_exit19": "function",
+    "field_enable_guards20": "function",
+    "field_safepoint_process20": "function",
+    "field_special_exit20": "function",
+    "field_throw_exception_entry": "data",
+    "interpreter_normal_table": "data",
+    "interpreter_throw_exception": "data",
+    "bytecode_lengths": "data",
+    "class_loader_data_head": "data",
+    "interpreter_entry_table": "data"
+  },
+  "derived_profile_facts": {
+    "ObservationABI": {
+      "native_layout": false,
+      "size": 0,
+      "source": "Exact private PDB signatures and TPI layout facts for the pinned image; stripped9/10 use separately audited source and machine callsites.",
+      "enums": {
+        "set_not_compilable_old_args": "1 for Method setter (int,bool,const char*),0 for (const char*,int,bool)",
+        "nmethod_metadata_closure": "0 for metadata_do(void(*)(Metadata*)),1 for metadata_do(MetadataClosure*)",
+        "deopt_mode": "0 for genuine VM_Deoptimize::doit,1 for deoptimize_all_marked(nmethod*),2 for DeoptimizationScope::deoptimize_marked",
+        "method_dont_inline_mask": "Bit mask extracted from Method::_dont_inline bitfield or Method::Flags/MethodFlags enumerator",
+        "method_dont_inline_offset": "Absolute byte offset within Method of the dont-inline storage unit",
+        "method_dont_inline_storage_size": "Exact dont-inline storage unit width in bytes from TPI member/bitfield type",
+        "callback_poll_bit": "Java20 only: immediate extracted from the PDB-named should_process machine test, whose load offset is checked against JavaThread._poll_data plus ThreadData._polling_word.",
+        "thread_is_java_slot": "Virtual table index of Thread::is_Java_thread()const, extracted from bounded TPI introducing-virtual offset;9/10 exact exported Thread/JavaThread/CompilerThread/VMThread vtable and return-bool audit.",
+        "anonymous_klass_offset": "Exact anonymous/hidden Klass predicate byte offset, storage width or bit mask from TPI or separately audited9/10 constructor bytes; zero denotes absent predicate.",
+        "anonymous_klass_width": "Exact anonymous/hidden Klass predicate byte offset, storage width or bit mask from TPI or separately audited9/10 constructor bytes; zero denotes absent predicate.",
+        "anonymous_klass_mask": "Exact anonymous/hidden Klass predicate byte offset, storage width or bit mask from TPI or separately audited9/10 constructor bytes; zero denotes absent predicate.",
+        "hidden_klass_offset": "Exact anonymous/hidden Klass predicate byte offset, storage width or bit mask from TPI or separately audited9/10 constructor bytes; zero denotes absent predicate.",
+        "hidden_klass_width": "Exact anonymous/hidden Klass predicate byte offset, storage width or bit mask from TPI or separately audited9/10 constructor bytes; zero denotes absent predicate.",
+        "hidden_klass_mask": "Exact anonymous/hidden Klass predicate byte offset, storage width or bit mask from TPI or separately audited9/10 constructor bytes; zero denotes absent predicate.",
+        "deallocate_list_size": "Exact size of the GrowableArray<Metadata *> reached through ClassLoaderData::_deallocate_list; PDB-resolved pointer target and flattened bases, or separately audited9/10 allocation and access bytes.",
+        "deallocate_list_data_offset": "Absolute GrowableArray payload-pointer member offset from the actual resolved TPI target and bases, or exact9/10 access bytes.",
+        "deallocate_list_data_width": "Exact payload-pointer storage width in bytes from TPI or independently audited9/10 machine loads/stores.",
+        "deallocate_list_length_offset": "Absolute GrowableArray length-member offset from the actual resolved TPI target and bases, or exact9/10 access bytes.",
+        "deallocate_list_length_width": "Exact length storage width in bytes from TPI or independently audited9/10 machine loads/stores."
+      }
+    }
+  },
+  "alias_data_layouts": {
+    "compile_jobs": {
+      "storage_size": 4,
+      "value": "int32 compiler activity; values from CompileBroker::CompilerActivity or its source anonymous enum in8/9"
+    },
+    "use_compiler": {
+      "storage_size": 1,
+      "value": "bool"
+    },
+    "compile_lock": {
+      "storage_size": 8,
+      "value": "Mutex*"
+    },
+    "compile_queue_lock": {
+      "storage_size": 8,
+      "value": "Monitor*"
+    },
+    "compilation_lock": {
+      "storage_size": 8,
+      "value": "Mutex*"
+    },
+    "codecache_lock": {
+      "storage_size": 8,
+      "value": "Monitor*"
+    },
+    "interpreter_code": {
+      "storage_size": 8,
+      "value": "StubQueue*"
+    },
+    "field_throw_exception_entry": {
+      "storage_size": 8,
+      "value": "address interpreter exception codelet"
+    },
+    "interpreter_throw_exception": {
+      "storage_size": 8,
+      "value": "address interpreter exception codelet"
+    },
+    "interpreter_normal_table": {
+      "type": "DispatchTable",
+      "value": "inline dispatch table object"
+    },
+    "bytecode_lengths": {
+      "element_size": 1,
+      "length_enum": "Bytecodes::Code::number_of_codes",
+      "value": "inline packed normal/wide lengths array"
+    },
+    "class_loader_data_head": {
+      "storage_size": 8,
+      "value": "ClassLoaderData*"
+    },
+    "interpreter_entry_table": {
+      "element_size": 8,
+      "length_enum": "AbstractInterpreter::MethodKind::number_of_method_entries",
+      "value": "inline normal/synchronized/intrinsic entry address array"
+    }
   }
 }

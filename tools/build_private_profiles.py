@@ -158,6 +158,33 @@ def audited_profile(entry: dict, recipe: dict, dll: Path) -> dict:
         expected = bytes.fromhex(prefix)
         if image.read(recipe["aliases"][alias], len(expected)) != expected:
             raise pp.ProfileError("Exact-image function fingerprint mismatch: " + alias)
+    for owner, fields in recipe["provenance"].get("member_layout_proofs", {}).items():
+        for name, proof in fields.items():
+            expected = bytes.fromhex(proof["bytes"])
+            if not expected or len(expected) > 256 or image.read(proof["rva"], len(expected)) != expected:
+                raise pp.ProfileError("Exact-image member fingerprint mismatch: " + owner + "::" + name)
+            facts = recipe["types"][owner]
+            if facts["members"][name] != proof["offset"] or \
+                    facts["enums"]["storage_size_" + name] != proof["storage_size"]:
+                raise pp.ProfileError("Exact-image member layout differs from proof: " + owner + "::" + name)
+    for alias, checks in recipe["provenance"].get("data_layout_proofs", {}).items():
+        for proof in checks:
+            expected = bytes.fromhex(proof["bytes"])
+            if len(expected) != 7 or expected[:3] not in (b"\x48\x8b\x05", b"\x48\x89\x05") or \
+                    image.read(proof["rva"], len(expected)) != expected:
+                raise pp.ProfileError("Exact-image data-reference mismatch: " + alias)
+            displacement = int.from_bytes(expected[3:], "little", signed=True)
+            if proof["rva"] + len(expected) + displacement != proof["target_rva"] or \
+                    proof["target_rva"] not in (recipe["aliases"][alias], recipe["aliases"][alias] + 8):
+                raise pp.ProfileError("Exact-image data-reference target mismatch: " + alias)
+    for owner, checks in recipe["provenance"].get("derived_layout_proofs", {}).items():
+        for proof in checks:
+            expected = bytes.fromhex(proof["bytes"])
+            if not expected or len(expected) > 256 or image.read(proof["rva"], len(expected)) != expected:
+                raise pp.ProfileError("Exact-image derived-layout fingerprint mismatch: " + owner)
+            for selector, value in proof["enums"].items():
+                if recipe["types"][owner]["enums"].get(selector) != value:
+                    raise pp.ProfileError("Exact-image derived layout differs from proof: " + owner + "::" + selector)
     types = {}
     for name, facts in recipe["types"].items():
         observed = metadata.get(name)

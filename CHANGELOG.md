@@ -23,6 +23,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Dedicated injected-runtime fixtures for direct native calls, construction,
   Unicode Strings, idle GC, exceptions, compiled calls, repeated/concurrent
   attachment and context lifetime. Both interfaces have Java 8–27 CI coverage.
+- Persistent `hook_field<Wrapper, T>` callbacks before static primitive reads
+  and writes, using generated ASM stubs in HotSpot's `getstatic`/`putstatic`
+  templates. `field_access<T>` supports replacement and prevention;
+  `unhook_field<Wrapper>` removes the registration. All eight primitive types
+  are supported; reference fields and accesses outside these bytecodes are
+  refused or outside the observation scope.
+- Persistent class observer IDs with `remove_class_observer`, covering
+  successful ordinary, bootstrap, ByteBuffer, hidden/anonymous and array
+  definition paths. Events expose actual defining loader-data identity and
+  borrowed metadata; failed definitions and existing-class replay are excluded.
+- Public injected-runtime fixtures for compiled and inlined method hooks,
+  typed cancellation/returns, registry contention, future compilation, static
+  fields, newly loaded accessors, class notifications and rooted callbacks.
 
 ### Changed
 
@@ -43,8 +56,27 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Native-context construction uses HotSpot's collector-aware allocator,
   initializes an already-loaded concrete class and invokes its real constructor.
   String arguments use the private VM String allocator, including Java 27's
-  default compact headers. Older Java-callback and raw-array TLAB paths retain
-  their narrower allocation requirements.
+  default compact headers. Method and field callbacks use the same private
+  JavaCalls/allocation backend with temporary VM roots; raw array TLAB paths
+  retain narrower allocation requirements.
+- Method hook installation temporarily pauses compiler dispatch, drains older
+  compilation tasks and performs real VM-safepoint deoptimization before
+  publishing the callback. Already-compiled and inlined calls reach the
+  interpreter hook; the target stays excluded from compilation and inlining,
+  while unrelated JIT compilation resumes. Native, abstract, constructor,
+  class-initializer methods and methods with an active HotSpot intrinsic ID
+  remain refused. Registration requires an already-linked declaring class and
+  does not load or initialize it.
+- Static-field hook installation excludes methods containing static field
+  bytecodes from compilation and inlining until the last field hook is removed.
+  Accessor intrinsic IDs and specialized interpreter entries are temporarily
+  suppressed too, then restored with VMHook's owned exclusions on removal.
+  New class-definition paths apply that policy before exposing their methods.
+  Failed policy preparation reports a preallocated, rooted Java
+  `OutOfMemoryError` without allocating on the failure path.
+- `watch_static_field` now uses synchronous pre-write ASM callbacks. Its first
+  callback argument is zero and its second is the pending value; no sampled
+  old value or hardware debug-register watchpoint is involved.
 - `method_proxy::value_t::was_invoked()` distinguishes refused calls from real
   void, null or zero results. Java exceptions are reported and consumed by the
   native backend; construction rejects an object whose constructor did not run.
@@ -56,7 +88,7 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   compact headers, array layouts and method-handle calling conventions.
 - `vmhook::dispatch` remains an optional route onto an existing hooked Java
   thread; direct native-context calls do not depend on it.
-- README and native-thread documentation describe the public API, GC lifetimes,
+- README, native-thread and hook documentation describe the public API, GC lifetimes,
   exact-build compatibility and validation limits. Historical benchmark numbers
   are not current performance claims.
 
@@ -68,8 +100,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Separate `static_method` and `static_field` APIs; use receiver-free
   `getMethod` and `getField`. Legacy snake_case instance lookups remain.
 - Compiler and operating-system branches outside Windows x64 G++.
-- JIT entry/flag rewrites, deoptimization sweeps and the hook-repair watchdog.
-  Hooks observe interpreter entries; compiled or inlined calls can bypass them.
+- Unchecked JIT entry rewrites and the hook-repair watchdog. Compilation
+  exclusions and deoptimization now follow the verified safepoint protocol.
 - Build targets referring to missing examples, injectors or test trees.
 
 ### Fixed
@@ -78,6 +110,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   A failed hint no longer falls back outside the relative jump's range.
   Cancellation tests use a previously unused method, verify its body is skipped,
   and verify normal execution resumes after shutdown.
+- Method dispatch uses an immutable published registry rather than dropping
+  callbacks when the installation mutex is busy. Method and field callbacks
+  enter native state with a walkable Java frame and VM-scanned roots, allowing
+  nested Java calls and collection before returning to the interpreter.
 
 The entries below preserve historical release notes. Earlier platform support,
 APIs, JNI paths, test counts, timing figures and claimed artifacts describe

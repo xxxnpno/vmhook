@@ -8,7 +8,6 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <tlhelp32.h>
 
 
 namespace vmhook::windows
@@ -30,12 +29,9 @@ namespace vmhook::windows
     using ::RUNTIME_FUNCTION;
     using ::SIZE_T;
     using ::SYSTEM_INFO;
-    using ::THREADENTRY32;
     using ::ULONG;
 
-    using ::AddVectoredExceptionHandler;
     using ::CloseHandle;
-    using ::CreateToolhelp32Snapshot;
     using ::DuplicateHandle;
     using ::FlushInstructionCache;
     using ::GetCurrentProcess;
@@ -54,15 +50,13 @@ namespace vmhook::windows
     using ::GetThreadId;
     using ::OpenThread;
     using ::ReadProcessMemory;
-    using ::RemoveVectoredExceptionHandler;
     using ::ResumeThread;
     using ::RtlAddFunctionTable;
     using ::RtlDeleteFunctionTable;
     using ::SetThreadContext;
+    using ::Sleep;
     using ::SuspendThread;
     using ::TerminateProcess;
-    using ::Thread32First;
-    using ::Thread32Next;
     using ::VirtualAlloc;
     using ::VirtualFree;
     using ::VirtualProtect;
@@ -89,7 +83,6 @@ namespace vmhook::windows
     inline constexpr DWORD mem_free{ MEM_FREE };
     inline constexpr DWORD mem_release{ MEM_RELEASE };
     inline constexpr DWORD mem_reserve{ MEM_RESERVE };
-    inline constexpr DWORD snapshot_threads{ TH32CS_SNAPTHREAD };
     inline constexpr DWORD thread_get_context{ THREAD_GET_CONTEXT };
     inline constexpr DWORD thread_set_context{ THREAD_SET_CONTEXT };
     inline constexpr DWORD thread_suspend_resume{ THREAD_SUSPEND_RESUME };
@@ -103,11 +96,5 @@ namespace vmhook::windows
     inline constexpr DWORD module_handle_pin{ GET_MODULE_HANDLE_EX_FLAG_PIN };
     inline constexpr DWORD error_write_fault{ ERROR_WRITE_FAULT };
     inline constexpr DWORD context_control{ CONTEXT_CONTROL };
-    inline constexpr DWORD context_debug_registers{ CONTEXT_DEBUG_REGISTERS };
-    inline constexpr DWORD exception_single_step{ EXCEPTION_SINGLE_STEP };
-    inline constexpr LONG exception_continue_execution{ EXCEPTION_CONTINUE_EXECUTION };
-    inline constexpr LONG exception_continue_search{ EXCEPTION_CONTINUE_SEARCH };
-    inline constexpr auto thread_owner_process_id_offset{
-        __builtin_offsetof(THREADENTRY32, th32OwnerProcessID) };
     inline const HANDLE invalid_handle_value{ INVALID_HANDLE_VALUE };
 }

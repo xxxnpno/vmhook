@@ -10,8 +10,26 @@ features, including static reflection.
 - Never call JNI or JVMTI. Avoiding their headers while calling function-table
   slots, exported JNI entry points, or reflection methods through JNI still
   violates this rule.
-- Work inside an already-running JVM without requiring launch arguments,
-  replacement bytecode, or a VM-wide JIT configuration change.
+- Work inside an already-running JVM without requiring launch arguments or
+  replacement bytecode. Hook installation may temporarily pause compiler
+  dispatch and deoptimize existing code through real VM safepoint operations;
+  it must restore the previous compiler setting and let unrelated methods
+  compile afterward. Do not permanently disable the VM's JIT.
+- Account for already-compiled methods, inlined callers and compilation tasks
+  started before installation. An interpreter-only assumption, a null
+  `Method::_code` write or an unverified dependency scan is insufficient.
+- Static field hooks intercept Java `getstatic`/`putstatic` through ASM stubs
+  before access. Preserve replacement, cancellation and volatile semantics;
+  do not substitute polling or post-write debug-register notifications.
+  Account for compiler intrinsics, special interpreter entries and class
+  definitions overlapping installation; compilation flags alone are insufficient.
+  Class linking may replace `Method` metadata. Resolve the current method from
+  its declaring class and stable metadata identity before applying or restoring
+  policy; a rooted class mirror does not keep every discarded method copy alive.
+- Class notifications follow successful definitions and expose the actual
+  defining loader identity. Observer callbacks cannot inject, rewrite or veto
+  class definitions. If field-policy setup fails, report a rooted Java exception
+  before exposing an unprotected accessor, without allocating in that failure path.
 - Keep static and instance wrappers simple: `getMethod` and `getField` are the
   public names for both. Instance access supplies the receiver explicitly.
 - Hooks persist until explicitly removed. Do not add scoped hook handles.
@@ -54,6 +72,14 @@ behavior. Separate compilation checks from tests in a live JVM. Report the
 compiler, JDK build, collector, and execution environment with the result.
 A cross-compiled executable or a declaration-only smoke test does not validate
 injection, moving GC, native-thread dispatch, or a live interpreter hook.
+
+Use [the observation fixtures](docs/hooks.md#reproduce-the-public-observation-fixtures)
+for JIT, field and class changes. Prove actual compilation and inlining before
+installing a method hook, exercise newly compiled callers and newly loaded
+field accessors, and verify compiler settings and original bodies after
+removal. Include callback reentry, moving GC, all primitive widths, failed
+class definitions and same-name classes from different defining loaders where
+those behaviors change.
 
 Check failure paths as well as successful calls: a missing member, a null
 receiver, an unsupported layout, a Java exception, and a dispatch task that

@@ -44,8 +44,10 @@ so its presence does not keep the JVM alive after application threads finish.
 
 Each wrapper operation enters VM state for the necessary work and returns to
 native state afterward. Normal C++ waits and sleeps therefore let HotSpot
-reach safepoints. Java method calls use normal interpreted or compiled execution;
-VMHook does not disable the JIT or require JVM arguments.
+reach safepoints. Java method calls use normal interpreted or compiled execution.
+This call route does not disable the JIT or require JVM arguments. Installing
+a method or field hook separately uses the deoptimization transaction described
+in [hooks and notifications](hooks.md).
 
 Construct and close the context on the same OS thread. `close()` returns false
 if called from another thread or during an active operation. The destructor
@@ -85,9 +87,31 @@ this protection automatically.
 `get_instance()` and lower-level `resolve()` APIs expose address snapshots.
 Do not dereference or retain those addresses across a safepoint. C++ ownership,
 compressed-pointer decoding and epoch checks alone do not establish a GC root.
-Wrappers obtained in the older Java-hook callback route have its narrower
-operation lifetime; the native-context guarantee does not extend to arbitrary
-raw objects captured before the context existed.
+Method and field callbacks also receive a temporary rooted context, on the Java
+thread already executing their ASM stub. Those callback-owned wrappers survive
+GC and nested Java calls while the callback runs, but expire when it returns.
+They do not acquire the lifetime of a separately attached worker context.
+Neither route protects arbitrary raw objects captured before its roots existed.
+
+## Java calls inside a hook callback
+
+A method or static-field callback does not need to construct a
+`native_thread_context`: the OS thread is already a JavaThread. VMHook publishes
+the interrupted interpreter frame, enters VM state to prepare roots and then
+enters native state before invoking C++. The usual wrapper calls and
+`vmhook::make_unique` use the private JavaCalls and VM allocator backend on
+that same thread. The callback may make nested Java calls; C++ waits allow GC
+to complete while its roots and the interrupted Java frame remain visible.
+
+The temporary context protects the receiver, object arguments and results until
+the callback returns. Returning a Java reference through `return_value::set`
+transfers it into a VM-scanned thread result slot across the VM-to-Java
+transition, then reloads its relocated address for the interpreter. Closing the
+temporary context invalidates C++ references retained beyond the callback.
+
+Class-load notifications have a different contract: they run in VM state with
+borrowed metadata and potentially held VM locks. They cannot call Java or block.
+See [the class notification contract](hooks.md#class-notifications).
 
 ## Java 8–27 private ABI resolution
 
@@ -113,8 +137,11 @@ The resolver checks the PDB GUID/age, Windows x64 target, required signatures,
 layouts and exported VM metadata before allocating thread state. It supports
 Java features 8–27. Missing or mismatched information produces an invalid
 context with an error; it does not silently substitute an address from another
-build. Providing a matching PDB permits checked resolution, not a promise that
-every vendor's semantic changes are compatible.
+build. Providing a matching PDB permits checked native-thread resolution, not
+a promise that every vendor's semantic changes are compatible. The observation
+backend for method hooks, field hooks and class notifications currently
+requires an exact built-in profile; its additional ABI facts are not dynamically
+inferred from an arbitrary external PDB.
 
 The adapters cover several real ABI changes: Java 8's thread-local storage and
 by-value `methodHandle`, later TLS and reference-parameter forms, stack guards
@@ -150,13 +177,15 @@ backend. Java methods and constructors still perform their own ordinary VM
 barriers; this limitation concerns a direct C++ reference-field store.
 Typed wrapper references currently require verified compressed oops.
 
-Native-context object and String allocation uses VM allocators on both ordinary
-and compact object headers. Java 27's default compact headers are part of the
-runtime coverage. Raw array assembly and allocation outside a native context
-have narrower TLAB/layout requirements.
+Native-context and method-callback object and String allocation uses VM
+allocators on both ordinary and compact object headers. Java 27's default
+compact headers are part of the runtime coverage. Raw array assembly has
+narrower TLAB/layout requirements.
 
 Classes must already be loaded; native calls and construction perform class
-initialization when required. Name-only lookup can choose the wrong copy when
+initialization when required. Method hook registration additionally requires
+an already-linked declaring class and does not initialize it. Name-only lookup
+can choose the wrong copy when
 multiple class loaders define the same name. Concurrent JVM shutdown, arbitrary
 class unloading of externally cached metadata, other JVM implementations and
 all vendor/collector combinations are outside the verified scope.
@@ -186,7 +215,17 @@ and after closure, bounded root-slot growth, repeated and concurrent attachment,
 and calls after the target method has actually compiled. It verifies that no
 hook was installed.
 
-The final public probe passed **20 strict checks on each of all 20 Java majors,
+The current frozen public probes passed **400/400 strict assertions on each
+interface**, across all 20 Java majors 8–27 under **Wine 10.0**: MinGW-w64
+G++ 14.2 for the C++23 header and Windows G++ 16.2 for the C++26 module.
+The matrices record unchanged source and DLL hashes. These are current-source
+results for the manifest's exact images and default collectors. Native Windows
+CI for the new observation backend remains pending; the completed native CI
+results below belong to the earlier direct-native implementation.
+
+The earlier public probe at
+[commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c)
+passed **20 strict checks on each of all 20 Java majors,
 8–27**, for the C++23 header compiled with MinGW-w64 G++ 14.2, the same header
 compiled with Windows G++ 16.2, and the genuine C++26 module compiled with
 Windows G++ 16.2. Each compiler/interface run produced **400/400 passes** under
@@ -200,11 +239,10 @@ probe across the full range. Seven header/source checks and six module
 executable suites passed; the README reflection example compiled, linked and
 ran with the generated standard-library overlay.
 
-Native Windows CI additionally passed the complete Java 8–27 public-wrapper
+At that commit, native Windows CI additionally passed the complete Java 8–27 public-wrapper
 matrix for the G++ 14.2 C++23 header and G++ 16.2 C++26 module: **400/400 checks
-per interface**. At
-[commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c),
-the [push run](https://github.com/xxxnpno/vmhook/actions/runs/37995958477) and
+per interface**. The
+[push run](https://github.com/xxxnpno/vmhook/actions/runs/37995958477) and
 [PR run](https://github.com/xxxnpno/vmhook/actions/runs/37995966320) each passed
 **53/53 jobs**: 52 on Windows Server 2025 (10.0.26100, runner image
 `windows-2025-vs2026` version `20260925.250.1`) and one profile-reproduction job
@@ -219,6 +257,11 @@ full public runtime matrix and the 18 explicit-PDB runs per G++ 16.2 interface
 remain **Wine 10.0** results. The
 [Windows CI workflow](../.github/workflows/build.yml) preserves the native
 Windows matrices for subsequent changes.
+
+Those completed runs predate the new JIT/field/class observation backend and
+temporary callback contexts. The current workflow also runs the
+[public observation fixtures](hooks.md#reproduce-the-public-observation-fixtures)
+across Java 8–27; their results must be identified separately from this baseline.
 
 ## Implementation references
 
