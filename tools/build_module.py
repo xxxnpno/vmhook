@@ -21,9 +21,9 @@ from make_header import code_mask
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(command: list[str], cwd: Path, capture: bool = False) -> str:
+def run(command: list[str], cwd: Path, capture: bool = False, input_text: str | None = None) -> str:
     result = subprocess.run(command, cwd=cwd, check=True, text=True,
-                            stdout=subprocess.PIPE if capture else None)
+                            input=input_text, stdout=subprocess.PIPE if capture else None)
     return result.stdout.strip() if capture else ""
 
 
@@ -41,6 +41,50 @@ def discover_std(compiler: str, flags: list[str], cwd: Path) -> Path:
     if not source.is_file() or not re.search(r"\bexport\s+module\s+std\s*;", code_mask(source.read_text(encoding="utf-8"))):
         raise ValueError("libstdc++ std module source is missing or empty")
     return source
+
+
+def prepare_standard_overlay(standard: Path, output: Path, compiler: str, flags: list[str]) -> Path | None:
+    """Preserve libstdc++'s shared_ptr tag COMDAT when imported through GCC.
+
+    GCC 16's Windows importer emits this function-local constexpr as a strong
+    symbol. Filesystem and future then fail to link with the compiler's own
+    static library. An inline class member has the required COMDAT linkage;
+    its explicit assembler name preserves the existing libstdc++ ABI. Only a
+    build-directory copy is changed, never the installed compiler headers.
+    """
+    header = standard.parent / "shared_ptr_base.h"
+    if not header.is_file():
+        raise ValueError("the GNU std module source must be beside shared_ptr_base.h")
+    original = header.read_text(encoding="utf-8")
+    before = """    static const type_info&
+    _S_ti() noexcept _GLIBCXX_VISIBILITY(default)
+    {
+      alignas(type_info) static constexpr char __tag[sizeof(type_info)] = { };
+      return reinterpret_cast<const type_info&>(__tag);
+    }"""
+    after = """    alignas(type_info) static inline constexpr char __tag[sizeof(type_info)]
+      __asm__("_ZZNSt19_Sp_make_shared_tag5_S_tiEvE5__tag") = { };
+    static const type_info&
+    _S_ti() noexcept _GLIBCXX_VISIBILITY(default)
+    {
+      return reinterpret_cast<const type_info&>(__tag);
+    }"""
+    if before not in original and not re.search(
+            r"alignas\s*\(\s*type_info\s*\)\s*static\s+constexpr\s+char\s+__tag", original):
+        (output / "stdlib-overlay/bits/shared_ptr_base.h").unlink(missing_ok=True)
+        return None
+    if original.count(before) != 1:
+        raise ValueError("unrecognized libstdc++ shared_ptr tag layout; review the GCC module workaround")
+    configuration = run([compiler, *flags, "-dM", "-E", "-x", "c++",
+                         "-include", "bits/c++config.h", "-"], output, True, "")
+    macros = dict(re.findall(r"^#define\s+(\w+)\s+([^\n]+)", configuration, re.MULTILINE))
+    if macros.get("_GLIBCXX_INLINE_VERSION") != "0" or "_WIN64" not in macros or "__x86_64__" not in macros:
+        raise ValueError("the shared_ptr ABI workaround requires unversioned libstdc++ on Windows x64")
+    overlay = output / "stdlib-overlay"
+    copied = overlay / "bits/shared_ptr_base.h"
+    copied.parent.mkdir(parents=True, exist_ok=True)
+    copied.write_text(original.replace(before, after), encoding="utf-8", newline="\n")
+    return overlay
 
 
 def build(args: argparse.Namespace) -> None:
@@ -61,6 +105,7 @@ def build(args: argparse.Namespace) -> None:
         if re.search(r"^\s*#", code_mask(path.read_text(encoding="utf-8")), re.MULTILINE):
             raise ValueError(f"{path.name} must contain no preprocessor directives")
     standard = args.std_source.resolve() if args.std_source else discover_std(args.compiler, args.flag, output)
+    standard_overlay = prepare_standard_overlay(standard, output, args.compiler, args.flag)
     cache = output / "gcm"
     cache.mkdir(exist_ok=True)
     mapper = output / "module.mapper"
@@ -75,6 +120,8 @@ def build(args: argparse.Namespace) -> None:
                               for name, path in mappings.items()), encoding="utf-8", newline="\n")
     flags = [*args.flag, "-std=c++26", "-freflection", "-fmodules",
              f"-fmodule-mapper={mapper.as_posix()}", "-Isdk"]
+    if standard_overlay:
+        flags.append("-I" + standard_overlay.as_posix())
     units = ((standard, "std.o", "c++"), (platform_import, None, "c++-header"),
              (bridge, "vmhook.windows.o", "c++"), (module, "vmhook.o", "c++"))
     for source, object_name, language in units:
@@ -91,7 +138,11 @@ def build(args: argparse.Namespace) -> None:
     for artifact in (*mappings.values(), archive):
         if not artifact.is_file():
             raise ValueError(f"compiler did not produce {artifact}")
-    print(f"Built {archive}\nConsumer flags: -std=c++26 -freflection -fmodules -fmodule-mapper={mapper.as_posix()}")
+    consumer_flags = [*args.flag, "-std=c++26", "-freflection", "-fmodules",
+                      "-fmodule-mapper=" + mapper.as_posix()]
+    if standard_overlay:
+        consumer_flags.append("-I" + standard_overlay.as_posix())
+    print(f"Built {archive}\nConsumer flags: {subprocess.list2cmdline(consumer_flags)}")
 
 
 def main() -> int:

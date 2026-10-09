@@ -27,18 +27,21 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--metadata-only', action='store_true')
     mode.add_argument('--hooks-only', action='store_true')
+    mode.add_argument('--native-threads', action='store_true',
+                      help='test direct calls on DLL-created OS threads without hooks')
     args = parser.parse_args()
     if os.name != 'nt':
         parser.error('this runtime harness requires native Windows')
-    source = Path(__file__).with_name('VMHookFixture.java')
+    fixture = 'NativeFixture' if args.native_threads else 'VMHookFixture'
+    source = Path(__file__).with_name(fixture + '.java')
     with tempfile.TemporaryDirectory(prefix='vmhook-test-') as temporary:
         directory = Path(temporary)
         result = directory / 'result.txt'
         subprocess.run([args.javac, '-d', str(directory), str(source)], check=True)
         environment = dict(os.environ, VMHOOK_TEST_RESULT=str(result),
                            VMHOOK_TEST_MODE='metadata' if args.metadata_only else
-                           'hooks' if args.hooks_only else 'runtime')
-        process = subprocess.Popen([args.java, '-cp', str(directory), 'VMHookFixture'],
+                           'hooks' if args.hooks_only else 'native' if args.native_threads else 'runtime')
+        process = subprocess.Popen([args.java, '-cp', str(directory), fixture],
                                    env=environment, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
         output = queue.Queue()
@@ -65,12 +68,12 @@ def main() -> int:
             subprocess.run([str(args.injector.resolve()), str(process.pid),
                             str(args.probe.resolve())], check=True, timeout=15)
             values = {}
-            deadline = time.monotonic() + 120
+            deadline = time.monotonic() + (300 if args.native_threads else 120)
             while time.monotonic() < deadline:
                 if result.is_file():
                     values = dict(line.split('=', 1) for line in result.read_text().splitlines()
                                   if '=' in line)
-                    if 'shutdown' in values or 'baseline' in values or any(value in ('fail', 'timeout', 'unsupported') for value in values.values()) or 'exception' in values:
+                    if 'shutdown' in values or 'baseline' in values or 'native_complete' in values or any(value in ('fail', 'timeout', 'unsupported') for value in values.values()) or 'exception' in values:
                         break
                 if process.poll() is not None:
                     raise RuntimeError(f'Java exited during the probe: {process.returncode}')
@@ -78,9 +81,15 @@ def main() -> int:
             for key, value in values.items():
                 print(f'{key}={value}')
             required = ['metadata', 'native_refusal']
-            if not args.metadata_only:
+            if args.native_threads:
+                required += ['native_attach', 'same_thread', 'class_initialization', 'construction',
+                             'constructor_refusal', 'dispatch_semantics', 'invocation', 'strings',
+                             'root_growth', 'java_exception', 'idle_gc', 'wrong_thread',
+                             'compiled_invocation', 'context_closed', 'repeated_attach',
+                             'concurrent_attach', 'no_hooks', 'native_complete']
+            elif not args.metadata_only:
                 required += ['hook', 'dispatch', 'argument_mutation', 'cancellation', 'shutdown']
-            if not args.metadata_only and not args.hooks_only:
+            if not args.metadata_only and not args.hooks_only and not args.native_threads:
                 required += ['invocation', 'construction', 'java_exception', 'string_read', 'gc_stress']
             failed = [key for key in required if values.get(key) != 'pass']
             failed += [key for key, value in values.items() if value in ('fail', 'timeout') or key == 'exception']

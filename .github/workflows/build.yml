@@ -14,103 +14,174 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: ["OFF", "ON"]
+        include:
+          - toolchain: header
+            compiler: "14.2.0"
+            module: "OFF"
+            release: "14.2.0posix-12.0.0-ucrt-r3"
+            archive: "winlibs-x86_64-posix-seh-gcc-14.2.0-mingw-w64ucrt-12.0.0-r3.zip"
+            sha256: "88868d745b807f083a117ff69348d8bc021ad7389aa503379dbed1866efcaeb9"
+          - toolchain: module
+            compiler: "16.2.0"
+            module: "ON"
+            release: "16.2.0posix-14.0.0-ucrt-r2"
+            archive: "winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r2.zip"
+            sha256: "d5dbafc4a170e762ca6143151ec918fb9e2c72736fb14cd704abebc6bdd5276a"
     steps:
       - uses: actions/checkout@v4
-      - uses: msys2/setup-msys2@v2
+      - uses: actions/setup-python@v5
         with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-python
-      - name: Configure
-        shell: msys2 {0}
+          python-version: "3.12"
+      - name: Install CMake and Ninja
+        run: python -m pip install cmake==4.4.4 ninja==1.13.2
+      - name: Install the pinned Windows GNU compiler
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'winlibs.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'winlibs'
+          $url = 'https://github.com/brechtsanders/winlibs_mingw/releases/download/${{ matrix.release }}/${{ matrix.archive }}'
+          Invoke-WebRequest $url -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne '${{ matrix.sha256 }}') {
+            throw 'Windows GNU compiler archive checksum mismatch'
+          }
+          Expand-Archive $archive -DestinationPath $destination
+          $bin = Join-Path $destination 'mingw64/bin'
+          $compiler = Join-Path $bin 'g++.exe'
+          if ((& $compiler -dumpfullversion) -ne '${{ matrix.compiler }}') {
+            throw 'Unexpected Windows GNU compiler version'
+          }
+          "GXX=$compiler" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $bin | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Configure C++23 header or C++26 reflection module
+        shell: pwsh
         run: >-
           cmake -S . -B build -G Ninja
-          -DCMAKE_CXX_COMPILER=g++
+          "-DCMAKE_CXX_COMPILER=$env:GXX"
           -DCMAKE_BUILD_TYPE=Release
           -DVMHOOK_BUILD_MODULE=${{ matrix.module }}
           -DBUILD_TESTING=ON
+          -DVMHOOK_BUILD_RUNTIME_TESTS=ON
           -DVMHOOK_WARNINGS_AS_ERRORS=ON
       - name: Build
-        shell: msys2 {0}
         run: cmake --build build --parallel
       - name: Test
-        shell: msys2 {0}
         run: ctest --test-dir build --output-on-failure
-      - name: Install header package
-        shell: msys2 {0}
+      - name: Install package
         run: cmake --install build --prefix build/install
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runtime-binaries-${{ matrix.toolchain }}
+          path: |
+            build/tests/vmhook*_probe.dll
+            build/tests/vmhook_test_injector.exe
+          retention-days: 7
 
   runtime:
+    needs: build
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        java: ["8", "17", "21", "25", "27"]
-        module: ["OFF", "ON"]
+        java: [8, 17, 21, 25, 27]
+        toolchain: [header, module]
         include:
-          - module: "OFF"
+          - toolchain: header
             probe: vmhook_probe.dll
-          - module: "ON"
+          - toolchain: module
             probe: vmhook_module_probe.dll
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-python@v5
         with:
-          distribution: temurin
-          java-version: ${{ matrix.java }}
-      - uses: msys2/setup-msys2@v2
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
         with:
-          msystem: MINGW64
-          update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
-            mingw-w64-x86_64-python
-      - name: Configure injected runtime tests
-        shell: msys2 {0}
+          name: runtime-binaries-${{ matrix.toolchain }}
+          path: runtime-binaries
+      - name: Download and verify the exact publisher JDK
+        shell: pwsh
         run: >-
-          cmake -S . -B build -G Ninja
-          -DCMAKE_CXX_COMPILER=g++
-          -DCMAKE_BUILD_TYPE=Release
-          -DBUILD_TESTING=ON
-          -DVMHOOK_BUILD_RUNTIME_TESTS=ON
-          -DVMHOOK_BUILD_MODULE=${{ matrix.module }}
-          -DVMHOOK_WARNINGS_AS_ERRORS=ON
-      - name: Build
-        id: build
-        shell: msys2 {0}
-        run: cmake --build build --parallel
+          python tools/build_private_profiles.py
+          --prepare-jdk ${{ matrix.java }}
+          --cache "$env:RUNNER_TEMP/vmhook-jdks"
+          --github-env "$env:GITHUB_ENV"
       - name: Inspect an ordinary JVM without JNI
-        shell: msys2 {0}
+        shell: pwsh
         run: >-
           python tests/runtime/run.py
-          --java "$JAVA_HOME/bin/java.exe"
-          --javac "$JAVA_HOME/bin/javac.exe"
-          --injector build/tests/vmhook_test_injector.exe
-          --probe build/tests/${{ matrix.probe }}
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.probe }}
           --metadata-only
       - name: Verify hooks and queued native callbacks
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        shell: msys2 {0}
+        if: ${{ !cancelled() }}
+        shell: pwsh
         run: >-
           python tests/runtime/run.py
-          --java "$JAVA_HOME/bin/java.exe"
-          --javac "$JAVA_HOME/bin/javac.exe"
-          --injector build/tests/vmhook_test_injector.exe
-          --probe build/tests/${{ matrix.probe }}
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.probe }}
           --hooks-only
       - name: Verify Java invocation, construction, and GC behavior
-        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
-        shell: msys2 {0}
+        if: ${{ !cancelled() }}
+        shell: pwsh
         run: >-
           python tests/runtime/run.py
-          --java "$JAVA_HOME/bin/java.exe"
-          --javac "$JAVA_HOME/bin/javac.exe"
-          --injector build/tests/vmhook_test_injector.exe
-          --probe build/tests/${{ matrix.probe }}
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.probe }}
+
+  native_threads:
+    needs: build
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27]
+        toolchain: [header, module]
+        include:
+          - toolchain: header
+            probe: vmhook_native_probe.dll
+          - toolchain: module
+            probe: vmhook_module_native_probe.dll
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: runtime-binaries-${{ matrix.toolchain }}
+          path: runtime-binaries
+      - name: Download and verify the exact Java 8–27 publisher JDK
+        shell: pwsh
+        run: >-
+          python tools/build_private_profiles.py
+          --prepare-jdk ${{ matrix.java }}
+          --cache "$env:RUNNER_TEMP/vmhook-jdks"
+          --github-env "$env:GITHUB_ENV"
+      - name: Verify direct calls on DLL-created OS threads
+        shell: pwsh
+        run: >-
+          python tests/runtime/run.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.probe }}
+          --native-threads
+
+  private_profile_reproduction:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Reproduce all private tables from pinned publisher artifacts
+        run: >-
+          python tools/build_private_profiles.py
+          --cache "$RUNNER_TEMP/vmhook-private-profiles"
+          --check modules/vmhook.ixx

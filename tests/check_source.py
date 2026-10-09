@@ -30,7 +30,7 @@ def main() -> int:
     if not modules:
         errors.append('no module sources found')
     prohibited = re.compile(
-        r'\b(?:JNI_GetCreatedJavaVMs|JNI_CreateJavaVM|JNIEnv|JavaVM|jvmtiEnv|'
+        r'\b(?:JNI_GetCreatedJavaVMs|JNI_CreateJavaVM|JNIEnv|JavaVM|jvmtiEnv|JvmtiExport|'
         r'AttachCurrentThread|AttachCurrentThreadAsDaemon|DetachCurrentThread|'
         r'jni_bridge|jni_slots|scoped_hook|hook_handle)\b'
     )

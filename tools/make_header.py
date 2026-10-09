@@ -16,10 +16,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 STANDARD_HEADERS = (
-    "algorithm", "array", "atomic", "chrono", "concepts", "condition_variable", "cstddef",
-    "cstdint", "cstdlib", "cstring", "exception", "expected", "format", "fstream",
+    "algorithm", "array", "atomic", "bit", "chrono", "concepts", "condition_variable", "cstddef",
+    "cstdint", "cstdlib", "cstring", "exception", "expected", "filesystem", "format", "fstream",
     "functional", "future", "initializer_list", "iostream", "limits", "memory", "mutex", "new", "optional",
-    "source_location", "span", "stdexcept", "string", "string_view", "thread", "tuple",
+    "map", "set", "source_location", "span", "stdexcept", "string", "string_view", "thread", "tuple",
     "typeindex", "typeinfo", "type_traits", "unordered_map", "unordered_set",
     "utility", "variant", "vector",
 )
@@ -58,6 +58,9 @@ MODULE_CACHE_FUNCTIONS = (
     "make_java_object",
     "read_gc_flags",
     "read_klass_from_header_buffer",
+    "rt",
+    "root_reuse_callback",
+    "current_context_lifetime",
     "resolve_code_cache_bounds",
     "resolve_gc_epoch_sources",
     "resolve_jvm_flag_table",
@@ -236,6 +239,11 @@ def generate(module_path: Path, platform_header_path: Path) -> str:
         r"^[ \t]*template\s*<\s*typename\s+enum_type\s*>\s*requires\s+std::is_enum_v\s*<\s*enum_type\s*>\s*\[\[nodiscard\]\]\s*inline\s+auto\s+enum_name\s*\(\s*const\s+enum_type\s+value\s*\)\s*noexcept\s*->\s*std::string_view",
         ENUM_NAME)
     module = replace_function(module, r"^[ \t]*struct\s+java_class\b", JAVA_CLASS)
+    # ABI layout assertions use reflection in the module. GNU's built-in
+    # offset calculation provides the same compile-time check in C++23.
+    module = re.sub(
+        r"std::meta::offset_of\(\^\^([A-Za-z_]\w*)::([A-Za-z_]\w*)\)\.bytes",
+        r"__builtin_offsetof(\1, \2)", module)
     # GCC's Windows module importer can emit duplicate dynamic local statics
     # for exported inline functions. These cache owners are compiled once in
     # the module; a standalone header needs inline definitions instead.

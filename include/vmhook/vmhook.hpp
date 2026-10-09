@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <exception>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <functional>
@@ -35,6 +37,8 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <map>
+#include <set>
 #include <source_location>
 #include <span>
 #include <stdexcept>
@@ -72,6 +76,10 @@ namespace vmhook::windows
     using ::EXCEPTION_POINTERS;
     using ::HANDLE;
     using ::HMODULE;
+    using ::IMAGE_DEBUG_DIRECTORY;
+    using ::IMAGE_DOS_HEADER;
+    using ::IMAGE_NT_HEADERS64;
+    using ::IMAGE_SECTION_HEADER;
     using ::LONG;
     using ::MEMORY_BASIC_INFORMATION;
     using ::PVOID;
@@ -89,6 +97,11 @@ namespace vmhook::windows
     using ::GetCurrentProcessId;
     using ::GetCurrentThreadId;
     using ::GetModuleHandleA;
+    using ::GetModuleHandleW;
+    using ::GetModuleFileNameA;
+    using ::GetModuleFileNameW;
+    using ::GetEnvironmentVariableA;
+    using ::GetEnvironmentVariableW;
     using ::GetProcAddress;
     using ::GetSystemInfo;
     using ::GetThreadContext;
@@ -110,6 +123,12 @@ namespace vmhook::windows
     using ::WriteProcessMemory;
 
     inline constexpr DWORD page_noaccess{ PAGE_NOACCESS };
+    inline constexpr auto image_dos_signature{ IMAGE_DOS_SIGNATURE };
+    inline constexpr auto image_nt_signature{ IMAGE_NT_SIGNATURE };
+    inline constexpr auto image_file_machine_amd64{ IMAGE_FILE_MACHINE_AMD64 };
+    inline constexpr auto image_nt_optional_hdr64_magic{ IMAGE_NT_OPTIONAL_HDR64_MAGIC };
+    inline constexpr auto image_directory_entry_debug{ IMAGE_DIRECTORY_ENTRY_DEBUG };
+    inline constexpr auto image_debug_type_codeview{ IMAGE_DEBUG_TYPE_CODEVIEW };
     inline constexpr DWORD page_readonly{ PAGE_READONLY };
     inline constexpr DWORD page_readwrite{ PAGE_READWRITE };
     inline constexpr DWORD page_writecopy{ PAGE_WRITECOPY };
@@ -1017,11 +1036,10 @@ namespace vmhook
         /*
             @brief Adopts the calling thread's HotSpot JavaThread* if it has one.
             @details
-            Checks whether the current OS thread is already a registered HotSpot
-            JavaThread and, if so, caches it.  It does NOT attach a fresh native
-            thread — that would require a call into the VM — so inside a detour /
-            hooked method the calling thread is already a JavaThread. Allocation
-            uses that thread's TLAB exclusively; native callers use dispatch().
+            Checks the JavaThread supplied by a validated interpreter detour.
+            This helper protects the detour-only raw TLAB allocation path.
+            Native workers use native_thread_context and the private VM
+            allocation/call backend, or explicitly submit work with dispatch().
             Defined later in the file after java_thread is fully declared.
 
             Complexity: O(N) where N = number of active Java threads (thread-list walk).
@@ -2164,7 +2182,9 @@ namespace vmhook
             @details
             Symbols are interned strings used throughout the JVM to represent class names,
             method names, field names, and type signatures. The layout is resolved at
-            runtime via gHotSpotVMStructs using the offsets of Symbol._length and Symbol._body.
+            runtime via gHotSpotVMStructs. Java 12–14 pack the length into the high
+            16 bits of Symbol._length_and_refcount; other supported releases expose
+            a separate Symbol._length field. Symbol._body locates the UTF-8 bytes.
         */
         struct symbol
         {
@@ -2177,13 +2197,14 @@ namespace vmhook
                 -> std::string
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const length_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_length") };
+                static const vmhook::hotspot::vm_struct_entry_t* const packed_length_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_length_and_refcount") };
                 static const vmhook::hotspot::vm_struct_entry_t* const body_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_body") };
 
                 try
                 {
-                    if (!length_entry)
+                    if (!length_entry && !packed_length_entry)
                     {
-                        throw vmhook::exception{ "Failed to find Symbol._length entry." };
+                        throw vmhook::exception{ "Failed to find Symbol length metadata." };
                     }
 
                     if (!body_entry)
@@ -2191,24 +2212,45 @@ namespace vmhook
                         throw vmhook::exception{ "Failed to find Symbol._body entry." };
                     }
 
+                    if (body_entry->is_static != 0
+                        || (length_entry && (length_entry->is_static != 0 || !length_entry->type_string
+                            || (std::string_view{ length_entry->type_string } != "unsigned short"
+                                && std::string_view{ length_entry->type_string } != "u2")))
+                        || (!length_entry && (packed_length_entry->is_static != 0 || !packed_length_entry->type_string
+                            || (std::string_view{ packed_length_entry->type_string } != "unsigned int"
+                                && std::string_view{ packed_length_entry->type_string } != "uint32_t"))))
+                    {
+                        throw vmhook::exception{ "Unsupported Symbol length metadata type." };
+                    }
+
                     if (!vmhook::hotspot::safe_read_pointer(this))
                     {
                         return std::string{};
                     }
 
-                    // Read _length through a kernel-validated probe rather than a
-                    // raw deref: safe_read_pointer(this) above only proved the
-                    // first pointer-sized chunk at `this` is mapped, and _length
-                    // (though small) need not lie within it on every JDK layout.
+                    // Probe the complete exported length field. In the packed
+                    // layout the low 16 bits are the mutable reference count.
                     std::uint16_t length{ 0 };
-                    if (!vmhook::os::safe_read(&length,
+                    if (length_entry && !vmhook::os::safe_read(&length,
                                                reinterpret_cast<const std::uint8_t*>(this) + length_entry->offset,
                                                sizeof(length)))
                     {
                         return std::string{};
                     }
 
-                    if (length == 0 || length > 0x1000)
+                    if (!length_entry)
+                    {
+                        std::uint32_t packed{ 0 };
+                        if (!vmhook::os::safe_read(&packed,
+                                                  reinterpret_cast<const std::uint8_t*>(this) + packed_length_entry->offset,
+                                                  sizeof(packed)))
+                        {
+                            return std::string{};
+                        }
+                        length = static_cast<std::uint16_t>(packed >> 16);
+                    }
+
+                    if (length == 0)
                     {
                         return std::string{};
                     }
@@ -2217,13 +2259,13 @@ namespace vmhook
 
                     // Read JVM memory through the Windows memory API and stop on unreadable data.
                     // A successful read does not establish object lifetime or a coherent VM snapshot.
-                    char buffer[0x1000];
-                    if (!vmhook::os::safe_read(buffer, body, length))
+                    std::string value(length, '\0');
+                    if (!vmhook::os::safe_read(value.data(), body, length))
                     {
                         return std::string{};
                     }
 
-                    return std::string{ buffer, length };
+                    return value;
                 }
                 catch (const std::exception& exception)
                 {
@@ -3093,6 +3135,30 @@ namespace vmhook
             }
 
             /*
+                @brief Returns the interface default methods selected by HotSpot
+                       for this concrete class, including most-specific overrides.
+                @note The caller must protect class metadata lifetime. Accessible
+                      memory alone does not establish a coherent VM snapshot.
+            */
+            auto get_default_methods_ptr(std::int32_t& count) const noexcept
+                -> vmhook::hotspot::method**
+            {
+                count = 0;
+                static const auto* const entry{
+                    vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_default_methods") };
+                if (!entry || !vmhook::hotspot::is_valid_pointer(this)) { return nullptr; }
+                const auto* const array{ static_cast<const std::uint8_t*>(
+                    vmhook::hotspot::safe_read_pointer(
+                        reinterpret_cast<const std::uint8_t*>(this) + entry->offset)) };
+                std::int32_t length{};
+                if (!array || !vmhook::os::safe_read(&length, array, sizeof(length))
+                    || length <= 0 || length > 65535) { return nullptr; }
+                count = length;
+                return reinterpret_cast<vmhook::hotspot::method**>(
+                    const_cast<std::uint8_t*>(array) + 8);
+            }
+
+            /*
                 @brief Returns the implemented-interface klasses of this InstanceKlass.
                 @note Windows memory reads report accessibility failures; they do not
                 validate object lifetime, prevent VM mutation, or register a GC root.
@@ -3227,9 +3293,10 @@ namespace vmhook
                 {
                     return nullptr;
                 }
-                auto* const super{
-                    *reinterpret_cast<klass**>(reinterpret_cast<std::uint8_t*>(
-                        const_cast<klass*>(this)) + entry->offset) };
+                klass* super{};
+                if (!vmhook::os::safe_read(&super,
+                    reinterpret_cast<const std::uint8_t*>(this) + entry->offset, sizeof(super)))
+                { return nullptr; }
                 return vmhook::hotspot::is_valid_pointer(super) ? super : nullptr;
             }
 
@@ -4799,8 +4866,9 @@ namespace vmhook
             A native OS thread cannot become a HotSpot JavaThread by writing
             VMStruct fields. Registration also requires VM-private construction,
             TLS, stack guards, handle areas and safepoint participation. VMHook
-            therefore adopts only the thread passed by a validated hook detour.
-            Native callers submit work with vmhook::dispatch instead.
+            This detour helper adopts only the thread supplied by a validated
+            hook. The separate native_thread_context performs VM registration
+            and uses private allocation/call entry points directly.
         */
         inline auto ensure_current_java_thread() noexcept -> bool
         {
@@ -6674,10 +6742,16 @@ namespace vmhook
         return result;
     }
 
-    /* True only inside a validated hook detour; never attaches an OS thread. */
+    namespace detail::native_backend
+    {
+        inline auto active() noexcept -> bool;
+        inline auto loaded_class(std::string_view, vmhook::hotspot::klass* = nullptr) noexcept -> vmhook::hotspot::klass*;
+    }
+
+    /* True in a validated detour or an active native-thread context. */
     [[nodiscard]] inline auto can_call_java() noexcept -> bool
     {
-        return vmhook::hotspot::in_java_detour();
+        return vmhook::hotspot::in_java_detour() || vmhook::detail::native_backend::active();
     }
 
     /*
@@ -6706,7 +6780,16 @@ namespace vmhook
         {
             return nullptr;
         }
-
+        if (vmhook::detail::native_backend::active())
+        {
+            vmhook::hotspot::klass* preferred{};
+            {
+                std::lock_guard lock{ vmhook::klass_lookup_cache_mutex };
+                if (const auto found{ vmhook::klass_lookup_cache.find(std::string{class_name}) };
+                    found != vmhook::klass_lookup_cache.end()) { preferred = found->second; }
+            }
+            return vmhook::detail::native_backend::loaded_class(class_name, preferred);
+        }
 
         if (class_name.front() == '[')
         {
@@ -9533,6 +9616,1853 @@ namespace vmhook
     } // namespace detail
 
 
+} // namespace vmhook
+
+// Native runtime: verified image profiles and private HotSpot ABI.
+// VMHOOK_NATIVE_RUNTIME_BEGIN
+
+namespace vmhook::private_metadata {
+// Values must be read from the loaded DLL, not from a caller-supplied version.
+struct image_identity {
+    std::array<std::byte,16> guid{};
+    std::uint32_t age{};
+    std::uint32_t image_size{};
+    std::vector<std::uint32_t> section_rvas;
+};
+
+class profile_error : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+struct type_layout {
+    std::uint64_t size{};
+    std::map<std::string,std::uint64_t,std::less<>> members;
+    std::map<std::string,std::uint32_t,std::less<>> member_types;
+    std::map<std::string,std::int64_t,std::less<>> enums;
+};
+
+// A bounded MSF7/CodeView reader. It invokes no debugger or JVM APIs. A
+// matching PDB supplies data; the actual lifecycle remains adapter-specific.
+class private_profile final {
+    using bytes = std::span<const std::byte>;
+    struct type_record { std::uint16_t leaf{}; bytes data; };
+    struct class_record {
+        std::uint32_t index{},fields{};
+        std::uint64_t size{};
+        std::string name;
+        bool forward{};
+    };
+    std::vector<std::vector<std::byte>> streams_;
+    std::map<std::uint32_t,type_record> records_;
+    std::map<std::string,std::vector<class_record>,std::less<>> classes_;
+    std::map<std::string,std::uint32_t,std::less<>> symbols_;
+    mutable std::map<std::string,type_layout,std::less<>> layouts_;
+    mutable std::mutex layouts_mutex_;
+    image_identity identity_;
+
+    template<class T> static T read(bytes data,std::size_t offset) {
+        static_assert(std::endian::native==std::endian::little);
+        if(offset>data.size() || sizeof(T)>data.size()-offset)
+            throw profile_error("Truncated private PDB record");
+        T value{}; std::memcpy(&value,data.data()+offset,sizeof value); return value;
+    }
+    static bytes slice(bytes data,std::size_t offset,std::size_t size) {
+        if(offset>data.size() || size>data.size()-offset)
+            throw profile_error("Private PDB slice outside stream");
+        return data.subspan(offset,size);
+    }
+    static std::string name(bytes data,std::size_t& offset) {
+        if(offset>data.size()) throw profile_error("Private PDB string outside stream");
+        const auto start=offset;
+        while(offset<data.size() && data[offset]!=std::byte{}) ++offset;
+        if(offset==data.size()) throw profile_error("Unterminated private PDB string");
+        std::string result(reinterpret_cast<const char*>(data.data()+start),offset-start);
+        ++offset; return result;
+    }
+    static std::uint64_t number(bytes data,std::size_t& offset) {
+        const auto leaf=read<std::uint16_t>(data,offset); offset+=2;
+        if(leaf<0x8000) return leaf;
+        switch(leaf) {
+            case 0x8000: {const auto v=read<std::int8_t>(data,offset);offset+=1;return static_cast<std::uint64_t>(v);}
+            case 0x8001: {const auto v=read<std::int16_t>(data,offset);offset+=2;return static_cast<std::uint64_t>(v);}
+            case 0x8002: {const auto v=read<std::uint16_t>(data,offset);offset+=2;return v;}
+            case 0x8003: {const auto v=read<std::int32_t>(data,offset);offset+=4;return static_cast<std::uint64_t>(v);}
+            case 0x8004: {const auto v=read<std::uint32_t>(data,offset);offset+=4;return v;}
+            case 0x8009: {const auto v=read<std::int64_t>(data,offset);offset+=8;return static_cast<std::uint64_t>(v);}
+            case 0x800a: {const auto v=read<std::uint64_t>(data,offset);offset+=8;return v;}
+            default: throw profile_error("Unsupported private PDB numeric leaf");
+        }
+    }
+    class_record class_info(std::uint32_t index) const {
+        const auto found=records_.find(index);
+        if(found==records_.end()) throw profile_error("Private PDB class index missing");
+        const auto& [leaf,data]=found->second;
+        class_record result; result.index=index;
+        result.forward=(read<std::uint16_t>(data,2)&0x80)!=0;
+        std::size_t offset{};
+        if(leaf==0x1507) { result.fields=read<std::uint32_t>(data,8); offset=12; }
+        else if(leaf==0x1504 || leaf==0x1505 || leaf==0x1506) {
+            result.fields=read<std::uint32_t>(data,4);
+            offset=leaf==0x1506?8:16; result.size=number(data,offset);
+        } else throw profile_error("Private PDB base is not a class");
+        result.name=name(data,offset); return result;
+    }
+    void fields(std::uint32_t index,type_layout& out,
+                std::vector<std::string>& inheritance,
+                std::vector<std::uint32_t>& continuations) const {
+        if(!index) return;
+        if(std::find(continuations.begin(),continuations.end(),index)!=continuations.end())
+            throw profile_error("Cyclic private PDB field list");
+        if(continuations.size()>128) throw profile_error("Private PDB field continuation too deep");
+        continuations.push_back(index);
+        const auto record=records_.find(index);
+        if(record==records_.end() || record->second.leaf!=0x1203)
+            throw profile_error("Private PDB field list missing");
+        const auto data=record->second.data;
+        std::size_t offset{};
+        while(offset<data.size()) {
+            const auto first=std::to_integer<unsigned>(data[offset]);
+            if(first>=0xf0) {
+                const auto count=first&0xf;
+                if(!count || count>data.size()-offset) throw profile_error("Invalid private PDB padding");
+                offset+=count; continue;
+            }
+            const auto leaf=read<std::uint16_t>(data,offset); offset+=2;
+            switch(leaf) {
+                case 0x150d: {
+                    const auto type=read<std::uint32_t>(data,offset+2); offset+=6;
+                    const auto value=number(data,offset); auto spelling=name(data,offset);
+                    out.members[spelling]=value; out.member_types[std::move(spelling)]=type; break;
+                }
+                case 0x1400: {
+                    const auto type=read<std::uint32_t>(data,offset+2); offset+=6;
+                    const auto base_offset=number(data,offset);
+                    const auto base=describe(class_info(type).name,inheritance);
+                    for(const auto& [spelling,value]:base.members) {
+                        if(value>std::numeric_limits<std::uint64_t>::max()-base_offset)
+                            throw profile_error("Private PDB base offset overflow");
+                        out.members[spelling]=value+base_offset;
+                        out.member_types[spelling]=base.member_types.at(spelling);
+                    }
+                    break;
+                }
+                case 0x1401: case 0x1402:
+                    throw profile_error("Virtual base layouts are unsupported for HotSpot lifecycle types");
+                case 0x150e: case 0x1510: case 0x1512: case 0x150f:
+                    offset+=6; (void)name(data,offset); break;
+                case 0x1511: {
+                    const auto attrs=read<std::uint16_t>(data,offset); offset+=6;
+                    const auto property=(attrs>>2)&7;
+                    if(property==4 || property==6) offset+=4;
+                    (void)name(data,offset); break;
+                }
+                case 0x1409: case 0x150c: offset+=6; break;
+                case 0x1513: offset+=10; break;
+                case 0x1404: {
+                    const auto continuation=read<std::uint32_t>(data,offset+2); offset+=6;
+                    fields(continuation,out,inheritance,continuations); break;
+                }
+                case 0x1502: {
+                    offset+=2; const auto value=number(data,offset); auto spelling=name(data,offset);
+                    out.enums[std::move(spelling)]=std::bit_cast<std::int64_t>(value); break;
+                }
+                default: throw profile_error("Unsupported private PDB field leaf");
+            }
+            if(offset>data.size()) throw profile_error("Private PDB field exceeds record");
+        }
+        continuations.pop_back();
+    }
+    type_layout describe(std::string_view spelling,std::vector<std::string>& inheritance) const {
+        if(inheritance.size()>128 || std::find(inheritance.begin(),inheritance.end(),spelling)!=inheritance.end())
+            throw profile_error("Cyclic private PDB class inheritance");
+        const auto found=classes_.find(spelling);
+        if(found==classes_.end()) throw profile_error("Required private PDB type missing: "+std::string(spelling));
+        inheritance.emplace_back(spelling);
+        type_layout result; bool first=true;
+        for(const auto& definition:found->second) {
+            type_layout candidate; candidate.size=definition.size;
+            std::vector<std::uint32_t> continuations;
+            fields(definition.fields,candidate,inheritance,continuations);
+            if(first) { result=std::move(candidate); first=false; }
+            else if(candidate.size!=result.size || candidate.members!=result.members || candidate.enums!=result.enums)
+                throw profile_error("Conflicting private PDB type definitions");
+        }
+        inheritance.pop_back(); return result;
+    }
+    const type_layout& layout(std::string_view spelling) const {
+        const std::lock_guard guard(layouts_mutex_);
+        const auto existing=layouts_.find(spelling);
+        if(existing!=layouts_.end()) return existing->second;
+        std::vector<std::string> inheritance;
+        auto result=describe(spelling,inheritance);
+        return layouts_.emplace(std::string(spelling),std::move(result)).first->second;
+    }
+public:
+    private_profile(const std::filesystem::path& path,image_identity expected):identity_(std::move(expected)) {
+        std::ifstream file(path,std::ios::binary|std::ios::ate);
+        if(!file) throw profile_error("Cannot open matching HotSpot PDB");
+        const auto length=file.tellg();
+        if(length<56 || length>512*1024*1024) throw profile_error("HotSpot PDB file size out of bounds");
+        std::vector<std::byte> storage(static_cast<std::size_t>(length)); file.seekg(0);
+        if(!file.read(reinterpret_cast<char*>(storage.data()),length)) throw profile_error("Cannot read HotSpot PDB");
+        const bytes data=storage;
+        constexpr char magic[]="Microsoft C/C++ MSF 7.00\r\n\x1a" "DS\0\0";
+        if(std::memcmp(data.data(),magic,32)) throw profile_error("HotSpot PDB is not MSF7");
+        const auto block_size=read<std::uint32_t>(data,32),block_count=read<std::uint32_t>(data,40);
+        const auto directory_size=read<std::uint32_t>(data,44),block_map=read<std::uint32_t>(data,52);
+        if((block_size!=512 && block_size!=1024 && block_size!=2048 && block_size!=4096 && block_size!=8192)
+            || static_cast<std::uint64_t>(block_count)*block_size>data.size())
+            throw profile_error("Invalid HotSpot PDB geometry");
+        const auto directory_blocks=(static_cast<std::uint64_t>(directory_size)+block_size-1)/block_size;
+        if(directory_blocks*4>block_size || directory_size>data.size())
+            throw profile_error("Unsupported HotSpot PDB directory map");
+        auto block=[&](std::uint32_t index)->bytes {
+            if(index>=block_count) throw profile_error("HotSpot PDB block index invalid");
+            return slice(data,static_cast<std::size_t>(index)*block_size,block_size);
+        };
+        const auto indexes=block(block_map);
+        std::vector<std::byte> directory; directory.reserve(static_cast<std::size_t>(directory_blocks)*block_size);
+        for(std::size_t i=0;i<directory_blocks;++i) {
+            const auto contents=block(read<std::uint32_t>(indexes,i*4));
+            directory.insert(directory.end(),contents.begin(),contents.end());
+        }
+        directory.resize(directory_size); const bytes dirs=directory;
+        const auto stream_count=read<std::uint32_t>(dirs,0);
+        if(stream_count>65536 || stream_count>directory_size/4) throw profile_error("HotSpot PDB stream count invalid");
+        std::uint64_t total_stream_bytes{};
+        for(std::size_t i=0;i<stream_count;++i) {
+            const auto size=read<std::uint32_t>(dirs,4+i*4);
+            if(size!=0xffffffff) total_stream_bytes+=size;
+        }
+        if(total_stream_bytes>data.size()) throw profile_error("HotSpot PDB streams exceed file capacity");
+        std::size_t offset=4+static_cast<std::size_t>(stream_count)*4;
+        streams_.reserve(stream_count);
+        for(std::size_t i=0;i<stream_count;++i) {
+            const auto size=read<std::uint32_t>(dirs,4+i*4);
+            if(size==0xffffffff) {streams_.emplace_back();continue;}
+            if(size>data.size()) throw profile_error("HotSpot PDB stream size invalid");
+            const auto count=(static_cast<std::uint64_t>(size)+block_size-1)/block_size;
+            std::vector<std::byte> stream; stream.reserve(static_cast<std::size_t>(count)*block_size);
+            for(std::size_t j=0;j<count;++j) {
+                const auto contents=block(read<std::uint32_t>(dirs,offset)); offset+=4;
+                stream.insert(stream.end(),contents.begin(),contents.end());
+            }
+            stream.resize(size); streams_.push_back(std::move(stream));
+        }
+        if(streams_.size()<4) throw profile_error("HotSpot PDB essential streams absent");
+        const bytes info=streams_[1];
+        if(read<std::uint32_t>(info,8)!=identity_.age || slice(info,12,16).size()!=16
+            || std::memcmp(info.data()+12,identity_.guid.data(),16))
+            throw profile_error("PDB does not match loaded HotSpot GUID and age");
+        const bytes dbi=streams_[3];
+        if(read<std::uint16_t>(dbi,58)!=0x8664) throw profile_error("PDB is not Windows x64");
+        const auto symbol_stream=read<std::uint16_t>(dbi,20);
+        if(symbol_stream>=streams_.size()) throw profile_error("Private PDB symbol stream missing");
+        const bytes symbols=streams_[symbol_stream]; offset=0;
+        while(offset+4<=symbols.size()) {
+            const auto size=read<std::uint16_t>(symbols,offset),kind=read<std::uint16_t>(symbols,offset+2);
+            if(size<2) throw profile_error("Private PDB symbol record invalid");
+            const auto record=slice(symbols,offset+4,size-2); offset+=size+2;
+            if(kind!=0x110e) continue;
+            const auto segment=read<std::uint16_t>(record,8);
+            const auto relative=read<std::uint32_t>(record,4);
+            std::size_t position=10; auto spelling=name(record,position);
+            if(!segment || segment>identity_.section_rvas.size()) continue;
+            const auto rva=static_cast<std::uint64_t>(identity_.section_rvas[segment-1])+relative;
+            if(rva>=identity_.image_size) throw profile_error("Private PDB symbol outside loaded DLL");
+            const auto [entry,inserted]=symbols_.emplace(std::move(spelling),static_cast<std::uint32_t>(rva));
+            if(!inserted && entry->second!=rva) throw profile_error("Conflicting private PDB symbol RVAs");
+        }
+        const bytes tpi=streams_[2];
+        offset=read<std::uint32_t>(tpi,4);
+        const auto first=read<std::uint32_t>(tpi,8),last=read<std::uint32_t>(tpi,12);
+        if(last<first || last-first>10000000) throw profile_error("Private PDB TPI index range invalid");
+        for(std::uint32_t index=first;index<last;++index) {
+            const auto length=read<std::uint16_t>(tpi,offset),leaf=read<std::uint16_t>(tpi,offset+2);
+            if(length<2) throw profile_error("Private PDB type record invalid");
+            records_.emplace(index,type_record{leaf,slice(tpi,offset+4,length-2)}); offset+=length+2;
+        }
+        for(const auto& [index,record]:records_) {
+            if(record.leaf!=0x1504 && record.leaf!=0x1505 && record.leaf!=0x1506 && record.leaf!=0x1507) continue;
+            auto definition=class_info(index);
+            if(!definition.forward) classes_[definition.name].push_back(std::move(definition));
+        }
+    }
+    private_profile(const private_profile&)=delete;
+    private_profile& operator=(const private_profile&)=delete;
+    private_profile(private_profile&&)=delete;
+    private_profile& operator=(private_profile&&)=delete;
+    const image_identity& identity() const noexcept {return identity_;}
+    std::size_t symbol_count() const noexcept {return symbols_.size();}
+    const type_layout& type(std::string_view spelling) const {return layout(spelling);}
+    bool has_type(std::string_view type) const {return classes_.contains(type);}
+    std::uint32_t symbol(std::string_view exact) const {
+        const auto found=symbols_.find(exact);
+        if(found==symbols_.end()) throw profile_error("Required private HotSpot symbol missing: "+std::string(exact));
+        return found->second;
+    }
+    bool has_symbol(std::string_view exact) const noexcept {return symbols_.contains(exact);}
+    std::uint32_t matching(std::string_view prefix,std::string_view required={}) const {
+        bool found=false; std::uint32_t result{};
+        for(auto candidate=symbols_.lower_bound(prefix);candidate!=symbols_.end() && candidate->first.starts_with(prefix);++candidate) {
+            if(!required.empty() && candidate->first.find(required)==std::string::npos) continue;
+            if(found && result!=candidate->second) throw profile_error("Ambiguous private HotSpot symbol selector: "+std::string(prefix));
+            result=candidate->second; found=true;
+        }
+        if(!found) throw profile_error("Required private HotSpot symbol selector missing: "+std::string(prefix));
+        return result;
+    }
+    std::uint64_t type_size(std::string_view type) const {return layout(type).size;}
+    std::uint64_t offset(std::string_view type,std::string_view field) const {
+        const auto& members=layout(type).members;const auto found=members.find(field);
+        if(found==members.end()) throw profile_error("Required private HotSpot field missing: "+std::string(type)+"::"+std::string(field));
+        return found->second;
+    }
+    bool has_field(std::string_view type,std::string_view field) const {return has_type(type) && layout(type).members.contains(field);}
+    std::uint32_t member_type(std::string_view type,std::string_view field) const {
+        const auto& members=layout(type).member_types;const auto found=members.find(field);
+        if(found==members.end()) throw profile_error("Private HotSpot member type missing");
+        return found->second;
+    }
+    std::int64_t enum_value(std::string_view type,std::string_view enumerator) const {
+        const auto& members=layout(type).enums;const auto found=members.find(enumerator);
+        if(found==members.end()) throw profile_error("Required private HotSpot enum missing: "+std::string(type)+"::"+std::string(enumerator));
+        return found->second;
+    }
+};
+} // export namespace vmhook::private_metadata
+
+namespace vmhook::detail::private_native {
+using namespace vmhook::windows;
+struct symbol_entry{std::string_view name;std::uint32_t rva;};
+struct field_entry{std::string_view type,name;std::size_t offset;};
+struct size_entry{std::string_view type;std::size_t size;};
+struct enum_entry{std::string_view type,name;int value;};
+struct capabilities{bool new_attaching_factory,native_transition_async_arg,cleanup_bool_arg,delete_flags_arg,guards_subobject,monitor_owner,jfr_before_publish,java_calls_by_value,anchor_thread_arg;};
+struct profile_entry{std::array<unsigned char,16> guid;std::uint32_t age,image_size,pe_timestamp;int java_feature;capabilities caps;std::span<const symbol_entry> symbols;std::span<const field_entry> fields;std::span<const size_entry> sizes;std::span<const enum_entry> enums;};
+inline constexpr symbol_entry symbols_8[]{{"java_thread_ctor",2229456},{"allocate_thread",2233136},{"malloc",2083520},{"current_thread",2264640},{"initialize_tls",2249424},{"is_tls_initialized",2264688},{"record_stack",2258656},{"create_os_thread",2583472},{"create_guards",2237616},{"remove_guards",2260448},{"tlab_initialize",891200},{"use_tlab",8114404},{"cache_globals",16576},{"vm_exited",8474112},{"java_version",8467128},{"threads_lock",8467488},{"old_lock",2054672},{"lock_without_safepoint",2054672},{"unlock",2054048},{"allocate_handle_block_legacy",2047776},{"add_thread",2232960},{"main_thread_group_raw",8462632},{"allocate_thread_object",2233936},{"set_thread_status",344544},{"jfr_thread_start",3519504},{"setup_fpu",16576},{"java_thread_id",345168},{"java_thread_tid_offset",8359112},{"cleanup_failed",2237248},{"exit_thread",2244192},{"delete_thread",2232176},{"clear_exception",2461824},{"native_to_vm",53120},{"vm_to_native",53008},{"native_to_vm_ctor",51056},{"vm_to_native_ctor",262816},{"anchor_walkable",2859376},{"handle_mark_initialize",2032672},{"handle_mark_destroy",2032544},{"arena_grow",744336},{"method_handle_construct",57040},{"method_handle_destroy",20176},{"java_calls",2038768},{"klass_initialize",989680},{"klass_check",977968},{"klass_allocate",975776},{"new_string_unicode",322976}};
+inline constexpr field_entry fields_8[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",56},{"Thread","_tlab",88},{"Thread","_osthread",392},{"Thread","_handle_area",408},{"Thread","_stack_base",424},{"Thread","_stack_size",432},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",56},{"JavaThread","_tlab",88},{"JavaThread","_osthread",392},{"JavaThread","_handle_area",408},{"JavaThread","_stack_base",424},{"JavaThread","_stack_size",432},{"JavaThread","_threadObj",568},{"JavaThread","_anchor",576},{"JavaThread","_thread_state",728},{"JavaThread","_jni_attach_state",768},{"JavaThread","_stack_guard_state",772},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"Flag","_type",0},{"Flag","_name",8},{"Flag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",0},{"Symbol","_body",8},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_8[]{{"Thread",552},{"ThreadShadow",32},{"JavaThread",1072},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",120},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"Flag",32},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",48},{"ConstantPool",80},{"Symbol",12},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",96},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",12}};
+inline constexpr enum_entry enums_8[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",2}};
+inline constexpr profile_entry profile_8{
+{148,117,137,121,227,74,255,70,138,59,6,176,0,48,129,190},1,9015296,1787151737,8,
+{0,0,0,1,0,0,0,1,1},
+symbols_8,fields_8,sizes_8,enums_8};
+inline constexpr symbol_entry symbols_9[]{{"allocate_thread",6387360},{"java_thread_ctor",6384032},{"record_stack",6414096},{"initialize_tls",6403456},{"create_os_thread",5480768},{"create_guards",6393248},{"cache_globals",2875488},{"threads_lock",9440712},{"lock",5366928},{"add_thread",6387184},{"unlock",5367776},{"handle_mark_initialize",3116544},{"handle_mark_destroy",3116032},{"arena_grow",683856},{"allocate_thread_object",6388128},{"clear_exception",2659024},{"cleanup_failed",6391264},{"set_thread_status",3365104},{"vm_to_native",945808},{"setup_fpu",2875488},{"current_thread",6425168},{"is_tls_initialized",6425136},{"native_to_vm",1149280},{"exit_thread",6397888},{"delete_thread",6386304},{"remove_guards",6415568},{"vm_exited",9589616},{"java_calls",3319808},{"klass_check",3224240},{"klass_initialize",3232608},{"klass_allocate",3221376},{"method_handle_construct",3115872},{"method_handle_destroy",3116128},{"new_string_unicode",3343200},{"tlab_initialize",6423008},{"use_tlab",9045822},{"main_thread_group_raw",9565176},{"lock_without_safepoint",5366928},{"allocate_handle_block_legacy",3614784}};
+inline constexpr field_entry fields_9[]{{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"Symbol","_length",0},{"Symbol","_body",6},{"Arena","_hwm",24},{"Arena","_max",32},{"ThreadShadow","_pending_exception",8},{"Thread","_active_handles",56},{"Thread","_tlab",88},{"Thread","_pending_exception",8},{"Thread","_handle_area",280},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",56},{"JavaThread","_tlab",88},{"JavaThread","_handle_area",280},{"JavaThread","_threadObj",432},{"JavaThread","_anchor",440},{"JavaThread","_thread_state",592},{"JavaThread","_osthread",264},{"JavaThread","_stack_base",296},{"JavaThread","_stack_size",304},{"JavaThread","_jni_attach_state",632},{"JavaThread","_stack_guard_state",672},{"Flag","_type",0},{"Flag","_name",8},{"Flag","_addr",16},{"JDK_Version","_major",0},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"JavaValue","_type",0},{"JavaValue","_value",8},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120}};
+inline constexpr size_entry sizes_9[]{{"ConstantPool",72},{"Method",80},{"ConstMethod",56},{"Symbol",8},{"ThreadLocalAllocBuffer",96},{"Arena",48},{"Chunk",16},{"ThreadShadow",32},{"Thread",424},{"JavaThread",960},{"OSThread",48},{"JavaFrameAnchor",24},{"JNIHandleBlock",312},{"Flag",32},{"JDK_Version",7},{"JavaThreadState",4},{"AccessFlags",4},{"BasicType",4},{"Handle",8},{"methodHandle",16},{"HandleMark",56},{"HandleArea",56},{"JavaValue",16},{"JavaCallArguments",128},{"MemoryType",4},{"MEMFLAGS",4},{"JavaThread::StackGuardState",4},{"JavaThread::JNIAttachStates",4},{"JavaThread::TerminatedTypes",4},{"JavaThread::ExitType",4},{"JavaThreadStatus",4},{"AllocFailStrategy::AllocFailEnum",4}};
+inline constexpr enum_entry enums_9[]{{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"MemoryType","mtThread",2},{"MEMFLAGS","mtThread",2},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_9{
+{235,166,202,212,168,175,95,69,142,33,158,149,21,182,42,63},1,10166272,1538933834,9,
+{0,0,0,1,0,0,0,0,0},
+symbols_9,fields_9,sizes_9,enums_9};
+inline constexpr symbol_entry symbols_10[]{{"allocate_thread",6496784},{"java_thread_ctor",6493456},{"record_stack",6524464},{"initialize_tls",6513216},{"create_os_thread",5552272},{"create_guards",6502608},{"cache_globals",5165616},{"threads_lock",9682832},{"lock",5433168},{"add_thread",6496592},{"unlock",5433968},{"handle_mark_initialize",3293040},{"handle_mark_destroy",3292528},{"arena_grow",764336},{"allocate_thread_object",6497552},{"clear_exception",2777728},{"cleanup_failed",6500784},{"set_thread_status",3545888},{"vm_to_native",1024752},{"setup_fpu",5165616},{"current_thread",6535696},{"is_tls_initialized",6535664},{"native_to_vm",1223168},{"exit_thread",6507584},{"delete_thread",6529152},{"remove_guards",6525808},{"vm_exited",9832480},{"java_calls",3505088},{"klass_check",3403408},{"klass_initialize",3411968},{"klass_allocate",3400544},{"method_handle_construct",3292368},{"method_handle_destroy",3292624},{"new_string_unicode",3527680},{"tlab_initialize",6533568},{"use_tlab",9218979},{"main_thread_group_raw",9807752},{"lock_without_safepoint",5433168},{"allocate_handle_block_legacy",3749792}};
+inline constexpr field_entry fields_10[]{{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"Symbol","_length",0},{"Symbol","_body",6},{"Arena","_hwm",24},{"Arena","_max",32},{"ThreadShadow","_pending_exception",8},{"Thread","_active_handles",80},{"Thread","_tlab",120},{"Thread","_pending_exception",8},{"Thread","_handle_area",312},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",80},{"JavaThread","_tlab",120},{"JavaThread","_handle_area",312},{"JavaThread","_threadObj",472},{"JavaThread","_anchor",480},{"JavaThread","_thread_state",632},{"JavaThread","_osthread",296},{"JavaThread","_stack_base",328},{"JavaThread","_stack_size",336},{"JavaThread","_jni_attach_state",672},{"JavaThread","_stack_guard_state",712},{"Flag","_type",0},{"Flag","_name",8},{"Flag","_addr",16},{"JDK_Version","_major",0},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"JavaValue","_type",0},{"JavaValue","_value",8},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120}};
+inline constexpr size_entry sizes_10[]{{"ConstantPool",64},{"Method",88},{"ConstMethod",56},{"Symbol",8},{"ThreadLocalAllocBuffer",96},{"Arena",48},{"ThreadShadow",32},{"Thread",456},{"JavaThread",1016},{"OSThread",48},{"JavaFrameAnchor",24},{"JNIHandleBlock",312},{"Flag",40},{"JDK_Version",7},{"JavaThreadState",4},{"AccessFlags",4},{"BasicType",4},{"JavaThread::TerminatedTypes",4},{"Handle",8},{"methodHandle",16},{"HandleMark",56},{"HandleArea",56},{"JavaValue",16},{"JavaCallArguments",128},{"MemoryType",4},{"MEMFLAGS",4},{"JavaThread::StackGuardState",4},{"JavaThread::JNIAttachStates",4},{"JavaThread::ExitType",4},{"JavaThreadStatus",4},{"AllocFailStrategy::AllocFailEnum",4}};
+inline constexpr enum_entry enums_10[]{{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"MemoryType","mtThread",2},{"MEMFLAGS","mtThread",2},{"JavaThread::StackGuardState","stack_guard_enabled",3},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_10{
+{126,134,29,206,158,24,61,64,132,195,159,211,72,213,114,253},1,10432512,1543318357,10,
+{0,0,0,0,0,0,0,0,0},
+symbols_10,fields_10,sizes_10,enums_10};
+inline constexpr symbol_entry symbols_11[]{{"java_thread_ctor",7928624},{"allocate_thread",7932960},{"malloc",6518976},{"current_thread",7979136},{"initialize_tls",7949008},{"is_tls_initialized",7979104},{"record_stack",7962032},{"register_stack",7962160},{"create_os_thread",6542288},{"create_guards",7937728},{"remove_guards",7963664},{"tlab_initialize",7976608},{"use_tlab",11022948},{"cache_globals",33424},{"vm_exited",11674672},{"java_version",11452736},{"threads_lock",11528208},{"old_lock",6377968},{"lock_without_safepoint",6377968},{"unlock",6377280},{"allocate_handle_block_legacy",4253104},{"add_thread",7932752},{"main_thread_group_raw",11663672},{"allocate_thread_object",7933632},{"set_thread_status",3830720},{"jfr_thread_start",3832656},{"setup_fpu",33424},{"java_thread_id",3831072},{"java_thread_tid_offset",11452892},{"cleanup_failed",7937056},{"exit_thread",7943392},{"delete_thread",7966640},{"clear_exception",3051376},{"native_to_vm",1372656},{"vm_to_native",1142144},{"native_to_vm_ctor",1316192},{"vm_to_native_ctor",2004640},{"anchor_walkable",3080656},{"handle_mark_initialize",3540560},{"handle_mark_destroy",3540256},{"arena_grow",798192},{"method_handle_construct",3540112},{"method_handle_destroy",3540368},{"java_calls",3784032},{"klass_initialize",3685616},{"klass_check",3673008},{"klass_allocate",3669712},{"new_string_unicode",3806976}};
+inline constexpr field_entry fields_11[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",224},{"Thread","_tlab",272},{"Thread","_osthread",624},{"Thread","_handle_area",640},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",224},{"JavaThread","_tlab",272},{"JavaThread","_osthread",624},{"JavaThread","_handle_area",640},{"JavaThread","_stack_base",656},{"JavaThread","_stack_size",664},{"JavaThread","_threadObj",808},{"JavaThread","_anchor",816},{"JavaThread","_thread_state",968},{"JavaThread","_jni_attach_state",1008},{"JavaThread","_stack_guard_state",1064},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_11[]{{"Thread",792},{"ThreadShadow",32},{"JavaThread",1256},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",7}};
+inline constexpr enum_entry enums_11[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr profile_entry profile_11{
+{82,139,244,174,119,12,135,9,252,84,237,205,129,137,89,96},1,12328960,1502678380,11,
+{0,0,1,0,0,0,0,0,1},
+symbols_11,fields_11,sizes_11,enums_11};
+inline constexpr symbol_entry symbols_12[]{{"java_thread_ctor",7729056},{"allocate_thread",7733312},{"malloc",6204624},{"current_thread",7772304},{"initialize_tls",7748576},{"is_tls_initialized",7772272},{"record_stack",7760336},{"register_stack",7760464},{"create_os_thread",6228016},{"create_guards",7737664},{"remove_guards",7762000},{"tlab_initialize",7768704},{"use_tlab",10736466},{"cache_globals",35616},{"vm_exited",11566960},{"java_version",11293232},{"threads_lock",11368296},{"old_lock",6067296},{"lock_without_safepoint",6067296},{"unlock",6066720},{"allocate_handle_block_legacy",4075680},{"add_thread",7733104},{"main_thread_group_raw",11556800},{"allocate_thread_object",7733984},{"set_thread_status",3683936},{"jfr_thread_start",3686464},{"setup_fpu",35616},{"java_thread_id",3684928},{"java_thread_tid_offset",11293388},{"cleanup_failed",7736992},{"exit_thread",7743456},{"delete_thread",7765456},{"clear_exception",2918544},{"native_to_vm",1276640},{"vm_to_native",1048352},{"native_to_vm_ctor",1220208},{"vm_to_native_ctor",1896624},{"anchor_walkable",2945136},{"handle_mark_initialize",3399408},{"handle_mark_destroy",3399120},{"arena_grow",779760},{"method_handle_construct",3398992},{"method_handle_destroy",3399232},{"java_calls",3637888},{"klass_initialize",3541328},{"klass_check",3529728},{"klass_allocate",3527216},{"new_string_unicode",3659920}};
+inline constexpr field_entry fields_12[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",224},{"Thread","_tlab",272},{"Thread","_osthread",608},{"Thread","_handle_area",624},{"Thread","_stack_base",640},{"Thread","_stack_size",648},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",224},{"JavaThread","_tlab",272},{"JavaThread","_osthread",608},{"JavaThread","_handle_area",624},{"JavaThread","_stack_base",640},{"JavaThread","_stack_size",648},{"JavaThread","_threadObj",776},{"JavaThread","_anchor",784},{"JavaThread","_thread_state",936},{"JavaThread","_jni_attach_state",976},{"JavaThread","_stack_guard_state",1008},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length_and_refcount",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_12[]{{"Thread",760},{"ThreadShadow",32},{"JavaThread",1200},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",7}};
+inline constexpr enum_entry enums_12[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr profile_entry profile_12{
+{200,14,242,71,189,83,236,65,173,237,231,112,42,226,247,10},1,12218368,1563469866,12,
+{0,0,0,0,0,0,0,0,1},
+symbols_12,fields_12,sizes_12,enums_12};
+inline constexpr symbol_entry symbols_13[]{{"java_thread_ctor",7969488},{"allocate_thread",7973424},{"malloc",6444816},{"current_thread",8013392},{"initialize_tls",7989360},{"is_tls_initialized",8013360},{"record_stack",8001552},{"register_stack",8001680},{"create_os_thread",6467952},{"create_guards",7977600},{"remove_guards",8002960},{"tlab_initialize",8009792},{"use_tlab",10991573},{"cache_globals",39696},{"vm_exited",11835392},{"java_version",11552496},{"threads_lock",11635712},{"old_lock",6304944},{"lock_without_safepoint",6304944},{"unlock",6305296},{"allocate_handle_block_legacy",4142608},{"add_thread",7973248},{"main_thread_group_raw",11824496},{"allocate_thread_object",7974096},{"set_thread_status",3737360},{"jfr_thread_start",3739680},{"setup_fpu",39696},{"java_thread_id",3737776},{"java_thread_tid_offset",11552656},{"cleanup_failed",7976784},{"exit_thread",7983680},{"delete_thread",8006656},{"clear_exception",2960112},{"native_to_vm",1311424},{"native_to_vm_ctor",1255216},{"vm_to_native_ctor",1926480},{"anchor_walkable",2989776},{"handle_mark_initialize",3456336},{"handle_mark_destroy",3456000},{"arena_grow",807296},{"method_handle_construct",3455872},{"method_handle_destroy",3456112},{"java_calls",3691776},{"klass_initialize",3598864},{"klass_check",3586992},{"klass_allocate",3584464},{"new_string_unicode",3714208}};
+inline constexpr field_entry fields_13[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",224},{"Thread","_tlab",272},{"Thread","_osthread",608},{"Thread","_handle_area",624},{"Thread","_stack_base",640},{"Thread","_stack_size",648},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",224},{"JavaThread","_tlab",272},{"JavaThread","_osthread",608},{"JavaThread","_handle_area",624},{"JavaThread","_stack_base",640},{"JavaThread","_stack_size",648},{"JavaThread","_threadObj",744},{"JavaThread","_anchor",752},{"JavaThread","_thread_state",904},{"JavaThread","_jni_attach_state",944},{"JavaThread","_stack_guard_state",984},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length_and_refcount",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_13[]{{"Thread",736},{"ThreadShadow",32},{"JavaThread",1184},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_13[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr profile_entry profile_13{
+{127,52,82,218,39,175,227,66,169,91,41,145,3,151,22,242},1,12509184,1598786650,13,
+{0,0,1,0,0,0,0,0,1},
+symbols_13,fields_13,sizes_13,enums_13};
+inline constexpr symbol_entry symbols_14[]{{"java_thread_ctor",7683328},{"allocate_thread",7687248},{"malloc",6227968},{"current_thread",7732736},{"initialize_tls",7703360},{"is_tls_initialized",7732704},{"record_stack",7715600},{"register_stack",7715728},{"create_os_thread",6251056},{"create_guards",7691600},{"remove_guards",7717008},{"tlab_initialize",7728928},{"use_tlab",10673571},{"cache_globals",41632},{"vm_exited",11499392},{"java_version",11216176},{"threads_lock",11299704},{"lock",6095328},{"lock_without_safepoint",6095696},{"unlock",6096048},{"allocate_handle_block_legacy",3883760},{"add_thread",7687072},{"main_thread_group_raw",11488496},{"allocate_thread_object",7687920},{"set_thread_status",3459808},{"jfr_thread_start",3462128},{"setup_fpu",41632},{"java_thread_id",3460240},{"java_thread_tid_offset",11216340},{"cleanup_failed",7690784},{"exit_thread",7697760},{"delete_thread",7721280},{"clear_exception",2659312},{"native_to_vm",1230096},{"native_to_vm_ctor",1174032},{"vm_to_native_ctor",1842400},{"anchor_walkable",2691904},{"handle_mark_initialize",3170432},{"handle_mark_destroy",3170096},{"arena_grow",709888},{"method_handle_construct",3169968},{"method_handle_destroy",3170208},{"java_calls",3411504},{"klass_initialize",3317360},{"klass_check",3304752},{"klass_allocate",3302432},{"new_string_unicode",3434864}};
+inline constexpr field_entry fields_14[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",232},{"Thread","_tlab",280},{"Thread","_osthread",624},{"Thread","_handle_area",640},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",232},{"JavaThread","_tlab",280},{"JavaThread","_osthread",624},{"JavaThread","_handle_area",640},{"JavaThread","_stack_base",656},{"JavaThread","_stack_size",664},{"JavaThread","_threadObj",744},{"JavaThread","_anchor",752},{"JavaThread","_thread_state",896},{"JavaThread","_jni_attach_state",936},{"JavaThread","_stack_guard_state",976},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",52},{"Symbol","_length_and_refcount",0},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_14[]{{"Thread",736},{"ThreadShadow",32},{"JavaThread",1176},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",64},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_14[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr profile_entry profile_14{
+{206,48,166,88,66,107,165,71,178,92,192,157,67,244,82,137},1,12144640,1595098468,14,
+{0,0,1,0,0,0,0,0,1},
+symbols_14,fields_14,sizes_14,enums_14};
+inline constexpr symbol_entry symbols_15[]{{"java_thread_ctor",7681600},{"allocate_thread",7685520},{"malloc",6204208},{"current_thread",7730960},{"initialize_tls",7701600},{"is_tls_initialized",7730928},{"record_stack",7713600},{"register_stack",7713728},{"create_os_thread",6227440},{"create_guards",7689840},{"remove_guards",7714992},{"tlab_initialize",7727168},{"use_tlab",10634170},{"cache_globals",42256},{"vm_exited",11484176},{"java_version",11204936},{"threads_lock",11284200},{"lock",6068240},{"lock_without_safepoint",6068656},{"unlock",6069008},{"allocate_handle_block_legacy",3871952},{"add_thread",7685344},{"main_thread_group_raw",11473280},{"allocate_thread_object",7686144},{"set_thread_status",3400304},{"jfr_thread_start",3402592},{"setup_fpu",42256},{"java_thread_id",3400752},{"java_thread_tid_offset",11205108},{"cleanup_failed",7689024},{"exit_thread",7696032},{"delete_thread",7719488},{"clear_exception",2560032},{"native_to_vm",1115600},{"native_to_vm_ctor",1061552},{"vm_to_native_ctor",1755248},{"anchor_walkable",2600176},{"handle_mark_initialize",3105760},{"handle_mark_destroy",3105424},{"arena_grow",630112},{"method_handle_construct",3105296},{"method_handle_destroy",3105536},{"java_calls",3351616},{"klass_initialize",3256816},{"klass_check",3243792},{"klass_allocate",3240816},{"new_string_unicode",3375200}};
+inline constexpr field_entry fields_15[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",232},{"Thread","_tlab",280},{"Thread","_osthread",648},{"Thread","_handle_area",664},{"Thread","_stack_base",680},{"Thread","_stack_size",688},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",232},{"JavaThread","_tlab",280},{"JavaThread","_osthread",648},{"JavaThread","_handle_area",664},{"JavaThread","_stack_base",680},{"JavaThread","_stack_size",688},{"JavaThread","_threadObj",768},{"JavaThread","_anchor",776},{"JavaThread","_thread_state",920},{"JavaThread","_jni_attach_state",960},{"JavaThread","_stack_guard_state",1000},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_type",0},{"JVMFlag","_name",8},{"JVMFlag","_addr",16},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_15[]{{"Thread",760},{"ThreadShadow",32},{"JavaThread",1224},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",40},{"MemoryType",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"JavaThread::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_15[]{{"MemoryType","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"JavaThread::StackGuardState","stack_guard_enabled",3}};
+inline constexpr profile_entry profile_15{
+{32,77,215,238,166,43,34,67,168,208,140,225,249,163,128,36},1,12120064,1611514237,15,
+{0,0,1,0,0,0,0,0,1},
+symbols_15,fields_15,sizes_15,enums_15};
+inline constexpr symbol_entry symbols_16[]{{"java_thread_ctor",8230304},{"allocate_thread",8233520},{"malloc",6732272},{"current_thread",8275696},{"initialize_tls",8248000},{"is_tls_initialized",8275664},{"record_stack",8259392},{"register_stack",8259536},{"unregister_stack",8264640},{"create_os_thread",6755680},{"create_guards",7669936},{"remove_guards",7672368},{"tlab_initialize",8271808},{"use_tlab",11479863},{"cache_globals",39632},{"vm_exited",12145000},{"java_version",11915216},{"threads_lock",11994520},{"lock",6593840},{"lock_without_safepoint",6594256},{"unlock",6594672},{"allocate_handle_block",4266224},{"add_thread",8233312},{"main_thread_group",8375232},{"allocate_thread_object",8234128},{"thread_object",8264384},{"set_thread_status",3766656},{"jfr_thread_start",3768960},{"setup_fpu",39632},{"java_thread_id",3767120},{"java_thread_tid_offset",11915388},{"cleanup_failed",8236464},{"exit_thread",8242736},{"delete_thread",8263904},{"clear_exception",2892432},{"native_to_vm",1373488},{"native_to_vm_ctor",1318208},{"vm_to_native_ctor",2067184},{"anchor_walkable",2940208},{"handle_mark_initialize",3469296},{"handle_mark_destroy",3468944},{"arena_grow",751888},{"method_handle_construct",3468800},{"method_handle_destroy",3469056},{"java_calls",3714832},{"klass_initialize",3619264},{"klass_check",3606880},{"klass_allocate",3603296},{"new_string_unicode",3739696}};
+inline constexpr field_entry fields_16[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",240},{"Thread","_tlab",296},{"Thread","_osthread",624},{"Thread","_handle_area",640},{"Thread","_stack_base",656},{"Thread","_stack_size",664},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",240},{"JavaThread","_tlab",296},{"JavaThread","_osthread",624},{"JavaThread","_handle_area",640},{"JavaThread","_stack_base",656},{"JavaThread","_stack_size",664},{"JavaThread","_threadObj",736},{"JavaThread","_anchor",744},{"JavaThread","_thread_state",896},{"JavaThread","_jni_attach_state",936},{"JavaThread","_stack_overflow_state",976},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",32},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",42},{"ConstMethod","_signature_index",44},{"ConstMethod","_size_of_parameters",52},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_16[]{{"Thread",728},{"ThreadShadow",32},{"JavaThread",1304},{"JavaFrameAnchor",32},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",312},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",120},{"Monitor",120},{"JVMFlag",24},{"StackOverflow",40},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",128},{"ThreadInVMfromNative",8},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_16[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_16{
+{4,201,170,174,122,236,61,242,228,159,160,111,169,105,151,101},1,12808192,1153291634,16,
+{0,0,1,0,1,0,0,0,1},
+symbols_16,fields_16,sizes_16,enums_16};
+inline constexpr symbol_entry symbols_17[]{{"java_thread_ctor",8299904},{"allocate_thread",8301920},{"malloc",6781520},{"current_thread",8340032},{"initialize_tls",8315024},{"is_tls_initialized",8340000},{"record_stack",8325344},{"register_stack",8325488},{"unregister_stack",8329280},{"create_os_thread",6802688},{"create_guards",7729760},{"remove_guards",7732192},{"initialize_tlab",8315072},{"tlab_initialize",8336240},{"use_tlab",11675278},{"cache_globals",40704},{"vm_exited",12354904},{"java_version",12118160},{"threads_lock",12201208},{"lock",6639792},{"lock_without_safepoint",6640320},{"unlock",6640752},{"allocate_handle_block",4265744},{"add_thread",8301696},{"main_thread_group",8438928},{"allocate_thread_object",8302224},{"thread_object",8329072},{"set_thread_status",3774160},{"jfr_thread_start",3776496},{"setup_fpu",40704},{"java_thread_id",3774688},{"java_thread_tid_offset",12118336},{"cleanup_failed",8304368},{"exit_thread",8310416},{"delete_thread",8328704},{"clear_exception",2891040},{"native_to_vm",1344032},{"process_safepoint_exit",1332176},{"native_to_vm_ctor",1289968},{"vm_to_native_ctor",2030336},{"anchor_walkable",2943184},{"handle_mark_initialize",3474336},{"handle_mark_destroy",3473984},{"arena_grow",711584},{"method_handle_construct",3473840},{"method_handle_destroy",3474096},{"java_calls",3720256},{"klass_initialize",3623728},{"klass_check",3610656},{"klass_allocate",3606912},{"new_string_unicode",3745984}};
+inline constexpr field_entry fields_17[]{{"Thread","_pending_exception",8},{"Thread","_active_handles",216},{"Thread","_tlab",256},{"Thread","_osthread",560},{"Thread","_handle_area",576},{"Thread","_stack_base",592},{"Thread","_stack_size",600},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_active_handles",216},{"JavaThread","_tlab",256},{"JavaThread","_osthread",560},{"JavaThread","_handle_area",576},{"JavaThread","_stack_base",592},{"JavaThread","_stack_size",600},{"JavaThread","_threadObj",656},{"JavaThread","_anchor",664},{"JavaThread","_thread_state",832},{"JavaThread","_jni_attach_state",884},{"JavaThread","_stack_overflow_state",944},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_17[]{{"Thread",648},{"ThreadShadow",32},{"JavaThread",1232},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",304},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",40},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",48},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_17[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_17{
+{30,174,66,228,51,42,150,251,153,27,174,79,132,4,159,229},1,13025280,807086503,17,
+{0,0,1,0,1,0,0,0,0},
+symbols_17,fields_17,sizes_17,enums_17};
+inline constexpr symbol_entry symbols_18[]{{"java_thread_ctor",8356992},{"allocate_thread",8358864},{"malloc",6881856},{"current_thread",8396240},{"initialize_tls",8371568},{"is_tls_initialized",8396208},{"record_stack",8382080},{"register_stack",8382224},{"unregister_stack",8386016},{"create_os_thread",6904784},{"create_guards",7810496},{"remove_guards",7812928},{"initialize_tlab",8371616},{"tlab_initialize",8392496},{"use_tlab",11738405},{"cache_globals",61856},{"vm_exited",12469560},{"java_version",12224896},{"threads_lock",12313056},{"lock",6744544},{"lock_without_safepoint",6744976},{"unlock",6745392},{"allocate_handle_block",4379616},{"add_thread",8358656},{"main_thread_group",8495440},{"allocate_thread_object",8359040},{"thread_object",8385808},{"set_thread_status",3899440},{"jfr_thread_start",3901680},{"setup_fpu",61856},{"java_thread_id",3899968},{"java_thread_tid_offset",12225120},{"cleanup_failed",8360912},{"exit_thread",8367248},{"delete_thread",8385440},{"clear_exception",3000016},{"process_safepoint_exit",1204272},{"anchor_walkable",3056928},{"handle_mark_initialize",3603408},{"handle_mark_destroy",3603056},{"arena_grow",764032},{"method_handle_construct",3602912},{"method_handle_destroy",3603168},{"java_calls",3847024},{"klass_initialize",3754368},{"klass_check",3742016},{"klass_allocate",3738384},{"new_string_unicode",3871296}};
+inline constexpr field_entry fields_18[]{{"Thread","_pending_exception",8},{"Thread","_tlab",232},{"Thread","_osthread",528},{"Thread","_handle_area",544},{"Thread","_stack_base",560},{"Thread","_stack_size",568},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",232},{"JavaThread","_osthread",528},{"JavaThread","_handle_area",544},{"JavaThread","_stack_base",560},{"JavaThread","_stack_size",568},{"JavaThread","_threadObj",616},{"JavaThread","_anchor",624},{"JavaThread","_active_handles",768},{"JavaThread","_thread_state",816},{"JavaThread","_jni_attach_state",868},{"JavaThread","_stack_overflow_state",928},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_18[]{{"Thread",608},{"ThreadShadow",32},{"JavaThread",1208},{"JavaFrameAnchor",24},{"OSThread",48},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",304},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",40},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",48},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_18[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_18{
+{74,19,208,125,72,222,92,178,54,189,95,141,72,60,90,42},1,13148160,388940897,18,
+{0,0,1,0,1,0,0,0,1},
+symbols_18,fields_18,sizes_18,enums_18};
+inline constexpr symbol_entry symbols_19[]{{"java_thread_ctor",8704432},{"allocate_thread",8706912},{"malloc",7194016},{"current_thread",8746144},{"initialize_tls",8719744},{"is_tls_initialized",8746112},{"record_stack",8731504},{"register_stack",8731696},{"unregister_stack",8735472},{"create_os_thread",7217360},{"create_guards",8138432},{"remove_guards",8140864},{"initialize_tlab",8719792},{"tlab_initialize",8742544},{"use_tlab",12164001},{"cache_globals",40320},{"vm_exited",12865224},{"java_version",12627232},{"threads_lock",12712008},{"lock",7051296},{"lock_without_safepoint",7051744},{"unlock",7052160},{"allocate_handle_block",4596192},{"add_thread",8706720},{"main_thread_group",8835744},{"allocate_thread_object",8707088},{"thread_object",8735168},{"set_thread_status",4110880},{"jfr_thread_start",4113328},{"setup_fpu",40320},{"next_thread_identifier",8741360},{"java_thread_tid_offset",12627396},{"cleanup_failed",8708544},{"exit_thread",8715104},{"delete_thread",8734560},{"clear_exception",3170896},{"native_to_vm",1488768},{"process_safepoint_exit",1258000},{"anchor_walkable",3231056},{"handle_mark_initialize",3791360},{"handle_mark_destroy",3791008},{"arena_grow",795984},{"method_handle_construct",3790864},{"method_handle_destroy",3791120},{"java_calls",4053280},{"klass_initialize",3948368},{"klass_check",3935488},{"klass_allocate",3931760},{"new_string_unicode",4080192}};
+inline constexpr field_entry fields_19[]{{"Thread","_pending_exception",8},{"Thread","_tlab",240},{"Thread","_osthread",584},{"Thread","_handle_area",600},{"Thread","_stack_base",616},{"Thread","_stack_size",624},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",240},{"JavaThread","_osthread",584},{"JavaThread","_handle_area",600},{"JavaThread","_stack_base",616},{"JavaThread","_stack_size",624},{"JavaThread","_threadObj",672},{"JavaThread","_anchor",704},{"JavaThread","_active_handles",848},{"JavaThread","_thread_state",884},{"JavaThread","_jni_attach_state",932},{"JavaThread","_stack_overflow_state",1000},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_19[]{{"Thread",664},{"ThreadShadow",32},{"JavaThread",1328},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",304},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_19[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_19{
+{199,230,204,177,25,167,172,198,50,107,230,97,244,176,25,204},1,13570048,2439021036,19,
+{0,1,1,0,1,0,0,0,0},
+symbols_19,fields_19,sizes_19,enums_19};
+inline constexpr symbol_entry symbols_20[]{{"java_thread_ctor",4152256},{"allocate_thread",8713296},{"malloc",7041248},{"current_thread",8725424},{"initialize_tls",8713808},{"is_tls_initialized",8725392},{"record_stack",8715488},{"register_stack",8715680},{"unregister_stack",8715872},{"create_os_thread",7064512},{"create_guards",7986352},{"remove_guards",7988768},{"initialize_tlab",8713856},{"tlab_initialize",8721776},{"use_tlab",12268528},{"cache_globals",33056},{"vm_exited",12984256},{"java_version",12734288},{"threads_lock",12814192},{"lock",6896576},{"lock_without_safepoint",6896992},{"unlock",6897408},{"allocate_handle_block",4650496},{"add_thread",8746208},{"main_thread_group",8826224},{"allocate_thread_object",4153648},{"thread_object",4167584},{"set_thread_status",4148896},{"jfr_thread_start",4169168},{"setup_fpu",33056},{"next_thread_identifier",8720592},{"java_thread_tid_offset",12734448},{"cleanup_failed",4154752},{"exit_thread",4156784},{"delete_thread",4167344},{"clear_exception",3209104},{"native_to_vm",1492976},{"native_to_vm_ctor",1435904},{"anchor_walkable",3270480},{"handle_mark_initialize",3833792},{"handle_mark_destroy",3833440},{"arena_grow",806288},{"method_handle_construct",3833296},{"method_handle_destroy",3833552},{"java_calls",4091584},{"klass_initialize",3987008},{"klass_check",3974064},{"klass_allocate",3970400},{"new_string_unicode",4117952}};
+inline constexpr field_entry fields_20[]{{"Thread","_pending_exception",8},{"Thread","_tlab",240},{"Thread","_osthread",584},{"Thread","_handle_area",600},{"Thread","_stack_base",616},{"Thread","_stack_size",624},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",240},{"JavaThread","_osthread",584},{"JavaThread","_handle_area",600},{"JavaThread","_stack_base",616},{"JavaThread","_stack_size",624},{"JavaThread","_threadObj",672},{"JavaThread","_anchor",704},{"JavaThread","_active_handles",848},{"JavaThread","_thread_state",884},{"JavaThread","_jni_attach_state",936},{"JavaThread","_stack_overflow_state",1008},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",34},{"ConstMethod","_signature_index",36},{"ConstMethod","_size_of_parameters",44},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_20[]{{"Thread",664},{"ThreadShadow",32},{"JavaThread",1344},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_20[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_20{
+{190,9,8,133,209,73,154,229,59,235,195,93,99,103,70,44},1,13692928,989450243,20,
+{0,1,1,0,1,0,0,0,0},
+symbols_20,fields_20,sizes_20,enums_20};
+inline constexpr symbol_entry symbols_21[]{{"java_thread_ctor",4149072},{"malloc",7116944},{"current_thread",8794272},{"initialize_tls",8782192},{"is_tls_initialized",8794240},{"record_stack",8783952},{"register_stack",8784144},{"unregister_stack",8784336},{"create_os_thread",7141904},{"create_guards",8049184},{"remove_guards",8051536},{"initialize_tlab",8782240},{"tlab_initialize",8790368},{"use_tlab",12825964},{"cache_globals",37344},{"vm_exited",13530720},{"java_version",13269856},{"threads_lock",13355032},{"lock",6968944},{"lock_without_safepoint",6969360},{"unlock",6969776},{"allocate_handle_block",4668448},{"add_thread",8815968},{"main_thread_group",8906512},{"allocate_thread_object",4150432},{"thread_object",4165968},{"set_thread_status",4145568},{"jfr_thread_start",4167200},{"setup_fpu",37344},{"next_thread_identifier",8789184},{"java_thread_tid_offset",13270028},{"cleanup_failed",4151376},{"exit_thread",4153168},{"delete_thread",4165712},{"clear_exception",3208624},{"native_to_vm",1478784},{"native_to_vm_ctor",1423760},{"anchor_walkable",3272224},{"handle_mark_initialize",3833104},{"handle_mark_destroy",3832752},{"arena_grow",814240},{"method_handle_construct",3832608},{"method_handle_destroy",3832864},{"java_calls",4090160},{"klass_initialize",3979488},{"klass_check",3965792},{"klass_allocate",3962160},{"new_string_unicode",4117168}};
+inline constexpr field_entry fields_21[]{{"Thread","_pending_exception",8},{"Thread","_tlab",432},{"Thread","_osthread",792},{"Thread","_handle_area",808},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",432},{"JavaThread","_osthread",792},{"JavaThread","_handle_area",808},{"JavaThread","_stack_base",824},{"JavaThread","_stack_size",832},{"JavaThread","_threadObj",896},{"JavaThread","_anchor",928},{"JavaThread","_active_handles",1072},{"JavaThread","_thread_state",1100},{"JavaThread","_jni_attach_state",1152},{"JavaThread","_stack_overflow_state",1224},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_21[]{{"Thread",888},{"ThreadShadow",32},{"JavaThread",1632},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",5}};
+inline constexpr enum_entry enums_21[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_21{
+{209,165,57,191,176,68,148,157,51,237,171,93,37,132,91,231},1,14295040,3619660896,21,
+{0,1,1,0,1,0,0,0,0},
+symbols_21,fields_21,sizes_21,enums_21};
+inline constexpr symbol_entry symbols_22[]{{"java_thread_ctor",4162352},{"malloc",7194864},{"current_thread",8883696},{"initialize_tls",8871696},{"is_tls_initialized",8883664},{"record_stack",8873488},{"register_stack",8873696},{"unregister_stack",8873888},{"create_os_thread",7217024},{"create_guards",8131072},{"remove_guards",8133424},{"initialize_tlab",8871744},{"tlab_initialize",8879808},{"use_tlab",12900504},{"cache_globals",41264},{"vm_exited",13668040},{"java_version",13341616},{"threads_lock",13492712},{"lock",7044800},{"lock_without_safepoint",7045216},{"unlock",7045632},{"allocate_handle_block",4705920},{"add_thread",8905648},{"main_thread_group",8997392},{"allocate_thread_object",4163600},{"thread_object",4179648},{"set_thread_status",4159040},{"jfr_thread_start",4180896},{"setup_fpu",41264},{"next_thread_identifier",8878624},{"java_thread_tid_offset",13341792},{"cleanup_failed",4164640},{"exit_thread",4166464},{"delete_thread",4179392},{"clear_exception",3213200},{"native_to_vm",4599856},{"native_to_vm_ctor",4592000},{"anchor_walkable",3277088},{"handle_mark_initialize",3844160},{"handle_mark_destroy",3843808},{"arena_grow",802032},{"method_handle_construct",3843664},{"method_handle_destroy",3843920},{"java_calls",4102864},{"klass_initialize",3990416},{"klass_check",3976944},{"klass_allocate",3972544},{"new_string_unicode",4130032}};
+inline constexpr field_entry fields_22[]{{"Thread","_pending_exception",8},{"Thread","_tlab",432},{"Thread","_osthread",792},{"Thread","_handle_area",808},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",432},{"JavaThread","_osthread",792},{"JavaThread","_handle_area",808},{"JavaThread","_stack_base",824},{"JavaThread","_stack_size",832},{"JavaThread","_threadObj",896},{"JavaThread","_anchor",928},{"JavaThread","_active_handles",1072},{"JavaThread","_thread_state",1108},{"JavaThread","_jni_attach_state",1160},{"JavaThread","_stack_overflow_state",1232},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_22[]{{"Thread",888},{"ThreadShadow",32},{"JavaThread",1640},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
+inline constexpr enum_entry enums_22[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_22{
+{130,229,184,193,178,68,8,21,45,225,100,29,132,24,212,52},1,14430208,132172161,22,
+{0,1,1,0,1,0,0,0,0},
+symbols_22,fields_22,sizes_22,enums_22};
+inline constexpr symbol_entry symbols_23[]{{"java_thread_ctor",4131424},{"malloc",7186256},{"current_thread",8926608},{"initialize_tls",8914640},{"is_tls_initialized",8926576},{"record_stack",8916400},{"register_stack",8916608},{"unregister_stack",8916800},{"create_os_thread",7210544},{"create_guards",8151440},{"remove_guards",8153792},{"initialize_tlab",8914688},{"tlab_initialize",8922720},{"use_tlab",12950680},{"cache_globals",41360},{"vm_exited",13716568},{"java_version",13389968},{"threads_lock",13541328},{"lock",7032464},{"lock_without_safepoint",7033168},{"unlock",7033584},{"allocate_handle_block",4677440},{"add_thread",8946800},{"main_thread_group",9039312},{"allocate_thread_object",4132640},{"thread_object",4149152},{"set_thread_status",4128128},{"jfr_thread_start",4150384},{"setup_fpu",41360},{"next_thread_identifier",8921536},{"java_thread_tid_offset",13390272},{"cleanup_failed",4133568},{"exit_thread",4135392},{"delete_thread",4148896},{"clear_exception",3197488},{"native_to_vm",4571376},{"native_to_vm_ctor",4563520},{"anchor_walkable",3262880},{"handle_mark_initialize",3840288},{"handle_mark_destroy",3839936},{"arena_grow",769136},{"method_handle_construct",3839792},{"method_handle_destroy",3840048},{"java_calls",4070752},{"klass_initialize",3957936},{"klass_check",3944672},{"klass_allocate",3941456},{"new_string_unicode",4098144}};
+inline constexpr field_entry fields_23[]{{"Thread","_pending_exception",8},{"Thread","_tlab",432},{"Thread","_osthread",792},{"Thread","_handle_area",808},{"Thread","_stack_base",824},{"Thread","_stack_size",832},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",432},{"JavaThread","_osthread",792},{"JavaThread","_handle_area",808},{"JavaThread","_stack_base",824},{"JavaThread","_stack_size",832},{"JavaThread","_threadObj",896},{"JavaThread","_anchor",928},{"JavaThread","_active_handles",1072},{"JavaThread","_thread_state",1092},{"JavaThread","_jni_attach_state",1144},{"JavaThread","_stack_overflow_state",1224},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",24},{"Arena","_max",32},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_23[]{{"Thread",888},{"ThreadShadow",32},{"JavaThread",1640},{"JavaFrameAnchor",24},{"OSThread",32},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MEMFLAGS",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
+inline constexpr enum_entry enums_23[]{{"MEMFLAGS","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_23{
+{134,59,27,180,85,171,205,58,215,1,116,57,184,217,104,185},1,14475264,3970002669,23,
+{0,1,1,0,1,0,1,0,0},
+symbols_23,fields_23,sizes_23,enums_23};
+inline constexpr symbol_entry symbols_24[]{{"create_attaching_thread",4382640},{"malloc",7492192},{"current_thread",9513504},{"initialize_tls",9501552},{"is_tls_initialized",9513472},{"record_stack",9503296},{"register_stack",9503504},{"unregister_stack",9503696},{"create_os_thread",7517008},{"create_guards",8719104},{"remove_guards",8721648},{"initialize_tlab",9501600},{"tlab_initialize",9509600},{"use_tlab",13542200},{"cache_globals",42528},{"vm_exited",14338112},{"java_version",13992656},{"threads_lock",14161752},{"lock",7331664},{"lock_without_safepoint",7332352},{"unlock",7332976},{"allocate_handle_block",4928848},{"add_thread",9533584},{"main_thread_group",9628000},{"allocate_thread_object",4380464},{"thread_object",4398080},{"set_thread_status",4375664},{"jfr_thread_start",4401456},{"setup_fpu",42528},{"next_thread_identifier",9508416},{"java_thread_tid_offset",13992992},{"cleanup_failed",4381472},{"exit_thread",4383744},{"delete_thread",4397792},{"clear_exception",3381888},{"native_to_vm",4818720},{"native_to_vm_ctor",4810624},{"anchor_walkable",3451616},{"handle_mark_initialize",4040592},{"handle_mark_destroy",4040240},{"arena_grow",847504},{"method_handle_construct",4040096},{"method_handle_destroy",4040352},{"java_calls",4317888},{"klass_initialize",4201808},{"klass_check",4188368},{"klass_allocate",4185072},{"new_string_unicode",4345088}};
+inline constexpr field_entry fields_24[]{{"Thread","_pending_exception",8},{"Thread","_tlab",448},{"Thread","_osthread",800},{"Thread","_handle_area",816},{"Thread","_stack_base",832},{"Thread","_stack_size",840},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",448},{"JavaThread","_osthread",800},{"JavaThread","_handle_area",816},{"JavaThread","_stack_base",832},{"JavaThread","_stack_size",840},{"JavaThread","_threadObj",904},{"JavaThread","_anchor",936},{"JavaThread","_active_handles",1080},{"JavaThread","_monitor_owner_id",1096},{"JavaThread","_thread_state",1108},{"JavaThread","_jni_attach_state",1152},{"JavaThread","_stack_overflow_state",1232},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",40},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_24[]{{"Thread",896},{"ThreadShadow",32},{"JavaThread",1840},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",16},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",4},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",120},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
+inline constexpr enum_entry enums_24[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_24{
+{165,77,242,187,127,109,105,38,14,41,42,211,188,153,210,167},1,15122432,1764072965,24,
+{1,1,1,0,1,1,1,0,0},
+symbols_24,fields_24,sizes_24,enums_24};
+inline constexpr symbol_entry symbols_25[]{{"create_attaching_thread",4775360},{"malloc",7978944},{"current_thread",10090624},{"initialize_tls",10079216},{"is_tls_initialized",10090592},{"record_stack",10080960},{"register_stack",10081168},{"unregister_stack",10081440},{"create_os_thread",8004640},{"create_guards",9242592},{"remove_guards",9245136},{"initialize_tlab",10079264},{"tlab_initialize",10087088},{"use_tlab",14311426},{"cache_globals",44832},{"vm_exited",15105944},{"java_version",14758672},{"threads_lock",14928920},{"lock",7805552},{"lock_without_safepoint",7806256},{"unlock",7806928},{"allocate_handle_block",5345584},{"add_thread",10117216},{"main_thread_group",10229408},{"allocate_thread_object",4773136},{"thread_object",4790736},{"set_thread_status",4767952},{"jfr_thread_start",4793616},{"setup_fpu",44832},{"next_thread_identifier",10085904},{"java_thread_tid_offset",14758964},{"cleanup_failed",4774192},{"exit_thread",4776448},{"delete_thread",4790448},{"clear_exception",3781088},{"native_to_vm",5233856},{"native_to_vm_ctor",2513264},{"anchor_walkable",3852352},{"handle_mark_initialize",4441600},{"handle_mark_destroy",4441248},{"arena_grow",1121120},{"method_handle_construct",4441104},{"method_handle_destroy",4441360},{"java_calls",4708736},{"klass_initialize",4594384},{"klass_check",4580432},{"klass_allocate",4577168},{"new_string_unicode",4736352}};
+inline constexpr field_entry fields_25[]{{"Thread","_pending_exception",8},{"Thread","_tlab",448},{"Thread","_osthread",928},{"Thread","_handle_area",944},{"Thread","_stack_base",960},{"Thread","_stack_size",968},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",448},{"JavaThread","_osthread",928},{"JavaThread","_handle_area",944},{"JavaThread","_stack_base",960},{"JavaThread","_stack_size",968},{"JavaThread","_threadObj",1032},{"JavaThread","_anchor",1064},{"JavaThread","_active_handles",1208},{"JavaThread","_monitor_owner_id",1224},{"JavaThread","_thread_state",1236},{"JavaThread","_jni_attach_state",1280},{"JavaThread","_stack_overflow_state",1360},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",44},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",60},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_25[]{{"Thread",1024},{"ThreadShadow",32},{"JavaThread",1968},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",56},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",24},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",72},{"Symbol",8},{"AccessFlags",2},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",112},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
+inline constexpr enum_entry enums_25[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_25{
+{63,120,183,198,252,206,242,110,106,141,75,92,188,238,188,109},1,15929344,589636596,25,
+{1,1,1,0,1,1,1,0,0},
+symbols_25,fields_25,sizes_25,enums_25};
+inline constexpr symbol_entry symbols_26[]{{"create_attaching_thread",4876368},{"malloc",8192992},{"current_thread",10384432},{"initialize_tls",10373152},{"is_tls_initialized",10384400},{"record_stack",10374896},{"register_stack",10375104},{"unregister_stack",10375376},{"create_os_thread",8219120},{"create_guards",9445680},{"remove_guards",9448224},{"initialize_tlab",10373200},{"tlab_initialize",10381024},{"use_tlab",14697702},{"cache_globals",45088},{"vm_exited",15523560},{"java_version",15141280},{"threads_lock",15331528},{"lock",8018464},{"lock_without_safepoint",8019168},{"unlock",8019840},{"allocate_handle_block",5457088},{"add_thread",10411008},{"main_thread_group",10526912},{"allocate_thread_object",4874160},{"thread_object",4891632},{"set_thread_status",4869056},{"jfr_thread_start",4894656},{"setup_fpu",45088},{"next_thread_identifier",10379856},{"java_thread_tid_offset",15141476},{"cleanup_failed",4875200},{"exit_thread",4877440},{"delete_thread",4891344},{"clear_exception",3882976},{"native_to_vm",5343728},{"native_to_vm_ctor",2595584},{"anchor_walkable",3956304},{"handle_mark_initialize",4538864},{"handle_mark_destroy",4538512},{"arena_grow",1182304},{"method_handle_construct",4538368},{"method_handle_destroy",4538624},{"java_calls",4808560},{"klass_initialize",4692608},{"klass_check",4678816},{"klass_allocate",4675904},{"new_string_unicode",4836352}};
+inline constexpr field_entry fields_26[]{{"Thread","_pending_exception",8},{"Thread","_tlab",424},{"Thread","_osthread",904},{"Thread","_handle_area",920},{"Thread","_stack_base",936},{"Thread","_stack_size",944},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",424},{"JavaThread","_osthread",904},{"JavaThread","_handle_area",920},{"JavaThread","_stack_base",936},{"JavaThread","_stack_size",944},{"JavaThread","_threadObj",1008},{"JavaThread","_anchor",1040},{"JavaThread","_active_handles",1168},{"JavaThread","_monitor_owner_id",1184},{"JavaThread","_thread_state",1196},{"JavaThread","_jni_attach_state",1248},{"JavaThread","_stack_overflow_state",1328},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaCallArguments","_alternative_target",120},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",44},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",68},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_26[]{{"Thread",1000},{"ThreadShadow",32},{"JavaThread",1952},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",48},{"JNIHandleBlock",296},{"JavaCallArguments",128},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",24},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",80},{"Symbol",8},{"AccessFlags",2},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",112},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
+inline constexpr enum_entry enums_26[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_26{
+{46,57,219,241,150,66,120,43,8,23,172,20,80,110,248,117},1,16363520,2855910861,26,
+{1,1,1,0,1,1,1,0,0},
+symbols_26,fields_26,sizes_26,enums_26};
+inline constexpr symbol_entry symbols_27[]{{"create_attaching_thread",4962064},{"malloc",7464368},{"current_thread",9637856},{"initialize_tls",9626544},{"is_tls_initialized",9637824},{"record_stack",9628240},{"register_stack",9628448},{"unregister_stack",9628720},{"create_os_thread",7490992},{"create_guards",8657440},{"remove_guards",8659984},{"initialize_tlab",9626592},{"tlab_initialize",9634576},{"use_tlab",13902791},{"cache_globals",37120},{"vm_exited",14694624},{"java_version",14317600},{"threads_lock",14502760},{"lock",7286000},{"lock_without_safepoint",7286704},{"unlock",7287376},{"allocate_handle_block",5553552},{"add_thread",9664864},{"main_thread_group",9781424},{"allocate_thread_object",4960384},{"thread_object",4976544},{"set_thread_status",4955808},{"jfr_thread_start",4979552},{"setup_fpu",37120},{"next_thread_identifier",9633200},{"java_thread_tid_offset",14317796},{"cleanup_failed",4961424},{"exit_thread",4962880},{"delete_thread",4976256},{"clear_exception",3948128},{"native_to_vm",5444320},{"native_to_vm_ctor",2664528},{"anchor_walkable",4022064},{"handle_mark_initialize",4621264},{"handle_mark_destroy",4620896},{"arena_grow",1247376},{"method_handle_construct",4620752},{"method_handle_destroy",4621008},{"java_calls",4895728},{"klass_initialize",4778416},{"klass_check",4764560},{"klass_allocate",4761632},{"new_string_unicode",4922544}};
+inline constexpr field_entry fields_27[]{{"Thread","_pending_exception",8},{"Thread","_tlab",424},{"Thread","_osthread",904},{"Thread","_handle_area",920},{"Thread","_stack_base",936},{"Thread","_stack_size",944},{"ThreadShadow","_pending_exception",8},{"JavaThread","_pending_exception",8},{"JavaThread","_tlab",424},{"JavaThread","_osthread",904},{"JavaThread","_handle_area",920},{"JavaThread","_stack_base",936},{"JavaThread","_stack_size",944},{"JavaThread","_threadObj",1008},{"JavaThread","_anchor",1040},{"JavaThread","_active_handles",1168},{"JavaThread","_monitor_owner_id",1184},{"JavaThread","_thread_state",1196},{"JavaThread","_jni_attach_state",1248},{"JavaThread","_stack_overflow_state",1256},{"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},{"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},{"JavaCallArguments","_start_at_zero",112},{"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},{"Arena","_hwm",32},{"Arena","_max",40},{"JVMFlag","_addr",0},{"JVMFlag","_name",8},{"JVMFlag","_type",20},{"StackOverflow","_stack_guard_state",0},{"Method","_constMethod",8},{"Method","_access_flags",44},{"ConstMethod","_constants",8},{"ConstMethod","_name_index",36},{"ConstMethod","_signature_index",38},{"ConstMethod","_size_of_parameters",46},{"ConstantPool","_pool_holder",24},{"ConstantPool","_length",68},{"Symbol","_length",4},{"Symbol","_body",6},{"JDK_Version","_major",0}};
+inline constexpr size_entry sizes_27[]{{"Thread",1000},{"ThreadShadow",32},{"JavaThread",1776},{"JavaFrameAnchor",24},{"OSThread",40},{"HandleMark",56},{"HandleArea",48},{"JNIHandleBlock",296},{"JavaCallArguments",120},{"JavaValue",16},{"methodHandle",16},{"Handle",8},{"Arena",48},{"Chunk",24},{"Mutex",64},{"Monitor",64},{"JVMFlag",24},{"StackOverflow",56},{"MemTag",0},{"JavaThreadState",0},{"BasicType",0},{"JavaThread::JNIAttachStates",0},{"JavaThread::TerminatedTypes",0},{"JavaThread::ExitType",0},{"StackOverflow::StackGuardState",0},{"Method",88},{"ConstMethod",56},{"ConstantPool",80},{"Symbol",8},{"AccessFlags",2},{"java_lang_Thread",1},{"JavaThreadStatus",0},{"AllocFailStrategy::AllocFailEnum",0},{"ThreadLocalAllocBuffer",112},{"ThreadInVMfromNative",16},{"ThreadToNativeFromVM",8},{"JDK_Version",20}};
+inline constexpr enum_entry enums_27[]{{"MemTag","mtThread",2},{"JavaThreadState","_thread_in_native",4},{"JavaThreadState","_thread_in_vm",6},{"JavaThreadState","_thread_in_Java",8},{"JavaThread::JNIAttachStates","_not_attaching_via_jni",1},{"JavaThread::JNIAttachStates","_attaching_via_jni",2},{"JavaThread::JNIAttachStates","_attached_via_jni",3},{"JavaThread::ExitType","normal_exit",0},{"JavaThread::ExitType","jni_detach",1},{"StackOverflow::StackGuardState","stack_guard_enabled",3},{"JavaThreadStatus","RUNNABLE",5}};
+inline constexpr profile_entry profile_27{
+{118,213,7,206,75,115,85,235,10,87,180,32,66,75,232,145},1,15519744,4183519753,27,
+{1,1,1,0,1,1,1,0,0},
+symbols_27,fields_27,sizes_27,enums_27};
+inline constexpr const profile_entry* all_profiles[]{&profile_8,&profile_9,&profile_10,&profile_11,&profile_12,&profile_13,&profile_14,&profile_15,&profile_16,&profile_17,&profile_18,&profile_19,&profile_20,&profile_21,&profile_22,&profile_23,&profile_24,&profile_25,&profile_26,&profile_27};
+}
+
+namespace vmhook::detail::private_native {
+struct function_alias{std::string_view key;std::span<const std::string_view> names;};
+inline constexpr std::string_view alias_java_thread_ctor[]{"??0JavaThread@@QEAA@_N@Z"};
+inline constexpr std::string_view alias_create_attaching_thread[]{"?create_attaching_thread@JavaThread@@SAPEAV1@XZ"};
+inline constexpr std::string_view alias_allocate_thread[]{"?allocate@Thread@@KAPEAX_K_NW4MEMFLAGS@@@Z","?allocate@Thread@@KAPEAX_K_NW4MemoryType@@@Z","?allocate@Thread@@KAPEAX_K_NW4MemTag@@@Z"};
+inline constexpr std::string_view alias_malloc[]{"?malloc@os@@SAPEAX_KW4MemoryType@@@Z","?malloc@os@@SAPEAX_KW4MEMFLAGS@@@Z","?malloc@os@@SAPEAX_KW4MemTag@@@Z"};
+inline constexpr std::string_view alias_current_thread[]{"?thread@ThreadLocalStorage@@SAPEAVThread@@XZ","?get_thread_slow@ThreadLocalStorage@@SAPEAVThread@@XZ"};
+inline constexpr std::string_view alias_initialize_tls[]{"?initialize_thread_current@Thread@@QEAAXXZ","?initialize_thread_local_storage@Thread@@QEAAXXZ"};
+inline constexpr std::string_view alias_is_tls_initialized[]{"?is_initialized@ThreadLocalStorage@@SA_NXZ"};
+inline constexpr std::string_view alias_record_stack[]{"?record_stack_base_and_size@Thread@@QEAAXXZ"};
+inline constexpr std::string_view alias_register_stack[]{"?register_thread_stack_with_NMT@Thread@@QEAAXXZ"};
+inline constexpr std::string_view alias_unregister_stack[]{"?unregister_thread_stack_with_NMT@Thread@@QEAAXXZ"};
+inline constexpr std::string_view alias_create_os_thread[]{"?create_attached_thread@os@@SA_NPEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_create_guards[]{"?create_stack_guard_pages@StackOverflow@@QEAAXXZ","?create_stack_guard_pages@JavaThread@@QEAAXXZ"};
+inline constexpr std::string_view alias_remove_guards[]{"?remove_stack_guard_pages@StackOverflow@@QEAAXXZ","?remove_stack_guard_pages@JavaThread@@QEAAXXZ"};
+inline constexpr std::string_view alias_initialize_tlab[]{"?initialize_tlab@Thread@@QEAAXXZ"};
+inline constexpr std::string_view alias_tlab_initialize[]{"?initialize@ThreadLocalAllocBuffer@@QEAAXXZ"};
+inline constexpr std::string_view alias_use_tlab[]{"UseTLAB"};
+inline constexpr std::string_view alias_cache_globals[]{"?cache_global_variables@JavaThread@@QEAAXXZ"};
+inline constexpr std::string_view alias_vm_exited[]{"?_vm_exited@VM_Exit@@0_NC"};
+inline constexpr std::string_view alias_java_version[]{"?_current@JDK_Version@@0V1@A"};
+inline constexpr std::string_view alias_threads_lock[]{"?Threads_lock@@3PEAVMonitor@@EA"};
+inline constexpr std::string_view alias_lock[]{"?lock@Mutex@@QEAAXPEAVThread@@@Z"};
+inline constexpr std::string_view alias_old_lock[]{"?lock_without_safepoint_check@Monitor@@QEAAXXZ"};
+inline constexpr std::string_view alias_lock_without_safepoint[]{"?lock_without_safepoint_check@Mutex@@QEAAXXZ","?lock_without_safepoint_check@Monitor@@QEAAXXZ"};
+inline constexpr std::string_view alias_unlock[]{"?unlock@Mutex@@QEAAXXZ","?unlock@Monitor@@QEAAXXZ"};
+inline constexpr std::string_view alias_allocate_handle_block_legacy[]{"?allocate_block@JNIHandleBlock@@SAPEAV1@PEAVThread@@@Z"};
+inline constexpr std::string_view alias_allocate_handle_block[]{"?allocate_block@JNIHandleBlock@@SAPEAV1@PEAVJavaThread@@W4AllocFailEnum@AllocFailStrategy@@@Z","?allocate_block@JNIHandleBlock@@SAPEAV1@PEAVThread@@W4AllocFailEnum@AllocFailStrategy@@@Z"};
+inline constexpr std::string_view alias_add_thread[]{"?add@Threads@@SAXPEAVJavaThread@@_N@Z"};
+inline constexpr std::string_view alias_main_thread_group[]{"?main_thread_group@Universe@@SAPEAVoopDesc@@XZ"};
+inline constexpr std::string_view alias_main_thread_group_raw[]{"?_main_thread_group@Universe@@0PEAVoopDesc@@EA"};
+inline constexpr std::string_view alias_allocate_thread_object[]{"?allocate_threadObj@JavaThread@@QEAAXVHandle@@PEBD_NPEAV1@@Z","?allocate_threadObj@JavaThread@@QEAAXVHandle@@PEBD_NPEAVThread@@@Z","?allocate_threadObj@JavaThread@@QEAAXVHandle@@PEAD_NPEAVThread@@@Z"};
+inline constexpr std::string_view alias_thread_object[]{"?threadObj@JavaThread@@QEBAPEAVoopDesc@@XZ"};
+inline constexpr std::string_view alias_set_thread_status[]{"?set_thread_status@java_lang_Thread@@SAXPEAVoopDesc@@W4JavaThreadStatus@@@Z","?set_thread_status@java_lang_Thread@@SAXPEAVoopDesc@@W4ThreadStatus@1@@Z"};
+inline constexpr std::string_view alias_jfr_thread_start[]{"?on_thread_start@Jfr@@SAXPEAVThread@@@Z"};
+inline constexpr std::string_view alias_setup_fpu[]{"?setup_fpu@os@@SAXXZ"};
+inline constexpr std::string_view alias_next_thread_identifier[]{"?next@ThreadIdentifier@@SA_JXZ"};
+inline constexpr std::string_view alias_java_thread_id[]{"?thread_id@java_lang_Thread@@SA_JPEAVoopDesc@@@Z"};
+inline constexpr std::string_view alias_java_thread_tid_offset[]{"?_tid_offset@java_lang_Thread@@0HA"};
+inline constexpr std::string_view alias_cleanup_failed[]{"?cleanup_failed_attach_current_thread@JavaThread@@QEAAX_N@Z","?cleanup_failed_attach_current_thread@JavaThread@@QEAAXXZ"};
+inline constexpr std::string_view alias_exit_thread[]{"?exit@JavaThread@@QEAAX_NW4ExitType@1@@Z"};
+inline constexpr std::string_view alias_delete_thread[]{"?smr_delete@JavaThread@@QEAAXXZ","??_GJavaThread@@UEAAPEAXI@Z"};
+inline constexpr std::string_view alias_clear_exception[]{"?clear_pending_exception@ThreadShadow@@QEAAXXZ"};
+inline constexpr std::string_view alias_native_to_vm[]{"?transition_from_native@ThreadStateTransition@@SAXPEAVJavaThread@@W4JavaThreadState@@_N@Z","?transition_from_native@ThreadStateTransition@@SAXPEAVJavaThread@@W4JavaThreadState@@@Z"};
+inline constexpr std::string_view alias_vm_to_native[]{"?transition_and_fence@ThreadStateTransition@@SAXPEAVJavaThread@@W4JavaThreadState@@1@Z","?transition@ThreadStateTransition@@SAXPEAVJavaThread@@W4JavaThreadState@@1@Z"};
+inline constexpr std::string_view alias_process_safepoint_exit[]{"?process_if_requested_with_exit_check@SafepointMechanism@@SAXPEAVJavaThread@@_N@Z"};
+inline constexpr std::string_view alias_process_safepoint[]{"?process_if_requested@SafepointMechanism@@SAXPEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_native_to_vm_ctor[]{"??0ThreadInVMfromNative@@QEAA@PEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_vm_to_native_ctor[]{"??0ThreadToNativeFromVM@@QEAA@PEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_anchor_walkable[]{"?make_walkable@JavaFrameAnchor@@QEAAXXZ","?make_walkable@JavaFrameAnchor@@QEAAXPEAVJavaThread@@@Z"};
+inline constexpr std::string_view alias_handle_mark_initialize[]{"?initialize@HandleMark@@AEAAXPEAVThread@@@Z"};
+inline constexpr std::string_view alias_handle_mark_destroy[]{"??1HandleMark@@QEAA@XZ"};
+inline constexpr std::string_view alias_arena_grow[]{"?grow@Arena@@IEAAPEAX_KW4AllocFailEnum@AllocFailStrategy@@@Z"};
+inline constexpr std::string_view alias_method_handle_construct[]{"??0methodHandle@@QEAA@AEBV0@@Z"};
+inline constexpr std::string_view alias_method_handle_destroy[]{"??1methodHandle@@QEAA@XZ"};
+inline constexpr std::string_view alias_java_calls[]{"?call@JavaCalls@@SAXPEAVJavaValue@@AEBVmethodHandle@@PEAVJavaCallArguments@@PEAVJavaThread@@@Z","?call@JavaCalls@@SAXPEAVJavaValue@@AEBVmethodHandle@@PEAVJavaCallArguments@@PEAVThread@@@Z","?call@JavaCalls@@SAXPEAVJavaValue@@VmethodHandle@@PEAVJavaCallArguments@@PEAVThread@@@Z"};
+inline constexpr std::string_view alias_klass_initialize[]{"?initialize@InstanceKlass@@UEAAXPEAVJavaThread@@@Z","?initialize@InstanceKlass@@UEAAXPEAVThread@@@Z"};
+inline constexpr std::string_view alias_klass_check[]{"?check_valid_for_instantiation@InstanceKlass@@UEAAX_NPEAVJavaThread@@@Z","?check_valid_for_instantiation@InstanceKlass@@UEAAX_NPEAVThread@@@Z"};
+inline constexpr std::string_view alias_klass_allocate[]{"?allocate_instance@InstanceKlass@@QEAAPEAVinstanceOopDesc@@PEAVJavaThread@@@Z","?allocate_instance@InstanceKlass@@QEAAPEAVinstanceOopDesc@@PEAVThread@@@Z"};
+inline constexpr std::string_view alias_new_string_unicode[]{"?create_from_unicode@java_lang_String@@SA?AVHandle@@PEBGHPEAVJavaThread@@@Z","?create_from_unicode@java_lang_String@@SA?AVHandle@@PEBGHPEAVThread@@@Z","?create_from_unicode@java_lang_String@@SA?AVHandle@@PEAGHPEAVThread@@@Z"};
+inline constexpr function_alias private_function_aliases[]{{"java_thread_ctor",alias_java_thread_ctor},{"create_attaching_thread",alias_create_attaching_thread},{"allocate_thread",alias_allocate_thread},{"malloc",alias_malloc},{"current_thread",alias_current_thread},{"initialize_tls",alias_initialize_tls},{"is_tls_initialized",alias_is_tls_initialized},{"record_stack",alias_record_stack},{"register_stack",alias_register_stack},{"unregister_stack",alias_unregister_stack},{"create_os_thread",alias_create_os_thread},{"create_guards",alias_create_guards},{"remove_guards",alias_remove_guards},{"initialize_tlab",alias_initialize_tlab},{"tlab_initialize",alias_tlab_initialize},{"use_tlab",alias_use_tlab},{"cache_globals",alias_cache_globals},{"vm_exited",alias_vm_exited},{"java_version",alias_java_version},{"threads_lock",alias_threads_lock},{"lock",alias_lock},{"old_lock",alias_old_lock},{"lock_without_safepoint",alias_lock_without_safepoint},{"unlock",alias_unlock},{"allocate_handle_block_legacy",alias_allocate_handle_block_legacy},{"allocate_handle_block",alias_allocate_handle_block},{"add_thread",alias_add_thread},{"main_thread_group",alias_main_thread_group},{"main_thread_group_raw",alias_main_thread_group_raw},{"allocate_thread_object",alias_allocate_thread_object},{"thread_object",alias_thread_object},{"set_thread_status",alias_set_thread_status},{"jfr_thread_start",alias_jfr_thread_start},{"setup_fpu",alias_setup_fpu},{"next_thread_identifier",alias_next_thread_identifier},{"java_thread_id",alias_java_thread_id},{"java_thread_tid_offset",alias_java_thread_tid_offset},{"cleanup_failed",alias_cleanup_failed},{"exit_thread",alias_exit_thread},{"delete_thread",alias_delete_thread},{"clear_exception",alias_clear_exception},{"native_to_vm",alias_native_to_vm},{"vm_to_native",alias_vm_to_native},{"process_safepoint_exit",alias_process_safepoint_exit},{"process_safepoint",alias_process_safepoint},{"native_to_vm_ctor",alias_native_to_vm_ctor},{"vm_to_native_ctor",alias_vm_to_native_ctor},{"anchor_walkable",alias_anchor_walkable},{"handle_mark_initialize",alias_handle_mark_initialize},{"handle_mark_destroy",alias_handle_mark_destroy},{"arena_grow",alias_arena_grow},{"method_handle_construct",alias_method_handle_construct},{"method_handle_destroy",alias_method_handle_destroy},{"java_calls",alias_java_calls},{"klass_initialize",alias_klass_initialize},{"klass_check",alias_klass_check},{"klass_allocate",alias_klass_allocate},{"new_string_unicode",alias_new_string_unicode}};
+}
+
+namespace vmhook::detail::private_native {
+inline thread_local std::size_t active_session_count{};
+inline std::filesystem::path native_symbols_path{};
+using root_slot_provider=void**(*)(void*) noexcept;
+inline auto root_reuse_callback() -> root_slot_provider&{static thread_local root_slot_provider callback{};return callback;}
+template<class T> inline T load(const void* p,std::size_t offset) {T result{};std::memcpy(&result,static_cast<const std::byte*>(p)+offset,sizeof result);return result;}
+template<class T> inline void store(void* p,std::size_t offset,T value) {std::memcpy(static_cast<std::byte*>(p)+offset,&value,sizeof value);}
+class runtime final {
+ HMODULE module_{};
+ std::unique_ptr<vmhook::private_metadata::private_profile> private_pdb_;
+ profile_entry fallback_{};
+ std::vector<symbol_entry> fallback_symbols_;
+ std::vector<field_entry> fallback_fields_;
+ std::vector<size_entry> fallback_sizes_;
+ std::vector<enum_entry> fallback_enums_;
+ std::string fallback_error_;
+ bool load_pdb(const IMAGE_NT_HEADERS64* nt,const unsigned char* rsds){
+  try {
+   std::vector<std::filesystem::path> paths;
+   if(!native_symbols_path.empty())paths.push_back(native_symbols_path);
+   wchar_t configured[32768]{};
+   if(GetEnvironmentVariableW(L"VMHOOK_PRIVATE_PDB",configured,32768))paths.emplace_back(configured);
+   if(paths.empty()){wchar_t file[32768]{};if(!GetModuleFileNameW(module_,file,32768))return false;
+    auto base_path=std::filesystem::path(file).parent_path();paths.push_back(base_path/L"jvm.dll.pdb");paths.push_back(base_path/L"jvm.pdb");}
+   vmhook::private_metadata::image_identity identity{};
+   std::memcpy(identity.guid.data(),rsds+4,16);identity.age=load<std::uint32_t>(rsds,20);identity.image_size=static_cast<std::uint32_t>(image_size);
+   const auto* sections=reinterpret_cast<const IMAGE_SECTION_HEADER*>(reinterpret_cast<const std::byte*>(&nt->OptionalHeader)+nt->FileHeader.SizeOfOptionalHeader);
+   for(std::size_t i=0;i<nt->FileHeader.NumberOfSections;++i)identity.section_rvas.push_back(sections[i].VirtualAddress);
+   for(const auto& path:paths){if(!std::filesystem::is_regular_file(path))continue;try{private_pdb_=std::make_unique<vmhook::private_metadata::private_profile>(path,identity);break;}catch(const std::exception& error){fallback_error_=error.what();}}
+   if(!private_pdb_)return false;
+   auto& pdb=*private_pdb_;
+   std::memcpy(fallback_.guid.data(),rsds+4,16);fallback_.age=identity.age;fallback_.image_size=identity.image_size;fallback_.pe_timestamp=nt->FileHeader.TimeDateStamp;
+   if(!pdb.has_symbol("?_current@JDK_Version@@0V1@A")||!pdb.has_field("JDK_Version","_major"))throw std::runtime_error("PDB cannot identify Java feature version");
+   fallback_.java_feature=load<unsigned char>(reinterpret_cast<void*>(base+pdb.symbol("?_current@JDK_Version@@0V1@A")),pdb.offset("JDK_Version","_major"));
+   if(fallback_.java_feature<8||fallback_.java_feature>27)throw std::runtime_error("Private PDB feature is outside Java8–27");
+   for(const auto& alias:private_function_aliases)for(const auto name:alias.names)if(pdb.has_symbol(name)){fallback_symbols_.push_back({alias.key,pdb.symbol(name)});break;}
+   std::set<std::string_view> names;
+   for(const auto* builtin:all_profiles)for(const auto& entry:builtin->sizes)names.insert(entry.type);
+   for(const auto name:names){if(!pdb.has_type(name))continue;const auto& layout=pdb.type(name);fallback_sizes_.push_back({name,static_cast<std::size_t>(layout.size)});
+    for(const auto& [member,offset]:layout.members)fallback_fields_.push_back({name,member,static_cast<std::size_t>(offset)});
+    for(const auto& [member,value]:layout.enums)fallback_enums_.push_back({name,member,static_cast<int>(value)});}
+   fallback_.symbols=fallback_symbols_;fallback_.fields=fallback_fields_;fallback_.sizes=fallback_sizes_;fallback_.enums=fallback_enums_;profile=&fallback_;
+   const auto has=[&](std::string_view key){for(const auto& entry:fallback_symbols_)if(entry.name==key)return true;return false;};
+   fallback_.caps={has("create_attaching_thread"),pdb.has_symbol("?transition_from_native@ThreadStateTransition@@SAXPEAVJavaThread@@W4JavaThreadState@@_N@Z"),
+    pdb.has_symbol("?cleanup_failed_attach_current_thread@JavaThread@@QEAAX_N@Z"),!pdb.has_symbol("?smr_delete@JavaThread@@QEAAXXZ"),pdb.has_type("StackOverflow"),
+    pdb.has_field("JavaThread","_monitor_owner_id"),fallback_.java_feature>=23,pdb.has_symbol("?call@JavaCalls@@SAXPEAVJavaValue@@VmethodHandle@@PEAVJavaCallArguments@@PEAVThread@@@Z"),
+    pdb.has_symbol("?make_walkable@JavaFrameAnchor@@QEAAXPEAVJavaThread@@@Z")};
+   return true;
+  }catch(const std::exception& error){fallback_error_=error.what();private_pdb_.reset();profile=nullptr;return false;}
+ }
+ template<class T>T exported_value(const char* name)const{
+  const auto address=GetProcAddress(module_,name);
+  if(!address)throw std::runtime_error("Required HotSpot metadata export missing");
+  return load<T>(reinterpret_cast<void*>(address),0);
+ }
+public:
+ const profile_entry* profile{};
+ std::uintptr_t base{};
+ std::size_t image_size{};
+ bool ready{};
+ const char* reason{"JVM not found"};
+ runtime(){
+  module_=GetModuleHandleW(L"jvm.dll");if(!module_)return;
+  base=reinterpret_cast<std::uintptr_t>(module_);
+  const auto* dos=reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if(dos->e_magic!=0x5a4d||dos->e_lfanew<0||dos->e_lfanew>0x100000){reason="Invalid JVM PE";return;}
+  const auto* nt=reinterpret_cast<const IMAGE_NT_HEADERS64*>(base+dos->e_lfanew);
+  if(nt->Signature!=0x4550||nt->FileHeader.Machine!=0x8664||nt->OptionalHeader.Magic!=0x20b){reason="JVM is not Windows x64";return;}
+  image_size=nt->OptionalHeader.SizeOfImage;
+  const auto debug=nt->OptionalHeader.DataDirectory[6];
+  if(debug.VirtualAddress>=image_size||debug.Size>image_size-debug.VirtualAddress){reason="Invalid debug directory";return;}
+  const auto* entries=reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(base+debug.VirtualAddress);
+  const unsigned char* rsds{};
+  for(std::size_t i=0;i<debug.Size/sizeof(IMAGE_DEBUG_DIRECTORY);++i){
+   const auto& e=entries[i];
+   if(e.Type!=2||e.SizeOfData<24||e.AddressOfRawData>=image_size||e.SizeOfData>image_size-e.AddressOfRawData)continue;
+   const auto* b=reinterpret_cast<const unsigned char*>(base+e.AddressOfRawData);
+   if(std::memcmp(b,"RSDS",4))continue;
+   rsds=b;
+   for(const auto* p:all_profiles)if(!std::memcmp(b+4,p->guid.data(),16)&&load<std::uint32_t>(b,20)==p->age&&p->image_size==image_size&&p->pe_timestamp==nt->FileHeader.TimeDateStamp)profile=p;
+  }
+  const bool explicit_pdb=!native_symbols_path.empty()||GetEnvironmentVariableW(L"VMHOOK_PRIVATE_PDB",nullptr,0)!=0;
+  if((!profile||explicit_pdb)&&(!rsds||!load_pdb(nt,rsds))){reason=fallback_error_.empty()?"No matching verified DLL/PDB profile":fallback_error_.c_str();return;}
+  try{
+   for(const char* n:{"JavaThread","Thread","JavaFrameAnchor","JNIHandleBlock"})if(type_size(n)!=size(n)){reason="VMTypes and PDB object sizes disagree";return;}
+   for(const auto& f:profile->fields){
+    if(f.type!="JavaThread"&&f.type!="Thread"&&f.type!="ThreadShadow"&&f.type!="Method"&&f.type!="ConstMethod"&&f.type!="ConstantPool"&&f.type!="Symbol")continue;
+    if(auto runtime_field=try_field_offset(f.type,f.name);runtime_field.first&&runtime_field.second!=f.offset){reason="VMStructs and PDB object offsets disagree";return;}
+   }
+   for(const char* name:{"current_thread","initialize_tls","record_stack","create_os_thread","create_guards","remove_guards","cache_globals","threads_lock","lock_without_safepoint","unlock","add_thread","allocate_thread_object","set_thread_status","cleanup_failed","exit_thread","delete_thread","clear_exception","handle_mark_initialize","handle_mark_destroy","arena_grow","method_handle_construct","method_handle_destroy","java_calls","klass_initialize","klass_check","klass_allocate","new_string_unicode"})if(!has_function(name))throw std::runtime_error("Required private lifecycle/call function unavailable");
+   const auto either=[&](std::string_view first,std::string_view second){if(!has_function(first)&&!has_function(second))throw std::runtime_error("Required private runtime alternative unavailable");};
+   either("create_attaching_thread","java_thread_ctor");
+   if(!has_function("create_attaching_thread"))either("allocate_thread","malloc");
+   either("initialize_tlab","tlab_initialize");if(!has_function("initialize_tlab")&&!has_function("use_tlab"))throw std::runtime_error("UseTLAB metadata unavailable");
+   either("allocate_handle_block","allocate_handle_block_legacy");either("main_thread_group","main_thread_group_raw");
+   if(!has_function("native_to_vm")&&!has_function("native_to_vm_ctor")&&(!has_function("process_safepoint_exit")||profile->java_feature<18))throw std::runtime_error("Native to VM transition unavailable");
+   if(!has_function("vm_to_native")&&!has_function("vm_to_native_ctor")&&(!has_function("anchor_walkable")||profile->java_feature<18))throw std::runtime_error("VM to native transition unavailable");
+   if(has_type("ThreadInVMfromNative")&&size("ThreadInVMfromNative")>64)throw std::runtime_error("Unsupported VM transition object size");
+   if(has_type("ThreadToNativeFromVM")&&size("ThreadToNativeFromVM")>64)throw std::runtime_error("Unsupported native transition object size");
+   for(const char* name:{"_pending_exception","_thread_state","_jni_attach_state","_anchor","_handle_area","_active_handles","_tlab","_threadObj","_osthread","_stack_base","_stack_size"}){(void)off("JavaThread",name);}
+   for(const char* name:{"_constMethod","_access_flags"}){(void)off("Method",name);}
+   for(const char* name:{"_constants","_name_index","_signature_index","_size_of_parameters"}){(void)off("ConstMethod",name);}
+   (void)off("ConstantPool","_length");(void)off("ConstantPool","_pool_holder");(void)off("Symbol","_body");
+   if(!has_field("Symbol","_length")&&!has_field("Symbol","_length_and_refcount"))throw std::runtime_error("Symbol length layout unavailable");
+   (void)off("Arena","_hwm");(void)off("Arena","_max");
+   const auto guard_type=profile->caps.guards_subobject?"StackOverflow":"JavaThread";
+   const auto guard_enum=profile->caps.guards_subobject?"StackOverflow::StackGuardState":"JavaThread::StackGuardState";
+   (void)off(guard_type,"_stack_guard_state");(void)enum_value(guard_enum,"stack_guard_enabled");
+   for(const auto& expected:std::array<std::tuple<std::string_view,std::string_view,std::size_t>,11>{{
+       {"JavaValue","_type",0},{"JavaValue","_value",8},{"methodHandle","_value",0},{"methodHandle","_thread",8},
+       {"JavaCallArguments","_value_buffer",0},{"JavaCallArguments","_value_state_buffer",72},{"JavaCallArguments","_value",88},
+       {"JavaCallArguments","_value_state",96},{"JavaCallArguments","_size",104},{"JavaCallArguments","_max_size",108},
+       {"JavaCallArguments","_start_at_zero",112}
+   }}){
+       if(off(std::get<0>(expected),std::get<1>(expected))!=std::get<2>(expected))throw std::runtime_error("Unsupported private argument/value field ABI");
+   }
+   if(has_field("JavaCallArguments","_alternative_target")&&off("JavaCallArguments","_alternative_target")!=120)throw std::runtime_error("Unsupported private JVMCI argument ABI");
+   if(size("AccessFlags")!=2&&size("AccessFlags")!=4)throw std::runtime_error("Unsupported Method access flag ABI");
+   if(size("Handle")!=8||size("methodHandle")!=16||size("HandleMark")!=56||size("JavaValue")!=16||(size("JavaCallArguments")!=120&&size("JavaCallArguments")!=128)){reason="Unsupported private call ABI";return;}
+  }catch(const std::exception& error){fallback_error_=error.what();reason=fallback_error_.c_str();return;}
+  ready=true;reason="Verified HotSpot private runtime profile ready";
+ }
+ std::size_t size(std::string_view type)const{for(auto& e:profile->sizes)if(e.type==type)return e.size;throw std::runtime_error("Required PDB type missing");}
+ std::size_t off(std::string_view type,std::string_view name)const{for(auto& e:profile->fields)if(e.type==type&&e.name==name)return e.offset;throw std::runtime_error("Required PDB member missing: "+std::string(type)+"::"+std::string(name));}
+ bool has_field(std::string_view type,std::string_view name)const{for(auto& e:profile->fields)if(e.type==type&&e.name==name)return true;return false;}
+ int enum_value(std::string_view type,std::string_view name)const{for(auto& e:profile->enums)if(e.type==type&&e.name==name)return e.value;throw std::runtime_error("Required PDB enumerator missing");}
+ bool has_type(std::string_view name)const{for(auto&e:profile->sizes)if(e.type==name)return true;return false;}
+ bool has_function(std::string_view name)const{for(auto& e:profile->symbols)if(e.name==name)return true;return false;}
+ void* function(std::string_view name)const{if(!ready)throw std::runtime_error(reason);for(auto& e:profile->symbols)if(e.name==name){if(e.rva>=image_size)throw std::runtime_error("Private symbol RVA invalid");return reinterpret_cast<void*>(base+e.rva);}throw std::runtime_error("Required private function missing");}
+ template<class T>T fn(std::string_view name)const{return reinterpret_cast<T>(function(name));}
+ bool uses_external_symbols()const noexcept{return private_pdb_!=nullptr;}
+ void* current_thread()const{return fn<void*(*)()>("current_thread")();}
+ std::size_t type_size(std::string_view name)const{
+  const auto table=exported_value<std::uintptr_t>("gHotSpotVMTypes"),stride=exported_value<std::uint64_t>("gHotSpotVMTypeEntryArrayStride"),n=exported_value<std::uint64_t>("gHotSpotVMTypeEntryTypeNameOffset"),s=exported_value<std::uint64_t>("gHotSpotVMTypeEntrySizeOffset");
+  for(std::size_t i=0;i<10000;++i){const auto row=reinterpret_cast<void*>(table+i*stride);const auto spelling=load<const char*>(row,n);if(!spelling)break;if(name==spelling)return load<std::uint64_t>(row,s);}throw std::runtime_error("VMType missing");
+ }
+ std::pair<bool,std::size_t> try_field_offset(std::string_view type,std::string_view field)const{
+  const auto table=exported_value<std::uintptr_t>("gHotSpotVMStructs"),stride=exported_value<std::uint64_t>("gHotSpotVMStructEntryArrayStride"),t=exported_value<std::uint64_t>("gHotSpotVMStructEntryTypeNameOffset"),n=exported_value<std::uint64_t>("gHotSpotVMStructEntryFieldNameOffset"),o=exported_value<std::uint64_t>("gHotSpotVMStructEntryOffsetOffset");
+  for(std::size_t i=0;i<20000;++i){const auto row=reinterpret_cast<void*>(table+i*stride);const auto type_name=load<const char*>(row,t);if(!type_name)break;const auto field_name=load<const char*>(row,n);if(type==type_name&&field_name&&field==field_name)return {true,load<std::uint64_t>(row,o)};}return {};
+ }
+ std::size_t field_offset(std::string_view type,std::string_view field)const{const auto result=try_field_offset(type,field);if(result.first)return result.second;throw std::runtime_error("Required VMStruct field missing");}
+};
+inline auto rt() -> runtime&{static runtime instance;return instance;}
+inline void* pending_exception(void* thread){return load<void*>(thread,rt().off("JavaThread","_pending_exception"));}
+inline int thread_state(void* thread){return load<int>(thread,rt().off("JavaThread","_thread_state"));}
+inline void clear_pending_exception(void* thread){rt().fn<void(*)(void*)>("clear_exception")(thread);}
+inline void transition_to_vm(void* thread){
+ auto& vm=rt();if(vm.current_thread()!=thread||thread_state(thread)!=4)throw std::runtime_error("VM transition requires own native thread");
+ if(!vm.has_function("native_to_vm")){
+  if(vm.has_function("native_to_vm_ctor")){alignas(8)std::array<std::byte,64> transition{};vm.fn<void(*)(void*,void*)>("native_to_vm_ctor")(transition.data(),thread);}
+  else{store<int>(thread,vm.off("JavaThread","_thread_state"),6);std::atomic_thread_fence(std::memory_order_seq_cst);vm.fn<void(*)(void*,bool)>("process_safepoint_exit")(thread,false);}
+ }
+ else if(vm.profile->caps.native_transition_async_arg)vm.fn<void(*)(void*,int,bool)>("native_to_vm")(thread,6,true);
+ else vm.fn<void(*)(void*,int)>("native_to_vm")(thread,6);
+}
+inline void transition_to_native(void* thread){
+ auto& vm=rt();if(vm.current_thread()!=thread||thread_state(thread)!=6)throw std::runtime_error("Native transition requires own VM thread");
+ if(vm.has_function("vm_to_native")){vm.fn<void(*)(void*,int,int)>("vm_to_native")(thread,6,4);return;}
+ if(vm.has_function("vm_to_native_ctor")){alignas(8)std::array<std::byte,64> transition{};vm.fn<void(*)(void*,void*)>("vm_to_native_ctor")(transition.data(),thread);return;}
+ auto*anchor=static_cast<std::byte*>(thread)+vm.off("JavaThread","_anchor");
+ if(vm.profile->caps.anchor_thread_arg)vm.fn<void(*)(void*,void*)>("anchor_walkable")(anchor,thread);else vm.fn<void(*)(void*)>("anchor_walkable")(anchor);
+ if(vm.profile->java_feature<=17){
+  store<int>(thread,vm.off("JavaThread","_thread_state"),7);std::atomic_thread_fence(std::memory_order_seq_cst);
+  vm.fn<void(*)(void*)>("process_safepoint")(thread);
+ }else std::atomic_thread_fence(std::memory_order_release);
+ store<int>(thread,vm.off("JavaThread","_thread_state"),4);
+}
+class vm_state_guard final{
+ void* thread_{};bool entered_{};
+public:
+ explicit vm_state_guard(void* thread):thread_(thread){if(rt().current_thread()!=thread)throw std::runtime_error("VM guard does not own native OS thread");if(thread_state(thread)==4){transition_to_vm(thread);entered_=true;}else if(thread_state(thread)!=6)throw std::runtime_error("Unexpected JavaThread state");}
+ ~vm_state_guard(){if(entered_)transition_to_native(thread_);}
+ vm_state_guard(const vm_state_guard&)=delete;vm_state_guard& operator=(const vm_state_guard&)=delete;
+};
+}
+
+namespace vmhook::detail::private_native::detail{
+class handle_mark final{
+ alignas(8)std::array<std::byte,56> bytes_{};
+public:
+ explicit handle_mark(void*thread){rt().fn<void(*)(void*,void*)>("handle_mark_initialize")(bytes_.data(),thread);}
+ ~handle_mark(){rt().fn<void(*)(void*)>("handle_mark_destroy")(bytes_.data());}
+ handle_mark(const handle_mark&)=delete;handle_mark&operator=(const handle_mark&)=delete;
+};
+inline void**root_oop(void*thread,void*oop){
+ if(!oop)return nullptr;
+ if(auto callback=root_reuse_callback()){if(auto**slot=callback(thread)){std::memcpy(slot,&oop,sizeof oop);return slot;}}
+ auto&vm=rt();void*area=load<void*>(thread,vm.off("JavaThread","_handle_area"));
+ auto*top=load<std::byte*>(area,vm.off("Arena","_hwm"));auto*limit=load<std::byte*>(area,vm.off("Arena","_max"));void**slot{};
+ if(top&&limit&&top<=limit&&static_cast<std::size_t>(limit-top)>=sizeof(void*)){slot=reinterpret_cast<void**>(top);top+=sizeof(void*);store(area,vm.off("Arena","_hwm"),top);}
+ else slot=vm.fn<void**(*)(void*,std::size_t,int)>("arena_grow")(area,sizeof(void*),1);
+ if(slot){std::memcpy(slot,&oop,sizeof oop);}
+ return slot;
+}
+inline void*resolve_root(void**root){return root?load<void*>(root,0):nullptr;}
+}
+
+namespace vmhook::detail::private_native{
+using progress_callback=void(*)(const char*);
+inline thread_local progress_callback on_progress{};
+inline void progress(const char*message)noexcept{if(on_progress){try{on_progress(message);}catch(...){}}}
+class scoped_attachment final{
+ void*thread_{};const char*error_{"Attachment not attempted"};bool nmt_registered_{},guards_created_{},on_list_{},attached_{};
+ void* guards_owner()const{auto&vm=rt();return vm.profile->caps.guards_subobject?static_cast<std::byte*>(thread_)+vm.off("JavaThread","_stack_overflow_state"):thread_;}
+ void destroy_thread(){auto&vm=rt();if(vm.profile->caps.delete_flags_arg)vm.fn<void*(*)(void*,unsigned)>("delete_thread")(thread_,1);else vm.fn<void(*)(void*)>("delete_thread")(thread_);thread_=nullptr;}
+ void cleanup_failed(){
+  if(!thread_)return;
+  auto&vm=rt();
+  if(on_list_){
+   if(vm.profile->caps.cleanup_bool_arg)vm.fn<void(*)(void*,bool)>("cleanup_failed")(thread_,true);
+   else vm.fn<void(*)(void*)>("cleanup_failed")(thread_);
+   on_list_=false;
+   // In HotSpot 8–20 this routine owns destruction. HotSpot 21 moved NMT
+   // unregistration and smr_delete to the caller. Never delete the old object
+   // twice or consult its fields after the cleanup routine returns.
+   if(vm.profile->java_feature<=20){thread_=nullptr;nmt_registered_=false;guards_created_=false;return;}
+  }
+  else if(guards_created_)vm.fn<void(*)(void*)>("remove_guards")(guards_owner());
+  if(nmt_registered_&&vm.has_function("unregister_stack"))vm.fn<void(*)(void*)>("unregister_stack")(thread_);
+  nmt_registered_=false;destroy_thread();guards_created_=false;
+ }
+ void set_monitor_owner(bool java_object){
+  auto&vm=rt();if(!vm.profile->caps.monitor_owner)return;
+  std::int64_t id{};
+  if(!java_object)id=vm.fn<std::int64_t(*)()>("next_thread_identifier")();
+  else{auto*object=thread_object();if(vm.has_function("java_thread_id"))id=vm.fn<std::int64_t(*)(void*)>("java_thread_id")(object);else id=load<std::int64_t>(object,load<int>(vm.function("java_thread_tid_offset"),0));}
+  store(thread_,vm.off("JavaThread","_monitor_owner_id"),id);
+ }
+ void* thread_object()const{auto&vm=rt();return vm.has_function("thread_object")?vm.fn<void*(*)(const void*)>("thread_object")(thread_):load<void*>(thread_,vm.off("JavaThread","_threadObj"));}
+
+public:
+ explicit scoped_attachment(const char*name=nullptr){
+  auto&vm=rt();if(!vm.ready){error_=vm.reason;return;}
+  if(vm.has_function("vm_exited")&&load<bool>(vm.function("vm_exited"),0)){error_="VM already exited";return;}
+  if(vm.has_function("is_tls_initialized")&&!vm.fn<bool(*)()>("is_tls_initialized")()){error_="VM TLS not initialized";return;}
+  if(vm.current_thread()){error_="Calling OS thread already belongs to VM";return;}
+  progress("attach: create private JavaThread");
+  if(vm.profile->caps.new_attaching_factory)thread_=vm.fn<void*(*)()>("create_attaching_thread")();
+  else{
+   const char*tag_type=vm.has_type("MemoryType")?"MemoryType":vm.has_type("MEMFLAGS")?"MEMFLAGS":"MemTag";
+   const int tag=vm.enum_value(tag_type,"mtThread");
+   if(vm.has_function("allocate_thread"))thread_=vm.fn<void*(*)(std::size_t,bool,int)>("allocate_thread")(vm.size("JavaThread"),false,tag);
+   else thread_=vm.fn<void*(*)(std::size_t,int)>("malloc")(vm.size("JavaThread"),tag);
+   if(thread_)vm.fn<void(*)(void*,bool)>("java_thread_ctor")(thread_,true);
+  }
+  if(!thread_){error_="Private JavaThread allocation failed";return;}
+  store(thread_,vm.off("JavaThread","_thread_state"),6);
+  vm.fn<void(*)(void*)>("record_stack")(thread_);
+  if(vm.profile->caps.new_attaching_factory)vm.fn<void(*)(void*)>("initialize_tls")(thread_);
+  if(vm.has_function("register_stack"))vm.fn<void(*)(void*)>("register_stack")(thread_);
+  nmt_registered_=true;
+  if(!vm.profile->caps.new_attaching_factory)vm.fn<void(*)(void*)>("initialize_tls")(thread_);
+  if(vm.current_thread()!=thread_){error_="Private VM TLS installation failed";cleanup_failed();return;}
+  progress("attach: associate Windows thread, guard pages and TLAB");
+  if(!vm.fn<bool(*)(void*)>("create_os_thread")(thread_)){error_="OSThread creation failed";cleanup_failed();return;}
+  vm.fn<void(*)(void*)>("create_guards")(guards_owner());
+  const auto guard_type=vm.profile->caps.guards_subobject?"StackOverflow":"JavaThread";
+  const auto guard_enum=vm.profile->caps.guards_subobject?"StackOverflow::StackGuardState":"JavaThread::StackGuardState";
+  guards_created_=load<int>(guards_owner(),vm.off(guard_type,"_stack_guard_state"))==vm.enum_value(guard_enum,"stack_guard_enabled");
+  if(!guards_created_){error_="Stack guard creation failed";cleanup_failed();return;}
+  if(vm.has_function("initialize_tlab"))vm.fn<void(*)(void*)>("initialize_tlab")(thread_);
+  else if(load<bool>(vm.function("use_tlab"),0))
+   vm.fn<void(*)(void*)>("tlab_initialize")(static_cast<std::byte*>(thread_)+vm.off("Thread","_tlab"));
+  vm.fn<void(*)(void*)>("cache_globals")(thread_);set_monitor_owner(false);
+  progress("attach: publish daemon JavaThread under Threads_lock");
+  auto*lock=load<void*>(vm.function("threads_lock"),0);if(!lock){error_="Threads_lock missing";cleanup_failed();return;}
+  // This thread is not yet visible to GC. HotSpot requires the publication
+  // lock path to avoid safepoint checks until Threads::add has completed.
+  vm.fn<void(*)(void*)>("lock_without_safepoint")(lock);
+  if(vm.has_function("vm_exited")&&load<bool>(vm.function("vm_exited"),0)){vm.fn<void(*)(void*)>("unlock")(lock);error_="VM exited before publication";cleanup_failed();return;}
+  auto*block=vm.has_function("allocate_handle_block_legacy")
+   ?vm.fn<void*(*)(void*)>("allocate_handle_block_legacy")(nullptr)
+   :vm.fn<void*(*)(void*,int)>("allocate_handle_block")(nullptr,1);
+  if(!block){vm.fn<void(*)(void*)>("unlock")(lock);error_="Active handle block allocation failed";cleanup_failed();return;}
+  store(thread_,vm.off("JavaThread","_active_handles"),block);vm.fn<void(*)(void*,bool)>("add_thread")(thread_,true);on_list_=true;vm.fn<void(*)(void*)>("unlock")(lock);
+  progress("attach: construct java.lang.Thread on this OS thread");
+  {detail::handle_mark roots(thread_);auto*group=vm.has_function("main_thread_group")?vm.fn<void*(*)()>("main_thread_group")():load<void*>(vm.function("main_thread_group_raw"),0);auto**root=detail::root_oop(thread_,group);
+   if(!root)error_="ThreadGroup root allocation failed";
+   else{vm.fn<void(*)(void*,void**,const char*,bool,void*)>("allocate_thread_object")(thread_,root,name,true,thread_);if(pending_exception(thread_)){clear_pending_exception(thread_);error_="java.lang.Thread constructor threw";}else attached_=true;}}
+  if(!attached_){cleanup_failed();return;}
+  set_monitor_owner(true);
+  if(vm.profile->caps.jfr_before_publish&&vm.has_function("jfr_thread_start"))vm.fn<void(*)(void*)>("jfr_thread_start")(thread_);
+  std::atomic_thread_fence(std::memory_order_seq_cst);store(thread_,vm.off("JavaThread","_jni_attach_state"),3);
+  auto*object=thread_object();vm.fn<void(*)(void*,int)>("set_thread_status")(object,5);
+  if(!vm.profile->caps.jfr_before_publish&&vm.has_function("jfr_thread_start"))vm.fn<void(*)(void*)>("jfr_thread_start")(thread_);
+  transition_to_native(thread_);vm.fn<void(*)()>("setup_fpu")();error_="Attached";progress("attach: native thread ready for direct calls");
+ }
+ ~scoped_attachment(){detach();}
+ bool valid()const noexcept{return attached_&&thread_;}void*get()const noexcept{return valid()?thread_:nullptr;}const char*error()const noexcept{return error_;}
+ bool detach(){
+  if(!thread_)return true;
+  if(active_session_count){error_="Detach refused: roots still owned by Java session";return false;}if(!attached_){cleanup_failed();return true;}
+  auto&vm=rt();if(vm.current_thread()!=thread_||thread_state(thread_)!=4||load<void*>(thread_,vm.off("JavaThread","_anchor"))){error_="Detach refused: foreign OS thread, VM state or active Java frame";return false;}
+  progress("detach: enter VM and retire JavaThread");transition_to_vm(thread_);vm.fn<void(*)(void*,bool,int)>("exit_thread")(thread_,false,1);on_list_=false;guards_created_=false;
+  if(nmt_registered_&&vm.has_function("unregister_stack")){vm.fn<void(*)(void*)>("unregister_stack")(thread_);}
+  nmt_registered_=false;destroy_thread();attached_=false;
+  if(vm.current_thread()){error_="VM TLS survived detach";return false;}error_="Detached";progress("detach: complete");return true;
+ }
+ scoped_attachment(const scoped_attachment&)=delete;scoped_attachment&operator=(const scoped_attachment&)=delete;
+};
+}
+
+namespace vmhook::detail::private_native {
+inline std::uint32_t method_access_flags(void*method){
+ const auto offset=rt().off("Method","_access_flags");
+ return rt().size("AccessFlags")==2?load<std::uint16_t>(method,offset):load<std::uint32_t>(method,offset);
+}
+
+
+enum class basic_type : int {
+    boolean=4, char_=5, float_=6, double_=7, byte=8, short_=9,
+    int_=10, long_=11, object=12, array=13, void_=14
+};
+
+struct argument final {
+    basic_type type{basic_type::int_};
+    std::uint64_t bits{};
+    void** oop_root{};
+
+    static argument i32(std::int32_t value) {
+        return {basic_type::int_, static_cast<std::uint32_t>(value), nullptr};
+    }
+    static argument i64(std::int64_t value) {
+        return {basic_type::long_, std::bit_cast<std::uint64_t>(value), nullptr};
+    }
+    static argument f32(float value) {
+        return {basic_type::float_, std::bit_cast<std::uint32_t>(value), nullptr};
+    }
+    static argument f64(double value) {
+        return {basic_type::double_, std::bit_cast<std::uint64_t>(value), nullptr};
+    }
+    static argument ref(void** root) { return {basic_type::object, 0, root}; }
+    static argument null_ref() { return ref(nullptr); }
+};
+
+struct call_result final {
+    bool invoked{};
+    bool threw{};
+    std::uint64_t bits{};
+    void** oop_root{};
+    void** exception_root{};
+    const char* error{};
+
+    template<class T> T as() const {
+        static_assert(std::is_trivially_copyable_v<T> && sizeof(T)<=sizeof(bits));
+        T value{}; std::memcpy(&value, &bits, sizeof value); return value;
+    }
+};
+
+namespace detail {
+
+inline std::string_view method_symbol(void* method,bool signature) {
+    void* constants_method=load<void*>(method,rt().off("Method","_constMethod"));
+    if (!constants_method) return {};
+    void* pool=load<void*>(constants_method,rt().off("ConstMethod","_constants"));
+    const auto index=load<std::uint16_t>(constants_method,rt().off("ConstMethod",signature ? "_signature_index" : "_name_index"));
+    if (!pool || !index || index>=load<std::uint32_t>(pool,rt().off("ConstantPool","_length"))) return {};
+    void* symbol=load<void*>(pool,rt().size("ConstantPool")+sizeof(void*)*index);
+    if (!symbol) return {};
+    const auto length=rt().has_field("Symbol","_length")
+        ?load<std::uint16_t>(symbol,rt().off("Symbol","_length"))
+        :static_cast<std::uint16_t>(load<std::uint32_t>(symbol,rt().off("Symbol","_length_and_refcount"))>>16);
+    return {static_cast<const char*>(symbol)+rt().off("Symbol","_body"),length};
+}
+
+inline bool descriptor_type(std::string_view signature,std::size_t& position,basic_type& type,bool allow_void=false) {
+    if (position>=signature.size()) return false;
+    const char code=signature[position++];
+    switch (code) {
+        case 'Z': type=basic_type::boolean; return true;
+        case 'C': type=basic_type::char_; return true;
+        case 'B': type=basic_type::byte; return true;
+        case 'S': type=basic_type::short_; return true;
+        case 'I': type=basic_type::int_; return true;
+        case 'J': type=basic_type::long_; return true;
+        case 'F': type=basic_type::float_; return true;
+        case 'D': type=basic_type::double_; return true;
+        case 'V': type=basic_type::void_; return allow_void;
+        case 'L': {
+            const auto end=signature.find(';',position);
+            if (end==std::string_view::npos || end==position) return false;
+            position=end+1; type=basic_type::object; return true;
+        }
+        case '[': {
+            while (position<signature.size() && signature[position]=='[') ++position;
+            basic_type element{};
+            if (!descriptor_type(signature,position,element,false)) return false;
+            type=basic_type::array; return true;
+        }
+        default: return false;
+    }
+}
+
+inline bool compatible_argument(basic_type expected,basic_type actual) {
+    const auto is_reference=[](basic_type t) {return t==basic_type::object || t==basic_type::array;};
+    if (is_reference(expected)) return is_reference(actual);
+    if (expected==basic_type::boolean || expected==basic_type::char_ || expected==basic_type::byte || expected==basic_type::short_) {
+        return actual==expected || actual==basic_type::int_;
+    }
+    return actual==expected;
+}
+
+inline bool validate_descriptor(std::string_view signature,std::span<const argument> args,basic_type result) {
+    if (signature.empty() || signature[0]!='(') return false;
+    std::size_t position=1,index=0;
+    while (position<signature.size() && signature[position]!=')') {
+        basic_type expected{};
+        if (index>=args.size() || !descriptor_type(signature,position,expected) || !compatible_argument(expected,args[index++].type)) return false;
+    }
+    if (index!=args.size() || position>=signature.size() || signature[position++]!=')') return false;
+    basic_type expected_result{};
+    if (!descriptor_type(signature,position,expected_result,true) || position!=signature.size()) return false;
+    if (expected_result==basic_type::object || expected_result==basic_type::array) return result==basic_type::object || result==basic_type::array;
+    return expected_result==result;
+}
+
+// Accessed offsets come from the exact DLL-matched private PDB profile.
+struct java_value_abi final {
+    int type{};
+    std::uint32_t padding{};
+    std::uint64_t value{};
+};
+static_assert(sizeof(java_value_abi)==16 && __builtin_offsetof(java_value_abi, value)==8);
+
+struct method_handle_abi final { void* value{}; void* thread{}; };
+static_assert(sizeof(method_handle_abi)==16 && __builtin_offsetof(method_handle_abi, thread)==8);
+
+class method_handle final {
+    method_handle_abi value_{};
+public:
+    explicit method_handle(void* method) {
+        // The private VM copy constructor registers this metadata in the current
+        // JavaThread's metadata_handles list, including its own growth protocol.
+        const method_handle_abi source{method,nullptr};
+        using construct=void(*)(void*,const void*);
+        reinterpret_cast<construct>(rt().function("method_handle_construct"))(&value_,&source);
+    }
+    ~method_handle() {
+        using destroy=void(*)(void*);
+        reinterpret_cast<destroy>(rt().function("method_handle_destroy"))(&value_);
+    }
+    const void* get() const { return &value_; }
+    method_handle(const method_handle&)=delete;
+    method_handle& operator=(const method_handle&)=delete;
+};
+
+struct java_arguments_abi final {
+    std::array<std::intptr_t,9> value_buffer{};
+    std::array<unsigned char,9> state_buffer{};
+    std::array<unsigned char,7> padding{};
+    std::intptr_t* values{};
+    unsigned char* states{};
+    int size{};
+    int max_size{};
+    bool starts_at_zero{};
+    std::array<unsigned char,7> padding2{};
+    void** alternative_target{};
+};
+static_assert(sizeof(java_arguments_abi)==128);
+static_assert(__builtin_offsetof(java_arguments_abi, state_buffer)==72);
+static_assert(__builtin_offsetof(java_arguments_abi, values)==88);
+static_assert(__builtin_offsetof(java_arguments_abi, states)==96);
+static_assert(__builtin_offsetof(java_arguments_abi, size)==104);
+static_assert(__builtin_offsetof(java_arguments_abi, max_size)==108);
+static_assert(__builtin_offsetof(java_arguments_abi, starts_at_zero)==112);
+static_assert(__builtin_offsetof(java_arguments_abi, alternative_target)==120);
+
+class java_arguments final {
+    std::array<std::intptr_t,256> values_{};
+    std::array<unsigned char,256> states_{};
+    java_arguments_abi value_{};
+public:
+    java_arguments() {
+        value_.values=values_.data()+1;
+        value_.states=states_.data()+1;
+        value_.max_size=255;
+    }
+    bool push_root(void** root) {
+        if (value_.size>=value_.max_size) return false;
+        value_.states[value_.size]=2; // JavaCallArguments::value_state_handle
+        value_.values[value_.size++]=reinterpret_cast<std::intptr_t>(root);
+        return true;
+    }
+    bool push(argument arg) {
+        if (arg.type==basic_type::object || arg.type==basic_type::array) return push_root(arg.oop_root);
+        const bool wide=arg.type==basic_type::long_ || arg.type==basic_type::double_;
+        const int width=wide ? 2 : 1;
+        if (arg.type==basic_type::void_ || value_.size+width>value_.max_size) return false;
+        value_.states[value_.size]=0; // JavaCallArguments::value_state_primitive
+        if (wide) {
+            value_.states[value_.size+1]=0;
+            // The actual AMD64 HotSpot JavaCalls ABI places a 64-bit primitive
+            // in the second of two Java parameter slots, even on Windows x64.
+            std::memcpy(&value_.values[value_.size+1],&arg.bits,8);
+        } else {
+            const auto low=static_cast<std::uint32_t>(arg.bits);
+            std::memcpy(&value_.values[value_.size],&low,4);
+        }
+        value_.size+=width;
+        return true;
+    }
+    int size() const { return value_.size; }
+    void* get() { return &value_; }
+};
+
+} // namespace detail
+
+// This session retains HandleArea roots while the
+// caller's OS thread is native between operations. Each operation uses a real
+// VM transition and returns to native state. No queue, hook, JNI or JVMTI entry
+// is used. Returned root slots are valid until this session is destroyed.
+class java_session final {
+    void* thread_{};
+    std::optional<detail::handle_mark> roots_;
+
+    bool owns_vm_state() const {
+        return rt().current_thread()==thread_ && thread_state(thread_)==6;
+    }
+    call_result exception_result(bool invoked) const {
+        call_result result{};
+        result.invoked=invoked;
+        if (void* exception=pending_exception(thread_)) {
+            result.threw=true;
+            result.exception_root=detail::root_oop(thread_,exception);
+            if (!result.exception_root) result.error="Unable to root pending Java exception";
+        }
+        return result;
+    }
+public:
+    explicit java_session(void* thread):thread_(thread) {
+        vm_state_guard state(thread_);
+        roots_.emplace(thread_);
+        ++active_session_count;
+    }
+    ~java_session() {
+        vm_state_guard state(thread_);
+        roots_.reset();
+        --active_session_count;
+    }
+    java_session(const java_session&)=delete;
+    java_session& operator=(const java_session&)=delete;
+
+    call_result invoke(void* method, basic_type return_type,
+                       std::span<const argument> arguments={},void** receiver_root=nullptr) {
+        vm_state_guard state(thread_);
+        call_result result{};
+        if (!owns_vm_state()) { result.error="Java session does not own current VM-state thread"; return result; }
+        if (pending_exception(thread_)) { result=exception_result(false); result.error="Pending Java exception must be handled before invocation"; return result; }
+        if (!method) { result.error="Method pointer is null"; return result; }
+        detail::method_handle metadata_root(method);
+        if (!detail::validate_descriptor(detail::method_symbol(method,true),arguments,return_type)) {
+            result.error="Arguments or return type do not match actual Method descriptor"; return result;
+        }
+        // Offsets and access flag width are verified against the matching PDB.
+        const auto flags=method_access_flags(method);
+        const bool is_static=(flags&0x0008u)!=0;
+        if ((flags&0x0400u)!=0) { result.error="Cannot directly invoke an abstract Method"; return result; }
+        if (is_static ? receiver_root!=nullptr : !detail::resolve_root(receiver_root)) {
+            result.error="Receiver does not match Method staticness"; return result;
+        }
+        detail::java_arguments packed;
+        if (!is_static && !packed.push_root(receiver_root)) { result.error="Receiver packing failed"; return result; }
+        for (const auto& arg : arguments) {
+            if (!packed.push(arg)) { result.error="Argument exceeds supported Java parameter slots"; return result; }
+        }
+        void* constant_method=load<void*>(method,rt().off("Method","_constMethod"));
+        if (!constant_method || load<std::uint16_t>(constant_method,rt().off("ConstMethod","_size_of_parameters"))!=packed.size()) {
+            result.error="Packed argument slots do not match actual Method metadata"; return result;
+        }
+        if (is_static) {
+            if (detail::method_symbol(method,false)=="<clinit>") {
+                result.error="A class initializer cannot be called as an ordinary static Method"; return result;
+            }
+            void* pool=load<void*>(constant_method,rt().off("ConstMethod","_constants"));
+            void* holder=pool ? load<void*>(pool,rt().off("ConstantPool","_pool_holder")) : nullptr;
+            if (!holder) { result.error="Static Method holder metadata is unavailable"; return result; }
+            // JavaCalls::call is the VM's low-level entry and deliberately does
+            // not initialize the holder. Restore Java static-call semantics with
+            // the VM's real class initialization lock/exception protocol first.
+            using initialize=void(*)(void*,void*);
+            reinterpret_cast<initialize>(rt().function("klass_initialize"))(holder,thread_);
+            if (pending_exception(thread_)) return exception_result(false);
+        }
+        const int ret=static_cast<int>(return_type);
+        if (ret<4 || ret>14) { result.error="Invalid Java result BasicType"; return result; }
+        detail::java_value_abi value{ret,0,0};
+        using call=void(*)(void*,const void*,void*,void*);
+        if(rt().profile->caps.java_calls_by_value){
+            // Old Windows JavaCalls consumes and destroys its by-value metadata handle.
+            // Supply a distinct VM-registered copy; retain the caller root separately.
+            alignas(8) std::array<std::byte,16> callee_handle{};
+            using copy=void(*)(void*,const void*);
+            rt().fn<copy>("method_handle_construct")(callee_handle.data(),metadata_root.get());
+            reinterpret_cast<call>(rt().function("java_calls"))(&value,callee_handle.data(),packed.get(),thread_);
+        } else reinterpret_cast<call>(rt().function("java_calls"))(&value,metadata_root.get(),packed.get(),thread_);
+        result=exception_result(true);
+        if (result.threw) return result;
+        result.bits=value.value;
+        if (return_type==basic_type::object || return_type==basic_type::array) {
+            void* oop{}; std::memcpy(&oop,&value.value,sizeof oop);
+            result.oop_root=detail::root_oop(thread_,oop);
+            if (oop && !result.oop_root) result.error="Unable to root returned Java object";
+        }
+        return result;
+    }
+
+    call_result invoke(void* method,basic_type type,std::initializer_list<argument> args,void** receiver=nullptr) {
+        return invoke(method,type,std::span<const argument>{args.begin(),args.size()},receiver);
+    }
+
+    void** allocate(void* klass) {
+        vm_state_guard state(thread_);
+        if (!owns_vm_state() || !klass || pending_exception(thread_)) return nullptr;
+        // Use the matching private VM's instantiation checks, initialization,
+        // collector-aware allocation and finalizer registration.
+        using check=void(*)(void*,bool,void*);
+        reinterpret_cast<check>(rt().function("klass_check"))(klass,false,thread_);
+        if (pending_exception(thread_)) return nullptr;
+        using initialize=void(*)(void*,void*);
+        reinterpret_cast<initialize>(rt().function("klass_initialize"))(klass,thread_);
+        if (pending_exception(thread_)) return nullptr;
+        using allocate=void*(*)(void*,void*);
+        void* oop=reinterpret_cast<allocate>(rt().function("klass_allocate"))(klass,thread_);
+        if (pending_exception(thread_)) return nullptr;
+        return detail::root_oop(thread_,oop);
+    }
+
+    void** construct(void* klass,void* constructor,std::span<const argument> arguments={}) {
+        vm_state_guard state(thread_);
+        if (!owns_vm_state() || !constructor || pending_exception(thread_)) return nullptr;
+        detail::method_handle metadata_root(constructor);
+        if (detail::method_symbol(constructor,false)!="<init>"
+            || !detail::validate_descriptor(detail::method_symbol(constructor,true),arguments,basic_type::void_)
+            || (method_access_flags(constructor)&0x0008u)!=0) return nullptr;
+        void* constants_method=load<void*>(constructor,rt().off("Method","_constMethod"));
+        void* pool=constants_method ? load<void*>(constants_method,rt().off("ConstMethod","_constants")) : nullptr;
+        if (!pool || load<void*>(pool,rt().off("ConstantPool","_pool_holder"))!=klass) return nullptr;
+        void** object=allocate(klass);
+        if (!object) return nullptr;
+        const auto result=invoke(constructor,basic_type::void_,arguments,object);
+        return result.invoked && !result.threw && !result.error ? object : nullptr;
+    }
+
+    void** construct(void* klass,void* constructor,std::initializer_list<argument> args) {
+        return construct(klass,constructor,std::span<const argument>{args.begin(),args.size()});
+    }
+
+    // A raw oop snapshot can move immediately after this returns to native.
+    // Never retain/dereference it, or compare two separately resolved snapshots.
+    // Invoke with root slots or use same_object for a guarded identity check.
+    void* resolve(void** root) const {
+        vm_state_guard state(thread_);
+        return owns_vm_state() ? detail::resolve_root(root) : nullptr;
+    }
+    bool same_object(void** first,void** second) const {
+        vm_state_guard state(thread_);
+        if (!owns_vm_state()) return false;
+        return detail::resolve_root(first)==detail::resolve_root(second);
+    }
+    void** new_string(std::u16string_view text) {
+        vm_state_guard state(thread_);
+        if(!owns_vm_state() || pending_exception(thread_) || text.size()>static_cast<std::size_t>(std::numeric_limits<int>::max())) return nullptr;
+        // MSVC nontrivial Handle value return uses an explicit hidden output slot.
+        void** root=nullptr;
+        using create=void*(*)(void*,const char16_t*,int,void*);
+        reinterpret_cast<create>(rt().function("new_string_unicode"))(&root,text.data(),static_cast<int>(text.size()),thread_);
+        return pending_exception(thread_)?nullptr:root;
+    }
+
+    void clear_exception() {
+        vm_state_guard state(thread_);
+        if (owns_vm_state()) clear_pending_exception(thread_);
+    }
+};
+
+} // export namespace vmhook::detail::private_native
+
+// VMHOOK_NATIVE_RUNTIME_END
+
+// VMHOOK_NATIVE_FACADE_BEGIN
+namespace vmhook::detail::native_backend
+{
+    struct root_ticket;
+    using root = std::shared_ptr<root_ticket>;
+
+    struct context_lifetime final
+    {
+        std::atomic<bool> alive{ false };
+        vmhook::windows::DWORD owner_id{};
+        void* thread{};
+        std::unique_ptr<vmhook::detail::private_native::scoped_attachment> attachment{};
+        std::unique_ptr<vmhook::detail::private_native::java_session> session{};
+        std::shared_ptr<context_lifetime> self_keepalive{};
+        std::mutex releases_mutex{};
+        std::vector<void**> releases{};
+        std::vector<void**> reusable{};
+        std::unordered_map<void**, std::weak_ptr<root_ticket>> tickets{};
+        std::size_t operation_depth{};
+        std::size_t temporary_depth{};
+        vmhook::detail::private_native::root_slot_provider previous_provider{};
+
+        auto drain_releases() noexcept -> void
+        {
+            std::vector<void**> pending{};
+            {
+                std::lock_guard lock{ this->releases_mutex };
+                pending.swap(this->releases);
+            }
+            for (void** const slot : pending)
+            {
+                const auto found{ this->tickets.find(slot) };
+                if (found != this->tickets.end() && !found->second.expired()) { continue; }
+                if (found != this->tickets.end()) { this->tickets.erase(found); }
+                void* null{};
+                std::memcpy(slot, &null, sizeof(null));
+                try { this->reusable.push_back(slot); }
+                catch (...) { /* A cleared slot remains safe if recycling cannot allocate. */ }
+            }
+        }
+    };
+
+    // The module owns this TLS slot. It carries no destructor and never detaches
+    // under the Windows loader lock. The public context closes on its owner thread.
+    inline auto current_context_lifetime() noexcept -> context_lifetime*&
+    {
+        static thread_local context_lifetime* current{};
+        return current;
+    }
+
+    inline auto active_context_lifetime() noexcept -> std::shared_ptr<context_lifetime>
+    {
+        auto* const current{ current_context_lifetime() };
+        if (!current || current->owner_id != vmhook::windows::GetCurrentThreadId()
+            || !current->alive.load(std::memory_order_acquire)) { return {}; }
+        return current->self_keepalive;
+    }
+
+    inline auto active() noexcept -> bool
+    {
+        const auto current{ active_context_lifetime() };
+        if (!current || current->temporary_depth != 0) { return false; }
+        try
+        {
+            if (vmhook::detail::private_native::rt().current_thread() != current->thread) { return false; }
+            const int state{ vmhook::detail::private_native::thread_state(current->thread) };
+            return state == 4 || state == 6;
+        }
+        catch (...) { return false; }
+    }
+
+    class operation final
+    {
+        std::shared_ptr<context_lifetime> context_{};
+        void* thread_{};
+        bool entered_{};
+        bool valid_{};
+    public:
+        operation() noexcept
+        {
+            this->context_ = active_context_lifetime();
+            if (!this->context_ || this->context_->temporary_depth != 0) { return; }
+            try
+            {
+                this->thread_ = this->context_->thread;
+                if (vmhook::detail::private_native::rt().current_thread() != this->thread_) { return; }
+                const int state{ vmhook::detail::private_native::thread_state(this->thread_) };
+                if (state == 4)
+                {
+                    vmhook::detail::private_native::transition_to_vm(this->thread_);
+                    this->entered_ = true;
+                }
+                else if (state != 6) { return; }
+                if (this->context_->operation_depth == 0) { this->context_->drain_releases(); }
+                ++this->context_->operation_depth;
+                this->valid_ = true;
+            }
+            catch (...)
+            {
+                if (this->entered_)
+                {
+                    vmhook::detail::private_native::transition_to_native(this->thread_);
+                    this->entered_ = false;
+                }
+                this->context_.reset();
+            }
+        }
+        ~operation()
+        {
+            if (this->valid_) { --this->context_->operation_depth; }
+            if (this->entered_) { vmhook::detail::private_native::transition_to_native(this->thread_); }
+        }
+        operation(const operation&) = delete;
+        auto operator=(const operation&) -> operation& = delete;
+        [[nodiscard]] auto valid() const noexcept -> bool { return this->valid_; }
+        explicit operator bool() const noexcept { return this->valid_; }
+    };
+
+    struct root_ticket final
+    {
+        std::weak_ptr<context_lifetime> owner{};
+        void** slot{};
+
+        ~root_ticket()
+        {
+            const auto context{ this->owner.lock() };
+            if (!context || !this->slot || !context->alive.load(std::memory_order_acquire)) { return; }
+            // Destruction may occur on a different OS thread. Queue C++ bookkeeping
+            // only; mutate the scanned VM root on the owner's next VM operation.
+            try
+            {
+                std::lock_guard lock{ context->releases_mutex };
+                if (context->alive.load(std::memory_order_acquire)) { context->releases.push_back(this->slot); }
+            }
+            catch (...) { /* Retain until context closure if the queue cannot grow. */ }
+        }
+
+        [[nodiscard]] auto valid() const noexcept -> bool
+        {
+            const auto context{ this->owner.lock() };
+            return this->slot && context && context->alive.load(std::memory_order_acquire)
+                && context->owner_id == vmhook::windows::GetCurrentThreadId()
+                && current_context_lifetime() == context.get();
+        }
+
+        [[nodiscard]] auto resolve_under_vm() const noexcept -> void*
+        {
+            if (!this->valid()) { return nullptr; }
+            try
+            {
+                const auto context{ this->owner.lock() };
+                if (vmhook::detail::private_native::rt().current_thread() != context->thread) { return nullptr; }
+                const int state{ vmhook::detail::private_native::thread_state(context->thread) };
+                if (state != 6 && !(state == 8 && vmhook::hotspot::in_java_detour())) { return nullptr; }
+                return vmhook::detail::private_native::detail::resolve_root(this->slot);
+            }
+            catch (...) { return nullptr; }
+        }
+
+        [[nodiscard]] auto resolve() const noexcept -> void*
+        {
+            if (!this->valid()) { return nullptr; }
+            operation access{};
+            return this->resolve_under_vm();
+        }
+    };
+
+    inline auto reuse_root_slot(void* const thread) noexcept -> void**
+    {
+        auto* const context{ current_context_lifetime() };
+        if (!context || !context->alive.load(std::memory_order_acquire)
+            || context->owner_id != vmhook::windows::GetCurrentThreadId()
+            || context->thread != thread || context->reusable.empty()) { return nullptr; }
+        try
+        {
+            if (vmhook::detail::private_native::thread_state(thread) != 6) { return nullptr; }
+            void** const slot{ context->reusable.back() };
+            context->reusable.pop_back();
+            return slot;
+        }
+        catch (...) { return nullptr; }
+    }
+
+    inline auto retain_root_slot(void** const slot) noexcept -> root
+    {
+        const auto context{ active_context_lifetime() };
+        if (!context || !slot || context->temporary_depth != 0) { return {}; }
+        try
+        {
+            if (vmhook::detail::private_native::thread_state(context->thread) != 6) { return {}; }
+            const auto found{ context->tickets.find(slot) };
+            if (found != context->tickets.end())
+            {
+                if (auto existing{ found->second.lock() }) { return existing; }
+            }
+            auto ticket{ std::make_shared<root_ticket>() };
+            ticket->owner = context;
+            context->tickets[slot] = ticket;
+            ticket->slot = slot;
+            return ticket;
+        }
+        catch (...) { return {}; }
+    }
+
+    inline auto retain_oop(void* const oop) noexcept -> root
+    {
+        if (!oop) { return {}; }
+        const auto context{ active_context_lifetime() };
+        if (!context || context->temporary_depth != 0) { return {}; }
+        try
+        {
+            if (vmhook::detail::private_native::thread_state(context->thread) != 6) { return {}; }
+            void** const slot{ vmhook::detail::private_native::detail::root_oop(context->thread, oop) };
+            auto ticket{ retain_root_slot(slot) };
+            if (slot && !ticket)
+            {
+                void* null{};
+                std::memcpy(slot, &null, sizeof(null));
+                try { context->reusable.push_back(slot); } catch (...) {}
+            }
+            return ticket;
+        }
+        catch (...) { return {}; }
+    }
+
+    inline auto retain_class(vmhook::hotspot::klass* const klass) noexcept -> root
+    {
+        return klass ? retain_oop(klass->get_java_mirror()) : root{};
+    }
+
+    inline auto reserve_result_root(vmhook::hotspot::klass* const klass) noexcept -> root
+    {
+        auto result{ retain_class(klass) };
+        if (result)
+        {
+            void* null{};
+            std::memcpy(result->slot, &null, sizeof(null));
+        }
+        return result;
+    }
+
+    inline auto promote_root(root destination, void** const temporary_slot) noexcept -> root
+    {
+        if (!destination || !destination->valid()) { return {}; }
+        void* const oop{ vmhook::detail::private_native::detail::resolve_root(temporary_slot) };
+        std::memcpy(destination->slot, &oop, sizeof(oop));
+        return oop ? std::move(destination) : root{};
+    }
+
+    class temporary_vm_scope final
+    {
+        std::shared_ptr<context_lifetime> context_;
+        vmhook::detail::private_native::root_slot_provider provider_;
+        vmhook::detail::private_native::detail::handle_mark mark_;
+    public:
+        explicit temporary_vm_scope(std::shared_ptr<context_lifetime> context)
+            : context_{ std::move(context) },
+              provider_{ vmhook::detail::private_native::root_reuse_callback() },
+              mark_{ this->context_->thread }
+        {
+            ++this->context_->temporary_depth;
+            vmhook::detail::private_native::root_reuse_callback() = nullptr;
+        }
+        ~temporary_vm_scope()
+        {
+            vmhook::detail::private_native::root_reuse_callback() = this->provider_;
+            --this->context_->temporary_depth;
+        }
+        temporary_vm_scope(const temporary_vm_scope&) = delete;
+        auto operator=(const temporary_vm_scope&) -> temporary_vm_scope& = delete;
+    };
+
+    inline auto loaded_class(const std::string_view name,
+                            vmhook::hotspot::klass* const preferred) noexcept -> vmhook::hotspot::klass*
+    {
+        operation access{};
+        if (!access || name.empty()) { return nullptr; }
+        try
+        {
+            if (name.front() == '[') { return vmhook::resolve_array_klass(name); }
+            vmhook::hotspot::klass* result{};
+            bool found_preferred{};
+            const vmhook::hotspot::class_loader_data_graph graph{};
+            graph.for_each_klass([&](const std::string_view observed_name, vmhook::hotspot::klass* const klass)
+            {
+                if (observed_name != name) { return; }
+                if (klass == preferred) { result = klass; found_preferred = true; }
+                else if (!result && !found_preferred) { result = klass; }
+            });
+            return result;
+        }
+        catch (...) { return nullptr; }
+    }
+
+    inline auto refresh(void** const owner, const root& ticket) noexcept -> void*
+    {
+        void* const current{ ticket ? ticket->resolve_under_vm() : owner ? *owner : nullptr };
+        if (owner) { *owner = current; }
+        return current;
+    }
+
+    inline auto allocate(vmhook::hotspot::klass* const klass) noexcept -> root
+    {
+        operation access{};
+        const auto context{ active_context_lifetime() };
+        if (!access || !context || !klass) { return {}; }
+        try
+        {
+            const auto metadata{ retain_class(klass) };
+            if (!metadata) { return {}; }
+            auto result{ reserve_result_root(klass) };
+            if (!result) { return {}; }
+            temporary_vm_scope temporary{ context };
+            result = promote_root(std::move(result), context->session->allocate(klass));
+            if (vmhook::detail::private_native::pending_exception(context->thread))
+            {
+                context->session->clear_exception();
+                return {};
+            }
+            return result;
+        }
+        catch (...) { return {}; }
+    }
+
+    inline auto make_string(const std::string_view value) noexcept -> root
+    {
+        operation access{};
+        const auto context{ active_context_lifetime() };
+        if (!access || !context) { return {}; }
+        try
+        {
+            const auto units{ vmhook::detail::utf8_to_utf16(value) };
+            std::u16string text{};
+            text.reserve(units.size());
+            for (const auto unit : units) { text.push_back(static_cast<char16_t>(unit)); }
+            auto* const klass{ vmhook::find_class("java/lang/String") };
+            auto result{ reserve_result_root(klass) };
+            if (!result) { return {}; }
+            temporary_vm_scope temporary{ context };
+            result = promote_root(std::move(result), context->session->new_string(text));
+            if (vmhook::detail::private_native::pending_exception(context->thread))
+            {
+                context->session->clear_exception();
+                return {};
+            }
+            return result;
+        }
+        catch (...) { return {}; }
+    }
+
+    struct native_call_result final
+    {
+        bool invoked{};
+        bool threw{};
+        std::uint64_t bits{};
+        root object{};
+        root receiver{};
+        root exception{};
+        std::string exception_class{};
+        std::string error{};
+    };
+
+inline auto invoke_packed(vmhook::hotspot::method* const method,
+                          const std::string_view signature,
+                          std::intptr_t* const parameters, const std::size_t slot_count,
+                          void** const receiver_owner,
+                          void** const* const argument_owners) noexcept -> native_call_result
+{
+    native_call_result result{};
+    operation access{};
+    const auto context{ active_context_lifetime() };
+    if (!access || !context || !context->thread || !context->session
+        || !method || slot_count > 20 || (slot_count && !parameters))
+    { result.error = "A current native context and valid Java parameters are required"; return result; }
+    try
+    {
+        if (method->get_signature() != signature)
+        { result.error = "Packed descriptor does not identify the selected Method"; return result; }
+        bool readable{};
+        const bool static_kind{ method->safe_access_flags_test(0x0008u, readable) };
+        if (!readable || method->safe_access_flags_test(0x0400u, readable) || !readable)
+        { result.error = "Selected Method is unreadable or abstract"; return result; }
+        if (signature.empty() || signature.front() != '(')
+        { result.error = "Java descriptor is malformed"; return result; }
+
+        std::array<private_native::argument, 20> arguments{};
+        std::array<root, 20> argument_roots{};
+        std::array<std::size_t, 20> reference_slots{};
+        std::size_t argument_count{}, reference_count{};
+        std::size_t descriptor_position{ 1 }, slot{ static_kind ? 0u : 1u };
+        root receiver{};
+        if (!static_kind)
+        {
+            if (!slot_count || !parameters[0])
+            { result.error = "Instance Method requires a receiver"; return result; }
+            receiver = retain_oop(reinterpret_cast<void*>(parameters[0]));
+            if (!receiver)
+            { result.error = "Instance receiver could not be rooted"; return result; }
+        }
+        while (descriptor_position < signature.size() && signature[descriptor_position] != ')')
+        {
+            private_native::basic_type type{};
+            if (argument_count == arguments.size()
+                || !private_native::detail::descriptor_type(signature, descriptor_position, type)
+                || slot >= slot_count)
+            { result.error = "Argument descriptor or slot count is invalid"; return result; }
+            auto& argument{ arguments[argument_count++] };
+            argument.type = type;
+            if (type == private_native::basic_type::object || type == private_native::basic_type::array)
+            {
+                auto& rooted{ argument_roots[reference_count] };
+                if (parameters[slot])
+                {
+                    rooted = retain_oop(reinterpret_cast<void*>(parameters[slot]));
+                    if (!rooted)
+                    { result.error = "Reference argument could not be rooted"; return result; }
+                    argument.oop_root = rooted->slot;
+                }
+                reference_slots[reference_count++] = slot;
+            }
+            else
+            {
+                const bool wide{ type == private_native::basic_type::long_
+                    || type == private_native::basic_type::double_ };
+                if (wide && slot + 1 >= slot_count)
+                { result.error = "Wide primitive argument is missing its value slot"; return result; }
+                argument.bits = static_cast<std::uint64_t>(parameters[slot + (wide ? 1u : 0u)]);
+            }
+            slot += type == private_native::basic_type::long_
+                || type == private_native::basic_type::double_ ? 2u : 1u;
+        }
+        private_native::basic_type return_type{};
+        if (slot != slot_count || descriptor_position >= signature.size()
+            || signature[descriptor_position++] != ')'
+            || !private_native::detail::descriptor_type(signature, descriptor_position, return_type, true)
+            || descriptor_position != signature.size())
+        { result.error = "Java return descriptor or packed slot count is invalid"; return result; }
+
+        const auto& runtime{ private_native::rt() };
+        void* const const_method{ private_native::load<void*>(method, runtime.off("Method", "_constMethod")) };
+        void* const constants{ const_method
+            ? private_native::load<void*>(const_method, runtime.off("ConstMethod", "_constants")) : nullptr };
+        auto* const holder{ constants ? private_native::load<vmhook::hotspot::klass*>(constants,
+            runtime.off("ConstantPool", "_pool_holder")) : nullptr };
+        if (!holder) { result.error = "Selected Method has no declaring class"; return result; }
+        const bool reference_result{ return_type == private_native::basic_type::object
+            || return_type == private_native::basic_type::array };
+        root reserved_result{ reference_result ? reserve_result_root(holder) : root{} };
+        root reserved_exception{ reserve_result_root(holder) };
+        if ((reference_result && !reserved_result) || !reserved_exception)
+        { result.error = "Call result roots could not be reserved"; return result; }
+        {
+            // VM routines allocate internal Handles even when their public
+            // result is primitive. Roll back those temporary handles after
+            // promoting result/exception into the outer context's roots.
+            temporary_vm_scope temporary{ context };
+            const auto called{ context->session->invoke(method, return_type,
+                std::span<const private_native::argument>{ arguments.data(), argument_count },
+                receiver ? receiver->slot : nullptr) };
+            result.invoked = called.invoked;
+            result.threw = called.threw;
+            result.bits = called.bits;
+            if (called.error) { result.error = called.error; }
+            if (called.oop_root)
+            { result.object = promote_root(std::move(reserved_result), called.oop_root); }
+            if (called.exception_root)
+            {
+                result.exception = promote_root(std::move(reserved_exception), called.exception_root);
+                void* const exception{ result.exception ? result.exception->resolve_under_vm() : nullptr };
+                if (auto* const klass{ vmhook::klass_from_oop(exception) })
+                {
+                    if (auto* const name{ klass->get_name() }) { result.exception_class = name->to_string(); }
+                }
+            }
+            if (called.threw) { context->session->clear_exception(); }
+        }
+        result.receiver = std::move(receiver);
+
+        if (result.receiver)
+        {
+            void* const relocated{ result.receiver->resolve_under_vm() };
+            parameters[0] = reinterpret_cast<std::intptr_t>(relocated);
+            if (receiver_owner) { *receiver_owner = relocated; }
+        }
+        for (std::size_t index{ 0 }; index < reference_count; ++index)
+        {
+            const auto parameter_index{ reference_slots[index] };
+            void* const relocated{ argument_roots[index]
+                ? argument_roots[index]->resolve_under_vm() : nullptr };
+            parameters[parameter_index] = reinterpret_cast<std::intptr_t>(relocated);
+            if (argument_owners && argument_owners[parameter_index])
+            { *argument_owners[parameter_index] = relocated; }
+        }
+        // The public method API reports and consumes Java exceptions. Leave the
+        // native context ready for a subsequent call on the same OS thread.
+        if (result.threw) { context->session->clear_exception(); }
+        return result;
+    }
+    catch (...)
+    {
+        // Retain invocation status if decoding or C++ root bookkeeping failed
+        // after execution, and never strand a pending exception on this thread.
+        result.error = "Native Java invocation bookkeeping failed";
+        if (result.threw && context->session) { context->session->clear_exception(); }
+        return result;
+    }
+}
+
+}
+
+namespace vmhook
+{
+    /*
+        @brief Registers this DLL's current OS thread in HotSpot without JNI/JVMTI.
+        @details Construct and close on the same thread, outside DllMain. Calls and
+        allocations execute on this OS thread immediately. Between operations the
+        thread remains native, and VM-scanned root tickets track relocated objects.
+        Ticket use requires this context and thread; closure invalidates all tickets.
+    */
+    class native_thread_context final
+    {
+        std::shared_ptr<vmhook::detail::native_backend::context_lifetime> lifetime_{};
+        std::string error_{ "Context not attached" };
+        bool closed_{};
+    public:
+        explicit native_thread_context(const std::string_view requested_name = {})
+        {
+            using namespace vmhook::detail;
+            if (native_backend::current_context_lifetime())
+            { this->error_ = "This OS thread already has a VMHook native context"; return; }
+            try
+            {
+                auto& runtime{ private_native::rt() };
+                if (!runtime.ready) { this->error_ = runtime.reason; return; }
+                if (!vmhook::detail::java_execution_supported())
+                { this->error_ = "Detected collector or VM metadata cannot support direct native access"; return; }
+                std::string name{ requested_name };
+                if (name.empty())
+                { name = "VMHook-native-" + std::to_string(vmhook::windows::GetCurrentThreadId()); }
+                if (name.find('\0') != std::string::npos)
+                { this->error_ = "Native thread name contains an interior NUL"; return; }
+                auto context{ std::make_shared<native_backend::context_lifetime>() };
+                context->owner_id = vmhook::windows::GetCurrentThreadId();
+                context->attachment = std::make_unique<private_native::scoped_attachment>(name.c_str());
+                if (!context->attachment->valid())
+                { this->error_ = context->attachment->error(); return; }
+                context->thread = context->attachment->get();
+                context->session = std::make_unique<private_native::java_session>(context->thread);
+                context->previous_provider = private_native::root_reuse_callback();
+                context->self_keepalive = context;
+                context->alive.store(true, std::memory_order_release);
+                this->lifetime_ = context;
+                native_backend::current_context_lifetime() = context.get();
+                private_native::root_reuse_callback() = &native_backend::reuse_root_slot;
+                this->error_ = "Attached";
+            }
+            catch (const std::exception& failure) { this->error_ = failure.what(); }
+            catch (...) { this->error_ = "Native context initialization failed"; }
+        }
+
+        ~native_thread_context() { (void)this->close(); }
+        native_thread_context(const native_thread_context&) = delete;
+        native_thread_context(native_thread_context&&) = delete;
+        auto operator=(const native_thread_context&) -> native_thread_context& = delete;
+        auto operator=(native_thread_context&&) -> native_thread_context& = delete;
+
+        [[nodiscard]] auto valid() const noexcept -> bool
+        {
+            return this->lifetime_ && this->lifetime_->alive.load(std::memory_order_acquire)
+                && this->lifetime_->owner_id == vmhook::windows::GetCurrentThreadId()
+                && vmhook::detail::native_backend::current_context_lifetime() == this->lifetime_.get();
+        }
+        explicit operator bool() const noexcept { return this->valid(); }
+        [[nodiscard]] auto error() const noexcept -> const char* { return this->error_.c_str(); }
+
+        auto close() noexcept -> bool
+        {
+            using namespace vmhook::detail;
+            if (this->closed_ || !this->lifetime_) { return true; }
+            auto context{ this->lifetime_ };
+            try
+            {
+                if (context->owner_id != vmhook::windows::GetCurrentThreadId()
+                    || native_backend::current_context_lifetime() != context.get()
+                    || context->operation_depth != 0
+                    || private_native::thread_state(context->thread) != 4)
+                { this->error_ = "Close requires the owner OS thread in native state with no active operation"; return false; }
+                context->alive.store(false, std::memory_order_release);
+                private_native::root_reuse_callback() = context->previous_provider;
+                context->session.reset();
+                context->tickets.clear();
+                context->reusable.clear();
+                {
+                    std::lock_guard lock{ context->releases_mutex };
+                    context->releases.clear();
+                }
+                if (!context->attachment->detach())
+                { this->error_ = context->attachment->error(); return false; }
+                context->attachment.reset();
+                native_backend::current_context_lifetime() = nullptr;
+                context->thread = nullptr;
+                context->self_keepalive.reset();
+                this->lifetime_.reset();
+                this->closed_ = true;
+                this->error_ = "Closed";
+                return true;
+            }
+            catch (...) { return false; }
+        }
+    };
+}
+
+// VMHOOK_NATIVE_FACADE_END
+
+
+namespace vmhook
+{
     // -------------------------------------------------------------------------
     // Class resolution under multiple classloaders.
     //
@@ -9696,10 +11626,12 @@ namespace vmhook
 
     /*
         @brief Allocates a Java object and attempts its selected Java constructor.
-        @details Requires a registered wrapper, a loaded initialized concrete
-        class, and a validated VMHook Java-thread operation. Early metadata and
-        backend eligibility checks precede allocation. The executing thread's
-        TLAB is tried first, followed by the Java allocation backend if available.
+        @details Requires a registered wrapper, a loaded concrete class, and an
+        active native_thread_context or validated VMHook Java detour. Native
+        construction uses HotSpot class initialization and collector-aware
+        InstanceKlass allocation, retaining receiver and argument roots. A detour
+        requires an initialized class and tries its own TLAB before the existing
+        Java allocation backend. Metadata and backend checks precede allocation.
 
         The constructor overload is chosen from the C++ argument types. Some
         refusals, including an unmatched overload or a late call-frame refusal,
@@ -9708,7 +11640,8 @@ namespace vmhook
         Check both the C++ wrapper pointer and get_instance() before use.
 
         An optional wrapper construct(args...) runs after the Java constructor.
-        The returned wrapper does not register a persistent Java GC root.
+        A native-context result retains a GC root until that context ends.
+        A detour result remains a non-owning wrapper.
         Defined after the invocation machinery; exception safety: noexcept.
     */
     template<typename wrapper_type, typename... args_t>
@@ -10204,12 +12137,10 @@ namespace vmhook
     /*
         @brief Allocates a new java.lang.String OOP from a UTF-8 string_view.
         @details
-        Allocates a java.lang.String instance via make_java_object(), then detects at
-        runtime whether the JVM uses compact strings (JDK 9+, "coder" field present) or
-        classic char[] strings (JDK 8):
-          - Compact:  allocates a byte[] ("[B"), copies UTF-8 bytes directly, sets coder=0 (LATIN1).
-          - Classic:  allocates a char[] ("[C"), widens each byte to uint16.
-        Sets the "value" field of the String to the encoded OOP of the backing array.
+        In a native_thread_context, uses HotSpot's collector-aware String allocator
+        and keeps its result rooted for the context's lifetime. In a validated
+        detour, decodes UTF-8 to UTF-16 and constructs compact byte[] strings
+        (Latin1 or UTF16 coder) or Java 8 char[] strings in the executing TLAB.
 
         LENGTH HANDLING (no silent truncation): the decode is lossless and the TLAB
         build path runs at ANY length, so the returned String EQUALS the complete
@@ -10262,6 +12193,13 @@ namespace vmhook
     inline auto make_java_string(const std::string_view value) noexcept
         -> void*
     {
+        vmhook::detail::native_backend::operation native_operation{};
+        if (vmhook::detail::native_backend::active())
+        {
+            if (!native_operation) { return nullptr; }
+            const auto rooted{ vmhook::detail::native_backend::make_string(value) };
+            return rooted ? rooted->resolve_under_vm() : nullptr;
+        }
         vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
         if (!string_klass)
         {
@@ -10578,6 +12516,13 @@ namespace vmhook
                 std::uint32_t   // reference / array (compressed OOP)
             > data;
             std::string signature{};
+            vmhook::detail::native_backend::root native_root{};
+
+            auto reference_address(const std::uint32_t compressed) const noexcept -> void*
+            {
+                return native_root ? native_root->resolve_under_vm()
+                                   : vmhook::hotspot::decode_oop_pointer(compressed);
+            }
 
             /*
                 @brief Appends one boolean element from a Java boolean[] to result.
@@ -10791,20 +12736,11 @@ namespace vmhook
                 {
                     return true;
                 }
-                std::uint32_t narrow_klass{ 0u };
-                if (!vmhook::os::safe_read_fast(&narrow_klass,
-                                                reinterpret_cast<const std::uint8_t*>(decoded_oop) + 8,
-                                                sizeof(narrow_klass)))
+                vmhook::hotspot::klass* const runtime_klass{ vmhook::klass_from_oop(decoded_oop) };
+                if (!runtime_klass || !vmhook::hotspot::is_valid_pointer(runtime_klass))
                 {
                     return true;
                 }
-                void* const decoded_klass_raw{ vmhook::hotspot::decode_klass_pointer(narrow_klass) };
-                if (!decoded_klass_raw || !vmhook::hotspot::is_valid_pointer(decoded_klass_raw))
-                {
-                    return true;
-                }
-                vmhook::hotspot::klass* const runtime_klass{
-                    reinterpret_cast<vmhook::hotspot::klass*>(decoded_klass_raw) };
 
                 // (4) Walk the runtime klass's SUPERCLASS chain; accept if the wrapper
                 // klass appears anywhere on it (IS-A), by pointer identity OR by name
@@ -10927,7 +12863,7 @@ namespace vmhook
                 {
                     return nullptr;
                 }
-                void* const decoded{ vmhook::hotspot::decode_oop_pointer(compressed) };
+                void* const decoded{ this->reference_address(compressed) };
                 if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
                 {
                     return nullptr;
@@ -10967,14 +12903,23 @@ namespace vmhook
             auto cast_for_variant(source_type value) const noexcept
                 -> target_type
             {
+                vmhook::detail::native_backend::operation access{};
                 using clean_target_type = std::remove_cvref_t<target_type>;
                 using clean_source_type = std::remove_cvref_t<source_type>;
+
+                if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
+                {
+                    if (this->native_root)
+                    {
+                        value = vmhook::hotspot::encode_oop_pointer(this->native_root->resolve_under_vm());
+                    }
+                }
 
                 if constexpr (std::is_same_v<clean_target_type, std::string>)
                 {
                     if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
                     {
-                        return vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(value));
+                        return vmhook::read_java_string(this->reference_address(value));
                     }
                     else
                     {
@@ -11015,13 +12960,15 @@ namespace vmhook
                         {
                             return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                         }
-                        void* const decoded{ vmhook::hotspot::decode_oop_pointer(value) };
+                        void* const decoded{ this->reference_address(value) };
                         if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)
                             || !klass_match_ok<wrapper_type>(decoded))
                         {
                             return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                         }
-                        return vmhook::detail::wrap_object<wrapper_type>(decoded);
+                        auto wrapped{ vmhook::detail::wrap_object<wrapper_type>(decoded) };
+                        if (wrapped) { wrapped->set_native_root(this->native_root); }
+                        return wrapped;
                     }
                     else
                     {
@@ -11035,7 +12982,7 @@ namespace vmhook
                     // For void*, only convert from uint32_t (compressed OOP)
                     if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
                     {
-                        return vmhook::hotspot::decode_oop_pointer(value);
+                        return this->reference_address(value);
                     }
                     else
                     {
@@ -11068,11 +13015,13 @@ namespace vmhook
                         }
                         if constexpr (vmhook::detail::is_borrowed_v<clean_target_type>)
                         {
-                            return clean_target_type{ decoded };
+                            return clean_target_type{ decoded, this->native_root };
                         }
                         else
                         {
-                            return clean_target_type::ephemeral(decoded);
+                            return this->native_root
+                                ? clean_target_type::from_native_root(this->native_root)
+                                : clean_target_type::ephemeral(decoded);
                         }
                     }
                     else
@@ -11086,7 +13035,9 @@ namespace vmhook
                 {
                     if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
                     {
-                        return clean_target_type{ reference_target<clean_target_type>(value) };
+                        clean_target_type wrapped{ reference_target<clean_target_type>(value) };
+                        wrapped.set_native_root(this->native_root);
+                        return wrapped;
                     }
                     else
                     {
@@ -11123,13 +13074,14 @@ namespace vmhook
             */
             auto as_string() const noexcept -> std::string
             {
-                return std::visit([](const auto& v) noexcept
+                vmhook::detail::native_backend::operation access{};
+                return std::visit([this](const auto& v) noexcept
                     -> std::string
                     {
                         using stored_type = std::remove_cvref_t<decltype(v)>;
                         if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                         {
-                            return vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(v));
+                            return vmhook::read_java_string(this->reference_address(v));
                         }
                         else
                         {
@@ -11225,17 +13177,33 @@ namespace vmhook
             , mirror_klass{ mirror_klass }
             , field_offset{ field_offset }
         {
+            vmhook::detail::native_backend::operation access{};
+            if (access)
+            {
+                this->native_bound = true;
+                this->holder_root = vmhook::detail::native_backend::retain_class(mirror_klass);
+            }
+        }
+
+        field_proxy(void* field_pointer, std::string sig, const bool is_static_flag,
+                    vmhook::detail::native_backend::root holder, const std::size_t offset) noexcept
+            : field_pointer{ field_pointer }, signature_text{ std::move(sig) }, static_field{ is_static_flag },
+              field_offset{ offset }, holder_root{ std::move(holder) }
+        {
+            this->native_bound = this->holder_root != nullptr || vmhook::detail::native_backend::active();
         }
 
         /*
             @brief Reads a field using its JVM descriptor and returns a copied value.
-            @details Primitive alternatives own their C++ value. Reference alternatives
-            contain non-owning addresses and require verified narrow-oop support; they
-            are not GC roots and do not retain Java objects.
+            @details Primitive alternatives own their C++ value. In a native-thread
+            context, reference results hold a VM-scanned root ticket until released
+            or the context closes. Legacy detour results remain non-owning snapshots.
+            Typed heap-field decoding requires verified narrow-oop support.
         */
         auto get() const noexcept
             -> value_t
         {
+            vmhook::detail::native_backend::operation access{};
             if (this->is_reference()
                 && (vmhook::detail::reference_storage_width() != sizeof(std::uint32_t)
                     || !vmhook::detail::reference_reads_supported()))
@@ -11246,8 +13214,8 @@ namespace vmhook
             }
             // Read the static mirror again instead of retaining its previously observed address.
             // This narrows staleness but does not synchronize with GC or class unloading.
-            void* read_pointer{ this->field_pointer };
-            if (this->mirror_klass)
+            void* read_pointer{ this->resolved_address_under_vm() };
+            if (!this->native_bound && !this->holder_root && this->mirror_klass)
             {
                 void* const live_mirror{ this->mirror_klass->get_java_mirror() };
                 if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
@@ -11325,7 +13293,14 @@ namespace vmhook
             // Reference or array type - store compressed OOP
             std::uint32_t value{};
             vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
-            return value_t{ value, this->signature_text };
+            value_t result{ value, this->signature_text };
+            if (access)
+            {
+                result.native_root = vmhook::detail::native_backend::retain_oop(
+                    vmhook::hotspot::decode_oop_pointer(value));
+                if (value != 0 && !result.native_root) { result.data = std::uint32_t{}; }
+            }
+            return result;
         }
 
         /*
@@ -11351,6 +13326,7 @@ namespace vmhook
         auto set(const value_type& value) const noexcept
             -> void
         {
+            vmhook::detail::native_backend::operation access{};
 
             if constexpr (names_a_java_object_v<std::remove_cvref_t<value_type>>)
             {
@@ -11532,8 +13508,8 @@ namespace vmhook
                     if (this->signature_text == "C" && sizeof(clean_value_type) == sizeof(char))
                     {
                         const std::uint16_t wide_value{ static_cast<std::uint16_t>(static_cast<unsigned char>(value)) };
-                        void* write_pointer{ this->field_pointer };
-                        if (this->mirror_klass)
+                        void* write_pointer{ this->resolved_address_under_vm() };
+                        if (!this->native_bound && !this->holder_root && this->mirror_klass)
                         {
                             void* const live_mirror{ this->mirror_klass->get_java_mirror() };
                             if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror)) { return; }
@@ -11573,8 +13549,8 @@ namespace vmhook
                 }
 
 
-                void* write_pointer{ this->field_pointer };
-                if (this->mirror_klass)
+                void* write_pointer{ this->resolved_address_under_vm() };
+                if (!this->native_bound && !this->holder_root && this->mirror_klass)
                 {
                     void* const live_mirror{ this->mirror_klass->get_java_mirror() };
                     if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
@@ -11620,13 +13596,8 @@ namespace vmhook
         */
         auto raw_address() const noexcept -> void*
         {
-            if (!this->mirror_klass) { return this->field_pointer; }
-            void* const mirror{ this->mirror_klass->get_java_mirror() };
-            if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror)) { return nullptr; }
-            const auto base{ reinterpret_cast<std::uintptr_t>(mirror) };
-            if (this->field_offset > std::numeric_limits<std::uintptr_t>::max() - base) { return nullptr; }
-            void* const address{ reinterpret_cast<void*>(base + this->field_offset) };
-            return vmhook::os::query_region(address).readable ? address : nullptr;
+            vmhook::detail::native_backend::operation access{};
+            return this->resolved_address_under_vm();
         }
 
         /*
@@ -11674,6 +13645,7 @@ namespace vmhook
         auto get_compressed_oop() const noexcept
             -> std::uint32_t
         {
+            vmhook::detail::native_backend::operation access{};
             // FLAW C fix: only reference/array fields hold a compressed OOP.  On a
             // PRIMITIVE field, memcpy'ing the first 4 bytes returns the primitive's
             // raw value bytes as a bogus "OOP" that later decodes to a wild pointer
@@ -11689,8 +13661,8 @@ namespace vmhook
 
             // Read JVM memory through the Windows memory API and stop on unreadable data.
             // A successful read does not establish object lifetime or a coherent VM snapshot.
-            void* read_pointer{ this->field_pointer };
-            if (this->mirror_klass)
+            void* read_pointer{ this->resolved_address_under_vm() };
+            if (!this->native_bound && !this->holder_root && this->mirror_klass)
             {
                 void* const live_mirror{ this->mirror_klass->get_java_mirror() };
                 if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
@@ -11735,6 +13707,7 @@ namespace vmhook
         auto store_object_oop(void* const decoded_oop) const noexcept
             -> bool
         {
+            vmhook::detail::native_backend::operation access{};
             if (!vmhook::detail::reference_stores_supported())
             {
                 ::vmhook::detail::log_line("{} reference store refused: collector write barriers are unavailable.", vmhook::error_tag);
@@ -11752,8 +13725,8 @@ namespace vmhook
 
             // Read the static mirror again before calculating the destination.
             // The collector gate, not this address refresh, determines whether reference stores are available.
-            void* write_pointer{ this->field_pointer };
-            if (this->mirror_klass)
+            void* write_pointer{ this->resolved_address_under_vm() };
+            if (!this->native_bound && !this->holder_root && this->mirror_klass)
             {
                 void* const live_mirror{ this->mirror_klass->get_java_mirror() };
                 if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
@@ -11874,6 +13847,26 @@ namespace vmhook
             return stored;
         }
 
+        auto resolved_address_under_vm() const noexcept -> void*
+        {
+            void* holder{};
+            if (this->native_bound && !this->holder_root) { return nullptr; }
+            if (this->holder_root)
+            {
+                holder = this->holder_root->resolve_under_vm();
+                if (!holder) { return nullptr; }
+            }
+            else if (this->mirror_klass)
+            {
+                holder = this->mirror_klass->get_java_mirror();
+                if (!holder) { return nullptr; }
+            }
+            else { return this->field_pointer; }
+            const auto base{ reinterpret_cast<std::uintptr_t>(holder) };
+            if (this->field_offset > std::numeric_limits<std::uintptr_t>::max() - base) { return nullptr; }
+            return reinterpret_cast<void*>(base + this->field_offset);
+        }
+
         void* field_pointer;
         std::string signature_text;
         bool        static_field;
@@ -11882,6 +13875,8 @@ namespace vmhook
         // The Klass must still be live, and later heap access can race with collection.
         vmhook::hotspot::klass* mirror_klass{ nullptr };
         std::size_t             field_offset{ 0 };
+        vmhook::detail::native_backend::root holder_root{};
+        bool native_bound{ false };
     };
 
     // --- detail helpers that depend on hotspot types -------------------------
@@ -12733,7 +14728,8 @@ namespace vmhook
         @brief Proxy for a Java method with descriptor-checked argument conversion.
         @details New getMethod lookups provide checked access to this proxy;
         legacy get_method lookups return an optional that must be checked.
-        Invocation uses the restricted Java-thread backend and returns value_t.
+        Invocation uses the active native_thread_context on the calling OS
+        thread, or the validated Java detour backend, and returns value_t.
 
         Usage inside a wrapper class:
             auto say_hi() -> void { getMethod("sayHi", *this)->call(); }
@@ -12782,6 +14778,15 @@ namespace vmhook
                 flag see a deterministic zero instead of the previous silent
                 garbage.
             */
+            vmhook::detail::native_backend::root native_root{};
+            vmhook::detail::native_backend::root native_receiver_root{};
+
+            auto reference_address(const std::uint32_t compressed) const noexcept -> void*
+            {
+                return native_root ? native_root->resolve_under_vm()
+                                   : vmhook::hotspot::decode_oop_pointer(compressed);
+            }
+
             bool invoked{ false };
             // Internal constructor handoff; borrowed immediately, never a GC root.
             void* receiver_address{ nullptr };
@@ -12794,6 +14799,17 @@ namespace vmhook
                 value_t result{ std::forward<stored_type>(value) };
                 result.invoked = true;
                 result.receiver_address = receiver;
+                return result;
+            }
+
+            static auto completed_reference(vmhook::detail::native_backend::root object,
+                                            vmhook::detail::native_backend::root receiver = {}) -> value_t
+            {
+                vmhook::detail::native_backend::operation access{};
+                value_t result{ std::uint32_t{} };
+                result.invoked = true;
+                result.native_root = std::move(object);
+                result.native_receiver_root = std::move(receiver);
                 return result;
             }
 
@@ -12833,10 +14849,10 @@ namespace vmhook
                 Complexity: O(D) in superclass-chain depth.  noexcept.
             */
             template<typename wrapper_type>
-            static auto reference_target(const std::uint32_t compressed) noexcept
+            auto reference_target(const std::uint32_t compressed) const noexcept
                 -> void*
             {
-                void* const decoded{ vmhook::hotspot::decode_oop_pointer(compressed) };
+                void* const decoded{ this->reference_address(compressed) };
                 if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
                 {
                     return nullptr;
@@ -12858,10 +14874,18 @@ namespace vmhook
                 requires vmhook::detail::value_t_convertible_target_v<target_type>
             operator target_type() const noexcept
             {
-                return std::visit([](const auto& v) noexcept
+                vmhook::detail::native_backend::operation access{};
+                return std::visit([this](auto v) noexcept
                     -> target_type
                     {
                         using stored_type = std::remove_cvref_t<decltype(v)>;
+                        if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                        {
+                            if (this->native_root)
+                            {
+                                v = vmhook::hotspot::encode_oop_pointer(this->native_root->resolve_under_vm());
+                            }
+                        }
 
                         // unique_ptr<wrapper> <- compressed-OOP reference return.
                         // Mirrors field_proxy::value_t::cast_for_variant so an
@@ -12882,13 +14906,15 @@ namespace vmhook
                             // object are kept as separate questions.
                             if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                             {
-                                void* const decoded{ vmhook::hotspot::decode_oop_pointer(v) };
+                                void* const decoded{ this->reference_address(v) };
                                 if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)
                                     || !vmhook::field_proxy::value_t::klass_match_ok<wrapper_type>(decoded))
                                 {
                                     return vmhook::detail::wrap_object<wrapper_type>(nullptr);
                                 }
-                                return vmhook::detail::wrap_object<wrapper_type>(decoded);
+                                auto wrapped{ vmhook::detail::wrap_object<wrapper_type>(decoded) };
+                                if (wrapped) { wrapped->set_native_root(this->native_root); }
+                                return wrapped;
                             }
                             else
                             {
@@ -12908,7 +14934,7 @@ namespace vmhook
                             }
                             else if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                             {
-                                return vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(v));
+                                return vmhook::read_java_string(this->reference_address(v));
                             }
                             else
                             {
@@ -12919,7 +14945,7 @@ namespace vmhook
                         else if constexpr (std::is_same_v<target_type, void*>
                                         && std::is_same_v<stored_type, std::uint32_t>)
                         {
-                            return vmhook::hotspot::decode_oop_pointer(v);
+                            return this->reference_address(v);
                         }
                         // --- Reference targets: borrowed<W> / ref<W> / a wrapper W --
                         // The call-result twin of the field_proxy arm.  What the
@@ -12941,11 +14967,13 @@ namespace vmhook
                                 }
                                 if constexpr (vmhook::detail::is_borrowed_v<target_type>)
                                 {
-                                    return target_type{ decoded };
+                                    return target_type{ decoded, this->native_root };
                                 }
                                 else
                                 {
-                                    return target_type::ephemeral(decoded);
+                                    return this->native_root
+                                        ? target_type::from_native_root(this->native_root)
+                                        : target_type::ephemeral(decoded);
                                 }
                             }
                             else
@@ -12959,7 +14987,9 @@ namespace vmhook
                         {
                             if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                             {
-                                return target_type{ reference_target<target_type>(v) };
+                                target_type wrapped{ reference_target<target_type>(v) };
+                                wrapped.set_native_root(this->native_root);
+                                return wrapped;
                             }
                             else
                             {
@@ -13002,7 +15032,8 @@ namespace vmhook
             */
             auto as_string() const noexcept -> std::string
             {
-                return std::visit([](const auto& v) noexcept
+                vmhook::detail::native_backend::operation access{};
+                return std::visit([this](const auto& v) noexcept
                     -> std::string
                     {
                         using stored_type = std::remove_cvref_t<decltype(v)>;
@@ -13012,7 +15043,7 @@ namespace vmhook
                         }
                         else if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                         {
-                            return vmhook::read_java_string(vmhook::hotspot::decode_oop_pointer(v));
+                            return vmhook::read_java_string(this->reference_address(v));
                         }
                         else
                         {
@@ -13062,13 +15093,38 @@ namespace vmhook
             @param signature     JVM method descriptor, e.g. "(I)Ljava/lang/String;"
         */
         method_proxy(void* owning_object, vmhook::hotspot::method* method_ptr, std::string sig,
-                     const bool pinned = false, void** const receiver_slot = nullptr) noexcept
+                     const bool pinned = false, void** const receiver_slot = nullptr,
+                     vmhook::detail::native_backend::root receiver_root = {}) noexcept
             : object{ owning_object }
             , method{ method_ptr }
             , signature_text{ std::move(sig) }
             , signature_pinned{ pinned }
             , receiver_slot{ receiver_slot }
+            , native_receiver_root{ std::move(receiver_root) }
         {
+            try
+            {
+                vmhook::detail::native_backend::operation operation{};
+                if (!method_ptr || !vmhook::hotspot::is_valid_pointer(method_ptr)) { return; }
+                this->method_name = method_ptr->get_name();
+                if (!vmhook::detail::native_backend::active() || !operation) { return; }
+                if (owning_object && !this->native_receiver_root)
+                { this->native_receiver_root = vmhook::detail::native_backend::retain_oop(owning_object); }
+                const auto* const const_method{ method_ptr->get_const_method() };
+                const auto* const constants{ const_method ? const_method->get_constants() : nullptr };
+                const auto* const holder_slot{
+                    vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
+                this->native_declaring_class = constants && holder_slot
+                    ? const_cast<vmhook::hotspot::klass*>(static_cast<const vmhook::hotspot::klass*>(
+                        vmhook::hotspot::safe_read_pointer(reinterpret_cast<const std::uint8_t*>(constants)
+                            + holder_slot->offset))) : nullptr;
+                if (this->native_declaring_class)
+                {
+                    this->native_class_root = vmhook::detail::native_backend::retain_class(
+                        this->native_declaring_class);
+                }
+            }
+            catch (...) {}
         }
 
         /*
@@ -13185,16 +15241,31 @@ namespace vmhook
 
         /*
             @brief Invokes a selected method from runtime-typed packed arguments.
-            @details Uses the same restricted backend and status result as call().
+            @details Uses the same direct-native or detour backend and status result as call().
             Arguments follow the JVM descriptor and long/double consume two slots.
-            String construction and raw object arguments do not independently register
-            GC roots; a callback alone is not a general object lifetime guarantee.
+            Native-context references are rooted before String allocation; results
+            remain rooted until the owning context ends. Raw incoming addresses
+            must be valid when handed to the library.
         */
-        auto call_packed(vmhook::hotspot::method* const selected_method,
+        auto call_packed(vmhook::hotspot::method* const requested_method,
                          const std::span<const java_arg> args) const noexcept
             -> value_t
         {
+            vmhook::detail::native_backend::operation native_operation{};
+            const bool native_call{ vmhook::detail::native_backend::active() };
+            if ((this->native_class_root && !this->native_class_root->valid())
+                || (this->native_receiver_root && !this->native_receiver_root->valid()))
+            { return value_t{ std::monostate{} }; }
+            auto* const previous_method{ this->method };
+            if (native_call && (!native_operation || !this->refresh_native_method()))
+            { return value_t{ std::monostate{} }; }
+            auto* const selected_method{ native_call && requested_method == previous_method
+                ? this->method : requested_method };
+            if (native_call && !this->current_native_method(selected_method))
+            { return value_t{ std::monostate{} }; }
             if (this->receiver_slot) { this->object = *this->receiver_slot; }
+            if (native_call && this->native_receiver_root)
+            { this->object = this->native_receiver_root->resolve_under_vm(); }
             if (!this->callable_candidate(selected_method))
             {
                 ::vmhook::detail::log_line("{} method_proxy::call_packed(): method pointer is null or invalid.",
@@ -13202,8 +15273,8 @@ namespace vmhook
                 return value_t{ std::monostate{} };
             }
 
-            if (!vmhook::hotspot::ensure_current_java_thread()
-                || !vmhook::hotspot::in_java_detour())
+            if (!native_call && (!vmhook::hotspot::ensure_current_java_thread()
+                || !vmhook::hotspot::in_java_detour()))
             {
                 ::vmhook::detail::log_line("{} method_proxy::call_packed(): Java calls require a Java-thread detour.",
                                           vmhook::error_tag);
@@ -13216,8 +15287,12 @@ namespace vmhook
             {
                 return value_t{ std::monostate{} };
             }
+            const bool selected_private{ selected_method->safe_access_flags_test(0x0002u, kind_readable) };
+            if (!kind_readable) { return value_t{ std::monostate{} }; }
+            auto* const selected_holder{ native_call ? declaring_class(selected_method) : nullptr };
 
             std::string selected_signature{ selected_method->get_signature() };
+            const std::string selected_name{ native_call ? selected_method->get_name() : std::string{} };
             if (selected_signature.empty())
             {
                 return value_t{ std::monostate{} };
@@ -13270,6 +15345,7 @@ namespace vmhook
             constexpr std::size_t max_param_slots{ 20 };
             std::intptr_t params[max_param_slots]{};
             std::size_t   param_idx{ 0 };
+            std::array<vmhook::detail::native_backend::root, 8> native_argument_roots{};
 
             if (args.size() > 8u)
             {
@@ -13277,6 +15353,18 @@ namespace vmhook
                            "interpreter locals[] array is sized for.",
                            vmhook::error_tag, this->name(), selected_signature, args.size());
                 return value_t{ std::monostate{} };
+            }
+
+            // Root every existing reference before String construction can
+            // enter a safepoint and relocate receivers or preceding arguments.
+            if (native_call)
+            {
+                for (std::size_t index{ 0 }; index < args.size(); ++index)
+                {
+                    if (args[index].type != java_arg::kind::object_ || !args[index].oop) { continue; }
+                    native_argument_roots[index] = vmhook::detail::native_backend::retain_oop(args[index].oop);
+                    if (!native_argument_roots[index]) { return value_t{ std::monostate{} }; }
+                }
             }
 
             // Receiver in locals[0] for an instance dispatch ONLY.  A static
@@ -13288,8 +15376,10 @@ namespace vmhook
                 params[param_idx++] = reinterpret_cast<std::intptr_t>(this->object);
             }
 
+            std::size_t native_argument_index{};
             for (const java_arg& argument : args)
             {
+                auto& native_argument_root{ native_argument_roots[native_argument_index++] };
                 const bool two_slots{ argument.type == java_arg::kind::long_
                                       || argument.type == java_arg::kind::double_ };
                 if (param_idx + (two_slots ? 2u : 1u) > max_param_slots)
@@ -13334,12 +15424,17 @@ namespace vmhook
                 }
 
                 case java_arg::kind::object_:
-                    params[param_idx++] = reinterpret_cast<std::intptr_t>(argument.oop);
+                    params[param_idx++] = reinterpret_cast<std::intptr_t>(native_argument_root
+                        ? native_argument_root->resolve_under_vm() : argument.oop);
                     break;
 
                 case java_arg::kind::string_:
                 {
-                    void* const string_oop{ vmhook::make_java_string(argument.text) };
+                    if (native_call)
+                    { native_argument_root = vmhook::detail::native_backend::make_string(argument.text); }
+                    void* const string_oop{ native_call
+                        ? (native_argument_root ? native_argument_root->resolve_under_vm() : nullptr)
+                        : vmhook::make_java_string(argument.text) };
                     if (!string_oop)
                     {
                         ::vmhook::detail::log_line("{} method_proxy::call_packed('{}{}'): failed to allocate a Java "
@@ -13353,7 +15448,24 @@ namespace vmhook
                 }
             }
 
-            return this->invoke_packed(selected_method, selected_signature, params, param_idx);
+            if (native_call)
+            {
+                std::size_t slot{ selected_static ? 0u : 1u };
+                if (!selected_static) { params[0] = reinterpret_cast<std::intptr_t>(
+                    this->native_receiver_root->resolve_under_vm()); }
+                for (std::size_t index{ 0 }; index < args.size(); ++index)
+                {
+                    if (native_argument_roots[index])
+                    { params[slot] = reinterpret_cast<std::intptr_t>(native_argument_roots[index]->resolve_under_vm()); }
+                    slot += args[index].type == java_arg::kind::long_
+                        || args[index].type == java_arg::kind::double_ ? 2u : 1u;
+                }
+            }
+
+            auto* const invocation_method{ native_call
+                ? this->current_native_signature(selected_name, selected_signature, selected_holder,
+                    !selected_static && !selected_private && selected_name != "<init>") : selected_method };
+            return this->invoke_packed(invocation_method, selected_signature, params, param_idx);
         }
 
     private:
@@ -13384,6 +15496,12 @@ namespace vmhook
                 || (param_idx != 0 && !params)
                 || selected_signature != selected_method->get_signature())
             { return value_t{ std::monostate{} }; }
+
+            if (vmhook::detail::native_backend::active())
+            {
+                return this->invoke_native_packed(selected_method, selected_signature,
+                    params, param_idx, argument_owners);
+            }
 
             void* const call_stub{ vmhook::detail::find_call_stub_entry() };
             if (!call_stub)
@@ -13846,12 +15964,11 @@ namespace vmhook
         }
 
         /*
-            @brief Attempts to invoke Java through a detected HotSpot x64 call stub.
-            @details Requires a validated VMHook callback on its existing JavaThread;
-            native callers submit dispatch tasks. The implementation probes layout and
-            collector capabilities, builds a synthetic call wrapper, and preserves
-            thread anchor/handle state. This backend is experimental: structural checks
-            are not proof of GC or frame-walking correctness on every VM build.
+            @brief Invokes Java on the calling OS thread with the active backend.
+            @details An explicit native_thread_context uses private HotSpot JavaCalls
+            with real VM transitions and GC roots, without hooks or queued work.
+            A validated Java detour uses the existing checked call-stub backend.
+            Runtime capabilities are verified before either backend executes.
             Arguments follow the Java descriptor: long/double use two slots with the
             value in the high slot; other supported parameters use one slot.
             @return was_invoked distinguishes refusal from an actual void/null/zero
@@ -13862,15 +15979,24 @@ namespace vmhook
         auto call(args_t&&... args) const noexcept
             -> value_t
         {
+            vmhook::detail::native_backend::operation native_operation{};
+            const bool native_call{ vmhook::detail::native_backend::active() };
+            if ((this->native_class_root && !this->native_class_root->valid())
+                || (this->native_receiver_root && !this->native_receiver_root->valid()))
+            { return value_t{ std::monostate{} }; }
+            if (native_call && (!native_operation || !this->refresh_native_method()))
+            { return value_t{ std::monostate{} }; }
             if (this->receiver_slot) { this->object = *this->receiver_slot; }
+            if (native_call && this->native_receiver_root)
+            { this->object = this->native_receiver_root->resolve_under_vm(); }
             if (!this->method || !vmhook::hotspot::is_valid_pointer(this->method))
             {
                 ::vmhook::detail::log_line("{} method_proxy::call(): method pointer is null or invalid.", vmhook::error_tag);
                 return value_t{ std::monostate{} };
             }
 
-            if (!vmhook::hotspot::ensure_current_java_thread()
-                || !vmhook::hotspot::in_java_detour())
+            if (!native_call && (!vmhook::hotspot::ensure_current_java_thread()
+                || !vmhook::hotspot::in_java_detour()))
             {
                 ::vmhook::detail::log_line("{} method_proxy::call(): Java calls require a Java-thread detour.",
                                           vmhook::error_tag);
@@ -13881,7 +16007,7 @@ namespace vmhook
             // ALLOCATES a Java object; doing that only to discover there is no
             // dispatcher would strand it.  find_call_stub_entry() caches, so the
             // authoritative resolve inside invoke_packed() costs nothing extra.
-            if (!vmhook::detail::find_call_stub_entry())
+            if (!native_call && !vmhook::detail::find_call_stub_entry())
             {
                 ::vmhook::detail::log_line("{} method_proxy::call('{}{}'): no call stub could be derived; "
                            "invocation is unavailable on this VM.",
@@ -13903,6 +16029,9 @@ namespace vmhook
             {
                 return value_t{ std::monostate{} };
             }
+            const bool selected_private{ selected_method->safe_access_flags_test(0x0002u, kind_readable) };
+            if (!kind_readable) { return value_t{ std::monostate{} }; }
+            auto* const selected_holder{ native_call ? declaring_class(selected_method) : nullptr };
             std::string selected_signature{ selected_method->get_signature() };
             if (!signature_matches_arguments<std::remove_cvref_t<args_t>...>(
                     selected_signature, this->signature_pinned))
@@ -13915,7 +16044,29 @@ namespace vmhook
             constexpr std::size_t max_param_slots{ 20 };
             std::intptr_t params[max_param_slots]{};
             std::array<void**, max_param_slots> argument_owners{};
+            std::array<vmhook::detail::native_backend::root, sizeof...(args_t)> native_argument_roots{};
             std::size_t   param_idx{ 0 };
+
+            // Existing object arguments must be rooted before allocating any
+            // String argument, because the allocation can run the collector.
+            if (native_call)
+            {
+                std::size_t root_index{};
+                bool roots_failed{};
+                [[maybe_unused]] auto retain_argument = [&](auto&& argument) noexcept
+                {
+                    const std::size_t index{ root_index++ };
+                    auto& root{ native_argument_roots[index] };
+                    bool required{};
+                    if (index < this->native_constructor_arguments.size())
+                    { root = this->native_constructor_arguments[index]; }
+                    else { root = retain_native_argument(argument, required); }
+                    if (required && !root) { roots_failed = true; }
+                    if (root && !root->valid()) { roots_failed = true; }
+                };
+                (retain_argument(args), ...);
+                if (roots_failed) { return value_t{ std::monostate{} }; }
+            }
 
             // Per-argument JVM descriptor letters of the CALLEE, which is what
             // decides the slot layout (see parse_parameter_descriptors).  A
@@ -13951,7 +16102,7 @@ namespace vmhook
                         argument_index < param_descriptor_count
                             ? param_descriptors[argument_index]
                             : '\0' };
-                    ++argument_index;
+                    const std::size_t native_root_index{ argument_index++ };
 
                     // Two slots for J / D, value in the HIGH slot.  With no
                     // descriptor, fall back to the C++ type: an 8-byte arithmetic
@@ -13967,7 +16118,8 @@ namespace vmhook
                     }
                     if constexpr (std::is_same_v<clean_t, std::string>)
                     {
-                        void* const string_oop{ vmhook::make_java_string(a) };
+                        void* const string_oop{ this->pack_string(a, native_call,
+                            native_argument_roots[native_root_index]) };
                         if (!string_oop)
                         {
                             ::vmhook::detail::log_line("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
@@ -13978,7 +16130,8 @@ namespace vmhook
                     }
                     else if constexpr (std::is_same_v<clean_t, std::string_view>)
                     {
-                        void* const string_oop{ vmhook::make_java_string(a) };
+                        void* const string_oop{ this->pack_string(a, native_call,
+                            native_argument_roots[native_root_index]) };
                         if (!string_oop)
                         {
                             ::vmhook::detail::log_line("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
@@ -13989,7 +16142,8 @@ namespace vmhook
                     }
                     else if constexpr (std::is_same_v<clean_t, const char*> || std::is_same_v<clean_t, char*>)
                     {
-                        void* const string_oop{ vmhook::make_java_string(a ? std::string_view{ a } : std::string_view{}) };
+                        void* const string_oop{ this->pack_string(a ? std::string_view{ a } : std::string_view{},
+                            native_call, native_argument_roots[native_root_index]) };
                         if (!string_oop)
                         {
                             ::vmhook::detail::log_line("{} method_proxy::call('{}{}'): failed to allocate Java String argument.", vmhook::error_tag, this->name(), selected_signature);
@@ -14003,7 +16157,8 @@ namespace vmhook
                     {
                         constexpr std::size_t extent{ std::extent_v<clean_t> };
                         const std::size_t length{ extent != 0 && a[extent - 1] == '\0' ? extent - 1 : extent };
-                        void* const string_oop{ vmhook::make_java_string(std::string_view{ a, length }) };
+                        void* const string_oop{ this->pack_string(std::string_view{ a, length },
+                            native_call, native_argument_roots[native_root_index]) };
                         if (!string_oop) { packing_failed = true; return; }
                         params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
                     }
@@ -14101,7 +16256,23 @@ namespace vmhook
             (pack(std::forward<args_t>(args)), ...);
             if (packing_failed) { return value_t{ std::monostate{} }; }
 
-            return this->invoke_packed(selected_method, selected_signature, params, param_idx,
+            if (native_call)
+            {
+                std::size_t slot{ selected_static ? 0u : 1u };
+                if (!selected_static) { params[0] = reinterpret_cast<std::intptr_t>(
+                    this->native_receiver_root->resolve_under_vm()); }
+                for (std::size_t index{ 0 }; index < sizeof...(args_t); ++index)
+                {
+                    if (native_argument_roots[index])
+                    { params[slot] = reinterpret_cast<std::intptr_t>(native_argument_roots[index]->resolve_under_vm()); }
+                    slot += param_descriptors[index] == 'J' || param_descriptors[index] == 'D' ? 2u : 1u;
+                }
+            }
+
+            auto* const invocation_method{ native_call
+                ? this->current_native_signature(this->method_name, selected_signature, selected_holder,
+                    !selected_static && !selected_private && this->method_name != "<init>") : selected_method };
+            return this->invoke_packed(invocation_method, selected_signature, params, param_idx,
                                        argument_owners.data());
         }
 
@@ -14111,6 +16282,7 @@ namespace vmhook
         auto name() const noexcept
             -> std::string
         {
+            if (!this->method_name.empty()) { return this->method_name; }
             if (!this->method)
             {
                 return {};
@@ -14138,12 +16310,17 @@ namespace vmhook
             access-flags slot can't be resolved (no VMStructs / no JVM) — the
             proxy carries no other static signal.
 
-            Complexity: O(1) after the first VMStruct lookup (cached).
+            Native contexts re-resolve the method under a VM guard and refuse
+            expired or foreign-context proxies.
+            Complexity: O(N) in a native context; O(1) for a legacy proxy.
             Exception safety: noexcept.
         */
         auto is_static() const noexcept
             -> bool
         {
+            vmhook::detail::native_backend::operation access{};
+            if ((this->native_class_root || this->native_receiver_root)
+                && (!access || !this->refresh_native_method())) { return false; }
             if (this->method)
             {
                 // Read JVM memory through the Windows memory API and stop on unreadable data.
@@ -14190,7 +16367,12 @@ namespace vmhook
         auto get_compressed_oop() const noexcept
             -> std::uint32_t
         {
-            return vmhook::hotspot::encode_oop_pointer(this->object);
+            vmhook::detail::native_backend::operation access{};
+            void* const receiver{ this->native_receiver_root
+                ? (access && this->native_receiver_root->valid()
+                    ? this->native_receiver_root->resolve_under_vm() : nullptr)
+                : this->object };
+            return vmhook::hotspot::encode_oop_pointer(receiver);
         }
 
         /*
@@ -14201,7 +16383,11 @@ namespace vmhook
             interpreter-entry rewrites) reach the Method* without going through
             vmhook::hook<T>().  Most code should prefer call() / hook<T>().
 
-            Complexity: O(1).
+            Native contexts return the current metadata snapshot or nullptr for
+            an expired/foreign proxy. Hold a native_backend::operation while
+            dereferencing it; this accessor does not extend that guard's lifetime.
+
+            Complexity: O(N) in a native context; O(1) for a legacy proxy.
             Exception safety: noexcept.
 
             @return The HotSpot Method*, or nullptr if the proxy holds no method
@@ -14210,10 +16396,222 @@ namespace vmhook
         auto raw_method() const noexcept
             -> vmhook::hotspot::method*
         {
+            vmhook::detail::native_backend::operation access{};
+            if ((this->native_class_root || this->native_receiver_root)
+                && (!access || !this->refresh_native_method())) { return nullptr; }
             return this->method;
         }
 
     private:
+        static auto declaring_class(vmhook::hotspot::method* const method) noexcept
+            -> vmhook::hotspot::klass*
+        {
+            const auto* const const_method{ method ? method->get_const_method() : nullptr };
+            const auto* const constants{ const_method ? const_method->get_constants() : nullptr };
+            const auto* const entry{ vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
+            return constants && entry ? const_cast<vmhook::hotspot::klass*>(
+                static_cast<const vmhook::hotspot::klass*>(vmhook::hotspot::safe_read_pointer(
+                    reinterpret_cast<const std::uint8_t*>(constants) + entry->offset))) : nullptr;
+        }
+
+        auto current_native_signature(const std::string_view name,
+                                      const std::string_view signature,
+                                      vmhook::hotspot::klass* const holder,
+                                      const bool virtual_dispatch) const noexcept
+            -> vmhook::hotspot::method*
+        {
+            auto* const receiver_class{ this->native_receiver_root
+                ? vmhook::klass_from_oop(this->native_receiver_root->resolve_under_vm()) : nullptr };
+            const auto search = [&](vmhook::hotspot::klass* start, const bool inherited) noexcept
+                -> vmhook::hotspot::method*
+            {
+                for (auto* klass{ start }; klass; klass = inherited ? klass->get_super() : nullptr)
+                {
+                    auto** const methods{ klass->get_methods_ptr() };
+                    const auto count{ klass->get_methods_count() };
+                    if (!methods || count < 1 || count > 65535) { continue; }
+                    for (std::int32_t index{ 0 }; index < count; ++index)
+                    {
+                        auto* const candidate{ methods[index] };
+                        if (candidate && candidate->get_name() == name && candidate->get_signature() == signature)
+                        { return candidate; }
+                    }
+                }
+                return nullptr;
+            };
+            if (virtual_dispatch && receiver_class)
+            {
+                if (auto* const override_method{ search(receiver_class, true) }) { return override_method; }
+                for (auto* klass{ receiver_class }; klass; klass = klass->get_super())
+                {
+                    std::int32_t count{};
+                    auto** const defaults{ klass->get_default_methods_ptr(count) };
+                    for (std::int32_t index{}; defaults && index < count; ++index)
+                    {
+                        auto* const candidate{ static_cast<vmhook::hotspot::method*>(const_cast<void*>(
+                            vmhook::hotspot::safe_read_pointer(&defaults[index]))) };
+                        if (!candidate || !vmhook::hotspot::is_valid_pointer(candidate)
+                            || candidate->get_name() != name || candidate->get_signature() != signature)
+                        { continue; }
+                        bool readable{};
+                        const bool excluded{ candidate->safe_access_flags_test(0x040Au, readable) };
+                        return readable && !excluded ? candidate : nullptr;
+                    }
+                }
+            }
+            // Private methods, static methods and constructors retain their
+            // declaring holder; virtual defaults use HotSpot's selected methods.
+            return search(holder ? holder : this->native_declaring_class, false);
+        }
+
+        auto current_native_method(vmhook::hotspot::method* const candidate) const noexcept -> bool
+        {
+            for (auto* klass{ this->native_declaring_class }; klass; klass = klass->get_super())
+            {
+                auto** const methods{ klass->get_methods_ptr() };
+                const auto count{ klass->get_methods_count() };
+                if (!methods || count < 1 || count > 65535) { continue; }
+                for (std::int32_t index{ 0 }; index < count; ++index)
+                { if (methods[index] == candidate) { return true; } }
+            }
+            return false;
+        }
+
+        // Re-resolve the selected metadata while the declaring class mirror is
+        // rooted. A cached Method* may have become obsolete after redefinition.
+        auto refresh_native_method() const noexcept -> bool
+        {
+            if (!this->native_class_root || !this->native_class_root->valid()
+                || !this->native_class_root->resolve_under_vm() || !this->native_declaring_class)
+            { return false; }
+            if (this->native_receiver_root)
+            {
+                if (!this->native_receiver_root->valid()) { return false; }
+                this->object = this->native_receiver_root->resolve_under_vm();
+                if (this->receiver_slot) { *this->receiver_slot = this->object; }
+            }
+            for (auto* klass{ this->native_declaring_class }; klass; klass = klass->get_super())
+            {
+                auto** const methods{ klass->get_methods_ptr() };
+                const auto count{ klass->get_methods_count() };
+                if (!methods || count < 1 || count > 65535) { continue; }
+                for (std::int32_t index{ 0 }; index < count; ++index)
+                {
+                    auto* const candidate{ methods[index] };
+                    if (!candidate || !vmhook::hotspot::is_valid_pointer(candidate)
+                        || candidate->get_name() != this->method_name
+                        || candidate->get_signature() != this->signature_text) { continue; }
+                    bool readable{};
+                    const bool static_kind{ candidate->safe_access_flags_test(0x0008u, readable) };
+                    if (!readable || (!static_kind && !this->native_receiver_root)) { return false; }
+                    this->method = candidate;
+                    return this->callable_candidate(candidate);
+                }
+            }
+            return false;
+        }
+
+        template<typename argument_type>
+        static auto retain_native_argument(argument_type&& argument, bool& required) noexcept
+            -> vmhook::detail::native_backend::root
+        {
+            using clean_type = std::remove_cvref_t<argument_type>;
+            void* oop{};
+            vmhook::detail::native_backend::root existing{};
+            if constexpr (vmhook::detail::is_unique_ptr_v<clean_type>)
+            {
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_type>::value_type_t;
+                if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
+                {
+                    if (argument)
+                    { existing = argument->get_native_root(); oop = argument->get_instance(); }
+                }
+            }
+            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_type>)
+            { existing = argument.get_native_root(); oop = argument.get_instance(); }
+            else if constexpr (vmhook::detail::is_ref_v<clean_type> || vmhook::detail::is_borrowed_v<clean_type>)
+            {
+                if constexpr (requires { argument.get_native_root(); })
+                { existing = argument.get_native_root(); }
+                oop = argument.resolve();
+            }
+            else if constexpr (std::is_same_v<clean_type, void*>)
+            { oop = argument; }
+            if (existing)
+            {
+                required = true;
+                return existing->valid() ? existing : vmhook::detail::native_backend::root{};
+            }
+            required = oop != nullptr;
+            return oop ? vmhook::detail::native_backend::retain_oop(oop)
+                       : vmhook::detail::native_backend::root{};
+        }
+
+        static auto pack_string(const std::string_view value, const bool native_call,
+                                vmhook::detail::native_backend::root& root) noexcept -> void*
+        {
+            if (!native_call) { return vmhook::make_java_string(value); }
+            root = vmhook::detail::native_backend::make_string(value);
+            return root ? root->resolve_under_vm() : nullptr;
+        }
+
+        auto invoke_native_packed(vmhook::hotspot::method* const selected_method,
+                                  const std::string_view signature,
+                                  std::intptr_t* const params, const std::size_t count,
+                                  void** const* const argument_owners) const noexcept -> value_t
+        {
+            const auto result{ vmhook::detail::native_backend::invoke_packed(
+                selected_method, signature, params, count, this->receiver_slot, argument_owners) };
+            if (!result.invoked && !result.threw) { return value_t{ std::monostate{} }; }
+            void* const receiver{ result.receiver ? result.receiver->resolve_under_vm() : nullptr };
+            if (result.receiver)
+            {
+                this->object = receiver;
+                if (this->receiver_slot) { *this->receiver_slot = receiver; }
+            }
+            const auto close{ signature.rfind(')') };
+            const char type{ close != std::string_view::npos && close + 1 < signature.size()
+                ? signature[close + 1] : 'V' };
+            const auto bits{ result.threw ? std::uint64_t{} : result.bits };
+            value_t converted{};
+            switch (type)
+            {
+            case 'Z': converted.data = (bits & 1u) != 0; break;
+            case 'B': converted.data = static_cast<std::int8_t>(bits); break;
+            case 'S': converted.data = static_cast<std::int16_t>(bits); break;
+            case 'I': converted.data = static_cast<std::int32_t>(bits); break;
+            case 'J': converted.data = static_cast<std::int64_t>(bits); break;
+            case 'C': converted.data = static_cast<std::uint16_t>(bits); break;
+            case 'F':
+            {
+                const std::uint32_t narrowed{ static_cast<std::uint32_t>(bits) };
+                float value{}; std::memcpy(&value, &narrowed, sizeof(value));
+                converted.data = value; break;
+            }
+            case 'D':
+            {
+                double value{}; std::memcpy(&value, &bits, sizeof(value));
+                converted.data = value; break;
+            }
+            case 'L':
+            case '[':
+                if (!result.threw && result.object)
+                {
+                    converted = value_t::completed_reference(result.object, result.receiver);
+                    if (signature.substr(close + 1) == "Ljava/lang/String;")
+                    { converted.data = vmhook::read_java_string(result.object->resolve_under_vm()); }
+                }
+                break;
+            default: break;
+            }
+            converted.invoked = result.invoked;
+            converted.receiver_address = receiver;
+            converted.native_receiver_root = result.receiver;
+            converted.exception_thrown = result.threw;
+            converted.exception_class = result.exception_class;
+            return converted;
+        }
+
         /* @brief Rejects abstract/unreadable methods and absent instance receivers. */
         auto callable_candidate(vmhook::hotspot::method* const candidate) const noexcept -> bool
         {
@@ -14565,6 +16963,10 @@ namespace vmhook
             const std::string method_name{ this->name() };
             for (vmhook::hotspot::klass* k{ resolved_klass }; k != nullptr; k = k->get_super())
             {
+                // Constructors belong only to their declaring class. A missing
+                // overload must not silently call a superclass constructor on
+                // the newly allocated instance.
+                if (method_name == "<init>" && k != resolved_klass) { break; }
                 const std::int32_t method_count{ k->get_methods_count() };
                 vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
                 if (!methods_array || method_count <= 0)
@@ -14588,14 +16990,29 @@ namespace vmhook
                 }
             }
 
+            for (auto* k{ resolved_klass }; k; k = k->get_super())
+            {
+                std::int32_t count{};
+                auto** const defaults{ k->get_default_methods_ptr(count) };
+                for (std::int32_t index{}; defaults && index < count; ++index)
+                {
+                    auto* const candidate{ static_cast<vmhook::hotspot::method*>(const_cast<void*>(
+                        vmhook::hotspot::safe_read_pointer(&defaults[index]))) };
+                    if (this->callable_candidate(candidate) && candidate->get_name() == method_name
+                        && signature_matches_arguments<args_t...>(candidate->get_signature()))
+                    { return candidate; }
+                }
+            }
+
             // A mismatched fallback can put a primitive in a reference slot or
             // omit a receiver. Refuse rather than invoking an arbitrary overload.
             return nullptr;
         }
 
         mutable void* object;
-        vmhook::hotspot::method* method;
+        mutable vmhook::hotspot::method* method;
         std::string signature_text;
+        std::string method_name{};
         // True when this proxy was created via get_method(name, SIGNATURE) /
         // getMethod(name, SIGNATURE): the caller pinned an EXACT overload, so
         // resolve_compatible_method() must NOT re-pick a different overload from
@@ -14607,6 +17024,13 @@ namespace vmhook
         // not outlive that wrapper. JavaCallWrapper roots only the active call;
         // updating this slot tracks its receiver's relocation during that call.
         void** receiver_slot{ nullptr };
+        vmhook::detail::native_backend::root native_receiver_root{};
+        vmhook::detail::native_backend::root native_class_root{};
+        vmhook::hotspot::klass* native_declaring_class{};
+        std::span<const vmhook::detail::native_backend::root> native_constructor_arguments{};
+
+        template<typename wrapper_type, typename... args_t>
+        friend auto make_unique(args_t&&... args) noexcept -> std::unique_ptr<wrapper_type>;
     };
 
     // --- Object base class ----------------------------------------------------
@@ -14632,8 +17056,10 @@ namespace vmhook
         @brief Base of the non-owning Java object wrappers.
         @details Typed wrappers derive from object<Derived>. The camelCase member
         lookups use an explicit receiver for instance access; static access uses
-        the registered Java class. A wrapper owns no Java object and does not
-        establish liveness across GC, callbacks, or threads.
+        the registered Java class. Native-context results carry VM-scanned root
+        tickets and refresh their address under a VM operation. Raw-pointer
+        wrappers remain non-owning. Context tickets are confined to their context
+        and OS thread and become invalid when that context closes.
     */
     class object_base
     {
@@ -14652,10 +17078,9 @@ namespace vmhook
         virtual ~object_base() = default;
 
         /*
-            @brief Copy constructor — copies the raw OOP pointer.
-            @details
-            Both the source and the copy point to the same Java object.
-            The pointer is not a GC handle so no reference counting occurs.
+            @brief Copies the address and shares an optional native-context root ticket.
+            @details A raw-pointer wrapper remains non-owning. Copies of a rooted
+            wrapper refer to the same VM-scanned slot and retain its context limits.
         */
         object_base(const object_base&) = default;
 
@@ -14672,7 +17097,7 @@ namespace vmhook
             the moved-from object is safely destructible.
         */
         object_base(object_base&& other) noexcept
-            : instance{ other.instance }
+            : instance{ other.instance }, native_root_{ std::move(other.native_root_) }
         {
             other.instance = nullptr;
         }
@@ -14683,18 +17108,43 @@ namespace vmhook
             if (this != &other)
             {
                 this->instance = other.instance;
+                this->native_root_ = std::move(other.native_root_);
                 other.instance = nullptr;
             }
             return *this;
         }
 
         /*
-            @brief Returns the raw decoded OOP pointer held by this wrapper.
+            @brief Returns the currently observed decoded OOP address.
+            @details A rooted wrapper refreshes under a VM operation. The returned
+            address is a snapshot and can move after this method returns to native
+            state; use wrapper calls and fields to keep operations guarded.
         */
         auto get_instance() const noexcept
             -> oop_type_t
         {
+            vmhook::detail::native_backend::operation access{};
+            if (this->native_root_)
+            {
+                if (!this->native_root_->valid()) { return nullptr; }
+                this->instance = this->native_root_->resolve_under_vm();
+            }
             return this->instance;
+        }
+
+        auto set_native_root(vmhook::detail::native_backend::root root) noexcept -> void
+        {
+            this->native_root_ = std::move(root);
+            if (this->native_root_)
+            {
+                vmhook::detail::native_backend::operation access{};
+                this->instance = this->native_root_->resolve_under_vm();
+            }
+        }
+
+        [[nodiscard]] auto get_native_root() const noexcept -> vmhook::detail::native_backend::root
+        {
+            return this->native_root_;
         }
 
         /*
@@ -14720,6 +17170,7 @@ namespace vmhook
         auto get_field(const std::string_view name) const
             -> std::optional<vmhook::field_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
             if (!resolved_klass)
             {
@@ -14751,8 +17202,8 @@ namespace vmhook
                     return std::nullopt;
                 }
                 void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-                // Pass the declaring Klass and offset so access can read the mirror again.
-                // This does not acquire a GC or class-lifetime guard.
+                // Native contexts retain the declaring mirror; access reconstructs
+                // the field address under a VM operation. Legacy access is observational.
                 return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
             }
 
@@ -14763,7 +17214,8 @@ namespace vmhook
             }
 
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
-            return vmhook::field_proxy{ field_pointer, entry->signature, false };
+            return vmhook::field_proxy{ field_pointer, entry->signature, false,
+                                        this->native_root_, entry->offset };
         }
 
         /*
@@ -14784,6 +17236,7 @@ namespace vmhook
         static auto get_field(const std::type_index wrapper_type, const std::string_view name)
             -> std::optional<vmhook::field_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
             if (!resolved_klass)
             {
@@ -14854,6 +17307,7 @@ namespace vmhook
         auto get_method(const std::string_view method_name) const
             -> std::optional<vmhook::method_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
             if (!resolved_klass)
             {
@@ -14881,7 +17335,7 @@ namespace vmhook
                         && !is_uncallable(current_method))
                     {
                         return vmhook::method_proxy{ this->instance, current_method, current_method->get_signature(),
-                                                     false, &this->instance };
+                                                     false, &this->instance, this->native_root_ };
                     }
                 }
             }
@@ -14896,7 +17350,7 @@ namespace vmhook
                     find_interface_default_method(resolved_klass, method_name, std::string_view{}) })
             {
                 return vmhook::method_proxy{ this->instance, default_method, default_method->get_signature(),
-                                             false, &this->instance };
+                                             false, &this->instance, this->native_root_ };
             }
 
             ::vmhook::detail::log_line("{} object::get_method('{}'): method not found in class hierarchy "
@@ -14922,6 +17376,7 @@ namespace vmhook
         auto get_method(const std::string_view method_name, const std::string_view method_signature) const
             -> std::optional<vmhook::method_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const resolved_klass{ this->resolve_klass() };
             if (!resolved_klass)
             {
@@ -14954,7 +17409,7 @@ namespace vmhook
                         && !is_uncallable(current_method))
                     {
                         return vmhook::method_proxy{ this->instance, current_method, current_signature,
-                                                     /*signature_pinned=*/true, &this->instance };
+                                                     /*signature_pinned=*/true, &this->instance, this->native_root_ };
                     }
                 }
             }
@@ -14967,7 +17422,7 @@ namespace vmhook
                     find_interface_default_method(resolved_klass, method_name, method_signature) })
             {
                 return vmhook::method_proxy{ this->instance, default_method, default_method->get_signature(),
-                                             /*signature_pinned=*/true, &this->instance };
+                                             /*signature_pinned=*/true, &this->instance, this->native_root_ };
             }
 
             ::vmhook::detail::log_line("{} object::get_method('{}{}'): no method with this exact name+signature "
@@ -14993,6 +17448,7 @@ namespace vmhook
         static auto get_method(const std::type_index wrapper_type, const std::string_view method_name)
             -> std::optional<vmhook::method_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
             if (!resolved_klass)
             {
@@ -15056,6 +17512,7 @@ namespace vmhook
         static auto get_method(const std::type_index wrapper_type, const std::string_view method_name, const std::string_view method_signature)
             -> std::optional<vmhook::method_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
             if (!resolved_klass)
             {
@@ -15109,6 +17566,7 @@ namespace vmhook
             @brief The raw decoded OOP pointer to the wrapped Java object.
         */
         mutable oop_type_t instance{ nullptr };
+        vmhook::detail::native_backend::root native_root_{};
 
     private:
         /*
@@ -15122,6 +17580,12 @@ namespace vmhook
         auto resolve_klass() const
             -> vmhook::hotspot::klass*
         {
+            if (this->native_root_)
+            {
+                if (!this->native_root_->valid()) { return nullptr; }
+                this->instance = this->native_root_->resolve_under_vm();
+                if (!this->instance) { return nullptr; }
+            }
             // THE OBJECT IS ASKED WHAT IT IS, not the wrapper.  A wrapper is
             // registered as the type its call site DECLARES -- a parameter typed
             // IChatComponent, a field typed Entity -- and the object that turns up
@@ -15426,8 +17890,9 @@ namespace vmhook
             }
 
             constexpr std::uint32_t acc_static{ 0x0008u };
+            constexpr std::uint32_t acc_private{ 0x0002u };
             constexpr std::uint32_t acc_abstract{ 0x0400u };
-            return (flags & (acc_static | acc_abstract)) == 0u;
+            return (flags & (acc_static | acc_private | acc_abstract)) == 0u;
         }
 
         /*
@@ -15443,6 +17908,27 @@ namespace vmhook
             if (!start_klass || !vmhook::hotspot::is_valid_pointer(start_klass))
             {
                 return nullptr;
+            }
+
+            // HotSpot has already resolved inherited default overrides and
+            // interface diamonds when linking the class. Use that selection
+            // before inspecting individual interface declarations.
+            for (auto* klass{ start_klass }; klass; klass = klass->get_super())
+            {
+                std::int32_t count{};
+                auto** const defaults{ klass->get_default_methods_ptr(count) };
+                for (std::int32_t index{}; defaults && index < count; ++index)
+                {
+                    auto* const candidate{ static_cast<vmhook::hotspot::method*>(const_cast<void*>(
+                        vmhook::hotspot::safe_read_pointer(&defaults[index]))) };
+                    std::string name;
+                    std::string signature;
+                    if (safe_method_is_default(candidate)
+                        && safe_method_name_signature(candidate, name, signature)
+                        && name == method_name
+                        && (method_signature.empty() || signature == method_signature))
+                    { return candidate; }
+                }
             }
 
             std::int32_t interface_count{ 0 };
@@ -15831,7 +18317,7 @@ namespace vmhook
         */
         auto oop_klass() const noexcept -> vmhook::hotspot::klass*
         {
-            return vmhook::klass_from_oop(this->instance);
+            return vmhook::klass_from_oop(this->get_instance());
         }
 
         /*
@@ -15840,6 +18326,7 @@ namespace vmhook
         auto get_field_by_oop_klass(const std::string_view name) const
             -> std::optional<vmhook::field_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const k{ oop_klass() };
             if (!k)
             {
@@ -15863,8 +18350,8 @@ namespace vmhook
                     return std::nullopt;
                 }
                 void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
-                // Pass the declaring Klass and offset so access can read the mirror again.
-                // This does not acquire a GC or class-lifetime guard.
+                // Native contexts retain the declaring mirror; access reconstructs
+                // the field address under a VM operation. Legacy access is observational.
                 return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
             }
             if (!this->instance)
@@ -15872,7 +18359,8 @@ namespace vmhook
                 return std::nullopt;
             }
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
-            return vmhook::field_proxy{ field_pointer, entry->signature, false };
+            return vmhook::field_proxy{ field_pointer, entry->signature, false,
+                                        this->get_native_root(), entry->offset };
         }
 
         /*
@@ -15881,6 +18369,7 @@ namespace vmhook
         auto get_method_by_oop_klass(const std::string_view method_name) const
             -> std::optional<vmhook::method_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             for (vmhook::hotspot::klass* k{ oop_klass() }; k != nullptr; k = k->get_super())
             {
                 const std::int32_t method_count{ k->get_methods_count() };
@@ -15895,7 +18384,7 @@ namespace vmhook
                     if (m && vmhook::hotspot::is_valid_pointer(m) && m->get_name() == method_name)
                     {
                         return vmhook::method_proxy{ this->instance, m, m->get_signature(),
-                                                     false, &this->instance };
+                                                     false, &this->instance, this->get_native_root() };
                     }
                 }
             }
@@ -15938,6 +18427,7 @@ namespace vmhook
                         const std::string_view method_signature) const
             -> std::optional<vmhook::method_proxy>
         {
+            vmhook::detail::native_backend::operation access{};
             for (vmhook::hotspot::klass* k{ this->oop_klass() }; k != nullptr; k = k->get_super())
             {
                 const std::int32_t method_count{ k->get_methods_count() };
@@ -15954,7 +18444,7 @@ namespace vmhook
                         && m->get_signature() == method_signature)
                     {
                         return vmhook::method_proxy{ this->get_instance(), m, m->get_signature(),
-                                                     true, &this->instance };
+                                                     true, &this->instance, this->get_native_root() };
                     }
                 }
             }
@@ -15970,6 +18460,7 @@ namespace vmhook
         auto class_name() const noexcept
             -> std::string
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::hotspot::klass* const k{ this->oop_klass() };
             if (!k)
             {
@@ -15987,6 +18478,7 @@ namespace vmhook
         auto instance_of(const std::string_view name) const noexcept
             -> bool
         {
+            vmhook::detail::native_backend::operation access{};
             return this->get_instance() != nullptr
                 && vmhook::is_instance_of(this->get_instance(), name);
         }
@@ -15997,6 +18489,22 @@ namespace vmhook
             return this->get_instance() != nullptr;
         }
     };
+
+    namespace detail
+    {
+        template<typename wrapper_type>
+        auto wrap_retained_object(void* const oop) -> std::unique_ptr<wrapper_type>
+        {
+            auto result{ vmhook::detail::wrap_object<wrapper_type>(oop) };
+            if (result && oop && vmhook::detail::native_backend::active())
+            {
+                auto root{ vmhook::detail::native_backend::retain_oop(oop) };
+                if (!root) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+                result->set_native_root(std::move(root));
+            }
+            return result;
+        }
+    }
 
     // Forward declarations of the templated walk helpers used by
     // collection::to_vector below.  The bodies live further down in this
@@ -16070,6 +18578,7 @@ namespace vmhook
         explicit collection(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::oop_reflective_base{ handle.resolve() }
         {
+            this->set_native_root(handle.get_native_root());
         }
 
         // oop_klass() / get_field_by_oop_klass() / get_method_by_oop_klass()
@@ -16133,6 +18642,8 @@ namespace vmhook
         template<typename element_type>
         auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
         {
+            vmhook::detail::native_backend::operation access{};
+            (void)this->get_instance();
             std::vector<std::unique_ptr<element_type>> result;
 
             if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
@@ -16170,7 +18681,7 @@ namespace vmhook
                         void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed_element) };
                         if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
                         {
-                            result.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(element_oop)));
+                            result.push_back(vmhook::detail::wrap_retained_object<element_type>(element_oop));
                         }
                         else
                         {
@@ -16275,7 +18786,7 @@ namespace vmhook
                 void* const element_oop{ vmhook::hotspot::decode_oop_pointer(element_value) };
                 if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
                 {
-                    result.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(element_oop)));
+                    result.push_back(vmhook::detail::wrap_retained_object<element_type>(element_oop));
                 }
                 else
                 {
@@ -16320,6 +18831,7 @@ namespace vmhook
         explicit list(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::collection{ handle.resolve() }
         {
+            this->set_native_root(handle.get_native_root());
         }
     };
 
@@ -16353,6 +18865,7 @@ namespace vmhook
         explicit set(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::collection{ handle.resolve() }
         {
+            this->set_native_root(handle.get_native_root());
         }
     };
 
@@ -16386,6 +18899,7 @@ namespace vmhook
         explicit linked_list(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::list{ handle.resolve() }
         {
+            this->set_native_root(handle.get_native_root());
         }
     };
 
@@ -16425,6 +18939,7 @@ namespace vmhook
         explicit map(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::oop_reflective_base{ handle.resolve() }
         {
+            this->set_native_root(handle.get_native_root());
         }
 
         // oop_klass() / get_field_by_oop_klass() / get_method_by_oop_klass()
@@ -16476,6 +18991,8 @@ namespace vmhook
         auto to_entries() const
             -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>
         {
+            vmhook::detail::native_backend::operation access{};
+            (void)this->get_instance();
             std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>> result;
             if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
             {
@@ -16531,6 +19048,7 @@ namespace vmhook
         explicit hash_map(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::map{ handle.resolve() }
         {
+            this->set_native_root(handle.get_native_root());
         }
     };
 
@@ -16636,7 +19154,7 @@ namespace vmhook
             void* const item_oop{ vmhook::hotspot::decode_oop_pointer(item_compressed) };
             if (item_oop && vmhook::hotspot::is_valid_pointer(item_oop))
             {
-                out.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(item_oop)));
+                out.push_back(vmhook::detail::wrap_retained_object<element_type>(item_oop));
             }
             else
             {
@@ -16731,11 +19249,11 @@ namespace vmhook
                 std::unique_ptr<value_type> v_ptr;
                 if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
                 {
-                    k_ptr = std::make_unique<key_type>(static_cast<vmhook::oop_t>(key_oop));
+                    k_ptr = vmhook::detail::wrap_retained_object<key_type>(key_oop);
                 }
                 if (value_oop && vmhook::hotspot::is_valid_pointer(value_oop))
                 {
-                    v_ptr = std::make_unique<value_type>(static_cast<vmhook::oop_t>(value_oop));
+                    v_ptr = vmhook::detail::wrap_retained_object<value_type>(value_oop);
                 }
                 out.emplace_back(std::move(k_ptr), std::move(v_ptr));
 
@@ -16810,7 +19328,7 @@ namespace vmhook
                 void* const key_oop{ vmhook::hotspot::decode_oop_pointer(key_compressed) };
                 if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
                 {
-                    out.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(key_oop)));
+                    out.push_back(vmhook::detail::wrap_retained_object<element_type>(key_oop));
                 }
                 else
                 {
@@ -16939,11 +19457,11 @@ namespace vmhook
             std::unique_ptr<value_type> v_ptr;
             if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
             {
-                k_ptr = std::make_unique<key_type>(static_cast<vmhook::oop_t>(key_oop));
+                k_ptr = vmhook::detail::wrap_retained_object<key_type>(key_oop);
             }
             if (value_oop && vmhook::hotspot::is_valid_pointer(value_oop))
             {
-                v_ptr = std::make_unique<value_type>(static_cast<vmhook::oop_t>(value_oop));
+                v_ptr = vmhook::detail::wrap_retained_object<value_type>(value_oop);
             }
             out.emplace_back(std::move(k_ptr), std::move(v_ptr));
 
@@ -17056,7 +19574,7 @@ namespace vmhook
             void* const key_oop{ vmhook::hotspot::decode_oop_pointer(key_compressed) };
             if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
             {
-                out.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(key_oop)));
+                out.push_back(vmhook::detail::wrap_retained_object<element_type>(key_oop));
             }
             else
             {
@@ -17092,8 +19610,9 @@ namespace vmhook
     auto field_proxy::value_t::to_vector() const
         -> std::vector<std::unique_ptr<element_type>>
     {
+        vmhook::detail::native_backend::operation access{};
         const std::uint32_t compressed_collection{ static_cast<std::uint32_t>(*this) };
-        void* const collection_oop{ vmhook::hotspot::decode_oop_pointer(compressed_collection) };
+        void* const collection_oop{ this->reference_address(compressed_collection) };
         if (!collection_oop || !vmhook::hotspot::is_valid_pointer(collection_oop))
         {
             ::vmhook::detail::log_line("{} field_proxy::value_t::to_vector<{}>(): underlying collection OOP is "
@@ -17128,7 +19647,9 @@ namespace vmhook
                     void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed_element) };
                     if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
                     {
-                        result.push_back(std::make_unique<element_type>(static_cast<vmhook::oop_t>(element_oop)));
+                        auto wrapped{ vmhook::detail::wrap_retained_object<element_type>(element_oop) };
+                        if (access) { wrapped->set_native_root(vmhook::detail::native_backend::retain_oop(element_oop)); }
+                        result.push_back(std::move(wrapped));
                     }
                     else
                     {
@@ -17139,7 +19660,17 @@ namespace vmhook
             return result;
         }
 
-        return vmhook::collection{ collection_oop }.to_vector<element_type>();
+        vmhook::collection wrapped{ collection_oop };
+        wrapped.set_native_root(this->native_root);
+        auto result{ wrapped.to_vector<element_type>() };
+        if (access)
+        {
+            for (auto& item : result)
+            {
+                if (item) { item->set_native_root(vmhook::detail::native_backend::retain_oop(item->get_instance())); }
+            }
+        }
+        return result;
     }
 
     /*
@@ -17154,8 +19685,9 @@ namespace vmhook
     auto field_proxy::value_t::to_entries() const
         -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>
     {
+        vmhook::detail::native_backend::operation access{};
         const std::uint32_t compressed_map{ static_cast<std::uint32_t>(*this) };
-        void* const map_oop{ vmhook::hotspot::decode_oop_pointer(compressed_map) };
+        void* const map_oop{ this->reference_address(compressed_map) };
         if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop))
         {
             ::vmhook::detail::log_line("{} field_proxy::value_t::to_entries<{},{}>(): underlying map OOP is null "
@@ -17164,7 +19696,18 @@ namespace vmhook
                        compressed_map);
             return {};
         }
-        return vmhook::map{ map_oop }.to_entries<key_type, value_type>();
+        vmhook::map wrapped{ map_oop };
+        wrapped.set_native_root(this->native_root);
+        auto result{ wrapped.to_entries<key_type, value_type>() };
+        if (access)
+        {
+            for (auto& [key, value] : result)
+            {
+                if (key) { key->set_native_root(vmhook::detail::native_backend::retain_oop(key->get_instance())); }
+                if (value) { value->set_native_root(vmhook::detail::native_backend::retain_oop(value->get_instance())); }
+            }
+        }
+        return result;
     }
 
     // --- Helper: read a Java String OOP to std::string ------------------------
@@ -19108,10 +21651,11 @@ namespace hotspot
         {
             // Direct oop decoding has no collector load-barrier backend.
             // A live Java-state detour excludes STW relocation during these
-            // reads; native threads must dispatch the operation there.
+            // reads. Native-context access holds a VM operation while reading.
             const auto& capabilities{ vmhook::vm_capabilities() };
             return capabilities.flags_resolved && capabilities.supported
-                && vmhook::hotspot::ensure_current_java_thread();
+                && (vmhook::detail::native_backend::active()
+                    || vmhook::hotspot::ensure_current_java_thread());
         }
 
         inline auto ordinary_object_headers_supported() noexcept -> bool
@@ -19258,12 +21802,14 @@ namespace hotspot
     /*
         @brief Shapes of non-owning Java reference paths.
         @details static_root names a declaring Klass and static-field offset; field_of
-        and element_of add hops. ephemeral stores an address and collection sample.
-        No path registers a root, pins an object, or makes traversal atomic against GC.
+        and element_of add hops. Native contexts retain a mirror root for static
+        paths; native_root retains an object directly in a VM-scanned slot.
+        Ephemeral paths store a non-owning address and a collection sample.
     */
     enum class anchor_kind : std::uint8_t
     {
         empty = 0,
+        native_root,
         static_root,
         field_of,
         element_of,
@@ -19379,6 +21925,7 @@ namespace hotspot
         {
             /* Which of the five shapes this link is. */
             vmhook::anchor_kind kind{ vmhook::anchor_kind::empty };
+            vmhook::detail::native_backend::root native_root{};
             /* The link this one hangs off; null for static_root / ephemeral. */
             std::shared_ptr<const vmhook::detail::anchor_node> parent{};
             /* static_root: the GC-stable klass whose mirror carries the field. */
@@ -19518,6 +22065,9 @@ namespace hotspot
 
             switch (node->kind)
             {
+            case vmhook::anchor_kind::native_root:
+                return node->native_root ? node->native_root->resolve_under_vm() : nullptr;
+
             case vmhook::anchor_kind::static_root:
             {
                 if (!node->declaring_klass
@@ -19527,7 +22077,8 @@ namespace hotspot
                 }
                 // Read the mirror through its VM-maintained indirection. The observed address
                 // can still become stale before the next heap access.
-                void* const mirror{ node->declaring_klass->get_java_mirror() };
+                void* const mirror{ node->native_root ? node->native_root->resolve_under_vm()
+                                                    : node->declaring_klass->get_java_mirror() };
                 if (!mirror || !vmhook::hotspot::is_valid_pointer(mirror))
                 {
                     return nullptr;
@@ -19595,6 +22146,12 @@ namespace hotspot
                 auto node{ std::make_shared<vmhook::detail::anchor_node>() };
                 node->kind            = vmhook::anchor_kind::static_root;
                 node->declaring_klass = declaring_klass;
+                vmhook::detail::native_backend::operation access{};
+                if (access)
+                {
+                    node->native_root = vmhook::detail::native_backend::retain_class(declaring_klass);
+                    if (!node->native_root) { return {}; }
+                }
                 node->offset          = offset;
                 node->depth           = 0u;
                 node->path_hash       = vmhook::detail::mix64(
@@ -19711,9 +22268,15 @@ namespace hotspot
         class access final
         {
         public:
-            explicit access(const vmhook::oop_t address) noexcept
+            explicit access(const vmhook::oop_t address,
+                            vmhook::detail::native_backend::root root = {}) noexcept
                 : wrapper_{ address }
             {
+                if (!root && this->lifetime_ && address)
+                {
+                    root = vmhook::detail::native_backend::retain_oop(address);
+                }
+                this->wrapper_.set_native_root(std::move(root));
             }
 
             // Axiom: an access binds its wrapper for ONE expression.  Making it
@@ -19753,17 +22316,18 @@ namespace hotspot
             }
 
         private:
+            vmhook::detail::native_backend::operation lifetime_{};
             wrapper_type wrapper_;
         };
     }
 
     /*
         @brief A copyable non-owning description of a Java reference path.
-        @details Anchored refs re-read their path; ephemeral refs retain an address and
-        collection sample. Neither registers a GC root or makes concurrent traversal safe.
-        A Java slot may change while it is read, and collection can race after a check.
-        Unsupported collectors/layouts can make resolution unavailable. Sharing the immutable
-        C++ path across threads does not synchronize access to JVM objects.
+        @details Anchored refs re-read their path. A native-root anchor retains its
+        referent in a VM-scanned slot and guarded traversal excludes relocating GC.
+        Java fields can still change concurrently. Native context references require
+        the owning OS thread and expire on context closure. Legacy ephemeral and
+        static paths do not independently retain an object or prevent concurrent GC.
         @tparam wrapper_type A wrapper constructible from oop_t, or void for untyped access.
     */
     template<typename wrapper_type>
@@ -19779,6 +22343,35 @@ namespace hotspot
         auto operator=(ref&&) noexcept -> ref& = default;
         ~ref() = default;
 
+        static auto from_native_root(vmhook::detail::native_backend::root root) noexcept -> ref
+        {
+            if (!root) { return {}; }
+            try
+            {
+                auto node{ std::make_shared<vmhook::detail::anchor_node>() };
+                node->kind = vmhook::anchor_kind::native_root;
+                node->native_root = std::move(root);
+                node->path_hash = vmhook::detail::mix64(
+                    reinterpret_cast<std::uintptr_t>(node->native_root->slot));
+                ref result{};
+                result.anchor_ = std::move(node);
+                return result;
+            }
+            catch (...) { return {}; }
+        }
+
+        [[nodiscard]] auto get_native_root() const noexcept -> vmhook::detail::native_backend::root
+        {
+            auto node{ this->anchor_ };
+            while (node && node->parent) { node = node->parent; }
+            if (!node || !node->native_root) { return {}; }
+            const auto root{ node->native_root };
+            if (!root->valid()) { return root; }
+            vmhook::detail::native_backend::operation access{};
+            if (!access) { return root; }
+            return vmhook::detail::native_backend::retain_oop(this->resolve());
+        }
+
         /*
             @brief Anchors a ref at a static reference field, given a GC-stable
                    klass and the field's offset inside that class's mirror.
@@ -19790,6 +22383,7 @@ namespace hotspot
                               const std::size_t offset) noexcept
             -> ref
         {
+            vmhook::detail::native_backend::operation access{};
             ref result{};
             result.anchor_ = vmhook::detail::make_static_anchor(declaring_klass, offset);
             return result;
@@ -19809,6 +22403,7 @@ namespace hotspot
                               const std::string_view field_name) noexcept
             -> ref
         {
+            vmhook::detail::native_backend::operation access{};
             try
             {
                 vmhook::hotspot::klass* const target{ vmhook::find_class(class_name) };
@@ -19876,6 +22471,7 @@ namespace hotspot
         auto resolve() const noexcept
             -> vmhook::oop_t
         {
+            vmhook::detail::native_backend::operation access{};
             if (!this->anchor_)
             {
                 return nullptr;
@@ -19979,7 +22575,10 @@ namespace hotspot
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
         {
-            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            const auto address{ this->resolve() };
+            return vmhook::detail::access<wrapper_type>{ address,
+                address ? vmhook::detail::native_backend::root{} : this->invalid_native_root() };
         }
 
         /* @brief Same as operator->, spelled for `(*ref).member`. */
@@ -19988,7 +22587,10 @@ namespace hotspot
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
         {
-            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            const auto address{ this->resolve() };
+            return vmhook::detail::access<wrapper_type>{ address,
+                address ? vmhook::detail::native_backend::root{} : this->invalid_native_root() };
         }
 
         /*
@@ -20003,7 +22605,10 @@ namespace hotspot
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
-            return vmhook::detail::access<vmhook::any_object>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            const auto address{ this->resolve() };
+            return vmhook::detail::access<vmhook::any_object>{ address,
+                address ? vmhook::detail::native_backend::root{} : this->invalid_native_root() };
         }
 
         /* @brief Same as operator->, spelled for `(*ref).member`. */
@@ -20011,7 +22616,10 @@ namespace hotspot
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
-            return vmhook::detail::access<vmhook::any_object>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            const auto address{ this->resolve() };
+            return vmhook::detail::access<vmhook::any_object>{ address,
+                address ? vmhook::detail::native_backend::root{} : this->invalid_native_root() };
         }
 
         /*
@@ -20027,12 +22635,14 @@ namespace hotspot
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::oop_t const address{ this->resolve() };
             if (!address)
             {
                 return false;
             }
             wrapper_type bound{ address };
+            if (access) { bound.set_native_root(vmhook::detail::native_backend::retain_oop(address)); }
             std::forward<visitor_type>(visitor)(bound);
             return true;
         }
@@ -20064,6 +22674,10 @@ namespace hotspot
         auto field(const std::string_view name) const noexcept
             -> vmhook::ref<field_wrapper>
         {
+            vmhook::detail::native_backend::operation access{};
+            // A failed native ticket must not fall back to a registered class
+            // and bind a static field in a different context or OS thread.
+            if (this->invalid_native_root()) { return {}; }
             try
             {
                 vmhook::hotspot::klass* holder_klass{ nullptr };
@@ -20199,6 +22813,7 @@ namespace hotspot
         auto instance_of(const std::string_view class_name) const noexcept
             -> bool
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::oop_t const address{ this->resolve() };
             return address != nullptr && vmhook::is_instance_of(address, class_name);
         }
@@ -20210,6 +22825,7 @@ namespace hotspot
         auto class_name() const
             -> std::string
         {
+            vmhook::detail::native_backend::operation access{};
             try
             {
                 vmhook::oop_t const address{ this->resolve() };
@@ -20248,6 +22864,7 @@ namespace hotspot
         auto same_object_as(const vmhook::ref<other_wrapper>& other) const noexcept
             -> bool
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::oop_t const mine{ this->resolve() };
             return mine != nullptr && mine == other.resolve();
         }
@@ -20293,6 +22910,14 @@ namespace hotspot
         template<typename> friend class vmhook::ref;
         template<typename> friend class vmhook::root;
         template<typename> friend class vmhook::borrowed;
+
+        auto invalid_native_root() const noexcept -> vmhook::detail::native_backend::root
+        {
+            auto base{ this->anchor_ };
+            while (base && base->parent) { base = base->parent; }
+            return base && base->native_root && !base->native_root->valid()
+                ? base->native_root : vmhook::detail::native_backend::root{};
+        }
 
         /* The ONLY member.  Immutable once built and shared by refcount, which
            is what makes a ref cheap to copy, safe to dereference concurrently
@@ -20358,6 +22983,15 @@ namespace hotspot
         {
             try
             {
+                if (vmhook::detail::native_backend::active())
+                {
+                    std::string owner{ this->class_name_ };
+                    if (owner.empty()) { owner = vmhook::detail::registered_class_name<wrapper_type>(); }
+                    if (owner.empty() || this->field_name_.empty()) { return {}; }
+                    // Each native context owns its own mirror root. Do not cache a
+                    // context ticket in a process-wide singleton or block in VM state.
+                    return vmhook::ref<wrapper_type>::at_static(owner, this->field_name_);
+                }
                 std::lock_guard<std::mutex> lock{ this->bind_mutex_ };
                 if (this->bound_.empty())
                 {
@@ -20410,6 +23044,7 @@ namespace hotspot
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
         {
+            vmhook::detail::native_backend::operation access{};
             return vmhook::detail::access<wrapper_type>{ this->resolve() };
         }
 
@@ -20422,6 +23057,7 @@ namespace hotspot
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
+            vmhook::detail::native_backend::operation access{};
             return vmhook::detail::access<vmhook::any_object>{ this->resolve() };
         }
 
@@ -20448,11 +23084,11 @@ namespace hotspot
     };
 
     /*
-        @brief An allocation-free, non-owning object address with an epoch sample.
-        @details Observed collection changes make resolution fail. An unchanged epoch
-        is not proof of liveness and does not prevent collection after the check.
-        pin() creates an ephemeral path with the same limits; it does not retain the object.
-        Copying the C++ value across threads does not establish a JVM access lifetime.
+        @brief A Java object reference with an optional native-context root ticket.
+        @details Native results share a VM-scanned root and pin() preserves that root
+        in a ref. They require the context's OS thread and expire on closure. Raw
+        borrows retain only an epoch sample; an unchanged sample is not proof of
+        liveness and does not prevent collection after the check.
     */
     template<typename wrapper_type>
     class borrowed final
@@ -20466,10 +23102,21 @@ namespace hotspot
         {
         }
 
+        borrowed(const vmhook::oop_t address, vmhook::detail::native_backend::root root) noexcept
+            : address_{ address }, born_{ vmhook::gc_epoch() }, native_root_{ std::move(root) }
+        {
+        }
+
+        [[nodiscard]] auto get_native_root() const noexcept -> vmhook::detail::native_backend::root
+        {
+            return this->native_root_;
+        }
+
         /* @brief The address, or nullptr once the epoch has moved. */
         auto resolve() const noexcept
             -> vmhook::oop_t
         {
+            if (this->native_root_) { return this->native_root_->resolve(); }
             if (!this->address_)
             {
                 return nullptr;
@@ -20486,7 +23133,7 @@ namespace hotspot
         auto expired() const noexcept
             -> bool
         {
-            return this->address_ != nullptr && this->resolve() == nullptr;
+            return (this->native_root_ || this->address_ != nullptr) && this->resolve() == nullptr;
         }
 
         /* @brief The captured address with NO staleness check - diagnostics only. */
@@ -20505,6 +23152,11 @@ namespace hotspot
             {
                 return vmhook::object_id{};
             }
+            if (this->native_root_)
+            {
+                return vmhook::object_id{ vmhook::detail::mix64(
+                    reinterpret_cast<std::uintptr_t>(this->native_root_->slot)) };
+            }
             return vmhook::object_id{ vmhook::detail::ephemeral_identity(
                 this->address_, this->born_.collections) };
         }
@@ -20514,7 +23166,8 @@ namespace hotspot
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
         {
-            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            return vmhook::detail::access<wrapper_type>{ this->resolve(), this->native_root_ };
         }
 
         auto operator*() const noexcept
@@ -20522,7 +23175,8 @@ namespace hotspot
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
         {
-            return vmhook::detail::access<wrapper_type>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            return vmhook::detail::access<wrapper_type>{ this->resolve(), this->native_root_ };
         }
 
         /*
@@ -20540,7 +23194,8 @@ namespace hotspot
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
-            return vmhook::detail::access<vmhook::any_object>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            return vmhook::detail::access<vmhook::any_object>{ this->resolve(), this->native_root_ };
         }
 
         /* @brief Same as operator->, spelled for `(*handle).member`. */
@@ -20548,7 +23203,8 @@ namespace hotspot
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
-            return vmhook::detail::access<vmhook::any_object>{ this->resolve() };
+            vmhook::detail::native_backend::operation access{};
+            return vmhook::detail::access<vmhook::any_object>{ this->resolve(), this->native_root_ };
         }
 
         /*
@@ -20560,7 +23216,8 @@ namespace hotspot
         auto pin() const noexcept
             -> vmhook::ref<wrapper_type>
         {
-            return vmhook::ref<wrapper_type>::ephemeral(this->resolve());
+            return this->native_root_ ? vmhook::ref<wrapper_type>::from_native_root(this->native_root_)
+                                      : vmhook::ref<wrapper_type>::ephemeral(this->resolve());
         }
 
         /* @brief Anchors a child ref at the named reference field of this object. */
@@ -20582,6 +23239,7 @@ namespace hotspot
         auto instance_of(const std::string_view class_name) const noexcept
             -> bool
         {
+            vmhook::detail::native_backend::operation access{};
             vmhook::oop_t const address{ this->resolve() };
             return address != nullptr && vmhook::is_instance_of(address, class_name);
         }
@@ -20601,6 +23259,7 @@ namespace hotspot
     private:
         vmhook::oop_t      address_{ nullptr };
         vmhook::gc_epoch_t born_{};
+        vmhook::detail::native_backend::root native_root_{};
     };
 
     /*
@@ -20619,7 +23278,7 @@ namespace hotspot
         {
             return vmhook::borrowed<derived>{};
         }
-        return vmhook::borrowed<derived>{ held };
+        return vmhook::borrowed<derived>{ held, this->get_native_root() };
     }
 
     /*
@@ -20696,6 +23355,10 @@ namespace hotspot
     inline auto make_unique(args_t&&... args) noexcept
         -> std::unique_ptr<wrapper_type>
     {
+        vmhook::detail::native_backend::operation native_operation{};
+        const bool native_call{ vmhook::detail::native_backend::active() };
+        if (native_call && !native_operation)
+        { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
         const std::string class_name{ vmhook::detail::registered_class_name<wrapper_type>() };
         if (class_name.empty())
         {
@@ -20717,7 +23380,7 @@ namespace hotspot
         // array).  `new` on one of those is a Java error, and allocating it here
         // would produce an object whose klass says it cannot exist.
         const std::size_t instance_size{ target_klass->get_instance_size() };
-        if (instance_size == 0 || !vmhook::detail::class_initialized(target_klass))
+        if (instance_size == 0 || (!native_call && !vmhook::detail::class_initialized(target_klass)))
         {
             ::vmhook::detail::log_line("{} make_unique(): '{}' is not instantiable (interface, "
                        "abstract, or its instance size could not be read).",
@@ -20762,14 +23425,14 @@ namespace hotspot
         // Check known backend prerequisites before reserving Java heap space.
         // Later constructor overload selection and invocation can still refuse;
         // was_invoked() distinguishes that refusal from a successful void return.
-        if (!vmhook::detail::find_call_stub_entry())
+        if (!native_call && !vmhook::detail::find_call_stub_entry())
         {
             ::vmhook::detail::log_line("{} make_unique(): no call stub could be derived on this VM, "
                        "so '{}' cannot be constructed - nothing was allocated.",
                        vmhook::error_tag, class_name);
             return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
-        if (!vmhook::hotspot::ensure_current_java_thread())
+        if (!native_call && !vmhook::hotspot::ensure_current_java_thread())
         {
             ::vmhook::detail::log_line("{} make_unique(): this thread is outside a validated Java detour, "
                        "so the constructor of '{}' cannot run - nothing "
@@ -20796,8 +23459,28 @@ namespace hotspot
         else
         {
 
-        void* allocated{ vmhook::make_java_object(target_klass, instance_size) };
-        if (!allocated) { allocated = vmhook::detail::allocate_instance_through_java(target_klass); }
+        std::array<vmhook::detail::native_backend::root, sizeof...(args_t)> native_argument_roots{};
+        if (native_call)
+        {
+            std::size_t index{};
+            bool failed{};
+            [[maybe_unused]] auto retain_argument = [&](auto&& argument) noexcept
+            {
+                bool required{};
+                auto& root{ native_argument_roots[index++] };
+                root = vmhook::method_proxy::retain_native_argument(argument, required);
+                if ((required && !root) || (root && !root->valid())) { failed = true; }
+            };
+            (retain_argument(args), ...);
+            if (failed) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+        }
+        vmhook::detail::native_backend::root allocated_root{};
+        if (native_call) { allocated_root = vmhook::detail::native_backend::allocate(target_klass); }
+        void* allocated{ native_call
+            ? (allocated_root ? allocated_root->resolve_under_vm() : nullptr)
+            : vmhook::make_java_object(target_klass, instance_size) };
+        if (!native_call && !allocated)
+        { allocated = vmhook::detail::allocate_instance_through_java(target_klass); }
         if (!allocated)
         {
             ::vmhook::detail::log_line("{} make_unique(): allocation of {} bytes for '{}' failed.",
@@ -20805,7 +23488,26 @@ namespace hotspot
             return vmhook::detail::wrap_object<wrapper_type>(nullptr);
         }
 
-        const vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature() };
+        if (native_call)
+        {
+            // Allocation and class initialization may have safepointed. Locate
+            // current constructor metadata again before using a Method pointer.
+            initializer = nullptr;
+            auto** const methods{ target_klass->get_methods_ptr() };
+            const auto count{ target_klass->get_methods_count() };
+            if (methods && count > 0 && count <= 65535)
+            {
+                for (std::int32_t index{ 0 }; index < count; ++index)
+                {
+                    auto* const method{ methods[index] };
+                    if (method && method->get_name() == "<init>") { initializer = method; break; }
+                }
+            }
+            if (!initializer) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+        }
+        vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature(),
+            false, native_call ? &allocated : nullptr, allocated_root };
+        if (native_call) { constructor.native_constructor_arguments = native_argument_roots; }
         const auto call_result{ constructor.call(std::forward<args_t>(args)...) };
         if (!call_result.was_invoked())
         {
@@ -20825,6 +23527,7 @@ namespace hotspot
         // wrap_object never yields a null pointer: a caller checks
         // get_instance(), exactly as for a field read or a call result.
         auto result{ vmhook::detail::wrap_object<wrapper_type>(call_result.receiver_address) };
+        if (native_call && result) { result->set_native_root(call_result.native_receiver_root); }
 
         // OPTIONAL C++-side hook.  It runs AFTER the Java constructor, so a
         // wrapper that wants to stamp extra state can, and one that does not
@@ -20909,18 +23612,19 @@ namespace hotspot
     auto method_proxy::value_t::to_borrowed() const noexcept
         -> vmhook::borrowed<wrapper_type>
     {
-        return std::visit([](const auto& stored) noexcept
+        vmhook::detail::native_backend::operation access{};
+        return std::visit([this](const auto& stored) noexcept
             -> vmhook::borrowed<wrapper_type>
             {
                 using stored_type = std::remove_cvref_t<decltype(stored)>;
                 if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                 {
-                    if (stored == 0u)
+                    if (stored == 0u && !this->native_root)
                     {
                         return vmhook::borrowed<wrapper_type>{};
                     }
                     return vmhook::borrowed<wrapper_type>{
-                        vmhook::hotspot::decode_oop_pointer(stored) };
+                        this->reference_address(stored), this->native_root };
                 }
                 else
                 {
@@ -20944,7 +23648,8 @@ namespace hotspot
     auto field_proxy::value_t::to_borrowed() const noexcept
         -> vmhook::borrowed<wrapper_type>
     {
-        return std::visit([](const auto& stored) noexcept
+        vmhook::detail::native_backend::operation access{};
+        return std::visit([this](const auto& stored) noexcept
             -> vmhook::borrowed<wrapper_type>
             {
                 using stored_type = std::remove_cvref_t<decltype(stored)>;
@@ -20954,12 +23659,12 @@ namespace hotspot
                     // nullptr anyway, but going through the empty-borrow
                     // constructor keeps "never borrowed" distinct from
                     // "borrowed and since expired".
-                    if (stored == 0u)
+                    if (stored == 0u && !this->native_root)
                     {
                         return vmhook::borrowed<wrapper_type>{};
                     }
                     return vmhook::borrowed<wrapper_type>{
-                        vmhook::hotspot::decode_oop_pointer(stored) };
+                        this->reference_address(stored), this->native_root };
                 }
                 else
                 {
@@ -20985,6 +23690,7 @@ namespace hotspot
     inline auto field_proxy::value_t::operator->() const noexcept
         -> vmhook::detail::access<vmhook::any_object>
     {
+        vmhook::detail::native_backend::operation access{};
         return std::visit([this](const auto& stored) noexcept
             -> vmhook::detail::access<vmhook::any_object>
             {
@@ -20992,7 +23698,7 @@ namespace hotspot
                 if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                 {
                     return vmhook::detail::access<vmhook::any_object>{
-                        this->reference_target<void>(stored) };
+                        this->reference_target<void>(stored), this->native_root };
                 }
                 else
                 {
@@ -21010,14 +23716,15 @@ namespace hotspot
     inline auto method_proxy::value_t::operator->() const noexcept
         -> vmhook::detail::access<vmhook::any_object>
     {
-        return std::visit([](const auto& stored) noexcept
+        vmhook::detail::native_backend::operation access{};
+        return std::visit([this](const auto& stored) noexcept
             -> vmhook::detail::access<vmhook::any_object>
             {
                 using stored_type = std::remove_cvref_t<decltype(stored)>;
                 if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                 {
                     return vmhook::detail::access<vmhook::any_object>{
-                        reference_target<void>(stored) };
+                        this->reference_target<void>(stored), this->native_root };
                 }
                 else
                 {

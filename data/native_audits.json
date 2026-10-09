@@ -1,0 +1,737 @@
+{
+  "schema": 1,
+  "profiles": [
+    {
+      "identity": {
+        "guid": "d4caa6eb-afa8-455f-8e21-9e9515b62a3f",
+        "age": 1,
+        "image_size": 10166272,
+        "pe_timestamp": 1538933834,
+        "machine": 34404,
+        "java_feature": 9,
+        "sha256": "d833b1172646fa19b7f2f9bea8aea2d844c9ebd1cf390764f3ba3779762d5014"
+      },
+      "aliases": {
+        "allocate_thread": 6387360,
+        "java_thread_ctor": 6384032,
+        "record_stack": 6414096,
+        "initialize_tls": 6403456,
+        "create_os_thread": 5480768,
+        "create_guards": 6393248,
+        "cache_globals": 2875488,
+        "threads_lock": 9440712,
+        "lock": 5366928,
+        "add_thread": 6387184,
+        "unlock": 5367776,
+        "handle_mark_initialize": 3116544,
+        "handle_mark_destroy": 3116032,
+        "arena_grow": 683856,
+        "allocate_thread_object": 6388128,
+        "clear_exception": 2659024,
+        "cleanup_failed": 6391264,
+        "set_thread_status": 3365104,
+        "vm_to_native": 945808,
+        "setup_fpu": 2875488,
+        "current_thread": 6425168,
+        "is_tls_initialized": 6425136,
+        "native_to_vm": 1149280,
+        "exit_thread": 6397888,
+        "delete_thread": 6386304,
+        "remove_guards": 6415568,
+        "vm_exited": 9589616,
+        "java_calls": 3319808,
+        "klass_check": 3224240,
+        "klass_initialize": 3232608,
+        "klass_allocate": 3221376,
+        "method_handle_construct": 3115872,
+        "method_handle_destroy": 3116128,
+        "new_string_unicode": 3343200,
+        "tlab_initialize": 6423008,
+        "use_tlab": 9045822,
+        "main_thread_group_raw": 9565176,
+        "lock_without_safepoint": 5366928,
+        "allocate_handle_block_legacy": 3614784
+      },
+      "capabilities": {
+        "new_attaching_factory": false,
+        "native_transition_async_arg": false,
+        "cleanup_bool_arg": false,
+        "delete_flags_arg": true,
+        "guards_subobject": false,
+        "monitor_owner": false,
+        "jfr_before_publish": false,
+        "java_calls_by_value": false,
+        "anchor_thread_arg": false
+      },
+      "types": {
+        "ConstantPool": {
+          "size": 72,
+          "members": {
+            "_pool_holder": 24,
+            "_length": 60
+          },
+          "enums": {}
+        },
+        "Method": {
+          "size": 80,
+          "members": {
+            "_constMethod": 8,
+            "_access_flags": 32
+          },
+          "enums": {}
+        },
+        "ConstMethod": {
+          "size": 56,
+          "members": {
+            "_constants": 8,
+            "_name_index": 42,
+            "_signature_index": 44,
+            "_size_of_parameters": 52
+          },
+          "enums": {}
+        },
+        "Symbol": {
+          "size": 8,
+          "members": {
+            "_length": 0,
+            "_body": 6
+          },
+          "enums": {}
+        },
+        "ThreadLocalAllocBuffer": {
+          "size": 96,
+          "members": {},
+          "enums": {}
+        },
+        "Arena": {
+          "size": 48,
+          "members": {
+            "_hwm": 24,
+            "_max": 32
+          },
+          "enums": {}
+        },
+        "Chunk": {
+          "size": 16,
+          "members": {},
+          "enums": {}
+        },
+        "ThreadShadow": {
+          "size": 32,
+          "members": {
+            "_pending_exception": 8
+          },
+          "enums": {}
+        },
+        "Thread": {
+          "size": 424,
+          "members": {
+            "_active_handles": 56,
+            "_tlab": 88,
+            "_pending_exception": 8,
+            "_handle_area": 280
+          },
+          "enums": {}
+        },
+        "JavaThread": {
+          "size": 960,
+          "members": {
+            "_pending_exception": 8,
+            "_active_handles": 56,
+            "_tlab": 88,
+            "_handle_area": 280,
+            "_threadObj": 432,
+            "_anchor": 440,
+            "_thread_state": 592,
+            "_osthread": 264,
+            "_stack_base": 296,
+            "_stack_size": 304,
+            "_jni_attach_state": 632,
+            "_stack_guard_state": 672
+          },
+          "enums": {}
+        },
+        "OSThread": {
+          "size": 48,
+          "members": {},
+          "enums": {}
+        },
+        "JavaFrameAnchor": {
+          "size": 24,
+          "members": {},
+          "enums": {}
+        },
+        "JNIHandleBlock": {
+          "size": 312,
+          "members": {},
+          "enums": {}
+        },
+        "Flag": {
+          "size": 32,
+          "members": {
+            "_type": 0,
+            "_name": 8,
+            "_addr": 16
+          },
+          "enums": {}
+        },
+        "JDK_Version": {
+          "size": 7,
+          "members": {
+            "_major": 0
+          },
+          "enums": {}
+        },
+        "JavaThreadState": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "_thread_in_native": 4,
+            "_thread_in_vm": 6,
+            "_thread_in_Java": 8
+          }
+        },
+        "AccessFlags": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        },
+        "BasicType": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        },
+        "Handle": {
+          "size": 8,
+          "members": {},
+          "enums": {}
+        },
+        "methodHandle": {
+          "size": 16,
+          "members": {
+            "_value": 0,
+            "_thread": 8
+          },
+          "enums": {}
+        },
+        "HandleMark": {
+          "size": 56,
+          "members": {},
+          "enums": {}
+        },
+        "HandleArea": {
+          "size": 56,
+          "members": {},
+          "enums": {}
+        },
+        "JavaValue": {
+          "size": 16,
+          "members": {
+            "_type": 0,
+            "_value": 8
+          },
+          "enums": {}
+        },
+        "JavaCallArguments": {
+          "size": 128,
+          "members": {
+            "_value_buffer": 0,
+            "_value_state_buffer": 72,
+            "_value": 88,
+            "_value_state": 96,
+            "_size": 104,
+            "_max_size": 108,
+            "_start_at_zero": 112,
+            "_alternative_target": 120
+          },
+          "enums": {}
+        },
+        "MemoryType": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "mtThread": 2
+          }
+        },
+        "MEMFLAGS": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "mtThread": 2
+          }
+        },
+        "JavaThread::StackGuardState": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "stack_guard_enabled": 3
+          }
+        },
+        "JavaThread::JNIAttachStates": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "_not_attaching_via_jni": 1,
+            "_attaching_via_jni": 2,
+            "_attached_via_jni": 3
+          }
+        },
+        "JavaThread::TerminatedTypes": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        },
+        "JavaThread::ExitType": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "normal_exit": 0,
+            "jni_detach": 1
+          }
+        },
+        "JavaThreadStatus": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "RUNNABLE": 5
+          }
+        },
+        "AllocFailStrategy::AllocFailEnum": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        }
+      },
+      "code_prefixes": {
+        "allocate_thread": "4c8bdc49895b1049897b1855498d6b88",
+        "java_thread_ctor": "48895c24084889742410574883ec200f",
+        "record_stack": "40564883ec30488bf1e852c7f1ff4889",
+        "initialize_tls": "8b153ebb300065488b04255800000041",
+        "create_os_thread": "48895c2408574883ec40488bf9ff15d5",
+        "create_guards": "40564883ec2083b9a002000000488bf1",
+        "cache_globals": "c20000cccccccccccccccccccccccccc",
+        "lock": "48895c2408574883ec208b15248c4000",
+        "add_thread": "48895c2408574883ec20803d47753000",
+        "unlock": "48c74108000000000fb6413084c07405",
+        "handle_mark_initialize": "4889114c8b82180100004c894108498b",
+        "handle_mark_destroy": "48895c2408574883ec20488b4110488b",
+        "arena_grow": "48895c240848896c2410488974241857",
+        "allocate_thread_object": "488954241055564154415641574883ec",
+        "clear_exception": "40574883ec304883790800488bf90f84",
+        "cleanup_failed": "40534883ec30488bd9488b8960030000",
+        "set_thread_status": "48630519c25b0085c07e03891408c3cc",
+        "vm_to_native": "48895c2408574883ec208d4201418bf8",
+        "setup_fpu": "c20000cccccccccccccccccccccccccc",
+        "current_thread": "8b0d06e32f0048ff2563780500cccccc",
+        "is_tls_initialized": "0fb60521e32f00c3cccccccccccccccc",
+        "native_to_vm": "48895c2408574883ec20c78150020000",
+        "exit_thread": "488bc444894018555356488d68d84881",
+        "delete_thread": "48895c2408574883ec208bda488bf9e8",
+        "remove_guards": "40534883ec2083b9a002000000488bd9",
+        "java_calls": "4883ec384c894c24204d8bc84c8bc248",
+        "klass_check": "48895c240848896c2410488974241848",
+        "klass_initialize": "48895c2408574883ec60488b01488bda",
+        "klass_allocate": "48895c2408574883ec208bb99c000000",
+        "method_handle_construct": "40534883ec20488b02488bd948890148",
+        "method_handle_destroy": "e98b020000cccccccccccccccccccccc",
+        "new_string_unicode": "48895c240848896c2410565741564883",
+        "tlab_initialize": "48895c2408574883ec2033ff488bd948",
+        "lock_without_safepoint": "48895c2408574883ec208b15248c4000",
+        "allocate_handle_block_legacy": "40574883ec204885c97416488b794048"
+      },
+      "provenance": {
+        "kind": "exact DLL control-flow/source audit",
+        "runtime_build": "9+181",
+        "source_url": "https://github.com/openjdk/jdk9/tree/jdk-9+181",
+        "product_url": "https://github.com/AdoptOpenJDK/openjdk9-binaries/releases/download/jdk-9%2B181/OpenJDK9U-jdk_x64_windows_hotspot_9_181.zip",
+        "product_sha256": "709baaf217d24503dff3194fd66aa25ae5976b3f52ed3a564cdd270b6f5eef40",
+        "symbols_url": null,
+        "binary_audit": "JNI bodies are offline call graph references only; no JNI/JVMTI entry or attachment helper is callable",
+        "abi_notes": [
+          "JavaCalls takes const methodHandle&; no callee destruction",
+          "Thread allocation uses VM biased-locking alignment",
+          "Thread records NMT stack and destructor releases it",
+          "Failure cleanup destroys the JavaThread itself",
+          "TLAB initialization is conditional and accepts TLAB subobject",
+          "Universe thread-group and JavaThread object accessors are inline"
+        ],
+        "source_hashes": {
+          "9-javaCalls.cpp": "974c9324fd5af15c2e743010e2e40a28f308464ae22d7941f3fb42a8048a8706",
+          "9-jni.cpp": "9926c2145ca3e94533f1385aacd6b27c7039dc9122566c514c4bfeefb60a6d2e",
+          "9-javaCalls.hpp": "239727f1a9ec9617efbebfd4dafc3940fd6527d7b44f139b05b9f42def8d7c72",
+          "9-thread.cpp": "c1afa1d73122b13dbe97e1b426d5ad3e826ae0e348508b12c05f4d93c0ec33fa",
+          "9-handles.hpp": "bc4f0b972c73c096f0ee3f5211e3d64d38e254b68c537c1da28294f17c095659",
+          "9-handles.cpp": "5368b3288bb2be2c418360324aa4ff260b2fcdd30f28638ffd4fd31bc4802607",
+          "9-interfaceSupport.hpp": "2672c874062b2eb0042c45063b3628f474c16429a7bf161afa2ed54288f00ece",
+          "9-allocation.hpp": "44a6c60aff1bac43456be7d3a1bb18dd1933d4fcf1978ae96a563e7b32a6dca9",
+          "9-javaClasses.cpp": "eee00d8efe9152db0374786c0a84c26cc45d4570e844969477211b8f80fd7ae5",
+          "9-thread.hpp": "77a881c75e0f643f83a2a14eeeb10fea41c020337052d360bd10aac27945c1d9"
+        }
+      }
+    },
+    {
+      "identity": {
+        "guid": "ce1d867e-189e-403d-84c3-9fd348d572fd",
+        "age": 1,
+        "image_size": 10432512,
+        "pe_timestamp": 1543318357,
+        "machine": 34404,
+        "java_feature": 10,
+        "sha256": "5d6d6d5ec754c8e12a3088011808841f5fab23686d879da6fd1e734c2fc71410"
+      },
+      "aliases": {
+        "allocate_thread": 6496784,
+        "java_thread_ctor": 6493456,
+        "record_stack": 6524464,
+        "initialize_tls": 6513216,
+        "create_os_thread": 5552272,
+        "create_guards": 6502608,
+        "cache_globals": 5165616,
+        "threads_lock": 9682832,
+        "lock": 5433168,
+        "add_thread": 6496592,
+        "unlock": 5433968,
+        "handle_mark_initialize": 3293040,
+        "handle_mark_destroy": 3292528,
+        "arena_grow": 764336,
+        "allocate_thread_object": 6497552,
+        "clear_exception": 2777728,
+        "cleanup_failed": 6500784,
+        "set_thread_status": 3545888,
+        "vm_to_native": 1024752,
+        "setup_fpu": 5165616,
+        "current_thread": 6535696,
+        "is_tls_initialized": 6535664,
+        "native_to_vm": 1223168,
+        "exit_thread": 6507584,
+        "delete_thread": 6529152,
+        "remove_guards": 6525808,
+        "vm_exited": 9832480,
+        "java_calls": 3505088,
+        "klass_check": 3403408,
+        "klass_initialize": 3411968,
+        "klass_allocate": 3400544,
+        "method_handle_construct": 3292368,
+        "method_handle_destroy": 3292624,
+        "new_string_unicode": 3527680,
+        "tlab_initialize": 6533568,
+        "use_tlab": 9218979,
+        "main_thread_group_raw": 9807752,
+        "lock_without_safepoint": 5433168,
+        "allocate_handle_block_legacy": 3749792
+      },
+      "capabilities": {
+        "new_attaching_factory": false,
+        "native_transition_async_arg": false,
+        "cleanup_bool_arg": false,
+        "delete_flags_arg": false,
+        "guards_subobject": false,
+        "monitor_owner": false,
+        "jfr_before_publish": false,
+        "java_calls_by_value": false,
+        "anchor_thread_arg": false
+      },
+      "types": {
+        "ConstantPool": {
+          "size": 64,
+          "members": {
+            "_pool_holder": 24,
+            "_length": 52
+          },
+          "enums": {}
+        },
+        "Method": {
+          "size": 88,
+          "members": {
+            "_constMethod": 8,
+            "_access_flags": 32
+          },
+          "enums": {}
+        },
+        "ConstMethod": {
+          "size": 56,
+          "members": {
+            "_constants": 8,
+            "_name_index": 42,
+            "_signature_index": 44,
+            "_size_of_parameters": 52
+          },
+          "enums": {}
+        },
+        "Symbol": {
+          "size": 8,
+          "members": {
+            "_length": 0,
+            "_body": 6
+          },
+          "enums": {}
+        },
+        "ThreadLocalAllocBuffer": {
+          "size": 96,
+          "members": {},
+          "enums": {}
+        },
+        "Arena": {
+          "size": 48,
+          "members": {
+            "_hwm": 24,
+            "_max": 32
+          },
+          "enums": {}
+        },
+        "ThreadShadow": {
+          "size": 32,
+          "members": {
+            "_pending_exception": 8
+          },
+          "enums": {}
+        },
+        "Thread": {
+          "size": 456,
+          "members": {
+            "_active_handles": 80,
+            "_tlab": 120,
+            "_pending_exception": 8,
+            "_handle_area": 312
+          },
+          "enums": {}
+        },
+        "JavaThread": {
+          "size": 1016,
+          "members": {
+            "_pending_exception": 8,
+            "_active_handles": 80,
+            "_tlab": 120,
+            "_handle_area": 312,
+            "_threadObj": 472,
+            "_anchor": 480,
+            "_thread_state": 632,
+            "_osthread": 296,
+            "_stack_base": 328,
+            "_stack_size": 336,
+            "_jni_attach_state": 672,
+            "_stack_guard_state": 712
+          },
+          "enums": {}
+        },
+        "OSThread": {
+          "size": 48,
+          "members": {},
+          "enums": {}
+        },
+        "JavaFrameAnchor": {
+          "size": 24,
+          "members": {},
+          "enums": {}
+        },
+        "JNIHandleBlock": {
+          "size": 312,
+          "members": {},
+          "enums": {}
+        },
+        "Flag": {
+          "size": 40,
+          "members": {
+            "_type": 0,
+            "_name": 8,
+            "_addr": 16
+          },
+          "enums": {}
+        },
+        "JDK_Version": {
+          "size": 7,
+          "members": {
+            "_major": 0
+          },
+          "enums": {}
+        },
+        "JavaThreadState": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "_thread_in_native": 4,
+            "_thread_in_vm": 6,
+            "_thread_in_Java": 8
+          }
+        },
+        "AccessFlags": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        },
+        "BasicType": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        },
+        "JavaThread::TerminatedTypes": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        },
+        "Handle": {
+          "size": 8,
+          "members": {},
+          "enums": {}
+        },
+        "methodHandle": {
+          "size": 16,
+          "members": {
+            "_value": 0,
+            "_thread": 8
+          },
+          "enums": {}
+        },
+        "HandleMark": {
+          "size": 56,
+          "members": {},
+          "enums": {}
+        },
+        "HandleArea": {
+          "size": 56,
+          "members": {},
+          "enums": {}
+        },
+        "JavaValue": {
+          "size": 16,
+          "members": {
+            "_type": 0,
+            "_value": 8
+          },
+          "enums": {}
+        },
+        "JavaCallArguments": {
+          "size": 128,
+          "members": {
+            "_value_buffer": 0,
+            "_value_state_buffer": 72,
+            "_value": 88,
+            "_value_state": 96,
+            "_size": 104,
+            "_max_size": 108,
+            "_start_at_zero": 112,
+            "_alternative_target": 120
+          },
+          "enums": {}
+        },
+        "MemoryType": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "mtThread": 2
+          }
+        },
+        "MEMFLAGS": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "mtThread": 2
+          }
+        },
+        "JavaThread::StackGuardState": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "stack_guard_enabled": 3
+          }
+        },
+        "JavaThread::JNIAttachStates": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "_not_attaching_via_jni": 1,
+            "_attaching_via_jni": 2,
+            "_attached_via_jni": 3
+          }
+        },
+        "JavaThread::ExitType": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "normal_exit": 0,
+            "jni_detach": 1
+          }
+        },
+        "JavaThreadStatus": {
+          "size": 4,
+          "members": {},
+          "enums": {
+            "RUNNABLE": 5
+          }
+        },
+        "AllocFailStrategy::AllocFailEnum": {
+          "size": 4,
+          "members": {},
+          "enums": {}
+        }
+      },
+      "code_prefixes": {
+        "allocate_thread": "4c8bdc49895b1049897b1855498d6b88",
+        "java_thread_ctor": "48895c24084889742410574883ec200f",
+        "record_stack": "40564883ec30488bf1e85232f1ff4889",
+        "initialize_tls": "8b15d6c3320065488b04255800000041",
+        "create_os_thread": "48895c2408574883ec40488bf9ff1595",
+        "create_guards": "40564883ec2083b9c802000000488bf1",
+        "cache_globals": "c20000cccccccccccccccccccccccccc",
+        "lock": "48895c2408574883ec208b15bc3e4300",
+        "add_thread": "48895c2408574883ec20803da77c3200",
+        "unlock": "48c74108000000000fb6413084c07405",
+        "handle_mark_initialize": "4889114c8b82380100004c894108498b",
+        "handle_mark_destroy": "48895c2408574883ec20488b4110488b",
+        "arena_grow": "48895c240848896c2410488974241857",
+        "allocate_thread_object": "488954241055564154415641574883ec",
+        "clear_exception": "4c8bdc534881ece0000000488b05ce6d",
+        "cleanup_failed": "40534883ec20488bd9488b49504885c9",
+        "set_thread_status": "486305e9af5c0085c07e03891408c3cc",
+        "vm_to_native": "48895c2408574883ec208d4201418bf8",
+        "setup_fpu": "c20000cccccccccccccccccccccccccc",
+        "current_thread": "8b0d06e6310048ff25ab480500cccccc",
+        "is_tls_initialized": "0fb60521e63100c3cccccccccccccccc",
+        "native_to_vm": "48895c2410574883ec20c78178020000",
+        "exit_thread": "44894424185556415441564157488d6c",
+        "delete_thread": "80b9d0010000000f85b3300000488b01",
+        "remove_guards": "40534883ec2083b9c802000000488bd9",
+        "java_calls": "4883ec384c894c24204d8bc84c8bc248",
+        "klass_check": "48895c240848896c2410488974241848",
+        "klass_initialize": "48895c2408574883ec20488b01488bfa",
+        "klass_allocate": "48895c2408574883ec208bb99c000000",
+        "method_handle_construct": "40534883ec20488b02488bd948890148",
+        "method_handle_destroy": "e98b020000cccccccccccccccccccccc",
+        "new_string_unicode": "48895c241048896c2418564156415748",
+        "tlab_initialize": "48895c2408574883ec2033ff488bd948",
+        "lock_without_safepoint": "48895c2408574883ec208b15bc3e4300",
+        "allocate_handle_block_legacy": "40574883ec204885c97416488b795848"
+      },
+      "provenance": {
+        "kind": "exact DLL control-flow/source audit",
+        "runtime_build": "10.0.2+13",
+        "source_url": "https://github.com/openjdk/jdk10u/tree/jdk-10.0.2+13",
+        "product_url": "https://github.com/AdoptOpenJDK/openjdk10-binaries/releases/download/jdk-10.0.2%2B13.1/OpenJDK10U-jdk_x64_windows_hotspot_10.0.2_13.zip",
+        "product_sha256": "108733ecde8422d6ca2bdc1c9368268605ea9e2d75679ac181333fa25b74d3f7",
+        "symbols_url": null,
+        "binary_audit": "JNI bodies are offline call graph references only; no JNI/JVMTI entry or attachment helper is callable",
+        "abi_notes": [
+          "JavaCalls takes const methodHandle&; no callee destruction",
+          "Thread allocation uses VM biased-locking alignment",
+          "Thread records NMT stack and destructor releases it",
+          "Failure cleanup destroys the JavaThread itself",
+          "TLAB initialization is conditional and accepts TLAB subobject",
+          "Universe thread-group and JavaThread object accessors are inline"
+        ],
+        "source_hashes": {
+          "10-handles.cpp": "42c41ba4b1387e23cf36dbda4162e6accbd23581690a7e8ac67202b476e9bc5f",
+          "10-arena.hpp": "43d1a69e6fe841dec81efc998575d01bfd38a4e796678ebb272893e5d7d7d389",
+          "10-handles.hpp": "c053f61fb23c327dd2c61090c244e5681c3daaf85ed4d9a4d1a2a160f79371e2",
+          "10-javaCalls.hpp": "2273808374c6bea8f10c6fbdfc78f1a1f2d090d5693c0e6ab6d545ab4915921e",
+          "10-jni.cpp": "19c52c5a594fcfbca85af54c2fd34cde0a8611674890b698f5fb2e6a36999153",
+          "10-interfaceSupport.hpp": "3733578c9d3eed6fb41cd77d38a279378469f1092b073a84a9f20945641ec15b",
+          "10-thread.hpp": "f88b9ad288943b6688e026c54f2412ced0cc58a5e7904351cbb3763e87f673a9",
+          "10-javaClasses.cpp": "60f7ebead1be30e198e409ed366dcf18eb5dffdd224b2be99d64b692951731d6",
+          "10-javaCalls.cpp": "ed7fe87a23af7840e63435e447ebd09da511b1becc19ccb4c554da1ae0506999",
+          "10-thread.cpp": "f105a26d4bb8a52d94550c745bebba3e56e2303b8c079bb16c03c26d57fea66c",
+          "10-allocation.hpp": "f85c6606fa60c78290712703d19a178ee48dd91852dceb921e82bf3abc856a9f"
+        }
+      }
+    }
+  ]
+}

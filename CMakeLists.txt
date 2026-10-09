@@ -154,6 +154,8 @@ static_assert(std::meta::annotations_of(^^annotated).size() == 1);
     target_compile_features(vmhook_module INTERFACE cxx_std_26)
     target_compile_options(vmhook_module INTERFACE -freflection -fmodules
         "-fmodule-mapper=${_vmhook_module_mapper}")
+    target_include_directories(vmhook_module SYSTEM INTERFACE
+        "${_vmhook_module_dir}/stdlib-overlay")
     target_link_libraries(vmhook_module INTERFACE "${_vmhook_module_archive}")
 endif()
 

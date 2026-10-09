@@ -6,60 +6,77 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `vmhook::native_thread_context` registers a DLL-created Windows OS thread with
+  HotSpot through private VM operations. Java methods and constructors execute
+  synchronously on that same OS thread, without JNI/JVMTI, a Java hook or a
+  dispatch queue. Contexts report attachment errors and have explicit closure.
+- Exact-image private ABI profiles spanning Java 8–27, plus a checked matching
+  full-PDB resolver for compatible unlisted builds. Thread lifecycle, private
+  signatures, type layouts and VM metadata are checked before attachment.
+- Context-bound VM roots for constructed objects, object-valued results,
+  reference field reads, wrapper copies and supported `borrowed`/`ref`
+  conversions. Roots survive moving GC while the native worker is idle;
+  foreign-thread use and use after context closure are refused. Temporary
+  internal handles are released and persistent root slots can be reused.
+- Dedicated injected-runtime fixtures for direct native calls, construction,
+  Unicode Strings, idle GC, exceptions, compiled calls, repeated/concurrent
+  attachment and context lifetime. Both interfaces have Java 8–27 CI coverage.
+
 ### Changed
 
 - Windows x64 and MinGW-w64 G++ are the supported platform and compiler.
-  The C++23 header remains C++23; the C++26 module uses static reflection.
-- The public header lives in `include/vmhook/vmhook.hpp`; the primary module
-  source lives in `modules/vmhook.ixx`. Both module interfaces contain no
-  preprocessor directives; the Windows bridge imports an SDK header unit.
-  `tools/make_header.py` regenerates the standalone header.
+  The standalone header remains C++23 permanently; the latest C++ module uses
+  static reflection. Both interfaces share the same runtime implementation.
+- The header lives in `include/vmhook/vmhook.hpp`; the canonical module source
+  lives in `modules/vmhook.ixx`. Neither module interface contains preprocessor
+  directives. The Windows bridge imports an SDK header unit, and
+  `tools/make_header.py` generates the C++23 header.
+- The module builder creates a build-directory libstdc++ overlay for affected
+  GCC 16 Windows `import std` linkage, preserving the ABI and forwarding the
+  required include path to consumers without changing installed headers.
 - Static and instance wrappers use `getMethod` and `getField`. Instance lookup
   takes an explicit receiver, such as `getMethod("add", *this)`; static lookup
-  needs only the name. Checked lookup arrows report missing members with
-  `vmhook::exception` instead of dereferencing an empty optional.
-- JNI and JVMTI calls are removed, including hidden function-table calls,
-  native-thread attachment, JNI string/object helpers, and global references.
-  Native threads submit `vmhook::dispatch` tasks; an existing hooked Java
-  thread services them. The application must keep reaching a hook.
-- Object construction first tries the current Java thread's TLAB, then can
-  invoke an already-loaded Java `Unsafe.allocateInstance` method through the
-  Java-call backend before invoking the selected constructor. Classes must
-  already be loaded, initialized, and concrete. Raw arrays/String assembly
-  retain their TLAB-only allocation path.
-- `method_proxy::value_t::was_invoked()` distinguishes refused calls from
-  successfully invoked methods returning void, null, or zero. Construction
-  rejects an object whose Java constructor was not invoked.
-- Public reference field stores require the Epsilon collector until a correct
-  write-barrier backend exists. Epoch checks detect some stale references and
-  do not establish a GC-root or pinning guarantee.
-- Typed reference fields and object-returning calls require verified compressed
-  oops. Wide reference slots need the appropriate lower-level access API.
-- Compact object headers use detected VM flags and exported mark-word metadata
-  for supported class/array reads. Direct TLAB assembly remains limited to
-  ordinary headers; object construction can use the Java allocation backend.
-  Calls refresh their bound receiver and directly supplied wrapper arguments
-  after collection during that call. Receiver-bound method proxies must not
-  outlive their C++ wrapper; the temporary handles do not persist after a call.
-- README and build configuration describe the implemented interfaces and
-  runtime boundaries. Historical benchmarks are not current performance claims.
+  uses the same name without a receiver. Checked lookup arrows report missing
+  members through `vmhook::exception`.
+- Native-context construction uses HotSpot's collector-aware allocator,
+  initializes an already-loaded concrete class and invokes its real constructor.
+  String arguments use the private VM String allocator, including Java 27's
+  default compact headers. Older Java-callback and raw-array TLAB paths retain
+  their narrower allocation requirements.
+- `method_proxy::value_t::was_invoked()` distinguishes refused calls from real
+  void, null or zero results. Java exceptions are reported and consumed by the
+  native backend; construction rejects an object whose constructor did not run.
+- Public reference field stores require Epsilon until a correct write-barrier
+  backend exists. Typed references require verified compressed oops. Concurrent
+  relocating collectors such as ZGC and Shenandoah are refused.
+- Java 8–27 metadata and ABI handling cover legacy thread alignment/TLS,
+  attachment cleanup ownership, packed Symbol lengths, narrow-reference widths,
+  compact headers, array layouts and method-handle calling conventions.
+- `vmhook::dispatch` remains an optional route onto an existing hooked Java
+  thread; direct native-context calls do not depend on it.
+- README and native-thread documentation describe the public API, GC lifetimes,
+  exact-build compatibility and validation limits. Historical benchmark numbers
+  are not current performance claims.
 
 ### Removed
 
+- JNI and JVMTI API calls, including function-table invocations, attachment
+  entry points, hidden JNI helpers and JNI global-reference fallbacks.
 - Scoped hooks and their RAII handles. Hooks have explicit persistent lifetime.
-- `static_method` and `static_field`; use the receiver-free `getMethod` and
-  `getField` overloads. Legacy snake_case instance lookups remain available.
+- Separate `static_method` and `static_field` APIs; use receiver-free
+  `getMethod` and `getField`. Legacy snake_case instance lookups remain.
 - Compiler and operating-system branches outside Windows x64 G++.
-- JIT entry/flag rewrites, deoptimization sweeps, and the hook-repair watchdog.
-  Hooks observe the interpreter path; compiled/inlined calls can bypass them.
-- Undocumented JNI fallback behavior.
-- Build targets that refer to missing examples, injectors, or test trees.
+- JIT entry/flag rewrites, deoptimization sweeps and the hook-repair watchdog.
+  Hooks observe interpreter entries; compiled or inlined calls can bypass them.
+- Build targets referring to missing examples, injectors or test trees.
 
 The entries below preserve historical release notes. Earlier platform support,
-APIs, JNI paths, test counts, timing figures, and claimed artifacts describe
+APIs, JNI paths, test counts, timing figures and claimed artifacts describe
 those entries as originally recorded; they have not been independently
 revalidated and are not guarantees for the current implementation. Use the
-README and current source for the supported behavior.
+README and current source for supported behavior.
 
 ## [7.0.0] — 2026-08-14
 

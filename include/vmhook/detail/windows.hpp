@@ -20,6 +20,10 @@ namespace vmhook::windows
     using ::EXCEPTION_POINTERS;
     using ::HANDLE;
     using ::HMODULE;
+    using ::IMAGE_DEBUG_DIRECTORY;
+    using ::IMAGE_DOS_HEADER;
+    using ::IMAGE_NT_HEADERS64;
+    using ::IMAGE_SECTION_HEADER;
     using ::LONG;
     using ::MEMORY_BASIC_INFORMATION;
     using ::PVOID;
@@ -37,6 +41,11 @@ namespace vmhook::windows
     using ::GetCurrentProcessId;
     using ::GetCurrentThreadId;
     using ::GetModuleHandleA;
+    using ::GetModuleHandleW;
+    using ::GetModuleFileNameA;
+    using ::GetModuleFileNameW;
+    using ::GetEnvironmentVariableA;
+    using ::GetEnvironmentVariableW;
     using ::GetProcAddress;
     using ::GetSystemInfo;
     using ::GetThreadContext;
@@ -58,6 +67,12 @@ namespace vmhook::windows
     using ::WriteProcessMemory;
 
     inline constexpr DWORD page_noaccess{ PAGE_NOACCESS };
+    inline constexpr auto image_dos_signature{ IMAGE_DOS_SIGNATURE };
+    inline constexpr auto image_nt_signature{ IMAGE_NT_SIGNATURE };
+    inline constexpr auto image_file_machine_amd64{ IMAGE_FILE_MACHINE_AMD64 };
+    inline constexpr auto image_nt_optional_hdr64_magic{ IMAGE_NT_OPTIONAL_HDR64_MAGIC };
+    inline constexpr auto image_directory_entry_debug{ IMAGE_DIRECTORY_ENTRY_DEBUG };
+    inline constexpr auto image_debug_type_codeview{ IMAGE_DEBUG_TYPE_CODEVIEW };
     inline constexpr DWORD page_readonly{ PAGE_READONLY };
     inline constexpr DWORD page_readwrite{ PAGE_READWRITE };
     inline constexpr DWORD page_writecopy{ PAGE_WRITECOPY };
