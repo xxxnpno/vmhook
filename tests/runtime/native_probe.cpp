@@ -174,7 +174,14 @@ namespace
 
             // No VM guard spans this native sleep. The fixture's independent
             // Java thread allocates and collects while persistent roots survive.
-            ::Sleep(300);
+            const auto gc_epoch = native_fixture::getField("gcEpoch");
+            const auto gc_before = gc_epoch ? static_cast<std::int32_t>(gc_epoch->get()) : -1;
+            bool collected{};
+            for (int attempt = 0; gc_epoch && attempt < 10 && !collected; ++attempt)
+            {
+                ::Sleep(300);
+                collected = static_cast<std::int32_t>(gc_epoch->get()) > gc_before;
+            }
             const std::unique_ptr<native_fixture> converted = result;
             const std::unique_ptr<native_fixture> converted_child = child_value;
             const vmhook::borrowed<native_fixture> borrowed = result;
@@ -188,7 +195,7 @@ namespace
                 stable_identity = reference.class_name() == "NativeFixture"
                     && reference.same_object_as(reference);
             }
-            if (!passed(output, "idle_gc", field && static_cast<std::int32_t>(field->get()) == 16
+            if (!passed(output, "idle_gc", collected && field && static_cast<std::int32_t>(field->get()) == 16
                 && converted && converted->get_instance() && converted->value() == 16
                 && converted_child && converted_child->get_instance() && converted_child->value() == 16
                 && borrowed.resolve() && reference.resolve() && child_path.resolve()

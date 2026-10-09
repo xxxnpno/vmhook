@@ -308,7 +308,7 @@ images. Both interfaces passed all **20 native-thread checks on each Java major
 Both G++ 16.2 interfaces also passed **360/360 checks each** with matching-PDB
 resolution explicitly selected on Java 8 and 11–27. The seven header/source
 checks and six module executable suites passed, as did the README's reflection
-example. The tests include idle moving GC, actual compiled methods, same-thread
+example. The tests include idle GC with moving collectors, actual compiled methods, same-thread
 execution and repeated/concurrent attachment without installing hooks.
 
 These runs used **Wine 10.0** and the listed exact builds/default collectors.

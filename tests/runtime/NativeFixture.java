@@ -17,6 +17,7 @@ class NativeBase {
 public class NativeFixture extends NativeBase implements NativeOverride {
     public static final String TEXT = "A\0\uD83D\uDE00\u00E9";
     public static NativeFixture holder;
+    public static volatile int gcEpoch;
     public int value;
     public String text;
     public NativeFixture child;
@@ -119,7 +120,7 @@ public class NativeFixture extends NativeBase implements NativeOverride {
         int iteration = 0;
         while (true) {
             live[iteration++ % live.length] = new byte[1024 * 1024];
-            if (iteration % 10 == 0) { System.gc(); }
+            if (iteration % 10 == 0) { System.gc(); ++gcEpoch; }
             Thread.sleep(20);
         }
     }
