@@ -48,7 +48,7 @@ def checksum(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def report_failure(args, mode, directory, result, pid, error):
+def report_failure(args, mode, directory, result, pid, error, process_alive=False):
     """Keep the last native checks and the JVM's fatal report on a failed run."""
     values = {}
     if result.is_file():
@@ -66,6 +66,19 @@ def report_failure(args, mode, directory, result, pid, error):
         message = f"Observation {mode}: {error}; last native checks: {values}"
         escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
         print("::error::" + escaped, flush=True)
+    if process_alive and pid and pid.isdecimal():
+        executable = args.java.parent / ("jcmd.exe" if args.java.suffix == ".exe" else "jcmd")
+        if executable.is_file():
+            prefix = [str(args.emulator)] if args.emulator else []
+            try:
+                diagnostic = subprocess.run(prefix + [str(executable), pid, "Thread.print", "-l"],
+                                            capture_output=True, text=True, timeout=10)
+                print(f"{mode}: thread diagnostic (exit {diagnostic.returncode})\n"
+                      f"{diagnostic.stdout}{diagnostic.stderr}", flush=True)
+            except subprocess.TimeoutExpired:
+                print(f"{mode}: thread diagnostic did not finish within 10 seconds", flush=True)
+            except OSError as diagnostic_error:
+                print(f"{mode}: thread diagnostic unavailable: {diagnostic_error}", flush=True)
     # HotSpot's default fatal-error path uses its process working directory.
     # Read only this fixture's PID, preserving the normal JVM launch arguments.
     if pid and pid.isdecimal():
@@ -174,7 +187,7 @@ def execute_mode(args, mode, directory):
                 break
             captured.append(line)
             print(f"{mode}: {line}", flush=True)
-        report_failure(args, mode, directory, result, pid, error)
+        report_failure(args, mode, directory, result, pid, error, process.poll() is None)
         raise
     finally:
         process.terminate()

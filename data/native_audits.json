@@ -79,7 +79,9 @@
         "nmethod_metadata_do": 5393008,
         "bytecode_lengths": 9345776,
         "class_loader_data_head": 9364920,
-        "interpreter_entry_table": 9337312
+        "interpreter_entry_table": 9337312,
+        "field_enable_guards10": 6397504,
+        "field_special_exit10": 6401232
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -226,7 +228,8 @@
             "storage_size__thread_state": 4,
             "storage_size__special_runtime_exit_condition": 4,
             "storage_size__suspend_flags": 4,
-            "storage_size__vm_result": 8
+            "storage_size__vm_result": 8,
+            "storage_size__stack_guard_state": 4
           }
         },
         "OSThread": {
@@ -848,7 +851,9 @@
         "nmethod_metadata_do": "48895c2408488974241048897c24184c",
         "bytecode_lengths": "00000000000000000000000000000000",
         "class_loader_data_head": "0000000000000000",
-        "interpreter_entry_table": "00000000000000000000000000000000"
+        "interpreter_entry_table": "00000000000000000000000000000000",
+        "field_enable_guards10": "48895c2408574883ec20488b81280100",
+        "field_special_exit10": "48895c240848896c2410488974241857"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -877,7 +882,8 @@
           "AbstractInterpreter::_entry_table normal index0/synchronized index1 are proven by the first two MethodKind source enumerators and distinct generate_all codelets. Unique normal/synchronized codelet names lead to generation with synchronized=false/true and exact RIP-relative load/store of table[0]/[1]. No JNI/JVMTI/WhiteBox code is called.",
           "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
           "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
-          "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body."
+          "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body.",
+          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace."
         ],
         "source_hashes": {
           "9-javaCalls.cpp": "974c9324fd5af15c2e743010e2e40a28f308464ae22d7941f3fb42a8048a8706",
@@ -1151,6 +1157,16 @@
               "function": "ClassLoaderData::add_to_deallocate_list",
               "proof": "Exact tagged source allocates GrowableArray<Metadata*>(100,true) and appends missing metadata; the native body allocates32, constructs length0/capacity100/payload24, stores the pointer in this exact CLD cell, then searches/appends Metadata* elements. The separately identified free_deallocate_list reads the same cell."
             }
+          },
+          "JavaThread": {
+            "_stack_guard_state": {
+              "offset": 672,
+              "storage_size": 4,
+              "rva": 1423648,
+              "bytes": "83b9a002000002",
+              "function": "ThreadInVMfromJava::~ThreadInVMfromJava",
+              "proof": "The exact native DWORD compare uses the VMStruct-exported stack-guard offset and immediate yellow_reserved_disabled(2), followed by the guard-enable call. The tagged ThreadInVMfromJava destructor requires this reguard before its VM-to-Java transition."
+            }
           }
         },
         "data_layout_proofs": {
@@ -1270,6 +1286,26 @@
                 "deallocate_list_data_width": 8
               },
               "proof": "Free-list loop loads exact CLD pointer then MOV RBX,qword ptr[RAX+24] payload and reads Metadata* at payload+index*8."
+            }
+          ]
+        },
+        "function_reference_proofs": {
+          "field_enable_guards10": [
+            {
+              "rva": 1423657,
+              "bytes": "e812e54b00",
+              "target_rva": 6397504,
+              "function": "ThreadInVMfromJava::~ThreadInVMfromJava",
+              "proof": "The exact destructor compares the DWORD stack-guard state at JavaThread+672 with yellow_reserved_disabled(2), then this relative CALL targets JavaThread::enable_stack_yellow_reserved_zone."
+            }
+          ],
+          "field_special_exit10": [
+            {
+              "rva": 1423804,
+              "bytes": "e80ff34b00",
+              "target_rva": 6401232,
+              "function": "ThreadInVMfromJava::~ThreadInVMfromJava",
+              "proof": "The exact destructor tests special-runtime-exit-condition DWORD at576 and external/deopt suspend bits29/28 at48, then loads DL=1 and this relative CALL targets JavaThread::handle_special_runtime_exit_condition(bool)."
             }
           ]
         }
@@ -1494,7 +1530,8 @@
             "storage_size__thread_state": 4,
             "storage_size__special_runtime_exit_condition": 4,
             "storage_size__suspend_flags": 4,
-            "storage_size__vm_result": 8
+            "storage_size__vm_result": 8,
+            "storage_size__stack_guard_state": 4
           }
         },
         "OSThread": {
@@ -2151,7 +2188,8 @@
           "AbstractInterpreter::_entry_table normal index0/synchronized index1 are proven by the first two MethodKind source enumerators and distinct generate_all codelets. Unique normal/synchronized codelet names lead to generation with synchronized=false/true and exact RIP-relative load/store of table[0]/[1]. No JNI/JVMTI/WhiteBox code is called.",
           "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
           "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
-          "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body."
+          "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body.",
+          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace."
         ],
         "source_hashes": {
           "10-handles.cpp": "42c41ba4b1387e23cf36dbda4162e6accbd23581690a7e8ac67202b476e9bc5f",
@@ -2435,6 +2473,16 @@
               "bytes": "49897668",
               "function": "ClassLoaderData::add_to_deallocate_list",
               "proof": "Exact tagged source allocates GrowableArray<Metadata*>(100,true) and appends missing metadata; the native body allocates32, constructs length0/capacity100/payload24, stores the pointer in this exact CLD cell, then searches/appends Metadata* elements. The separately identified free_deallocate_list reads the same cell."
+            }
+          },
+          "JavaThread": {
+            "_stack_guard_state": {
+              "offset": 712,
+              "storage_size": 4,
+              "rva": 1513329,
+              "bytes": "83bbc802000002",
+              "function": "Identified runtime body with inlined ThreadInVMfromJava destructor",
+              "proof": "The exact native DWORD compare uses the VMStruct-exported stack-guard offset and immediate yellow_reserved_disabled(2), followed by the guard-enable call. The tagged ThreadInVMfromJava destructor requires this reguard before its VM-to-Java transition."
             }
           }
         },

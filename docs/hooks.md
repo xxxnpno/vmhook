@@ -196,6 +196,11 @@ result slot before the interpreter receives its relocated address. Raw heap
 address snapshots do not acquire an independent lifetime. See
 [native-thread roots](native-threads.md#roots-across-calls-and-idle-gc).
 
+Windows Java 8–11 callback returns use the private safe transition with a
+memory fence, followed by the exact image's special-exit checks. This avoids
+depending on a Java call-stub exception handler across the generated trampoline;
+the VM's safepoint protocol remains active.
+
 Do not install or remove hooks from a hook callback. Keep callbacks bounded
 and avoid waiting for Java work that needs the interrupted thread itself.
 Callback exceptions are contained by VMHook; use explicit call results to

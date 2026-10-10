@@ -187,11 +187,29 @@ jobs:
           --probe runtime-binaries/${{ matrix.observation_probe }}
           --callback-probe runtime-binaries/${{ matrix.callback_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
+      - name: Repeat rooted callback transitions on legacy JVMs
+        if: ${{ !cancelled() && contains(fromJSON('[8,9,10,11,15,16]'), matrix.java) }}
+        shell: pwsh
+        run: |
+          foreach ($iteration in 1..3) {
+            Write-Output "callback-repeat=$iteration"
+            python tools/run_observation_fixture.py `
+              --java "$env:JAVA_HOME/bin/java.exe" `
+              --javac "$env:JAVA_HOME/bin/javac.exe" `
+              --injector runtime-binaries/vmhook_test_injector.exe `
+              --probe runtime-binaries/${{ matrix.observation_probe }} `
+              --callback-probe runtime-binaries/${{ matrix.callback_probe }} `
+              --mode callbacks `
+              --evidence callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-$iteration.json
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
           name: observation-${{ matrix.java }}-${{ matrix.toolchain }}
-          path: observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
+          path: |
+            observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
+            callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-*.json
           if-no-files-found: ignore
           retention-days: 7
 

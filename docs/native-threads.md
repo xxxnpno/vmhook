@@ -109,6 +109,13 @@ transfers it into a VM-scanned thread result slot across the VM-to-Java
 transition, then reloads its relocated address for the interpreter. Closing the
 temporary context invalidates C++ references retained beyond the callback.
 
+For the profiled Windows Java 8–11 images, callback return uses HotSpot's
+`transition_and_fence`, with the original guard and special-exit checks.
+An ordinary transition can touch the protected memory-serialization page;
+that path requires a reachable HotSpot exception handler. The safe transition
+preserves safepoint handling without relying on unwinding through the generated
+method trampoline. Java 12 and later retain their audited return protocol.
+
 Class-load notifications have a different contract: they run in VM state with
 borrowed metadata and potentially held VM locks. They cannot call Java or block.
 See [the class notification contract](hooks.md#class-notifications).

@@ -167,6 +167,16 @@ def audited_profile(entry: dict, recipe: dict, dll: Path) -> dict:
             if facts["members"][name] != proof["offset"] or \
                     facts["enums"]["storage_size_" + name] != proof["storage_size"]:
                 raise pp.ProfileError("Exact-image member layout differs from proof: " + owner + "::" + name)
+    for alias, checks in recipe["provenance"].get("function_reference_proofs", {}).items():
+        for proof in checks:
+            expected = bytes.fromhex(proof["bytes"])
+            if len(expected) != 5 or expected[0] not in (0xe8, 0xe9) or \
+                    image.read(proof["rva"], len(expected)) != expected:
+                raise pp.ProfileError("Exact-image function-reference mismatch: " + alias)
+            displacement = int.from_bytes(expected[1:], "little", signed=True)
+            if proof["rva"] + len(expected) + displacement != proof["target_rva"] or \
+                    proof["target_rva"] != recipe["aliases"][alias]:
+                raise pp.ProfileError("Exact-image function-reference target mismatch: " + alias)
     for alias, checks in recipe["provenance"].get("data_layout_proofs", {}).items():
         for proof in checks:
             expected = bytes.fromhex(proof["bytes"])

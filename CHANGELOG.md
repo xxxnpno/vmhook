@@ -39,6 +39,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Windows Java 8–11 callback return uses HotSpot's `transition_and_fence` with
+  the original stack-guard and special-exit handling. Java 9 guard and exit
+  aliases are verified against exact relative CALL targets. The Windows CI
+  repeats rooted callbacks during moving GC on Java 8–11, 15 and 16.
+
 - Windows x64 and MinGW-w64 G++ are the supported platform and compiler.
   The standalone header remains C++23 permanently; the latest C++ module uses
   static reflection. Both interfaces share the same runtime implementation.
