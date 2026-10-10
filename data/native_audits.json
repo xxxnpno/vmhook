@@ -81,7 +81,8 @@
         "class_loader_data_head": 9364920,
         "interpreter_entry_table": 9337312,
         "field_enable_guards10": 6397504,
-        "field_special_exit10": 6401232
+        "field_special_exit10": 6401232,
+        "frame_oops_interpreted": 2697552
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -695,7 +696,10 @@
             "deallocate_list_data_offset": 24,
             "deallocate_list_data_width": 8,
             "deallocate_list_length_offset": 0,
-            "deallocate_list_length_width": 4
+            "deallocate_list_length_width": 4,
+            "frame_scan_legacy_cld_arg": 0,
+            "frame_scan_small_maps": 0,
+            "frame_stack_slots_relative": 0
           }
         },
         "DispatchTable": {
@@ -785,6 +789,32 @@
             "number_of_method_entries": 34,
             "invalid": -1
           }
+        },
+        "frame": {
+          "size": 48,
+          "members": {
+            "_sp": 0,
+            "_pc": 8,
+            "_fp": 32
+          },
+          "enums": {
+            "storage_size__sp": 8,
+            "storage_size__pc": 8,
+            "storage_size__fp": 8,
+            "interpreter_frame_method_offset": -3,
+            "interpreter_frame_bcp_offset": -8,
+            "interpreter_frame_initial_sp_offset": -9,
+            "interpreter_frame_monitor_block_top_offset": -9,
+            "interpreter_frame_last_sp_offset": -2
+          }
+        },
+        "OopClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_oop_wide": 1,
+            "vtable_count": 2
+          }
         }
       },
       "code_prefixes": {
@@ -853,7 +883,8 @@
         "class_loader_data_head": "0000000000000000",
         "interpreter_entry_table": "00000000000000000000000000000000",
         "field_enable_guards10": "48895c2408574883ec20488b81280100",
-        "field_special_exit10": "48895c240848896c2410488974241857"
+        "field_special_exit10": "48895c240848896c2410488974241857",
+        "frame_oops_interpreted": "48895c24185556574154415541564157488d6c24e04881ec20010000488b05cd"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -1167,6 +1198,29 @@
               "function": "ThreadInVMfromJava::~ThreadInVMfromJava",
               "proof": "The exact native DWORD compare uses the VMStruct-exported stack-guard offset and immediate yellow_reserved_disabled(2), followed by the guard-enable call. The tagged ThreadInVMfromJava destructor requires this reguard before its VM-to-Java transition."
             }
+          },
+          "frame": {
+            "_sp": {
+              "rva": 2698127,
+              "bytes": "488b16",
+              "offset": 0,
+              "storage_size": 8,
+              "proof": "The scanner keeps this frame in RSI; after a null last_sp it loads full-width SP directly from [RSI]. Tagged PRODUCT frame declares SP first."
+            },
+            "_pc": {
+              "rva": 2702279,
+              "bytes": "488b5108",
+              "offset": 8,
+              "storage_size": 8,
+              "proof": "frame::is_interpreted_frame loads full-width PC from [RCX+8] and compares it against exact AbstractInterpreter::_code StubQueue code limits. Its caller branches to this scanner on success."
+            },
+            "_fp": {
+              "rva": 2697634,
+              "bytes": "488b4120",
+              "offset": 32,
+              "storage_size": 8,
+              "proof": "The scanner first loads full-width FP from [RCX+32], then Method from FP-24; the same frame is used for BCI, monitors, mirror and expression-stack scanning."
+            }
           }
         },
         "data_layout_proofs": {
@@ -1286,6 +1340,62 @@
                 "deallocate_list_data_width": 8
               },
               "proof": "Free-list loop loads exact CLD pointer then MOV RBX,qword ptr[RAX+24] payload and reads Metadata* at payload+index*8."
+            },
+            {
+              "rva": 2697129,
+              "bytes": "440fb64c24504c8bc7488bd6488bcbe893010000",
+              "enums": {
+                "frame_scan_legacy_cld_arg": 0,
+                "frame_scan_small_maps": 0
+              },
+              "proof": "Exact ordinary frame::oops_do call copies OopClosure toRDX,map toR8,cache bool toR9,frame toRCX; four machine arguments, no CLDClosure parameter or SmallRegisterMap template. Source9/10 frame.cpp uses the ordinary RegisterMap signature."
+            },
+            {
+              "rva": 2701856,
+              "bytes": "488b4120488b40b8c3",
+              "enums": {
+                "frame_stack_slots_relative": 0
+              },
+              "proof": "Exact monitor-end getter loads the full-width pointer at FP-72 and returns it without adding FP or scaling an offset. The separately checked last_sp path loads the full-width slot at FP-16 directly, using frame SP only when it is null."
+            }
+          ],
+          "frame": [
+            {
+              "rva": 2697704,
+              "bytes": "488b4620488b50c0488b48e8",
+              "enums": {
+                "interpreter_frame_method_offset": -3,
+                "interpreter_frame_bcp_offset": -8
+              },
+              "proof": "Frame FP from this+32, BCP from FP-64 and Method from FP-24 feed Method::bci_from/validate_bci."
+            },
+            {
+              "rva": 2698114,
+              "bytes": "488b4e20488b51f04885d27503488b16",
+              "enums": {
+                "interpreter_frame_last_sp_offset": -2
+              },
+              "proof": "Frame FP from this+32; last_sp from FP-16; when null use frame SP. This is interpreter_frame_tos_address used by expression-stack-size calculation."
+            },
+            {
+              "rva": 2701856,
+              "bytes": "488b4120488b40b8c3",
+              "enums": {
+                "interpreter_frame_initial_sp_offset": -9,
+                "interpreter_frame_monitor_block_top_offset": -9
+              },
+              "proof": "interpreter_frame_monitor_end reads the pointer at FP-72. Its adjacent monitor_begin returns FP-72. Tagged x86 frame places both initial_sp and monitor-block-top at this same slot."
+            }
+          ],
+          "OopClosure": [
+            {
+              "rva": 2697840,
+              "bytes": "488b5620488b07488bcf4883ea20ff5008",
+              "enums": {
+                "vtable_do_oop_wide": 1,
+                "vtable_count": 2
+              },
+              "proof": "Frame mirror is a full-width oop slot at FP-32. The scanner passes that slot in RDX and OopClosure in RCX, then calls [closure_vptr+8], proving the wide overload is slot1. Tagged PRODUCT OopClosure/Closure have no virtual destructor or diagnostic base; OopClosure declares exactly the wide and narrow do_oop virtuals."
             }
           ]
         },
@@ -1306,6 +1416,14 @@
               "target_rva": 6401232,
               "function": "ThreadInVMfromJava::~ThreadInVMfromJava",
               "proof": "The exact destructor tests special-runtime-exit-condition DWORD at576 and external/deopt suspend bits29/28 at48, then loads DL=1 and this relative CALL targets JavaThread::handle_special_runtime_exit_condition(bool)."
+            }
+          ],
+          "frame_oops_interpreted": [
+            {
+              "rva": 2697144,
+              "bytes": "e893010000",
+              "target_rva": 2697552,
+              "proof": "frame::oops_do tests is_interpreted_frame and passes RCX=this,RDX=OopClosure,R8=RegisterMap,R9b=query_oop_map_cache to the exact scanner; no CLDClosure argument. The body matches the tagged source: Method/BCI, monitors, native temporary oop, mirror, invoke arguments, mask_for/compute_one_oop_map, then iterate_oop."
             }
           ]
         }
@@ -1391,7 +1509,8 @@
         "nmethod_metadata_do": 5459392,
         "bytecode_lengths": 9586800,
         "class_loader_data_head": 9606128,
-        "interpreter_entry_table": 9577632
+        "interpreter_entry_table": 9577632,
+        "frame_oops_interpreted": 2796992
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -2009,7 +2128,10 @@
             "deallocate_list_data_offset": 24,
             "deallocate_list_data_width": 8,
             "deallocate_list_length_offset": 0,
-            "deallocate_list_length_width": 4
+            "deallocate_list_length_width": 4,
+            "frame_scan_legacy_cld_arg": 0,
+            "frame_scan_small_maps": 0,
+            "frame_stack_slots_relative": 0
           }
         },
         "DispatchTable": {
@@ -2091,6 +2213,32 @@
             "number_of_method_entries": 34,
             "invalid": -1
           }
+        },
+        "frame": {
+          "size": 48,
+          "members": {
+            "_sp": 0,
+            "_pc": 8,
+            "_fp": 32
+          },
+          "enums": {
+            "storage_size__sp": 8,
+            "storage_size__pc": 8,
+            "storage_size__fp": 8,
+            "interpreter_frame_method_offset": -3,
+            "interpreter_frame_bcp_offset": -8,
+            "interpreter_frame_initial_sp_offset": -9,
+            "interpreter_frame_monitor_block_top_offset": -9,
+            "interpreter_frame_last_sp_offset": -2
+          }
+        },
+        "OopClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_oop_wide": 1,
+            "vtable_count": 2
+          }
         }
       },
       "code_prefixes": {
@@ -2159,7 +2307,8 @@
         "nmethod_metadata_do": "48895c2408488974241048897c24184c",
         "bytecode_lengths": "00000000000000000000000000000000",
         "class_loader_data_head": "0000000000000000",
-        "interpreter_entry_table": "00000000000000000000000000000000"
+        "interpreter_entry_table": "00000000000000000000000000000000",
+        "frame_oops_interpreted": "4c8bdc554156498d6ba84881ec48010000488b05882265004833c44889451844"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -2484,6 +2633,29 @@
               "function": "Identified runtime body with inlined ThreadInVMfromJava destructor",
               "proof": "The exact native DWORD compare uses the VMStruct-exported stack-guard offset and immediate yellow_reserved_disabled(2), followed by the guard-enable call. The tagged ThreadInVMfromJava destructor requires this reguard before its VM-to-Java transition."
             }
+          },
+          "frame": {
+            "_sp": {
+              "rva": 2797562,
+              "bytes": "488b16",
+              "offset": 0,
+              "storage_size": 8,
+              "proof": "The scanner keeps this frame in RSI; after a null last_sp it loads full-width SP directly from [RSI]. Tagged PRODUCT frame declares SP first."
+            },
+            "_pc": {
+              "rva": 2801031,
+              "bytes": "488b5108",
+              "offset": 8,
+              "storage_size": 8,
+              "proof": "frame::is_interpreted_frame loads full-width PC from [RCX+8] and compares it against exact AbstractInterpreter::_code StubQueue code limits. Its caller branches to this scanner on success."
+            },
+            "_fp": {
+              "rva": 2797074,
+              "bytes": "488b4120",
+              "offset": 32,
+              "storage_size": 8,
+              "proof": "The scanner first loads full-width FP from [RCX+32], then Method from FP-24; the same frame is used for BCI, monitors, mirror and expression-stack scanning."
+            }
           }
         },
         "data_layout_proofs": {
@@ -2603,6 +2775,72 @@
                 "deallocate_list_data_width": 8
               },
               "proof": "Free-list loop loads exact CLD pointer then MOV RBX,qword ptr[RAX+24] payload and reads Metadata* at payload+index*8."
+            },
+            {
+              "rva": 2796569,
+              "bytes": "440fb64c24504c8bc7488bd6488bcbe893010000",
+              "enums": {
+                "frame_scan_legacy_cld_arg": 0,
+                "frame_scan_small_maps": 0
+              },
+              "proof": "Exact ordinary frame::oops_do call copies OopClosure toRDX,map toR8,cache bool toR9,frame toRCX; four machine arguments, no CLDClosure parameter or SmallRegisterMap template. Source9/10 frame.cpp uses the ordinary RegisterMap signature."
+            },
+            {
+              "rva": 2800608,
+              "bytes": "488b4120488b40b8c3",
+              "enums": {
+                "frame_stack_slots_relative": 0
+              },
+              "proof": "Exact monitor-end getter loads the full-width pointer at FP-72 and returns it without adding FP or scaling an offset. The separately checked last_sp path loads the full-width slot at FP-16 directly, using frame SP only when it is null."
+            }
+          ],
+          "frame": [
+            {
+              "rva": 2797149,
+              "bytes": "488b4620488b50c0488b48e8",
+              "enums": {
+                "interpreter_frame_method_offset": -3,
+                "interpreter_frame_bcp_offset": -8
+              },
+              "proof": "Frame FP from this+32, BCP from FP-64 and Method from FP-24 feed Method::bci_from/validate_bci."
+            },
+            {
+              "rva": 2797549,
+              "bytes": "488b4e20488b51f04885d27503488b16",
+              "enums": {
+                "interpreter_frame_last_sp_offset": -2
+              },
+              "proof": "Frame FP from this+32; last_sp from FP-16; when null use frame SP. This is interpreter_frame_tos_address used by expression-stack-size calculation."
+            },
+            {
+              "rva": 2800608,
+              "bytes": "488b4120488b40b8c3",
+              "enums": {
+                "interpreter_frame_initial_sp_offset": -9,
+                "interpreter_frame_monitor_block_top_offset": -9
+              },
+              "proof": "interpreter_frame_monitor_end reads the pointer at FP-72. Its adjacent monitor_begin returns FP-72. Tagged x86 frame places both initial_sp and monitor-block-top at this same slot."
+            }
+          ],
+          "OopClosure": [
+            {
+              "rva": 2797280,
+              "bytes": "488b5620488b07488bcf4883ea20ff5008",
+              "enums": {
+                "vtable_do_oop_wide": 1,
+                "vtable_count": 2
+              },
+              "proof": "Frame mirror is a full-width oop slot at FP-32. The scanner passes that slot in RDX and OopClosure in RCX, then calls [closure_vptr+8], proving the wide overload is slot1. Tagged PRODUCT OopClosure/Closure have no virtual destructor or diagnostic base; OopClosure declares exactly the wide and narrow do_oop virtuals."
+            }
+          ]
+        },
+        "function_reference_proofs": {
+          "frame_oops_interpreted": [
+            {
+              "rva": 2796584,
+              "bytes": "e893010000",
+              "target_rva": 2796992,
+              "proof": "frame::oops_do tests is_interpreted_frame and passes RCX=this,RDX=OopClosure,R8=RegisterMap,R9b=query_oop_map_cache to the exact scanner; no CLDClosure argument. The body matches the tagged source: Method/BCI, monitors, native temporary oop, mirror, invoke arguments, mask_for/compute_one_oop_map, then iterate_oop."
             }
           ]
         }

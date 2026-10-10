@@ -381,6 +381,50 @@ class Pdb:
             return {"storage_size": next(iter(sizes)) if sizes else 0}
         return {"storage_size": 0}
 
+    def points_to(self, index: int, name: str, depth: int,
+                  seen: frozenset[int] = frozenset()) -> bool:
+        """Identify an exact pointer target without relying on overload order."""
+        if index in seen or len(seen) > 16 or index not in self.records:
+            return False
+        seen = seen | {index}
+        leaf, record = self.records[index]
+        if leaf == 0x1001:  # LF_MODIFIER
+            return self.points_to(integer(record, 0), name, depth, seen)
+        if depth:
+            if leaf != 0x1002 or (integer(record, 4) >> 5) & 7:
+                return False  # LF_POINTER, excluding references/member pointers
+            return self.points_to(integer(record, 0), name, depth - 1, seen)
+        return leaf in (0x1504, 0x1505, 0x1506) and self.class_info(index)["name"] == name
+
+    def wide_oop_closure(self) -> dict:
+        """Resolve do_oop(oopDesc**) and its Microsoft vtable slot from TPI."""
+        layouts = []
+        for definition in self.classes.get("OopClosure", []):
+            wide, slots = [], []
+            for method in self.fields(definition["field_index"]):
+                if method["kind"] != "method" or method["virtual_offset"] is None:
+                    continue
+                offset = method["virtual_offset"]
+                if offset % 8 or offset > 1024:
+                    raise ProfileError("Invalid bounded OopClosure virtual slot")
+                slots.append(offset // 8)
+                if method["name"] != "do_oop":
+                    continue
+                leaf, record = self.records[method["type_index"]]
+                if leaf != 0x1009 or integer(record, 0) != 3 or integer(record, 14, "H") != 1:
+                    raise ProfileError("OopClosure do_oop is not a void member function")
+                arguments_leaf, arguments = self.records[integer(record, 16)]
+                if arguments_leaf != 0x1201 or integer(arguments, 0) != 1:
+                    raise ProfileError("OopClosure do_oop does not have one argument")
+                if self.points_to(integer(arguments, 4), "oopDesc", 2):
+                    wide.append(offset // 8)
+            if len(wide) != 1 or not slots:
+                raise ProfileError("Ambiguous OopClosure wide do_oop overload")
+            layouts.append({"vtable_do_oop_wide": wide[0], "vtable_count": max(slots) + 1})
+        if not layouts or any(layout != layouts[0] for layout in layouts[1:]):
+            raise ProfileError("Conflicting OopClosure virtual layouts")
+        return layouts[0]
+
     def describe(self, name: str, seen: frozenset[str] = frozenset()) -> dict:
         if name in seen:
             raise ProfileError("Cyclic PDB class inheritance")
@@ -469,6 +513,19 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
         raise ProfileError(f"PDB/DLL identity mismatch: {pdb.identity} != {image.identity}")
     types = {name: pdb.describe(name) for name in names if name in pdb.classes}
     symbols = pdb.symbols(image.sections, image.image_size)
+    if "frame" in names:
+        frame = types["frame"]
+        offsets = pdb.describe("frame::<unnamed-enum-pc_return_offset>")["enums"]
+        for name in ("interpreter_frame_method_offset", "interpreter_frame_last_sp_offset",
+                     "interpreter_frame_initial_sp_offset", "interpreter_frame_monitor_block_top_offset"):
+            frame["enums"][name] = offsets[name]
+        bcp_offsets = [offsets[name] for name in ("interpreter_frame_bcp_offset", "interpreter_frame_bcx_offset")
+                       if name in offsets]
+        if len(bcp_offsets) != 1:
+            raise ProfileError("Ambiguous interpreter-frame bytecode-pointer offset")
+        frame["enums"]["interpreter_frame_bcp_offset"] = bcp_offsets[0]
+    if "OopClosure" in names:
+        types["OopClosure"]["enums"].update(pdb.wide_oop_closure())
     if "ObservationABI" in names:
         # This explicitly synthetic profile record contains signature/layout
         # selectors, not a native object layout. See derived_profile_facts in
@@ -520,6 +577,67 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
                 "method_dont_inline_offset": flag_offset,
                 "method_dont_inline_storage_size": flag_width,
                 "thread_is_java_slot": java_thread_slot // 8}}
+        if "frame" in names:
+            legacy_scan = "?oops_interpreted_do@frame@@QEAAXPEAVOopClosure@@PEAVCLDClosure@@PEBVRegisterMap@@_N@Z" in symbols
+            ordinary_scans = tuple(name in symbols for name in (
+                "?oops_interpreted_do@frame@@QEAAXPEAVOopClosure@@PEBVRegisterMap@@_N@Z",
+                "?oops_interpreted_do@frame@@QEBAXPEAVOopClosure@@PEBVRegisterMap@@_N@Z"))
+            template_scan = "??$oops_interpreted_do@VRegisterMap@@@frame@@QEBAXPEAVOopClosure@@PEBVRegisterMap@@_N@Z" in symbols
+            small_scan = tuple(name in symbols for name in (
+                "??$oops_interpreted_do@V?$SmallRegisterMapType@$0A@@@@frame@@QEBAXPEAVOopClosure@@PEBV?$SmallRegisterMapType@$0A@@@_N@Z",
+                "??$oops_interpreted_do@V?$SmallRegisterMapType@$00@@@frame@@QEBAXPEAVOopClosure@@PEBV?$SmallRegisterMapType@$00@@_N@Z"))
+            if sum((legacy_scan, *ordinary_scans, template_scan)) != 1 or any(flag != template_scan for flag in small_scan):
+                raise ProfileError("Ambiguous interpreted-frame scanning signatures")
+            types["ObservationABI"]["enums"].update({
+                "frame_scan_legacy_cld_arg": int(legacy_scan),
+                "frame_scan_small_maps": int(template_scan)})
+            # Physical interpreter-stack slots can hold either absolute pointers
+            # or signed word offsets from FP. The named getter's exact bytes,
+            # checked against TPI field/slot offsets, distinguish the three ABIs.
+            frame = types["frame"]
+            fp = frame["members"]["_fp"]["offset"]
+            monitor = 8 * frame["enums"]["interpreter_frame_monitor_block_top_offset"]
+            if not 0 <= fp < 128 or not -128 <= monitor < 0:
+                raise ProfileError("Interpreter monitor getter offsets exceed audited encodings")
+            getter = "?interpreter_frame_monitor_end@frame@@QEBAPEAVBasicObjectLock@@XZ"
+            if getter not in symbols:
+                raise ProfileError("Interpreted-frame monitor getter is missing from matching PDB")
+            code = image.read(symbols[getter], 32)
+            absolute = b"\x48\x8b\x41" + bytes([fp]) + b"\x48\x8b\x40" + bytes([monitor & 255]) + b"\xc3"
+            relative = b"\x48\x8b\x51" + bytes([fp]) + b"\x48\x8b\x42" + bytes([monitor & 255]) + b"\x48\x8d\x04\xc2\xc3"
+            heap = frame["members"].get("_on_heap")
+            conditional = b""
+            if heap and 0 <= heap["offset"] < 128:
+                conditional = b"\x80\x79" + bytes([heap["offset"]]) + b"\0" + relative[:8] + b"\x74\x04" + relative[8:]
+            if code.startswith(relative):
+                slots_relative = True
+            elif code.startswith(absolute) or conditional and code.startswith(conditional):
+                slots_relative = False  # Conditional relocation concerns heap frames only.
+            else:
+                raise ProfileError("Interpreted-frame monitor getter differs from audited ABI patterns")
+            size_getters = [name for name in symbols if name.startswith("?interpreter_frame_expression_stack_size@frame@@")]
+            if len(size_getters) != 1:
+                raise ProfileError("Ambiguous interpreted expression-stack-size getter")
+            code = image.read(symbols[size_getters[0]], 96)
+            last = 8 * frame["enums"]["interpreter_frame_last_sp_offset"]
+            if not -128 <= last < 0:
+                raise ProfileError("Interpreter last_sp offset exceeds audited encodings")
+            last_byte = bytes([last & 255])
+            relative_last = b"\x48\x8b\x51" + last_byte + b"\x48\x85\xd2\x74\x09\x48\x8d\x14\xd1"
+            absolute_last = (b"\x48\x8b\x53" + bytes([fp]) + b"\x4c\x8b\x42" + last_byte + b"\x4d\x85\xc0\x75\x03\x4c\x8b\x03",
+                             b"\x48\x8b\x43" + bytes([fp]) + b"\x4c\x8b\x40" + last_byte + b"\x4d\x85\xc0\x75\x03\x4c\x8b\x03")
+            conditional_last = (b"\x74\x0a\x49\x8b\x50" + last_byte + b"\x4d\x8d\x04\xd0\xeb\x04\x4d\x8b\x40" + last_byte,
+                                b"\x74\x0a\x49\x8b\x40" + last_byte + b"\x4d\x8d\x04\xc0\xeb\x04\x4d\x8b\x40" + last_byte)
+            if slots_relative:
+                matches_last = relative_last in code
+            elif heap:
+                heap_load = b"\x80\x7b" + bytes([heap["offset"]]) + b"\0\x4c\x8b\x43" + bytes([fp])
+                matches_last = heap_load in code and any(pattern in code for pattern in conditional_last)
+            else:
+                matches_last = any(pattern in code for pattern in absolute_last)
+            if not matches_last:
+                raise ProfileError("Physical last_sp conversion disagrees with the monitor-slot ABI")
+            types["ObservationABI"]["enums"]["frame_stack_slots_relative"] = int(slots_relative)
         special_klass = {f"{kind}_klass_{part}": 0
                          for kind in ("anonymous", "hidden")
                          for part in ("offset", "width", "mask")}

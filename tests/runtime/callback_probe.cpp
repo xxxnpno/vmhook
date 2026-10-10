@@ -92,7 +92,8 @@ namespace
             { vmhook::windows::Sleep(10); }
             const auto returned{static_cast<std::int32_t>(callback_fixture::getField("validReturns")->get())};
             report << "callbacks=" << callback_count.load() << "\nnested=" << nested_count.load()
-                   << "\ngc_observed=" << observed_gc.load() << "\nreturns=" << returned << '\n';
+                   << "\ngc_observed=" << observed_gc.load() << "\nreturns=" << returned
+                   << "\nreturn_roots_scanned=" << vmhook::detail::callback_return_roots::scanned_slots.load() << '\n';
             if (callback_count.load() != 24) { check(false, "worker.callback_count"); }
             else if (nested_count.load() != 24) { check(false, "worker.nested_count"); }
             else if (observed_gc.load() == 0) { check(false, "worker.gc_observed"); }

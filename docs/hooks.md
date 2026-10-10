@@ -32,6 +32,13 @@ descriptor. VMHook checks that signature before installation. Pass the
 descriptor when a name is overloaded. A duplicate hook on the same method is
 refused.
 
+For an object-valued cancellation, the returned object stays rooted across the
+VM-to-Java transition and the real HotSpot return epilogue. VMHook supplies its
+synthetic operand-stack cell to the genuine GC frame scanner; a moving collector
+updates the address subsequently consumed by the epilogue. The original BCI0
+oop map alone would omit that cell. This is verified for platform-thread frames;
+virtual-thread frames remain outside the verified scope.
+
 The declaring class must already be loaded and linked. Registration does not
 load, link or initialize it. A class that has merely been loaded can still lack
 the interpreter entries and adapters needed for a hook; registration then
@@ -282,7 +289,10 @@ under **Wine 10.0**, with no JVM tuning, agent or JIT arguments:
 Each Java major runs the JIT, field, class and callback fixtures. The 47 strict
 assertions per major are separate from the callback fixture's 24 nested calls
 and rooted object returns; every callback fixture observes independent GC
-progress. Both source and probe hashes remain unchanged through their matrices.
+progress. Object returns expose their actual expression-stack cell to the
+genuine GC frame scanner while keeping HotSpot's normal return epilogue.
+Virtual thread frames remain outside this platform-frame validation.
+Both source and probe hashes remain unchanged through their matrices.
 These results cover the manifest's exact images and default collectors.
 Native Windows CI for the new backend is pending; the older passing runs at
 `cdbf2e5` predate it.

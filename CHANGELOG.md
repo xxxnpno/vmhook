@@ -39,6 +39,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Object-valued method cancellation keeps its synthetic return stack cell
+  visible to HotSpot's real GC frame walker. Moving collectors update the
+  address consumed by the normal return epilogue, including its safepoint
+  polls and stack-watermark handling. Exact profiles cover Java 8's temporary
+  BCI representation, relative stack slots from Java 22 and all three scanner
+  specializations in Java 26/27. Frozen runtime probes report actual visits to
+  that additional root; virtual-thread frames remain outside verified scope.
 - Windows Java 8–11 callback return uses HotSpot's `transition_and_fence` with
   the original stack-guard and special-exit handling. Java 9 guard and exit
   aliases are verified against exact relative CALL targets. The Windows CI

@@ -215,6 +215,8 @@ def resolve_profile(profile: dict, manifest: dict) -> dict:
     selected = dict(profile.get("aliases", {}))
     for key, names in aliases.items():
         matches = [name for name in names if name in profile["symbols"]]
+        if key.startswith("frame_oops_interpreted") and len(matches) > 1:
+            raise pp.ProfileError("Ambiguous interpreted-frame scanner alias: " + key)
         if matches:
             selected[key] = profile["symbols"][matches[0]]
     for forbidden in ("should_post_thread_life", "post_thread_start"):
@@ -233,6 +235,41 @@ def resolve_profile(profile: dict, manifest: dict) -> dict:
     }
     if not symbols:
         caps.update(profile["capabilities"])
+    frame = types.get("frame")
+    closure = types.get("OopClosure")
+    observation = types.get("ObservationABI", {}).get("enums", {})
+    if not frame or not closure or not selected.get("frame_oops_interpreted"):
+        raise pp.ProfileError("Interpreted-frame root scanning facts are missing; regenerate the profiles")
+    for member in ("_sp", "_pc", "_fp"):
+        field = frame["members"].get(member)
+        if not field or frame["enums"].get("storage_size_" + member) != 8 or \
+                field["offset"] < 0 or field["offset"] + 8 > frame["size"]:
+            raise pp.ProfileError("Invalid bounded frame pointer layout: " + member)
+    heap = frame["members"].get("_on_heap")
+    if "_offset_fp" in frame["members"] and not heap:
+        raise pp.ProfileError("Relative frame pointers require a heap-frame discriminator")
+    if heap and (frame["enums"].get("storage_size__on_heap") != 1 or not 0 <= heap["offset"] < frame["size"]):
+        raise pp.ProfileError("Invalid bounded heap-frame discriminator")
+    for selector in ("interpreter_frame_method_offset", "interpreter_frame_bcp_offset",
+                     "interpreter_frame_initial_sp_offset", "interpreter_frame_monitor_block_top_offset",
+                     "interpreter_frame_last_sp_offset"):
+        value = frame["enums"].get(selector)
+        if not isinstance(value, int) or not -64 <= value < 0:
+            raise pp.ProfileError("Invalid bounded interpreted-frame slot: " + selector)
+    slot, count = closure["enums"].get("vtable_do_oop_wide"), closure["enums"].get("vtable_count")
+    if not isinstance(slot, int) or not isinstance(count, int) or not 0 <= slot < count <= 128:
+        raise pp.ProfileError("Invalid bounded OopClosure wide virtual slot")
+    legacy_scan, small_scan = observation.get("frame_scan_legacy_cld_arg"), observation.get("frame_scan_small_maps")
+    relative_slots = observation.get("frame_stack_slots_relative")
+    if legacy_scan not in (0, 1) or small_scan not in (0, 1) or relative_slots not in (0, 1) or legacy_scan and small_scan:
+        raise pp.ProfileError("Invalid interpreted-frame scanning ABI selectors")
+    if symbols:
+        legacy_name = "?oops_interpreted_do@frame@@QEAAXPEAVOopClosure@@PEAVCLDClosure@@PEBVRegisterMap@@_N@Z"
+        if bool(legacy_scan) != (legacy_name in symbols):
+            raise pp.ProfileError("Interpreted-frame legacy ABI selector disagrees with matching symbols")
+    if any(bool(selected.get(alias)) != bool(small_scan)
+           for alias in ("frame_oops_interpreted_small0", "frame_oops_interpreted_small1")):
+        raise pp.ProfileError("Incomplete interpreted-frame SmallRegisterMap scanning coverage")
     profile["aliases"], profile["capabilities"] = selected, caps
     return profile
 

@@ -10,7 +10,7 @@ import vmhook.windows;
 // CPU stack effects are simulated independently; the operating system consumes
 // the generated UNWIND_INFO at every instruction boundary and both jump sites.
 namespace {
-enum class operation { push, allocate, anchor_rsp, anchor_r11, save_rsp, save_rax, call, jump };
+enum class operation { push, allocate, anchor_rsp, anchor_r11, anchor_rbp_from_r11, save_rsp, save_rax, call, jump };
 struct instruction {
     std::size_t offset{}, size{};
     operation action{};
@@ -20,7 +20,7 @@ struct instruction {
 
 constexpr std::array<unsigned, 8> nonvolatile{3, 5, 6, 7, 12, 13, 14, 15};
 constexpr DWORD64 poison = 0xdddd000000000000ull;
-// Twenty distinct instruction sequences from the eighty Java 8-27 entries.
+// Audited instruction sequences from the Java 8-27 entries.
 constexpr std::byte prefix_0[]{std::byte{0x48},std::byte{0x89},std::byte{0x5c},std::byte{0x24},std::byte{0x18}};
 constexpr std::byte prefix_1[]{std::byte{0x4c},std::byte{0x8b},std::byte{0xdc},std::byte{0x55},std::byte{0x48},std::byte{0x81},std::byte{0xec},std::byte{0x30},std::byte{0x02},std::byte{0x00},std::byte{0x00}};
 constexpr std::byte prefix_2[]{std::byte{0x48},std::byte{0x89},std::byte{0x5c},std::byte{0x24},std::byte{0x08}};
@@ -41,8 +41,11 @@ constexpr std::byte prefix_16[]{std::byte{0x48},std::byte{0x8b},std::byte{0xc4},
 constexpr std::byte prefix_17[]{std::byte{0x40},std::byte{0x53},std::byte{0x55},std::byte{0x41},std::byte{0x57}};
 constexpr std::byte prefix_18[]{std::byte{0x40},std::byte{0x53},std::byte{0x41},std::byte{0x56},std::byte{0x41},std::byte{0x57}};
 constexpr std::byte prefix_19[]{std::byte{0x40},std::byte{0x53},std::byte{0x55},std::byte{0x56},std::byte{0x48},std::byte{0x83},std::byte{0xec},std::byte{0x40}};
-constexpr std::array<std::span<const std::byte>, 20> prefixes{
-    prefix_0, prefix_1, prefix_2, prefix_3, prefix_4, prefix_5, prefix_6, prefix_7, prefix_8, prefix_9, prefix_10, prefix_11, prefix_12, prefix_13, prefix_14, prefix_15, prefix_16, prefix_17, prefix_18, prefix_19
+// Java 26/27 RegisterMap and SmallRegisterMapWithArgs scanners: save caller RBP,
+// then set RBP to entry RSP-95 without declaring a Windows unwind frame register.
+constexpr std::byte prefix_20[]{std::byte{0x4c},std::byte{0x8b},std::byte{0xdc},std::byte{0x55},std::byte{0x49},std::byte{0x8d},std::byte{0x6b},std::byte{0xa1}};
+constexpr std::array<std::span<const std::byte>, 21> prefixes{
+    prefix_0, prefix_1, prefix_2, prefix_3, prefix_4, prefix_5, prefix_6, prefix_7, prefix_8, prefix_9, prefix_10, prefix_11, prefix_12, prefix_13, prefix_14, prefix_15, prefix_16, prefix_17, prefix_18, prefix_19, prefix_20
 };
 
 auto reg(CONTEXT& context, unsigned index) -> DWORD64& {
@@ -83,6 +86,10 @@ auto decode(std::span<const std::byte> bytes, std::vector<instruction>& output) 
         } else if (left >= 3 && byte(offset) == 0x4c && byte(offset + 1) == 0x8b && byte(offset + 2) == 0xdc) {
             output.push_back({offset, 3, operation::anchor_r11});
             offset += 3;
+        } else if (left >= 4 && byte(offset) == 0x49 && byte(offset + 1) == 0x8d && byte(offset + 2) == 0x6b) {
+            output.push_back({offset, 4, operation::anchor_rbp_from_r11, 5,
+                              static_cast<std::int8_t>(byte(offset + 3))});
+            offset += 4;
         } else if (left >= 4 && byte(offset) == 0x48 && byte(offset + 1) == 0x83 && byte(offset + 2) == 0xec) {
             output.push_back({offset, 4, operation::allocate, 0, static_cast<int>(byte(offset + 3))});
             offset += 4;
@@ -139,6 +146,9 @@ auto execute(const instruction& ins, CONTEXT& context, unsigned& saved_mask) -> 
     case operation::anchor_r11:
         context.R11 = context.Rsp;
         break;
+    case operation::anchor_rbp_from_r11:
+        context.Rbp = context.R11 + ins.displacement;
+        break;
     case operation::save_rsp:
     case operation::save_rax:
         *reinterpret_cast<DWORD64*>((ins.action == operation::save_rsp ? context.Rsp : context.Rax)
@@ -178,10 +188,12 @@ auto detour() -> void {}
 
 auto unwind_at(std::byte* code, std::size_t offset, CONTEXT context, unsigned saved_mask,
                DWORD64 entry_rsp, DWORD64 return_address, int feature, std::size_t hook,
-               bool expect_pass = true, bool report_failure = true) -> bool {
+               bool expect_pass = true, bool report_failure = true,
+               bool poison_saved_registers = true) -> bool {
     // Make restoration observable even for stores which do not themselves
     // change a nonvolatile register. Only already-saved registers are poisoned.
-    for (const auto index : nonvolatile) if (saved_mask & (1u << index)) reg(context, index) = poison | index;
+    if (poison_saved_registers)
+        for (const auto index : nonvolatile) if (saved_mask & (1u << index)) reg(context, index) = poison | index;
     context.Rip = reinterpret_cast<DWORD64>(code + offset);
     DWORD64 image_base{};
     auto* function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
@@ -214,6 +226,7 @@ auto unwind_at(std::byte* code, std::size_t offset, CONTEXT context, unsigned sa
 auto main() -> int {
     std::size_t profiles{}, boundary_checks{}, relay_checks{}, negative_controls{}, ff25_detected{};
     std::size_t relocated_call_checks{}, relocated_jump_checks{}, anchor_execution_checks{}, continuation_encoding_checks{};
+    std::size_t rbp_lea_checks{}, rbp_lea_metadata_checks{};
     struct fixture { int feature; std::size_t index; std::span<const std::byte> prefix; };
     std::vector<fixture> fixtures;
     for (std::size_t index = 0; index < prefixes.size(); ++index) {
@@ -236,6 +249,7 @@ auto main() -> int {
             if (!target) return 2;
             std::memcpy(target, prefix.data(), prefix.size());
             const auto has_r11_anchor = std::any_of(instructions.begin(), instructions.end(), [](const auto& ins) { return ins.action == operation::anchor_r11; });
+            const auto has_rbp_lea = std::any_of(instructions.begin(), instructions.end(), [](const auto& ins) { return ins.action == operation::anchor_rbp_from_r11; });
             auto* resume = target + prefix.size();
             if (has_r11_anchor) {
                 std::int32_t stack_size{};
@@ -282,6 +296,20 @@ auto main() -> int {
             for (const auto reg_index : nonvolatile) reg(context, reg_index) = original_value(reg_index);
             unsigned saved_mask{};
             bool passed = true;
+            if (has_rbp_lea) {
+                DWORD64 image_base{};
+                auto* function = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(code), &image_base, nullptr);
+                const auto* info = function ? reinterpret_cast<const unsigned char*>(image_base + function->UnwindData) : nullptr;
+                // The LEA changes RBP, but this prefix has exactly one stack
+                // effect: PUSH_NONVOL RBP ending at offset4. SET_FPREG would
+                // incorrectly make unwinding depend on the changed RBP.
+                const bool metadata_ok = info && info[0] == 1 && info[1] == 8
+                    && info[2] == 1 && info[3] == 0 && info[4] == 4 && info[5] == 0x50;
+                passed &= metadata_ok;
+                ++rbp_lea_metadata_checks;
+                std::printf("feature=%d hook=%zu rbp_lea_rsp_unwind_metadata=%s\n",
+                            profile.feature, index, metadata_ok ? "pass" : "fail");
+            }
             const auto continuation_ok = code[prefix.size()] == std::byte{0x49}
                 && code[prefix.size() + 1] == std::byte{0xba}
                 && code[prefix.size() + 10] == std::byte{0x41}
@@ -315,6 +343,18 @@ auto main() -> int {
                 passed &= unwind_at(code, ins.offset, context, saved_mask, entry_rsp, return_address, profile.feature, index);
                 ++boundary_checks;
                 execute(ins, context, saved_mask);
+                if (ins.action == operation::anchor_rbp_from_r11) {
+                    const bool state_ok = context.Rbp == entry_rsp - 95 && context.Rsp == entry_rsp - 8;
+                    // Keep the actual LEA-produced RBP for this check. The
+                    // normal boundary checks also poison it, proving that
+                    // Windows restores caller RBP from the saved stack cell.
+                    const bool restored = unwind_at(code, ins.offset + ins.size, context, saved_mask,
+                        entry_rsp, return_address, profile.feature, index, true, true, false);
+                    passed &= state_ok && restored;
+                    ++rbp_lea_checks;
+                    std::printf("feature=%d hook=%zu rbp_lea_state_and_unwind=%s\n",
+                                profile.feature, index, state_ok && restored ? "pass" : "fail");
+                }
             }
             passed &= unwind_at(code, prefix.size(), context, saved_mask, entry_rsp, return_address, profile.feature, index);
             ++boundary_checks;
@@ -364,10 +404,13 @@ auto main() -> int {
             // remain resident for the process lifetime, matching the hook API.
     }
     all_passed &= profiles == fixtures.size() && negative_controls == 1 && relocated_call_checks == 1
-        && relocated_jump_checks == 1 && anchor_execution_checks == 1;
+        && relocated_jump_checks == 1 && anchor_execution_checks == 2
+        && rbp_lea_checks == 1 && rbp_lea_metadata_checks == 1;
     std::printf("profiles=%zu instruction_boundary_checks=%zu relay_checks=%zu negative_controls=%zu relocated_call_checks=%zu relocated_jump_checks=%zu r11_anchor_checks=%zu continuation_r10_checks=%zu\n",
                 profiles, boundary_checks, relay_checks, negative_controls, relocated_call_checks,
                 relocated_jump_checks, anchor_execution_checks, continuation_encoding_checks);
+    std::printf("rbp_lea_checks=%zu rbp_lea_rsp_unwind_metadata_checks=%zu\n",
+                rbp_lea_checks, rbp_lea_metadata_checks);
     std::printf("synthetic_unwind=%s\n", all_passed ? "pass" : "fail");
     return all_passed ? 0 : 1;
 }

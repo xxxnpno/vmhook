@@ -106,7 +106,14 @@ to complete while its roots and the interrupted Java frame remain visible.
 The temporary context protects the receiver, object arguments and results until
 the callback returns. Returning a Java reference through `return_value::set`
 transfers it into a VM-scanned thread result slot across the VM-to-Java
-transition, then reloads its relocated address for the interpreter. Closing the
+transition, then reloads its relocated address for the interpreter. The normal
+HotSpot return epilogue can poll or process a stack watermark afterward. A
+cancelled method is still at BCI0, whose ordinary oop map has an empty operand
+stack, so VMHook adds the synthetic return cell to the genuine frame scan. The
+collector visits and updates the actual cell that the epilogue will pop, rather
+than only keeping a separate copy of the object alive. The normal epilogue and
+safepoint handling remain intact. These paths are verified for platform-thread
+frames; virtual-thread frames remain outside the verified scope. Closing the
 temporary context invalidates C++ references retained beyond the callback.
 
 For the profiled Windows Java 8–11 images, callback return uses HotSpot's

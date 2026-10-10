@@ -214,7 +214,10 @@ installation finishes. No JVM launch flags are required.
 
 Method and field callbacks run synchronously on the executing Java thread, in
 native state. They can use the wrapper API to call Java or create objects;
-their temporary roots survive GC until the callback returns. Ordinary Java
+their temporary roots survive GC until the callback returns. A forced object
+return also remains visible to the collector through HotSpot's normal return
+epilogue, including its safepoint polls. Platform-thread frames are verified;
+virtual-thread frames remain outside the verified scope. Ordinary Java
 bytecode methods are supported; native, abstract, constructor, class-initializer
 methods and methods with an active HotSpot intrinsic ID are refused. See
 [hooks and notifications](docs/hooks.md)
@@ -386,7 +389,11 @@ Each observation matrix runs four fixtures per Java major. Its 47 strict
 assertions cover actual compilation and inlining, deoptimization, future
 compilation, all eight primitive field types, new definitions and removal.
 Every callback fixture additionally completes 24 nested calls and rooted
-object returns while independent GC progresses. Source and DLL hashes are
+object returns while independent GC progresses. Its synthetic object return
+cell participates in HotSpot's genuine GC frame scan, preserving the normal
+return epilogue and moving-GC address updates. This covers the tested platform
+thread frames; virtual thread frames remain outside the verified scope.
+Source and DLL hashes are
 checked before and after the run. The G++ 14.2 build passed **8/8 CTest suites**. The combined G++ 16.2 header/module build passed **15/15 CTest suites**.
 
 Native Windows CI for this observation backend is **pending**. The
