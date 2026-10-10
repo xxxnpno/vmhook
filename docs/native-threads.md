@@ -233,9 +233,7 @@ The current frozen public probes passed **400/400 strict assertions on each
 interface**, across all 20 Java majors 8–27 under **Wine 10.0**: MinGW-w64
 G++ 14.2 for the C++23 header and Windows G++ 16.2 for the C++26 module.
 The matrices record unchanged source and DLL hashes. These are current-source
-results for the manifest's exact images and default collectors. Native Windows
-CI for the new observation backend remains pending; the completed native CI
-results below belong to the earlier direct-native implementation.
+results for the manifest's exact images and default collectors. Native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The logs confirm the 40 direct-native and observation jobs across Java 8–27 and both interfaces. The completed CI results below belong to the earlier direct-native implementation. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
 
 The earlier public probe at
 [commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c)

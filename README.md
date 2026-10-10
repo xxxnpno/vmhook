@@ -396,9 +396,7 @@ thread frames; virtual thread frames remain outside the verified scope.
 Source and DLL hashes are
 checked before and after the run. The G++ 14.2 build passed **8/8 CTest suites**. The combined G++ 16.2 header/module build passed **15/15 CTest suites**.
 
-Native Windows CI for this observation backend is **pending**. The
-[workflow](.github/workflows/build.yml) runs both interfaces on all 20 profiled
-JVMs; the Wine results above are identified separately.
+Native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The 52 Windows jobs cover both builds, all 40 direct-native and observation jobs across Java 8–27, and the 10 interpreter/dispatch jobs. One Ubuntu job reproduces the private profiles. The Wine matrices above identify their separate frozen probes. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
 
 The older direct-native implementation at
 [commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c)

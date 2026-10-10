@@ -294,8 +294,7 @@ genuine GC frame scanner while keeping HotSpot's normal return epilogue.
 Virtual thread frames remain outside this platform-frame validation.
 Both source and probe hashes remain unchanged through their matrices.
 These results cover the manifest's exact images and default collectors.
-Native Windows CI for the new backend is pending; the older passing runs at
-`cdbf2e5` predate it.
+Native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The logs confirm all four observation fixtures in every Java 8–27 job for both interfaces. The older runs at `cdbf2e5` remain historical. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
 
 ## Reproduce the public observation fixtures
 
