@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <chrono>
 #include <fstream>
 #endif
 
@@ -36,6 +37,7 @@ namespace
 
     auto worker(void*) -> vmhook::windows::DWORD
     {
+        const auto worker_started{std::chrono::steady_clock::now()};
         char destination[4096]{};
         if (!vmhook::windows::GetEnvironmentVariableA("VMHOOK_CALLBACK_RESULT", destination, sizeof(destination)))
         { return 1; }
@@ -87,12 +89,30 @@ namespace
                 })};
             if (!nested || !main) { throw vmhook::exception{"Callback hooks refused"}; }
             callback_fixture::getField("start")->set(true);
-            for (unsigned attempt{}; attempt < 3000 && correct.load(std::memory_order_acquire)
-                && static_cast<std::int32_t>(callback_fixture::getField("validReturns")->get()) < 24; ++attempt)
-            { vmhook::windows::Sleep(10); }
+            // Field reads can wait for safepoints during the concurrent GC storm.
+            const auto wait_started{std::chrono::steady_clock::now()};
+            const auto deadline{wait_started + std::chrono::seconds{120}};
+            unsigned polls{};
+            bool deadline_reached{};
+            while (correct.load(std::memory_order_acquire))
+            {
+                if (std::chrono::steady_clock::now() >= deadline)
+                { deadline_reached = true; break; }
+                ++polls;
+                const auto observed{static_cast<std::int32_t>(callback_fixture::getField("validReturns")->get())};
+                if (std::chrono::steady_clock::now() >= deadline)
+                { deadline_reached = true; break; }
+                if (observed >= 24) { break; }
+                vmhook::windows::Sleep(10);
+            }
+            if (deadline_reached) { check(false, "worker.wait_deadline"); }
             const auto returned{static_cast<std::int32_t>(callback_fixture::getField("validReturns")->get())};
+            const auto finished{std::chrono::steady_clock::now()};
             report << "callbacks=" << callback_count.load() << "\nnested=" << nested_count.load()
                    << "\ngc_observed=" << observed_gc.load() << "\nreturns=" << returned
+                   << "\nwait_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(finished - wait_started).count()
+                   << "\nworker_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(finished - worker_started).count()
+                   << "\npolls=" << polls << "\nwait_completed=" << (returned == 24)
                    << "\nreturn_roots_scanned=" << vmhook::detail::callback_return_roots::scanned_slots.load() << '\n';
             if (callback_count.load() != 24) { check(false, "worker.callback_count"); }
             else if (nested_count.load() != 24) { check(false, "worker.nested_count"); }
