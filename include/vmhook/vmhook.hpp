@@ -19878,11 +19878,11 @@ namespace vmhook
     /*
         @brief Resolves the HotSpot klass* directly from a decoded OOP header.
 
-        On x64 HotSpot (compressed class pointers enabled, the default):
-          offset 0  : mark word (8 bytes)
-          offset 8  : narrow klass (uint32_t, 4 bytes)
-        The narrow klass is decoded the same way as regular narrow oops but using
-        the klass base/shift instead of the oop base/shift.
+        Header layout follows the verified VMStructs and active header mode:
+          ordinary headers: read the metadata-selected wide or narrow klass slot;
+          compact headers: extract narrow klass bits from the verified mark word.
+        Narrow klass pointers use the klass base/shift codec, separately from
+        the oop base/shift; an unavailable layout or codec is refused.
 
         Returns nullptr if the pointer is invalid or decoding fails.
     */
@@ -19937,15 +19937,15 @@ namespace vmhook
         Reads the object's runtime klass out of its header (klass_from_oop), then
         walks the superclass chain (Klass::_super via get_super) comparing each
         Klass::_name (get_name()->to_string()) against class_name in JVM internal
-        '/'-separated form, e.g. "net/minecraft/item/ItemSword".  VMStructs reads
-        only; nothing is invoked.  Loader-INDEPENDENT — it matches by name, like the JVM's
-        own subtype test, so it works against a class loaded under a custom loader
-        (e.g. Lunar's) without needing the exact klass* find_class would hand back.
+        '/'-separated form, e.g. "java/util/ArrayList". VMStructs reads only;
+        nothing is invoked. Matching compares names without defining-loader
+        identity, so same-name classes from different loaders are indistinguishable.
+        The JVM's full subtype test also considers class identity and interfaces.
 
-        Covers CLASS inheritance only: interfaces live in the secondary-super
-        array, NOT on the _super chain, so an interface name is not matched.  The
-        current callers all test a concrete class (ItemSword / ItemBlock / ItemBow
-        / ItemFood / ItemPotion), for which the super-chain walk is exact.
+        Covers class inheritance only: interfaces live in the secondary-super
+        array rather than the _super chain, so an interface name is not matched.
+        Generic any_object, ref and borrowed helpers use this name-based walk.
+        A matching name alone does not establish exact JVM type assignability.
 
         Complexity: O(chain depth), one Symbol::to_string() per level.
         Exception safety: noexcept — an invalid pointer stops the walk (false).
@@ -24209,7 +24209,7 @@ namespace hotspot
         }
 
         /*
-            @brief Java `instanceof`, keyed on a REGISTERED wrapper type.
+            @brief Name-based superclass test, keyed on a REGISTERED wrapper type.
             @details Resolves `other_wrapper`'s registered class name and walks the
             live object's superclass chain.  Interfaces are NOT matched - the
             secondary-super array is not walked (the same limitation
@@ -24227,7 +24227,7 @@ namespace hotspot
             return this->instance_of(name);
         }
 
-        /* @brief Java `instanceof` by internal ('/'-separated) class name. */
+        /* @brief Tests the superclass chain by internal ('/'-separated) class name. */
         auto instance_of(const std::string_view class_name) const noexcept
             -> bool
         {

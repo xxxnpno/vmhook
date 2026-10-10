@@ -14,6 +14,8 @@ import json
 from pathlib import Path, PurePosixPath
 import shutil
 import sys
+import time
+import urllib.error
 import urllib.request
 import uuid
 import zipfile
@@ -51,9 +53,21 @@ def download(url: str, destination: Path, sha256: str | None = None) -> Path:
     if not destination.is_file():
         temporary = destination.with_suffix(destination.suffix + ".part")
         print("Downloading " + url, file=sys.stderr, flush=True)
-        with urllib.request.urlopen(url, timeout=90) as response, temporary.open("wb") as output:
-            shutil.copyfileobj(response, output)
-        temporary.replace(destination)
+        for attempt in range(1, 4):
+            try:
+                with urllib.request.urlopen(url, timeout=90) as response, temporary.open("wb") as output:
+                    shutil.copyfileobj(response, output)
+                temporary.replace(destination)
+                break
+            except urllib.error.HTTPError as error:
+                error.close()
+                if error.code not in (500, 502, 503, 504) or attempt == 3:
+                    raise
+                print(f"HTTP {error.code}; retrying download in {attempt}s "
+                      f"(attempt {attempt + 1}/3): {url}", file=sys.stderr, flush=True)
+                time.sleep(attempt)
+            finally:
+                temporary.unlink(missing_ok=True)
     if sha256:
         digest = hashlib.sha256()
         with destination.open("rb") as archive:

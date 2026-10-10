@@ -99,6 +99,7 @@ jobs:
           name: runtime-binaries-${{ matrix.toolchain }}
           path: runtime-binaries
       - name: Download and verify the exact publisher JDK
+        id: prepare_jdk
         shell: pwsh
         run: >-
           python tools/build_private_profiles.py
@@ -115,7 +116,7 @@ jobs:
           --probe runtime-binaries/${{ matrix.probe }}
           --metadata-only
       - name: Verify method hooks and explicit callback dispatch
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
         run: >-
           python tests/runtime/run.py
@@ -125,7 +126,7 @@ jobs:
           --probe runtime-binaries/${{ matrix.probe }}
           --hooks-only
       - name: Verify Java invocation, construction, and GC behavior
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
         run: >-
           python tests/runtime/run.py
@@ -161,6 +162,7 @@ jobs:
           name: runtime-binaries-${{ matrix.toolchain }}
           path: runtime-binaries
       - name: Download and verify the exact Java 8–27 publisher JDK
+        id: prepare_jdk
         shell: pwsh
         run: >-
           python tools/build_private_profiles.py
@@ -177,7 +179,7 @@ jobs:
           --probe runtime-binaries/${{ matrix.probe }}
           --native-threads
       - name: Verify method hooks, field stubs, class notifications and rooted callbacks
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
         run: >-
           python tools/run_observation_fixture.py
@@ -188,7 +190,7 @@ jobs:
           --callback-probe runtime-binaries/${{ matrix.callback_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Repeat rooted callback transitions on legacy JVMs
-        if: ${{ !cancelled() && contains(fromJSON('[8,9,10,11,15,16]'), matrix.java) }}
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[8,9,10,11,15,16]'), matrix.java) }}
         shell: pwsh
         run: |
           foreach ($iteration in 1..3) {
