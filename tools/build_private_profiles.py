@@ -251,15 +251,16 @@ def cpp_profiles(profiles: list[dict], manifest: dict) -> str:
               "struct profile_entry{std::array<unsigned char,16> guid;std::uint32_t age,image_size,pe_timestamp;int java_feature;capabilities caps;std::span<const symbol_entry> symbols;std::span<const field_entry> fields;std::span<const size_entry> sizes;std::span<const enum_entry> enums;};"]
     for profile in profiles:
         version = str(profile["identity"]["java_feature"])
-        items = ["{" + json.dumps(key) + "," + str(value) + "}" for key, value in profile["aliases"].items()]
+        # Canonical tables must not depend on PDB traversal or JSON key order.
+        items = ["{" + json.dumps(key) + "," + str(value) + "}" for key, value in sorted(profile["aliases"].items())]
         result.append("inline constexpr symbol_entry symbols_" + version + "[]{" + ",".join(items) + "};")
         fields, sizes, enums = [], [], []
-        for name, facts in profile["types"].items():
+        for name, facts in sorted(profile["types"].items()):
             sizes.append("{" + json.dumps(name) + "," + str(facts["size"]) + "}")
-            for field, info in facts["members"].items():
+            for field, info in sorted(facts["members"].items()):
                 if field in manifest["required_fields"].get(name, []):
                     fields.append("{" + json.dumps(name) + "," + json.dumps(field) + "," + str(info["offset"]) + "}")
-            for name2, value in facts["enums"].items():
+            for name2, value in sorted(facts["enums"].items()):
                 if name2 in manifest["required_enums"].get(name, []):
                     enums.append("{" + json.dumps(name) + "," + json.dumps(name2) + "," + str(value) + "}")
         result.append("inline constexpr field_entry fields_" + version + "[]{" + ",".join(fields) + "};")

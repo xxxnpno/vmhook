@@ -48,6 +48,36 @@ def checksum(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def report_failure(args, mode, directory, result, pid, error):
+    """Keep the last native checks and the JVM's fatal report on a failed run."""
+    values = {}
+    if result.is_file():
+        values = dict(line.split("=", 1) for line in result.read_text(errors="replace").splitlines()
+                      if "=" in line)
+        for key, value in values.items():
+            print(f"{mode}.{key}={value}", flush=True)
+    if args.evidence:
+        args.evidence.parent.mkdir(parents=True, exist_ok=True)
+        args.evidence.write_text(json.dumps({"native_windows": os.name == "nt",
+                                            "java": str(args.java), "failed_mode": mode,
+                                            "passed": False, "error": str(error),
+                                            "partial_checks": values}, indent=2) + "\n")
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        message = f"Observation {mode}: {error}; last native checks: {values}"
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print("::error::" + escaped, flush=True)
+    # HotSpot's default fatal-error path uses its process working directory.
+    # Read only this fixture's PID, preserving the normal JVM launch arguments.
+    if pid and pid.isdecimal():
+        paths = {directory / f"hs_err_pid{pid}.log", Path.cwd() / f"hs_err_pid{pid}.log"}
+        for path in sorted(paths):
+            if path.is_file():
+                text = path.read_text(errors="replace")
+                print(f"{mode}: fatal JVM report {path}\n{text[:100000]}", flush=True)
+                if len(text) > 100000:
+                    print(f"{mode}: fatal report truncated after 100000 characters", flush=True)
+
+
 def execute_mode(args, mode, directory):
     result = directory / (mode + "-result.txt")
     control = directory / (mode + "-control")
@@ -70,7 +100,8 @@ def execute_mode(args, mode, directory):
         for line in process.stdout:
             output.put(line.rstrip())
 
-    threading.Thread(target=read_output, daemon=True).start()
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
 
     def next_line(timeout):
         try:
@@ -84,9 +115,9 @@ def execute_mode(args, mode, directory):
         return line
 
     started = time.monotonic()
+    pid = None
     try:
         deadline = started + 90
-        pid = None
         while time.monotonic() < deadline:
             if process.poll() is not None:
                 raise RuntimeError(f"Java exited before injection: {process.returncode}")
@@ -133,6 +164,18 @@ def execute_mode(args, mode, directory):
             raise RuntimeError("failed " + mode + " checks: " + ", ".join(sorted(set(failed))))
         return {"mode": mode, "checks": values, "java_output": captured,
                 "seconds": round(time.monotonic() - started, 3)}
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        if process.poll() is not None:
+            reader.join(timeout=0.5)
+        while True:
+            try:
+                line = output.get_nowait()
+            except queue.Empty:
+                break
+            captured.append(line)
+            print(f"{mode}: {line}", flush=True)
+        report_failure(args, mode, directory, result, pid, error)
+        raise
     finally:
         process.terminate()
         try:
