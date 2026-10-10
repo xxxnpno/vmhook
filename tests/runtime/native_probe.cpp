@@ -14,15 +14,15 @@ namespace
     public:
         using vmhook::object<native_fixture>::object;
         static auto thread_name() -> std::string
-        { return getMethod("threadName", "()Ljava/lang/String;")->call(); }
+        { return static_members::get_method("threadName", "()Ljava/lang/String;")->call(); }
         static auto plain(std::int32_t input) -> vmhook::method_proxy::value_t
-        { return getMethod("plain", "(I)I")->call(input); }
+        { return static_members::get_method("plain", "(I)I")->call(input); }
         auto add(std::int32_t amount) const -> std::int32_t
-        { return getMethod("add", "(I)I", *this)->call(amount); }
-        auto value() const -> std::int32_t { return getField("value", *this)->get(); }
-        auto text() const -> std::string { return getField("text", *this)->get(); }
+        { return get_method("add", "(I)I")->call(amount); }
+        auto value() const -> std::int32_t { return get_field("value")->get(); }
+        auto text() const -> std::string { return get_field("text")->get(); }
         static auto collect() -> vmhook::method_proxy::value_t
-        { return getMethod("collect", "()V")->call(); }
+        { return static_members::get_method("collect", "()V")->call(); }
     };
 
     class lazy_fixture : public vmhook::object<lazy_fixture>
@@ -30,7 +30,7 @@ namespace
     public:
         using vmhook::object<lazy_fixture>::object;
         static auto initialized_on() -> std::string
-        { return getMethod("initializedOn", "()Ljava/lang/String;")->call(); }
+        { return static_members::get_method("initializedOn", "()Ljava/lang/String;")->call(); }
     };
 
     vmhook::root<native_fixture> static_holder{"NativeFixture", "holder"};
@@ -89,7 +89,7 @@ namespace
 
     auto check_root_growth() -> bool
     {
-        const auto echo = native_fixture::getMethod("echo", "(Ljava/lang/String;)Ljava/lang/String;");
+        const auto echo = native_fixture::static_members::get_method("echo", "(Ljava/lang/String;)Ljava/lang/String;");
         const auto invoke = [&]
         {
             const auto value = echo->call(unicode_text());
@@ -100,6 +100,30 @@ namespace
         for (int iteration = 0; iteration < 512; ++iteration) { if (!invoke()) { return false; } }
         const auto after = root_frontier();
         return before.first != 0 && before == after;
+    }
+
+    auto check_receiver_binding(const native_fixture& first,
+                                const native_fixture& second) -> bool
+    {
+        // Keep both instances' proxies alive together. The second lookup must
+        // never redirect the first field or method to a different Java object.
+        const auto first_field = first.get_field("value");
+        const auto first_method = first.get_method("add");
+        const auto second_field = second.get_field("value");
+        const auto second_method = second.get_method("add", "(I)I");
+        const auto static_from_instance = first.get_method("plain", "(I)I");
+        return first_field && first_method && second_field && second_method
+            && static_from_instance
+            && static_cast<std::int32_t>(first_method->call(std::int32_t{})) == 10
+            && static_cast<std::int32_t>(second_method->call(std::int32_t{})) == 20
+            && static_cast<std::int32_t>(first_field->get()) == 10
+            && static_cast<std::int32_t>(second_field->get()) == 20
+            && static_cast<std::int32_t>(static_from_instance->call(std::int32_t{40})) == 41
+            && !native_fixture::static_members::get_field("value")
+            && !native_fixture::static_members::get_method("add")
+            && !native_fixture::static_members::get_method("add", "(I)I")
+            && !first.get_field("missing_field")
+            && !first.get_method("missing_method");
     }
 
     auto check_context(std::ostream& output) -> bool
@@ -128,7 +152,8 @@ namespace
             auto second = vmhook::make_unique<native_fixture>(std::int32_t{20}, unicode_text(), first);
             if (!passed(output, "construction", first && first->get_instance() && second
                 && second->get_instance() && first->value() == 10 && second->value() == 20
-                && second->text() == unicode_text())) { return false; }
+                && second->text() == unicode_text()
+                && check_receiver_binding(*first, *second))) { return false; }
             auto missing_constructor = vmhook::make_unique<native_fixture>(true);
             if (!passed(output, "constructor_refusal", missing_constructor
                 && !missing_constructor->get_instance())) { return false; }
@@ -136,7 +161,7 @@ namespace
             const auto virtual_call = base_method(*first, "virtualValue");
             const auto private_call = base_method(*first, "privateValue");
             const auto static_call = base_method(*first, "staticValue");
-            const auto default_call = native_fixture::getMethod("defaultValue", "()I", *first);
+            const auto default_call = first->get_method("defaultValue", "()I");
             const auto inherited_default = base_method(*first, "defaultValue", "NativeDefault");
             if (!passed(output, "dispatch_semantics", virtual_call && private_call && static_call
                 && inherited_default
@@ -149,12 +174,12 @@ namespace
             const auto field = first->get_field("value");
             const auto child = second->get_field("child");
             const auto child_value = child ? child->get() : vmhook::field_proxy::value_t{};
-            auto touch = native_fixture::getMethod("touch", "(LNativeFixture;Ljava/lang/String;LNativeFixture;)LNativeFixture;");
+            auto touch = native_fixture::static_members::get_method("touch", "(LNativeFixture;Ljava/lang/String;LNativeFixture;)LNativeFixture;");
             const auto result = touch->call(first, unicode_text(), first);
-            const auto echo = native_fixture::getMethod("echo", "(Ljava/lang/String;)Ljava/lang/String;")->call(unicode_text());
-            const auto wide = native_fixture::getMethod("wide", "(JDI)J")->call(
+            const auto echo = native_fixture::static_members::get_method("echo", "(Ljava/lang/String;)Ljava/lang/String;")->call(unicode_text());
+            const auto wide = native_fixture::static_members::get_method("wide", "(JDI)J")->call(
                 std::int64_t{0x1122334455667788LL}, 42.25, std::int32_t{-7});
-            const auto floating = native_fixture::getMethod("floating", "(FD)D")->call(1.25f, 2.5);
+            const auto floating = native_fixture::static_members::get_method("floating", "(FD)D")->call(1.25f, 2.5);
             if (!passed(output, "invocation", result.was_invoked() && !result.threw()
                 && first->add(5) == 16 && wide.was_invoked() && !wide.threw()
                 && static_cast<std::int64_t>(wide) == 0x1122334455667788LL
@@ -165,7 +190,7 @@ namespace
             { return false; }
             if (!passed(output, "root_growth", check_root_growth())) { return false; }
 
-            const auto thrown = native_fixture::getMethod("fail", "()V")->call();
+            const auto thrown = native_fixture::static_members::get_method("fail", "()V")->call();
             const auto after_exception = native_fixture::plain(40);
             if (!passed(output, "java_exception", thrown.was_invoked() && thrown.threw()
                 && thrown.exception_class == "java/lang/IllegalStateException"
@@ -174,7 +199,7 @@ namespace
 
             // No VM guard spans this native sleep. The fixture's independent
             // Java thread allocates and collects while persistent roots survive.
-            const auto gc_epoch = native_fixture::getField("gcEpoch");
+            const auto gc_epoch = native_fixture::static_members::get_field("gcEpoch");
             const auto gc_before = gc_epoch ? static_cast<std::int32_t>(gc_epoch->get()) : -1;
             bool collected{};
             for (int attempt = 0; gc_epoch && attempt < 10 && !collected; ++attempt)
@@ -222,7 +247,7 @@ namespace
 
             // Warm the unmodified method until HotSpot compiles it, then continue
             // calling that same Method without installing a hook or disabling JIT.
-            const auto warm = native_fixture::getMethod("plain", "(I)I");
+            const auto warm = native_fixture::static_members::get_method("plain", "(I)I");
             bool correct = true;
             for (std::int32_t input = 0; input < 30000 && correct; ++input)
             {
@@ -247,7 +272,7 @@ namespace
             escaped = std::move(first);
             escaped_borrow = borrowed;
             escaped_ref = reference;
-            escaped_field = field;
+            escaped_field = field ? std::optional<vmhook::field_proxy>{*field} : std::nullopt;
             escaped_method = virtual_call;
             escaped_value = result;
             if (!context.close())

@@ -17,82 +17,82 @@ public:
 
     static auto count() -> std::int32_t
     {
-        return getMethod("count")->call();
+        return static_members::get_method("count")->call();
     }
 
     static auto count(std::int32_t limit) -> std::int32_t
     {
-        return getMethod("count", "(I)I")->call(limit);
+        return static_members::get_method("count", "(I)I")->call(limit);
     }
 
     static auto total() -> std::int32_t
     {
-        return getField("total")->get();
+        return static_members::get_field("total")->get();
     }
 
     static auto set_total(std::int32_t value) -> void
     {
-        getField("total")->set(value);
+        static_members::get_field("total")->set(value);
     }
 
     auto kill() const -> void
     {
-        getMethod("kill", *this)->call();
+        get_method("kill")->call();
     }
 
     auto damage(std::int32_t amount) const -> void
     {
-        getMethod("damage", "(I)V", *this)->call(amount);
+        get_method("damage", "(I)V")->call(amount);
     }
 
     auto health() const -> float
     {
-        return getField("health", *this)->get();
+        return get_field("health")->get();
     }
 
     auto set_health(float value) -> void
     {
-        getField("health", *this)->set(value);
+        get_field("health")->set(value);
     }
 
     auto name() const -> std::string
     {
-        return getField("name", *this)->get();
+        return get_field("name")->get();
     }
 
     auto say_hello() const -> void
     {
-        getMethod("say", *this)->call("hello");
+        get_method("say")->call("hello");
     }
 
     auto ride(const vmhook::borrowed<entity>& passenger) const -> void
     {
-        getMethod("ride", *this)->call(passenger);
+        get_method("ride")->call(passenger);
     }
 
     auto ride(const vmhook::ref<entity>& passenger) const -> void
     {
-        getMethod("ride", *this)->call(passenger);
+        get_method("ride")->call(passenger);
     }
 
     auto dismount() const -> void
     {
-        getMethod("ride", *this)->call(nullptr);
+        get_method("ride")->call(nullptr);
     }
 
     auto replace_arrays() const -> void
     {
-        getField("numbers", *this)->set(std::vector<std::int32_t>{1, 2, 3});
-        getField("flags", *this)->set(std::vector<bool>{true, false});
-        getField("names", *this)->set(std::vector<std::string>{"first", "second"});
-        const auto name_field = getField("name", *this);
+        get_field("numbers")->set(std::vector<std::int32_t>{1, 2, 3});
+        get_field("flags")->set(std::vector<bool>{true, false});
+        get_field("names")->set(std::vector<std::string>{"first", "second"});
+        const auto name_field = get_field("name");
         vmhook::set_str_field(*name_field, "new name");
     }
 
     // A bound instance can read a Java static using the same accessor.
     auto total_from_instance() const -> std::int32_t
     {
-        return getField("total", *this)->get();
+        return get_field("total")->get();
     }
 };
 
@@ -102,26 +102,66 @@ public:
     using vmhook::object<other>::object;
 };
 
-template<class receiver>
-concept entity_receiver = requires(const receiver& object)
+template<class wrapper>
+concept implicit_receiver_lookup = requires(const wrapper& object)
 {
-    entity::getMethod("kill", object);
-    entity::getMethod("damage", "(I)V", object);
-    entity::getField("health", object);
+    object.get_method("kill");
+    object.get_method("damage", "(I)V");
+    object.get_field("health");
 };
 
-static_assert(entity_receiver<entity>);
-static_assert(!entity_receiver<other>);
-static_assert(!entity_receiver<std::string>);
-static_assert(std::is_same_v<decltype(entity::getMethod("count")),
+template<class wrapper>
+concept static_instance_method_lookup = requires { wrapper::get_method("kill"); };
+
+template<class wrapper>
+concept static_instance_pinned_method_lookup = requires {
+    wrapper::get_method("damage", "(I)V");
+};
+
+template<class wrapper>
+concept static_instance_field_lookup = requires { wrapper::get_field("health"); };
+
+template<class owner, class receiver>
+concept method_receiver_argument = requires(const owner& object, const receiver& receiver_object)
+{
+    object.get_method("kill", receiver_object);
+};
+
+template<class owner, class receiver>
+concept pinned_method_receiver_argument = requires(const owner& object, const receiver& receiver_object)
+{
+    object.get_method("damage", "(I)V", receiver_object);
+};
+
+template<class owner, class receiver>
+concept field_receiver_argument = requires(const owner& object, const receiver& receiver_object)
+{
+    object.get_field("health", receiver_object);
+};
+
+static_assert(implicit_receiver_lookup<entity>);
+static_assert(implicit_receiver_lookup<other>);
+static_assert(!implicit_receiver_lookup<std::string>);
+static_assert(!static_instance_method_lookup<entity>);
+static_assert(!static_instance_pinned_method_lookup<entity>);
+static_assert(!static_instance_field_lookup<entity>);
+static_assert(!method_receiver_argument<entity, entity>);
+static_assert(!method_receiver_argument<entity, other>);
+static_assert(!pinned_method_receiver_argument<entity, entity>);
+static_assert(!pinned_method_receiver_argument<entity, other>);
+static_assert(!field_receiver_argument<entity, entity>);
+static_assert(!field_receiver_argument<entity, other>);
+static_assert(std::is_same_v<decltype(entity::static_members::get_method("count")),
                              vmhook::member_lookup<vmhook::method_proxy>>);
-static_assert(std::is_same_v<decltype(entity::getMethod("count", "()I")),
+static_assert(std::is_same_v<decltype(entity::static_members::get_method("count", "()I")),
                              vmhook::member_lookup<vmhook::method_proxy>>);
-static_assert(std::is_same_v<decltype(entity::getField("total")),
+static_assert(std::is_same_v<decltype(entity::static_members::get_field("total")),
                              vmhook::member_lookup<vmhook::field_proxy>>);
-static_assert(std::is_same_v<decltype(entity::getMethod("kill", std::declval<const entity&>())),
+static_assert(std::is_same_v<decltype(std::declval<const entity&>().get_method("kill")),
                              vmhook::member_lookup<vmhook::method_proxy>>);
-static_assert(std::is_same_v<decltype(entity::getField("health", std::declval<const entity&>())),
+static_assert(std::is_same_v<decltype(std::declval<const entity&>().get_method("damage", "(I)V")),
+                             vmhook::member_lookup<vmhook::method_proxy>>);
+static_assert(std::is_same_v<decltype(std::declval<const entity&>().get_field("health")),
                              vmhook::member_lookup<vmhook::field_proxy>>);
 
 // This test runs without a JVM. The accessor bodies above are compiled but

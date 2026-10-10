@@ -2,9 +2,15 @@
 
 `vmhook::native_thread_context` lets the DLL's current Windows OS thread call
 Java and create Java objects immediately. The public wrappers keep their usual
-`getMethod(...)->call(...)`, `getField(...)` and `vmhook::make_unique<T>(...)`
+`get_method(...)->call(...)`, `get_field(...)` and `vmhook::make_unique<wrapper>(...)`
 syntax. This route does not install a hook or wait for an application method to
 service a queue. See the complete [wrapper example](../README.md).
+
+Instance lookups bind the inherited `object<wrapper>` receiver automatically;
+do not pass `this`. Static lookups use
+`wrapper::static_members::get_method(...)` or
+`wrapper::static_members::get_field(...)`, because they do not have an instance
+receiver.
 
 ## What JNI attachment does, and what VMHook does
 
@@ -229,11 +235,21 @@ and after closure, bounded root-slot growth, repeated and concurrent attachment,
 and calls after the target method has actually compiled. It verifies that no
 hook was installed.
 
-The current frozen public probes passed **400/400 strict assertions on each
-interface**, across all 20 Java majors 8–27 under **Wine 10.0**: MinGW-w64
+The current receiver-bound snake_case API's frozen public probes passed
+**400/400 strict assertions on each interface**, across all 20 Java majors 8–27 under **Wine 10.0**: MinGW-w64
 G++ 14.2 for the C++23 header and Windows G++ 16.2 for the C++26 module.
-The matrices record unchanged source and DLL hashes. These are current-source
-results for the manifest's exact images and default collectors. Native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The logs confirm the 40 direct-native and observation jobs across Java 8–27 and both interfaces. The completed CI results below belong to the earlier direct-native implementation. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
+The matrices record unchanged current source and DLL hashes for the manifest's
+exact images and default collectors, including receiver-bound instance calls
+and qualified static lookups. Two simultaneously retained sets of field and
+method proxies remain bound to distinct Java objects. Static-only lookup
+refuses instance members, and missing-member results remain observable.
+
+Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
+
+The preceding API at [commit 6de00ce](https://github.com/xxxnpno/vmhook/commit/6de00ce0d4dd46b404ff24a4358a00b9d4f5e9d9) passed native Windows CI **53/53 in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38015950857) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38015954009). Each run passed 36 callback stress repetitions; actual GC frame scans visited 628/582 synthetic return slots. These runs predate the receiver-bound snake_case API.
+
+
+Earlier native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The logs confirm the 40 direct-native and observation jobs across Java 8–27 and both interfaces. The completed CI results below belong to the earlier direct-native implementation. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
 
 The earlier public probe at
 [commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c)

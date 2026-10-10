@@ -39,45 +39,49 @@ public class Counter {
 }
 ```
 
-Expose only the members you need. `getMethod` and `getField` work for both static
-and instance members; an instance lookup supplies its receiver:
+Expose only the members you need. Instance members use `get_method` and
+`get_field` directly; static members use the same names through `static_members`:
 
 ```cpp
-class Counter : public vmhook::object<Counter>
+class counter : public vmhook::object<counter>
 {
 public:
-    using vmhook::object<Counter>::object;
+    using vmhook::object<counter>::object;
 
     auto value() const -> std::int32_t
     {
-        return getField("value", *this)->get();
+        return get_field("value")->get();
     }
 
     auto value(std::int32_t next) -> void
     {
-        getField("value", *this)->set(next);
+        get_field("value")->set(next);
     }
 
     auto add(std::int32_t amount) -> std::int32_t
     {
-        return getMethod("add", *this)->call(amount);
+        return get_method("add", "(I)I")->call(amount);
     }
 
     static auto count() -> std::int32_t
     {
-        return getMethod("count")->call();
+        return static_members::get_method("count")->call();
     }
 
     static auto total() -> std::int32_t
     {
-        return getField("total")->get();
+        return static_members::get_field("total")->get();
     }
 };
 ```
 
-There is no separate `staticMethod` or `staticField`. For an overloaded method,
-provide its JVM descriptor: `getMethod("add", "(I)I", *this)` or
-`getMethod("count", "()I")`.
+The CRTP base `object<counter>` knows the wrapper type and its registered Java
+class. Its inherited instance functions also have the current wrapper as their
+receiver, so neither lookup needs `this` or `*this` as an argument. Static
+functions have no instance receiver; `static_members` selects class-bound
+lookup explicitly. For an overloaded method, provide its JVM descriptor:
+`get_method("add", "(I)I")` or `static_members::get_method("count", "()I")`.
+C++ identifiers use snake_case; Java class and member names remain unchanged.
 
 ## Call Java from the DLL's own thread
 
@@ -92,19 +96,19 @@ auto worker() -> void
         throw vmhook::exception{java.error()};
     }
 
-    if (!vmhook::register_class<Counter>("example/Counter"))
+    if (!vmhook::register_class<counter>("example/Counter"))
     {
         throw vmhook::exception{"example.Counter is not loaded"};
     }
 
-    auto counter = vmhook::make_unique<Counter>(std::int32_t{10});
-    if (!counter || !counter->get_instance())
+    auto instance = vmhook::make_unique<counter>(std::int32_t{10});
+    if (!instance || !instance->get_instance())
     {
         throw vmhook::exception{"Counter construction failed"};
     }
 
-    const auto value = counter->add(5);
-    const auto total = Counter::count();
+    const auto value = instance->add(5);
+    const auto total = counter::count();
     std::cout << value << ", total: " << total << '\n';
 }
 ```
@@ -126,16 +130,16 @@ function, and keep the DLL loaded while its contexts or hooks are active.
 The module can put the Java class name on the wrapper at compile time:
 
 ```cpp
-class [[= vmhook::java_class("example/Counter")]] Counter
-    : public vmhook::object<Counter>
+class [[= vmhook::java_class("example/Counter")]] counter
+    : public vmhook::object<counter>
 {
 public:
-    using vmhook::object<Counter>::object;
+    using vmhook::object<counter>::object;
     // The same wrapper members as above.
 };
 
 // During setup, inside the native context:
-const bool registered = vmhook::register_class<Counter>();
+const bool registered = vmhook::register_class<counter>();
 ```
 
 The C++23 interface uses explicit string registration.
@@ -148,7 +152,7 @@ you need to distinguish a refused call or Java exception from a valid zero,
 null, or void result:
 
 ```cpp
-const auto result = Counter::getMethod("count", "()I")->call();
+const auto result = counter::static_members::get_method("count", "()I")->call();
 if (!result.was_invoked() || result.threw())
 {
     // result.exception_class identifies a reported Java exception.
@@ -159,11 +163,11 @@ const auto count = static_cast<std::int32_t>(result);
 
 Direct conversion to a primitive returns its default value when invocation is
 refused. A reported Java exception is consumed by the native call backend so
-the next call can proceed. The legacy snake_case instance lookups return
-optionals and remain available.
+the next call can proceed. Both instance lookups and `static_members` lookups
+support boolean checks before using `->`.
 
 `std::string` carries UTF-8 text for a Java String, and
-`std::unique_ptr<Wrapper>` represents a wrapped Java object. The unique pointer
+`std::unique_ptr<wrapper>` represents a wrapped Java object. The unique pointer
 owns the **C++ wrapper**. Inside a
 native context, constructed objects, object-valued results and reference field
 reads carry VM-scanned roots. Those roots follow moving GC during calls and
@@ -186,7 +190,7 @@ then the Java arguments. Register and remove hooks on a DLL worker, outside
 
 ```cpp
 auto add_hook(vmhook::return_value& result,
-              const std::unique_ptr<Counter>& self,
+              const std::unique_ptr<counter>& self,
               std::int32_t amount) -> void
 {
     if (amount < 0)
@@ -195,7 +199,7 @@ auto add_hook(vmhook::return_value& result,
     }
 }
 
-const bool installed = vmhook::hook<Counter>("add", "(I)I", &add_hook);
+const bool installed = vmhook::hook<counter>("add", "(I)I", &add_hook);
 ```
 
 `result.set_arg(0, value)` replaces the first Java argument, excluding the
@@ -228,7 +232,7 @@ for the installation cost, callback lifetime and failure boundaries.
 Register a callback before Java reads or writes a static primitive field:
 
 ```cpp
-const bool installed = vmhook::hook_field<Counter, std::int32_t>("total",
+const bool installed = vmhook::hook_field<counter, std::int32_t>("total",
     [](vmhook::field_access<std::int32_t>& event)
     {
         if (event.is_write() && event.value() < 0)
@@ -242,7 +246,7 @@ const bool installed = vmhook::hook_field<Counter, std::int32_t>("total",
     });
 
 // Later:
-vmhook::unhook_field<Counter>("total");
+vmhook::unhook_field<counter>("total");
 ```
 
 The callback is reached through generated ASM stubs in HotSpot's `getstatic`
@@ -377,8 +381,9 @@ shutdown or arbitrary unloading of cached metadata.
 [Native-thread documentation](docs/native-threads.md) records the private ABI
 checks, root lifetimes, reproducible runtime tests and exact build scope.
 The [profile manifest](data/native_profiles.json) identifies the built-in images.
-The current source and frozen probe DLLs passed these complete matrices under
-**Wine 10.0**, with ordinary JVM launches and default collectors:
+The current receiver-bound snake_case API and frozen probe DLLs passed these
+complete matrices under **Wine 10.0**, with ordinary JVM launches and default
+collectors:
 
 | Interface | Compiler | Direct native calls, Java 8–27 | JIT/field/class/callback fixtures, Java 8–27 |
 | --- | --- | --- | --- |
@@ -396,7 +401,16 @@ thread frames; virtual thread frames remain outside the verified scope.
 Source and DLL hashes are
 checked before and after the run. The G++ 14.2 build passed **8/8 CTest suites**. The combined G++ 16.2 header/module build passed **15/15 CTest suites**.
 
-Native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The 52 Windows jobs cover both builds, all 40 direct-native and observation jobs across Java 8–27, and the 10 interpreter/dispatch jobs. One Ubuntu job reproduces the private profiles. The Wine matrices above identify their separate frozen probes. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
+These fresh builds validate automatic instance receivers and class-bound
+lookups through `static_members`; source and probe hashes identify the tested
+implementation. The native fixture retains proxies for two distinct Java
+objects simultaneously and verifies each stays bound to its own receiver.
+
+Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
+
+The preceding API at [commit 6de00ce](https://github.com/xxxnpno/vmhook/commit/6de00ce0d4dd46b404ff24a4358a00b9d4f5e9d9) passed native Windows CI **53/53 in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38015950857) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38015954009). Each run passed 36 callback stress repetitions; actual GC frame scans visited 628/582 synthetic return slots. These runs predate the receiver-bound snake_case API.
+
+Earlier native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The 52 Windows jobs cover both builds, all 40 direct-native and observation jobs across Java 8–27, and the 10 interpreter/dispatch jobs. One Ubuntu job reproduces the private profiles. Those runs precede the receiver-bound snake_case API. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
 
 The older direct-native implementation at
 [commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c)

@@ -17,17 +17,17 @@ namespace
         using vmhook::object<jit_fixture>::object;
         static auto count(std::string_view name) -> std::int64_t
         {
-            const auto field = getField(name);
+            const auto field = static_members::get_field(name);
             return field ? static_cast<std::int64_t>(field->get()) : -1;
         }
-        static auto start_future() -> void { getField("futureRequested")->set(true); }
+        static auto start_future() -> void { static_members::get_field("futureRequested")->set(true); }
     };
 
     class field_fixture : public vmhook::object<field_fixture>
     {
     public:
         using vmhook::object<field_fixture>::object;
-        static auto gc_epoch() -> std::int32_t { return getField("gcEpoch")->get(); }
+        static auto gc_epoch() -> std::int32_t { return static_members::get_field("gcEpoch")->get(); }
     };
 
     auto find_method(vmhook::hotspot::klass* klass, std::string_view name,

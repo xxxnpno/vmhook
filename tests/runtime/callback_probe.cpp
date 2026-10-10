@@ -16,7 +16,7 @@ namespace
     {
     public:
         using vmhook::object<callback_node>::object;
-        auto value() const -> std::int32_t { return getField("value", *this)->get(); }
+        auto value() const -> std::int32_t { return get_field("value")->get(); }
     };
     std::atomic<unsigned> callback_count{}, nested_count{}, observed_gc{};
     std::atomic<bool> correct{true};
@@ -33,7 +33,7 @@ namespace
     }
 
     auto read_gc() -> std::int32_t
-    { return callback_fixture::getField("gcEpoch")->get(); }
+    { return callback_fixture::static_members::get_field("gcEpoch")->get(); }
 
     auto worker(void*) -> vmhook::windows::DWORD
     {
@@ -73,7 +73,7 @@ namespace
                     if (!input) { check(false, "outer.input_present_after_gc"); }
                     else { check(input->value() == expected, "outer.input_value_after_gc"); }
                     auto* const parent{vmhook::detail::native_backend::current_context_lifetime()};
-                    const auto nested_result{callback_fixture::getMethod("nested", "(LObservationCallbackFixture$Node;)I")->call(input)};
+                    const auto nested_result{callback_fixture::static_members::get_method("nested", "(LObservationCallbackFixture$Node;)I")->call(input)};
                     if (!nested_result.was_invoked()) { check(false, "outer.nested_invoked"); }
                     else { check(static_cast<std::int32_t>(nested_result) == expected, "outer.nested_value"); }
                     check(vmhook::detail::native_backend::current_context_lifetime() == parent,
@@ -88,7 +88,7 @@ namespace
                     callback_count.fetch_add(1, std::memory_order_release);
                 })};
             if (!nested || !main) { throw vmhook::exception{"Callback hooks refused"}; }
-            callback_fixture::getField("start")->set(true);
+            callback_fixture::static_members::get_field("start")->set(true);
             // Field reads can wait for safepoints during the concurrent GC storm.
             const auto wait_started{std::chrono::steady_clock::now()};
             const auto deadline{wait_started + std::chrono::seconds{120}};
@@ -99,14 +99,14 @@ namespace
                 if (std::chrono::steady_clock::now() >= deadline)
                 { deadline_reached = true; break; }
                 ++polls;
-                const auto observed{static_cast<std::int32_t>(callback_fixture::getField("validReturns")->get())};
+                const auto observed{static_cast<std::int32_t>(callback_fixture::static_members::get_field("validReturns")->get())};
                 if (std::chrono::steady_clock::now() >= deadline)
                 { deadline_reached = true; break; }
                 if (observed >= 24) { break; }
                 vmhook::windows::Sleep(10);
             }
             if (deadline_reached) { check(false, "worker.wait_deadline"); }
-            const auto returned{static_cast<std::int32_t>(callback_fixture::getField("validReturns")->get())};
+            const auto returned{static_cast<std::int32_t>(callback_fixture::static_members::get_field("validReturns")->get())};
             const auto finished{std::chrono::steady_clock::now()};
             report << "callbacks=" << callback_count.load() << "\nnested=" << nested_count.load()
                    << "\ngc_observed=" << observed_gc.load() << "\nreturns=" << returned

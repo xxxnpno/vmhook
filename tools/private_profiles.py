@@ -15,7 +15,7 @@ import struct
 import uuid
 
 
-class ProfileError(ValueError):
+class profile_error(ValueError):
     pass
 
 
@@ -23,13 +23,13 @@ def integer(data: bytes, offset: int, fmt: str = "I") -> int:
     try:
         return struct.unpack_from("<" + fmt, data, offset)[0]
     except struct.error as error:
-        raise ProfileError("Truncated PDB or PE record") from error
+        raise profile_error("Truncated PDB or PE record") from error
 
 
 def spelling(data: bytes, offset: int) -> tuple[str, int]:
     end = data.find(b"\0", offset)
     if end < 0:
-        raise ProfileError("Unterminated CodeView string")
+        raise profile_error("Unterminated CodeView string")
     return data[offset:end].decode("utf-8", "strict"), end + 1
 
 
@@ -40,23 +40,23 @@ def numeric(data: bytes, offset: int) -> tuple[int, int]:
     formats = {0x8000: "b", 0x8001: "h", 0x8002: "H", 0x8003: "i",
                0x8004: "I", 0x8009: "q", 0x800A: "Q"}
     if leaf not in formats:
-        raise ProfileError(f"Unsupported integer CodeView leaf {leaf:#x}")
+        raise profile_error(f"Unsupported integer CodeView leaf {leaf:#x}")
     fmt = formats[leaf]
     return integer(data, offset + 2, fmt), offset + 2 + struct.calcsize(fmt)
 
 
-class PeImage:
+class pe_image:
     def __init__(self, path: Path):
         data = path.read_bytes()
         self.data = data
         if data[:2] != b"MZ":
-            raise ProfileError("DLL is not a PE image")
+            raise profile_error("DLL is not a PE image")
         pe = integer(data, 0x3C)
         if data[pe:pe + 4] != b"PE\0\0":
-            raise ProfileError("Invalid PE signature")
+            raise profile_error("Invalid PE signature")
         self.machine = integer(data, pe + 4, "H")
         if self.machine != 0x8664 or integer(data, pe + 24, "H") != 0x20B:
-            raise ProfileError("Only Windows x64 HotSpot images are supported")
+            raise profile_error("Only Windows x64 HotSpot images are supported")
         self.timestamp = integer(data, pe + 8)
         self.image_size = integer(data, pe + 24 + 56)
         self.base = integer(data, pe + 24 + 24, "Q")
@@ -80,7 +80,7 @@ class PeImage:
                     result = section["raw_offset"] + delta
                     if result <= len(data) and size <= len(data) - result:
                         return result
-            raise ProfileError("CodeView RVA is not backed by DLL bytes")
+            raise profile_error("CodeView RVA is not backed by DLL bytes")
 
         directory = pe + 24 + 112 + 6 * 8
         debug_rva, debug_size = integer(data, directory), integer(data, directory + 4)
@@ -96,17 +96,17 @@ class PeImage:
                 identities.append({"guid": str(uuid.UUID(bytes_le=data[offset + 4:offset + 20])),
                                    "age": integer(data, offset + 20)})
         if len(identities) != 1:
-            raise ProfileError("DLL must have exactly one RSDS identity")
+            raise profile_error("DLL must have exactly one RSDS identity")
         self.identity = identities[0]
 
     def read(self, rva: int, size: int) -> bytes:
         """Read an image RVA, including its zero-filled virtual section tail."""
         if rva < 0 or size < 0 or rva > self.image_size or size > self.image_size - rva:
-            raise ProfileError("RVA outside PE image")
+            raise profile_error("RVA outside PE image")
         if rva < self.header_size and size <= self.header_size - rva:
             result = self.data[rva:rva + size]
             if len(result) != size:
-                raise ProfileError("Truncated PE header")
+                raise profile_error("Truncated PE header")
             return result
         for section in self.sections:
             delta = rva - section["rva"]
@@ -116,9 +116,9 @@ class PeImage:
                 start = section["raw_offset"] + delta
                 result = self.data[start:start + backed]
                 if len(result) != backed:
-                    raise ProfileError("Truncated PE section")
+                    raise profile_error("Truncated PE section")
                 return result + bytes(size - backed)
-        raise ProfileError("RVA does not belong to a PE section")
+        raise profile_error("RVA does not belong to a PE section")
 
     def rva_number(self, rva: int, fmt: str = "Q") -> int:
         return integer(self.read(rva, struct.calcsize(fmt)), 0, fmt)
@@ -130,23 +130,23 @@ class PeImage:
             if byte == b"\0":
                 return result.decode("utf-8", "strict")
             result.extend(byte)
-        raise ProfileError("Unterminated PE string")
+        raise profile_error("Unterminated PE string")
 
     def exports(self) -> dict[str, int]:
         table = self.export_directory
         if not table:
-            raise ProfileError("PE exports are missing")
+            raise profile_error("PE exports are missing")
         count, function_count = self.rva_number(table + 24, "I"), self.rva_number(table + 20, "I")
         functions = self.rva_number(table + 28, "I")
         names, ordinals = self.rva_number(table + 32, "I"), self.rva_number(table + 36, "I")
         if max(count, function_count) > 1_000_000:
-            raise ProfileError("PE export count out of bounds")
+            raise profile_error("PE export count out of bounds")
         result = {}
         for index in range(count):
             name = self.string(self.rva_number(names + index * 4, "I"))
             ordinal = self.rva_number(ordinals + index * 2, "H")
             if ordinal >= function_count:
-                raise ProfileError("PE export ordinal out of bounds")
+                raise profile_error("PE export ordinal out of bounds")
             result[name] = self.rva_number(functions + ordinal * 4, "I")
         return result
 
@@ -156,19 +156,19 @@ class PeImage:
 
         def exported(name: str) -> int:
             if name not in exports:
-                raise ProfileError("Required HotSpot metadata export missing: " + name)
+                raise profile_error("Required HotSpot metadata export missing: " + name)
             return self.rva_number(exports[name])
 
         def rows(table: str, stride: str, limit: int):
             start, step = exported(table) - self.base, exported(stride)
             if not 8 <= step <= 256:
-                raise ProfileError("VM metadata stride out of bounds")
+                raise profile_error("VM metadata stride out of bounds")
             for index in range(limit):
                 row = start + index * step
                 if not self.rva_number(row):
                     return
                 yield row
-            raise ProfileError("VM metadata table has no bounded terminator")
+            raise profile_error("VM metadata table has no bounded terminator")
 
         result = {}
         name_offset = exported("gHotSpotVMTypeEntryTypeNameOffset")
@@ -190,36 +190,36 @@ class PeImage:
         return result
 
 
-class Pdb:
+class pdb_file:
     def __init__(self, path: Path):
         data = path.read_bytes()
         if data[:32] != b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0":
-            raise ProfileError("PDB is not MSF 7")
+            raise profile_error("PDB is not MSF 7")
         block_size = integer(data, 32)
         blocks = integer(data, 40)
         directory_size = integer(data, 44)
         block_map = integer(data, 52)
         if block_size not in (512, 1024, 2048, 4096, 8192) or blocks * block_size > len(data):
-            raise ProfileError("Invalid PDB block geometry")
+            raise profile_error("Invalid PDB block geometry")
 
         def read_blocks(indexes: list[int], size: int) -> bytes:
             if size > len(data) or any(index >= blocks for index in indexes):
-                raise ProfileError("PDB block index out of bounds")
+                raise profile_error("PDB block index out of bounds")
             return b"".join(data[index * block_size:(index + 1) * block_size]
                             for index in indexes)[:size]
 
         directory_blocks = (directory_size + block_size - 1) // block_size
         block_index_offset = block_map * block_size
         if directory_blocks * 4 > block_size:
-            raise ProfileError("Unsupported multi-page PDB directory block map")
+            raise profile_error("Unsupported multi-page PDB directory block map")
         indexes = [integer(data, block_index_offset + i * 4) for i in range(directory_blocks)]
         directory = read_blocks(indexes, directory_size)
         stream_count = integer(directory, 0)
         if stream_count > 65536 or stream_count > directory_size // 4:
-            raise ProfileError("PDB stream count out of bounds")
+            raise profile_error("PDB stream count out of bounds")
         sizes = [integer(directory, 4 + i * 4) for i in range(stream_count)]
         if sum(size for size in sizes if size != 0xFFFFFFFF) > len(data):
-            raise ProfileError("PDB streams exceed file capacity")
+            raise profile_error("PDB streams exceed file capacity")
         cursor = 4 + stream_count * 4
         self.streams = []
         for size in sizes:
@@ -228,19 +228,19 @@ class Pdb:
             cursor += count * 4
             self.streams.append(b"" if size == 0xFFFFFFFF else read_blocks(indexes, size))
         if len(self.streams) < 4 or len(self.streams[1]) < 28:
-            raise ProfileError("PDB identity/DBI/TPI streams are missing")
+            raise profile_error("PDB identity/DBI/TPI streams are missing")
         info = self.streams[1]
         self.identity = {"guid": str(uuid.UUID(bytes_le=info[12:28])), "age": integer(info, 8)}
         tpi = self.streams[2]
         cursor, first, last = integer(tpi, 4), integer(tpi, 8), integer(tpi, 12)
         if last < first or last - first > 10_000_000:
-            raise ProfileError("PDB type index range invalid")
+            raise profile_error("PDB type index range invalid")
         self.records = {}
         self.classes = {}
         for index in range(first, last):
             length = integer(tpi, cursor, "H")
             if length < 2 or cursor + length + 2 > len(tpi):
-                raise ProfileError("PDB type record out of bounds")
+                raise profile_error("PDB type record out of bounds")
             leaf = integer(tpi, cursor + 2, "H")
             record = tpi[cursor + 4:cursor + 2 + length]
             self.records[index] = (leaf, record)
@@ -267,17 +267,17 @@ class Pdb:
         if not index:
             return []
         if index in seen:
-            raise ProfileError("Cyclic PDB field continuation")
+            raise profile_error("Cyclic PDB field continuation")
         seen = seen | {index}
         leaf, record = self.records[index]
         if leaf != 0x1203:
-            raise ProfileError("Expected CodeView field list")
+            raise profile_error("Expected CodeView field list")
         result, cursor = [], 0
         while cursor < len(record):
             if record[cursor] >= 0xF0:
                 padding = record[cursor] & 0xF
                 if not padding:
-                    raise ProfileError("Invalid CodeView padding")
+                    raise profile_error("Invalid CodeView padding")
                 cursor += padding
                 continue
             kind = integer(record, cursor, "H")
@@ -304,7 +304,7 @@ class Pdb:
                 name, cursor = spelling(record, cursor)
                 method_leaf, method_record = self.records[method_index]
                 if method_leaf != 0x1206 or count > 1024:
-                    raise ProfileError("Invalid bounded PDB method list")
+                    raise profile_error("Invalid bounded PDB method list")
                 position = 0
                 for _ in range(count):
                     attributes = integer(method_record, position, "H")
@@ -342,13 +342,13 @@ class Pdb:
             elif kind == 0x150C:  # LF_FRIENDCLS
                 cursor += 6
             else:
-                raise ProfileError(f"Unsupported CodeView field leaf {kind:#x}")
+                raise profile_error(f"Unsupported CodeView field leaf {kind:#x}")
         return result
 
     def storage(self, index: int, seen: frozenset[int] = frozenset()) -> dict:
         """Resolve exact field storage, including forward types and bitfields."""
         if index in seen:
-            raise ProfileError("Cyclic PDB field storage type")
+            raise profile_error("Cyclic PDB field storage type")
         seen = seen | {index}
         if index < 0x1000:
             if index >> 8 == 6:
@@ -377,7 +377,7 @@ class Pdb:
             candidates = self.classes.get(definition["name"], [])
             sizes = {candidate["size"] for candidate in candidates}
             if len(sizes) > 1:
-                raise ProfileError("Conflicting PDB field storage definitions")
+                raise profile_error("Conflicting PDB field storage definitions")
             return {"storage_size": next(iter(sizes)) if sizes else 0}
         return {"storage_size": 0}
 
@@ -406,31 +406,31 @@ class Pdb:
                     continue
                 offset = method["virtual_offset"]
                 if offset % 8 or offset > 1024:
-                    raise ProfileError("Invalid bounded OopClosure virtual slot")
+                    raise profile_error("Invalid bounded OopClosure virtual slot")
                 slots.append(offset // 8)
                 if method["name"] != "do_oop":
                     continue
                 leaf, record = self.records[method["type_index"]]
                 if leaf != 0x1009 or integer(record, 0) != 3 or integer(record, 14, "H") != 1:
-                    raise ProfileError("OopClosure do_oop is not a void member function")
+                    raise profile_error("OopClosure do_oop is not a void member function")
                 arguments_leaf, arguments = self.records[integer(record, 16)]
                 if arguments_leaf != 0x1201 or integer(arguments, 0) != 1:
-                    raise ProfileError("OopClosure do_oop does not have one argument")
+                    raise profile_error("OopClosure do_oop does not have one argument")
                 if self.points_to(integer(arguments, 4), "oopDesc", 2):
                     wide.append(offset // 8)
             if len(wide) != 1 or not slots:
-                raise ProfileError("Ambiguous OopClosure wide do_oop overload")
+                raise profile_error("Ambiguous OopClosure wide do_oop overload")
             layouts.append({"vtable_do_oop_wide": wide[0], "vtable_count": max(slots) + 1})
         if not layouts or any(layout != layouts[0] for layout in layouts[1:]):
-            raise ProfileError("Conflicting OopClosure virtual layouts")
+            raise profile_error("Conflicting OopClosure virtual layouts")
         return layouts[0]
 
     def describe(self, name: str, seen: frozenset[str] = frozenset()) -> dict:
         if name in seen:
-            raise ProfileError("Cyclic PDB class inheritance")
+            raise profile_error("Cyclic PDB class inheritance")
         candidates = self.classes.get(name)
         if not candidates:
-            raise ProfileError(f"Required PDB type missing: {name}")
+            raise profile_error(f"Required PDB type missing: {name}")
         descriptions = []
         for definition in candidates:
             result = {"size": definition["size"], "members": {}, "bases": [], "enums": {}}
@@ -451,7 +451,7 @@ class Pdb:
                     offset = field["virtual_offset"]
                     if offset is not None:
                         if offset % 8 or offset > 1024:
-                            raise ProfileError("PDB virtual slot offset out of bounds")
+                            raise profile_error("PDB virtual slot offset out of bounds")
                         result["enums"]["vtable_" + field["name"]] = offset // 8
             if name in ("VM_Operation", "ThreadClosure", "MetadataClosure", "NMethodClosure"):
                 slots = [value for key, value in result["enums"].items() if key.startswith("vtable_")]
@@ -466,19 +466,19 @@ class Pdb:
             descriptions.append(result)
         first = descriptions[0]
         if any(description != first for description in descriptions[1:]):
-            raise ProfileError(f"Conflicting PDB type definitions: {name}")
+            raise profile_error(f"Conflicting PDB type definitions: {name}")
         return first
 
     def symbols(self, sections: list[dict], image_size: int) -> dict[str, int]:
         dbi = self.streams[3]
         stream_index = integer(dbi, 20, "H")
         if stream_index >= len(self.streams):
-            raise ProfileError("PDB symbol stream index out of bounds")
+            raise profile_error("PDB symbol stream index out of bounds")
         records, cursor, result = self.streams[stream_index], 0, {}
         while cursor + 4 <= len(records):
             length, kind = integer(records, cursor, "H"), integer(records, cursor + 2, "H")
             if length < 2 or cursor + length + 2 > len(records):
-                raise ProfileError("PDB symbol record out of bounds")
+                raise profile_error("PDB symbol record out of bounds")
             record = records[cursor + 4:cursor + length + 2]
             cursor += length + 2
             if kind != 0x110E:  # S_PUB32: decorated private function/data names
@@ -489,9 +489,9 @@ class Pdb:
                 continue
             rva = sections[segment - 1]["rva"] + offset
             if rva >= image_size:
-                raise ProfileError(f"Symbol RVA outside DLL: {name}")
+                raise profile_error(f"Symbol RVA outside DLL: {name}")
             if name in result and result[name] != rva:
-                raise ProfileError(f"Conflicting PDB symbol: {name}")
+                raise profile_error(f"Conflicting PDB symbol: {name}")
             result[name] = rva
         return result
 
@@ -507,10 +507,10 @@ DEFAULT_TYPES = ("Thread", "ThreadShadow", "JavaThread", "JavaFrameAnchor", "OST
 def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             names: tuple[str, ...] = DEFAULT_TYPES) -> dict:
     if not 8 <= java_feature <= 27:
-        raise ProfileError("Java feature must be between 8 and 27")
-    image, pdb = PeImage(dll_path), Pdb(pdb_path)
+        raise profile_error("Java feature must be between 8 and 27")
+    image, pdb = pe_image(dll_path), pdb_file(pdb_path)
     if image.identity != pdb.identity:
-        raise ProfileError(f"PDB/DLL identity mismatch: {pdb.identity} != {image.identity}")
+        raise profile_error(f"PDB/DLL identity mismatch: {pdb.identity} != {image.identity}")
     types = {name: pdb.describe(name) for name in names if name in pdb.classes}
     symbols = pdb.symbols(image.sections, image.image_size)
     if "frame" in names:
@@ -522,7 +522,7 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
         bcp_offsets = [offsets[name] for name in ("interpreter_frame_bcp_offset", "interpreter_frame_bcx_offset")
                        if name in offsets]
         if len(bcp_offsets) != 1:
-            raise ProfileError("Ambiguous interpreter-frame bytecode-pointer offset")
+            raise profile_error("Ambiguous interpreter-frame bytecode-pointer offset")
         frame["enums"]["interpreter_frame_bcp_offset"] = bcp_offsets[0]
     if "OopClosure" in names:
         types["OopClosure"]["enums"].update(pdb.wide_oop_closure())
@@ -541,12 +541,12 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
         vm_deoptimize = "?doit@VM_Deoptimize@@UEAAXXZ" in symbols
         if old_setter == new_setter or callback_metadata == closure_metadata or \
                 sum((scope, marked, vm_deoptimize)) != 1:
-            raise ProfileError("Ambiguous observation ABI signatures")
+            raise profile_error("Ambiguous observation ABI signatures")
         method = types["Method"]
         if "_dont_inline" in method["members"]:
             flags = method["members"]["_dont_inline"]
             if flags["bit_length"] != 1:
-                raise ProfileError("Unexpected Method dont-inline bitfield")
+                raise profile_error("Unexpected Method dont-inline bitfield")
             flag_offset, flag_width = flags["offset"], flags["storage_size"]
             flag_mask = 1 << flags["bit_position"]
         elif "Method::Flags" in types:
@@ -559,15 +559,15 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             flag_width = flags["storage_size"]
             flag_mask = types["MethodFlags::<unnamed-enum-_misc_has_monitor_bytecodes>"]["enums"]["_misc_dont_inline"]
         if flag_width not in (1, 2, 4) or flag_mask <= 0 or flag_mask >= 1 << (8 * flag_width):
-            raise ProfileError("Invalid bounded Method dont-inline layout")
+            raise profile_error("Invalid bounded Method dont-inline layout")
         java_thread_slots = {field["virtual_offset"] for definition in pdb.classes["Thread"]
                              for field in pdb.fields(definition["field_index"])
                              if field["kind"] == "method" and field["name"] == "is_Java_thread"}
         if len(java_thread_slots) != 1:
-            raise ProfileError("Ambiguous Thread is_Java_thread virtual slot")
+            raise profile_error("Ambiguous Thread is_Java_thread virtual slot")
         java_thread_slot = next(iter(java_thread_slots))
         if java_thread_slot is None or java_thread_slot % 8 or java_thread_slot > 1024:
-            raise ProfileError("Invalid bounded Thread is_Java_thread virtual slot")
+            raise profile_error("Invalid bounded Thread is_Java_thread virtual slot")
         types["ObservationABI"] = {"size": 0, "members": {}, "bases": [],
             "synthetic": "signature/layout-derived selectors", "enums": {
                 "set_not_compilable_old_args": int(old_setter),
@@ -587,7 +587,7 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
                 "??$oops_interpreted_do@V?$SmallRegisterMapType@$0A@@@@frame@@QEBAXPEAVOopClosure@@PEBV?$SmallRegisterMapType@$0A@@@_N@Z",
                 "??$oops_interpreted_do@V?$SmallRegisterMapType@$00@@@frame@@QEBAXPEAVOopClosure@@PEBV?$SmallRegisterMapType@$00@@_N@Z"))
             if sum((legacy_scan, *ordinary_scans, template_scan)) != 1 or any(flag != template_scan for flag in small_scan):
-                raise ProfileError("Ambiguous interpreted-frame scanning signatures")
+                raise profile_error("Ambiguous interpreted-frame scanning signatures")
             types["ObservationABI"]["enums"].update({
                 "frame_scan_legacy_cld_arg": int(legacy_scan),
                 "frame_scan_small_maps": int(template_scan)})
@@ -598,10 +598,10 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             fp = frame["members"]["_fp"]["offset"]
             monitor = 8 * frame["enums"]["interpreter_frame_monitor_block_top_offset"]
             if not 0 <= fp < 128 or not -128 <= monitor < 0:
-                raise ProfileError("Interpreter monitor getter offsets exceed audited encodings")
+                raise profile_error("Interpreter monitor getter offsets exceed audited encodings")
             getter = "?interpreter_frame_monitor_end@frame@@QEBAPEAVBasicObjectLock@@XZ"
             if getter not in symbols:
-                raise ProfileError("Interpreted-frame monitor getter is missing from matching PDB")
+                raise profile_error("Interpreted-frame monitor getter is missing from matching PDB")
             code = image.read(symbols[getter], 32)
             absolute = b"\x48\x8b\x41" + bytes([fp]) + b"\x48\x8b\x40" + bytes([monitor & 255]) + b"\xc3"
             relative = b"\x48\x8b\x51" + bytes([fp]) + b"\x48\x8b\x42" + bytes([monitor & 255]) + b"\x48\x8d\x04\xc2\xc3"
@@ -614,14 +614,14 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             elif code.startswith(absolute) or conditional and code.startswith(conditional):
                 slots_relative = False  # Conditional relocation concerns heap frames only.
             else:
-                raise ProfileError("Interpreted-frame monitor getter differs from audited ABI patterns")
+                raise profile_error("Interpreted-frame monitor getter differs from audited ABI patterns")
             size_getters = [name for name in symbols if name.startswith("?interpreter_frame_expression_stack_size@frame@@")]
             if len(size_getters) != 1:
-                raise ProfileError("Ambiguous interpreted expression-stack-size getter")
+                raise profile_error("Ambiguous interpreted expression-stack-size getter")
             code = image.read(symbols[size_getters[0]], 96)
             last = 8 * frame["enums"]["interpreter_frame_last_sp_offset"]
             if not -128 <= last < 0:
-                raise ProfileError("Interpreter last_sp offset exceeds audited encodings")
+                raise profile_error("Interpreter last_sp offset exceeds audited encodings")
             last_byte = bytes([last & 255])
             relative_last = b"\x48\x8b\x51" + last_byte + b"\x48\x85\xd2\x74\x09\x48\x8d\x14\xd1"
             absolute_last = (b"\x48\x8b\x53" + bytes([fp]) + b"\x4c\x8b\x42" + last_byte + b"\x4d\x85\xc0\x75\x03\x4c\x8b\x03",
@@ -636,7 +636,7 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             else:
                 matches_last = any(pattern in code for pattern in absolute_last)
             if not matches_last:
-                raise ProfileError("Physical last_sp conversion disagrees with the monitor-slot ABI")
+                raise profile_error("Physical last_sp conversion disagrees with the monitor-slot ABI")
             types["ObservationABI"]["enums"]["frame_stack_slots_relative"] = int(slots_relative)
         special_klass = {f"{kind}_klass_{part}": 0
                          for kind in ("anonymous", "hidden")
@@ -646,7 +646,7 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
                            if name in anonymous]
         if anonymous_masks:
             if len(anonymous_masks) != 1:
-                raise ProfileError("Ambiguous anonymous Klass predicate")
+                raise profile_error("Ambiguous anonymous Klass predicate")
             flags = types["InstanceKlass"]["members"]["_misc_flags"]
             special_klass.update(anonymous_klass_offset=flags["offset"],
                                  anonymous_klass_width=flags["storage_size"],
@@ -665,7 +665,7 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             # from TPI. The getter is inspected offline and is never invoked.
             flags = types["Klass"]["members"]["_access_flags"]
             if flags["storage_size"] != 4:
-                raise ProfileError("Unexpected hidden Klass AccessFlags width")
+                raise profile_error("Unexpected hidden Klass AccessFlags width")
             getter = image.read(image.exports()["JVM_IsHiddenClass"], 480)
             shifts = []
             for offset in range(len(getter) - 13):
@@ -683,14 +683,14 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
                     continue
                 shifts.append(shift)
             if len(shifts) != 1:
-                raise ProfileError("Ambiguous bounded hidden Klass getter predicate")
+                raise profile_error("Ambiguous bounded hidden Klass getter predicate")
             special_klass.update(hidden_klass_offset=flags["offset"],
                                  hidden_klass_width=flags["storage_size"],
                                  hidden_klass_mask=1 << shifts[0])
         for kind in ("anonymous", "hidden"):
             width, mask = special_klass[kind + "_klass_width"], special_klass[kind + "_klass_mask"]
             if width and (width not in (1, 2, 4) or not 0 < mask < 1 << (8 * width)):
-                raise ProfileError("Invalid bounded special Klass predicate")
+                raise profile_error("Invalid bounded special Klass predicate")
         types["ObservationABI"]["enums"].update(special_klass)
         # Follow the actual CLD pointer type and flatten its TPI bases. The
         # GrowableArray payload moved when its allocator/view hierarchy
@@ -698,16 +698,16 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
         deallocate = types["ClassLoaderData"]["members"]["_deallocate_list"]
         pointer_leaf, pointer_record = pdb.records[deallocate["type_index"]]
         if pointer_leaf != 0x1002 or deallocate["storage_size"] != 8:
-            raise ProfileError("Unexpected ClassLoaderData deallocate-list pointer")
+            raise profile_error("Unexpected ClassLoaderData deallocate-list pointer")
         array_name = pdb.class_info(integer(pointer_record, 0))["name"]
         if array_name != "GrowableArray<Metadata *>":
-            raise ProfileError("Unexpected deallocate-list array element type")
+            raise profile_error("Unexpected deallocate-list array element type")
         array = pdb.describe(array_name)
         data, length = array["members"]["_data"], array["members"]["_len"]
         if data["storage_size"] != 8 or length["storage_size"] != 4 or not 0 < array["size"] <= 128 or \
                 any(member["offset"] < 0 or member["offset"] + member["storage_size"] > array["size"]
                     for member in (data, length)):
-            raise ProfileError("Invalid bounded deallocate-list array layout")
+            raise profile_error("Invalid bounded deallocate-list array layout")
         types["ObservationABI"]["enums"].update({
             "deallocate_list_size": array["size"],
             "deallocate_list_data_offset": data["offset"],
@@ -725,10 +725,10 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             load_test = b"\x48\x8b\x81" + struct.pack("<I", poll_offset) + b"\x48\x8b\xd9\xa8"
             offset = code.find(load_test)
             if offset < 0 or offset + len(load_test) >= len(code):
-                raise ProfileError("Java20 polling-word audit pattern differs")
+                raise profile_error("Java20 polling-word audit pattern differs")
             poll_bit = code[offset + len(load_test)]
             if not poll_bit or poll_bit & (poll_bit - 1):
-                raise ProfileError("Invalid Java20 local-poll bit")
+                raise profile_error("Invalid Java20 local-poll bit")
             types["ObservationABI"]["enums"]["callback_poll_bit"] = poll_bit
     return {"schema": 1, "identity": {**image.identity, "machine": image.machine,
             "image_size": image.image_size, "pe_timestamp": image.timestamp,
@@ -747,7 +747,7 @@ def main() -> None:
     try:
         profile = extract(arguments.pdb, arguments.dll, arguments.java_feature,
                           tuple(arguments.types) if arguments.types else DEFAULT_TYPES)
-    except (ProfileError, OSError, UnicodeError) as error:
+    except (profile_error, OSError, UnicodeError) as error:
         parser.exit(1, f"private_profiles: {error}\n")
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")

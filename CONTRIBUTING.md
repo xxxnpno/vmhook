@@ -30,8 +30,10 @@ features, including static reflection.
   defining loader identity. Observer callbacks cannot inject, rewrite or veto
   class definitions. If field-policy setup fails, report a rooted Java exception
   before exposing an unprotected accessor, without allocating in that failure path.
-- Keep static and instance wrappers simple: `getMethod` and `getField` are the
-  public names for both. Instance access supplies the receiver explicitly.
+- Keep static and instance wrappers simple: `get_method` and `get_field` are
+  inherited instance functions that bind the current CRTP wrapper without an
+  explicit receiver argument. Class-bound lookup uses the same names under
+  `static_members`; a static wrapper function uses that qualifier explicitly.
 - Hooks persist until explicitly removed. Do not add scoped hook handles.
 - Keep preprocessor directives out of every `.ixx` file. Import the standard
   library and use the SDK header unit for Windows declarations.
@@ -53,8 +55,10 @@ and the [Windows x64 ABI](https://learn.microsoft.com/en-us/cpp/build/x64-callin
 Record the exact source revision when it justifies a layout or instruction
 sequence. An observed offset or prologue on one JDK is not a portable guarantee.
 
-Keep comments and documentation in English. Match the surrounding formatting,
-use descriptive names, and prefer trailing return types. Use `constexpr`,
+Keep comments and documentation in English. Use snake_case for C++ identifiers,
+including wrapper types and public APIs. Preserve exact Java class/member
+strings and external Windows/HotSpot ABI names. Match the surrounding
+formatting, use descriptive names, and prefer trailing return types. Use `constexpr`,
 `consteval`, and `noexcept` where their actual contracts permit them. Runtime
 metadata and VM state still require runtime validation.
 

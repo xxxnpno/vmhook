@@ -590,8 +590,8 @@ export namespace vmhook
         normally.
 
         Example:
-            vmhook::hook<MyClass>("getScore",
-                [](vmhook::return_value& ret, const std::unique_ptr<MyClass>& self) {
+            vmhook::hook<my_class>("getScore",
+                [](vmhook::return_value& ret, const std::unique_ptr<my_class>& self) {
                     ret.set(std::int32_t{ 9999 });   // always return 9999
                 });
     */
@@ -981,19 +981,16 @@ export namespace vmhook
     /*
         @brief Why a member lookup failed.
         @details
-        get_field() / get_method() return std::optional, which says a lookup
-        failed but not why - and the four causes want four different responses.
+        Low-level object_base lookups return std::optional, which reports
+        absence without its cause. Typed object<wrapper_type> getters instead
+        return member_lookup: test it when absence is expected; dereferencing
+        an empty result throws vmhook::exception. The causes still differ.
         "The class is not loaded yet" is usually a timing problem the caller can
         retry past; "this wrapper was never registered" is a setup bug that will
         never fix itself; "the field does not exist" is a name typo or an
         obfuscated build that renamed it; "the object is null" is ordinary Java.
 
-        Collapsing all four into nullopt is why the house one-liner
-        `get_field("x")->get()` is so common and so dangerous: with no way to
-        distinguish "not yet" from "never", callers stopped checking at all.  It
-        has taken the whole JVM suite down at least once.
-
-        The try_* accessors return std::expected<T, access_error> so the caller
+        The try_* accessors return std::expected<value_type, access_error> so the caller
         can branch on the cause without giving up the one-liner in the happy
         path.  @see vmhook::error_message.
     */
@@ -1208,7 +1205,7 @@ export namespace vmhook
             @brief Convenience bool constant for vmhook::detail::is_unique_ptr<T>.
             @details
             Strips cv-ref qualifiers from type before testing so that
-            is_unique_ptr_v<const std::unique_ptr<Foo>&> == true.
+            is_unique_ptr_v<const std::unique_ptr<foo>&> == true.
         */
         template<typename type>
         inline constexpr bool is_unique_ptr_v{ is_unique_ptr<std::remove_cvref_t<type>>::value };
@@ -1364,7 +1361,7 @@ export namespace vmhook
             !vmhook::detail::annotated_class_name<wrapper_type>().empty() };
 
         /*
-            @brief "Lcom/example/Foo;" for an annotated wrapper, at compile time.
+            @brief "Lcom/example/foo;" for an annotated wrapper, at compile time.
             @details
             The annotation gives the bare internal name; a descriptor needs it
             wrapped in L...;.  Doing that in a constexpr array rather than with
@@ -1422,7 +1419,7 @@ export namespace vmhook
         /*
             @brief Convenience bool constant for vmhook::detail::is_borrowed<T>.
             @details
-            Strips cv-ref qualifiers first, so is_borrowed_v<const borrowed<Foo>&>
+            Strips cv-ref qualifiers first, so is_borrowed_v<const borrowed<foo>&>
             is true - detours normally take a borrow by value, but taking it by
             const-ref must classify identically.
         */
@@ -4300,8 +4297,8 @@ export namespace vmhook
                 @brief The thread is currently executing Java bytecode in the interpreter.
                 @note This is the only state in which method hooks are safely intercepted.
             */
-            _thread_in_Java = 8,
-            _thread_in_Java_trans = 9,
+            _thread_in_java = 8,
+            _thread_in_java_trans = 9,
             _thread_blocked = 10,
             _thread_blocked_trans = 11,
             _thread_max_state = 12
@@ -4593,7 +4590,7 @@ export namespace vmhook
         */
         inline auto enter_java_state(vmhook::hotspot::java_thread* thread) noexcept -> bool;
 
-        /* @brief Leaves `_thread_in_Java`, releasing any safepoint waiting on us. */
+        /* @brief Leaves the Java execution state, releasing any waiting safepoint. */
         inline auto leave_java_state(vmhook::hotspot::java_thread* thread,
                                      vmhook::hotspot::java_thread_state previous) noexcept -> void;
 
@@ -6165,7 +6162,7 @@ export namespace vmhook
             auto* const thread{ vmhook::hotspot::current_java_thread };
             if (!thread || !vmhook::hotspot::current_detour_anchor.valid) { return false; }
             const auto state{ thread->get_thread_state() };
-            return state == vmhook::hotspot::java_thread_state::_thread_in_Java
+            return state == vmhook::hotspot::java_thread_state::_thread_in_java
                 || state == vmhook::hotspot::java_thread_state::_thread_in_vm
                 || state == vmhook::hotspot::java_thread_state::_thread_in_native;
         }
@@ -6232,7 +6229,7 @@ export namespace vmhook
             try
             {
                 if (!vmhook::hotspot::is_valid_pointer(thread)
-                    || thread->get_thread_state() != vmhook::hotspot::java_thread_state::_thread_in_Java)
+                    || thread->get_thread_state() != vmhook::hotspot::java_thread_state::_thread_in_java)
                 { return 0; }
                 const auto* const current_method{ frame_pointer->get_method() };
                 if (!current_method) { return 0; }
@@ -7182,9 +7179,9 @@ export namespace vmhook
                              // plausible donor. Its throwing entry is not a
                              // usable calling-convention adapter candidate.
                             // NATIVE: _from_compiled_entry is the native wrapper.
-                            constexpr std::uint32_t JVM_ACC_STATIC_BIT{ 0x0008u };
-                            constexpr std::uint32_t JVM_ACC_NATIVE_BIT{ 0x0100u };
-                            constexpr std::uint32_t JVM_ACC_ABSTRACT_BIT{ 0x0400u };
+                            constexpr std::uint32_t jvm_acc_static_bit{ 0x0008u };
+                            constexpr std::uint32_t jvm_acc_native_bit{ 0x0100u };
+                            constexpr std::uint32_t jvm_acc_abstract_bit{ 0x0400u };
 
                             // Cheapest discriminators first: every one of these
                             // is a syscall, and the signature read below also
@@ -7202,7 +7199,7 @@ export namespace vmhook
                                 ++skip_flags;
                                 continue;
                             }
-                            if ((access & (JVM_ACC_NATIVE_BIT | JVM_ACC_ABSTRACT_BIT)) != 0u)
+                            if ((access & (jvm_acc_native_bit | jvm_acc_abstract_bit)) != 0u)
                             {
                                 ++skip_abstract_native;
                                 continue;
@@ -7219,13 +7216,13 @@ export namespace vmhook
                                 continue;
                             }
                             const std::string key{ vmhook::detail::adapter_fingerprint(
-                                signature, (access & JVM_ACC_STATIC_BIT) != 0u) };
+                                signature, (access & jvm_acc_static_bit) != 0u) };
                             if (key.empty())
                             {
                                 continue;
                             }
 
-                            if ((access & JVM_ACC_STATIC_BIT) != 0u) { ++donors_static; }
+                            if ((access & jvm_acc_static_bit) != 0u) { ++donors_static; }
                             else { ++donors_instance; }
 
                             vmhook::detail::c2i_vote& vote{ state.votes[key] };
@@ -7538,13 +7535,13 @@ export namespace vmhook
         Concurrent GC and allocation can race with the scan; callbacks receive
         non-owning wrappers without a registered root or object lifetime guarantee.
     */
-    template<typename T, typename visitor_type>
+    template<typename value_type, typename visitor_type>
     inline auto for_each_instance(visitor_type&& visit,
                                   std::size_t   max_visits = std::numeric_limits<std::size_t>::max())
         -> std::size_t
     {
         // Resolve T's registered klass.
-        const std::string registered_name{ vmhook::detail::registered_class_name<T>() };
+        const std::string registered_name{ vmhook::detail::registered_class_name<value_type>() };
         if (registered_name.empty())
         {
             ::vmhook::detail::log_line("{} for_each_instance: type not registered (call register_class<T>() first)",
@@ -7693,8 +7690,8 @@ export namespace vmhook
                     // `p` is a const scan cursor; the oop the wrapper carries is
                     // the live, mutable Java object address, so const_cast is the
                     // intended bridge (the scan itself writes nothing through it).
-                    auto wrapper{ std::unique_ptr<T>{
-                        new T{ const_cast<void*>(static_cast<const void*>(p + off)) } } };
+                    auto wrapper{ std::unique_ptr<value_type>{
+                        new value_type{ const_cast<void*>(static_cast<const void*>(p + off)) } } };
                     visit(std::move(wrapper));
                 }
                 catch (const std::exception& ex)
@@ -7956,7 +7953,7 @@ export namespace vmhook
         discovering an obfuscated class's shape).  noexcept; empty vector if the
         class isn't loaded.
 
-            for (auto& [name, descriptor] : vmhook::get_class_methods("net/minecraft/Foo"))
+            for (auto& [name, descriptor] : vmhook::get_class_methods("net/minecraft/foo"))
                 ::vmhook::detail::log_line("{}{}", name, descriptor);
     */
     inline auto get_class_methods(const std::string_view class_name) noexcept
@@ -9604,7 +9601,7 @@ export namespace vmhook
                 else
                 {
                     // Resolve the JVM class name from the registered wrapper map so the
-                    // descriptor reads `Lcom/example/Foo;` instead of the old silently-wrong
+                    // descriptor reads `Lcom/example/foo;` instead of the old silently-wrong
                     // `I` fallback, which broke object construction whenever someone
                     // passed an object to a constructor that took another object.
                     const std::string registered_name{ vmhook::detail::registered_class_name<wrapper_type>() };
@@ -9702,11 +9699,11 @@ class private_profile final {
     mutable std::mutex layouts_mutex_;
     image_identity identity_;
 
-    template<class T> static T read(bytes data,std::size_t offset) {
+    template<class value_type> static value_type read(bytes data,std::size_t offset) {
         static_assert(std::endian::native==std::endian::little);
-        if(offset>data.size() || sizeof(T)>data.size()-offset)
+        if(offset>data.size() || sizeof(value_type)>data.size()-offset)
             throw profile_error("Truncated private PDB record");
-        T value{}; std::memcpy(&value,data.data()+offset,sizeof value); return value;
+        value_type value{}; std::memcpy(&value,data.data()+offset,sizeof value); return value;
     }
     static bytes slice(bytes data,std::size_t offset,std::size_t size) {
         if(offset>data.size() || size>data.size()-offset)
@@ -10259,8 +10256,8 @@ thread_local std::size_t active_session_count{};
 inline std::filesystem::path native_symbols_path{};
 using root_slot_provider=void**(*)(void*) noexcept;
 auto root_reuse_callback() -> root_slot_provider&{static thread_local root_slot_provider callback{};return callback;}
-template<class T> inline T load(const void* p,std::size_t offset) {T result{};std::memcpy(&result,static_cast<const std::byte*>(p)+offset,sizeof result);return result;}
-template<class T> inline void store(void* p,std::size_t offset,T value) {std::memcpy(static_cast<std::byte*>(p)+offset,&value,sizeof value);}
+template<class value_type> inline value_type load(const void* p,std::size_t offset) {value_type result{};std::memcpy(&result,static_cast<const std::byte*>(p)+offset,sizeof result);return result;}
+template<class value_type> inline void store(void* p,std::size_t offset,value_type value) {std::memcpy(static_cast<std::byte*>(p)+offset,&value,sizeof value);}
 class runtime final {
  HMODULE module_{};
  std::unique_ptr<vmhook::private_metadata::private_profile> private_pdb_;
@@ -10304,10 +10301,10 @@ class runtime final {
    return true;
   }catch(const std::exception& error){fallback_error_=error.what();private_pdb_.reset();profile=nullptr;return false;}
  }
- template<class T>T exported_value(const char* name)const{
+ template<class value_type>value_type exported_value(const char* name)const{
   const auto address=GetProcAddress(module_,name);
   if(!address)throw std::runtime_error("Required HotSpot metadata export missing");
-  return load<T>(reinterpret_cast<void*>(address),0);
+  return load<value_type>(reinterpret_cast<void*>(address),0);
  }
 public:
  const profile_entry* profile{};
@@ -10383,7 +10380,7 @@ public:
  bool has_type(std::string_view name)const{for(auto&e:profile->sizes)if(e.type==name)return true;return false;}
  bool has_function(std::string_view name)const{for(auto& e:profile->symbols)if(e.name==name)return true;return false;}
  void* function(std::string_view name)const{if(!ready)throw std::runtime_error(reason);for(auto& e:profile->symbols)if(e.name==name){if(e.rva>=image_size)throw std::runtime_error("Private symbol RVA invalid");return reinterpret_cast<void*>(base+e.rva);}throw std::runtime_error("Required private function missing");}
- template<class T>T fn(std::string_view name)const{return reinterpret_cast<T>(function(name));}
+ template<class value_type>value_type fn(std::string_view name)const{return reinterpret_cast<value_type>(function(name));}
  bool uses_external_symbols()const noexcept{return private_pdb_!=nullptr;}
  void* current_thread()const{return fn<void*(*)()>("current_thread")();}
  std::size_t type_size(std::string_view name)const{
@@ -10597,9 +10594,9 @@ struct call_result final {
     void** exception_root{};
     const char* error{};
 
-    template<class T> T as() const {
-        static_assert(std::is_trivially_copyable_v<T> && sizeof(T)<=sizeof(bits));
-        T value{}; std::memcpy(&value, &bits, sizeof value); return value;
+    template<class value_type> value_type as() const {
+        static_assert(std::is_trivially_copyable_v<value_type> && sizeof(value_type)<=sizeof(bits));
+        value_type value{}; std::memcpy(&value, &bits, sizeof value); return value;
     }
 };
 
@@ -11192,11 +11189,11 @@ export namespace vmhook::detail::jit_backend
         }
         catch (...) { return false; }
     }
-    template<typename T> inline auto atomic_bits(void* const method, const std::size_t offset, const std::uint32_t mask, const bool set) noexcept -> void
+    template<typename value_type> inline auto atomic_bits(void* const method, const std::size_t offset, const std::uint32_t mask, const bool set) noexcept -> void
     {
-        auto& cell{ *reinterpret_cast<T*>(static_cast<std::byte*>(method) + offset) };
-        if (set) { std::atomic_ref<T>{cell}.fetch_or(static_cast<T>(mask), std::memory_order_relaxed); }
-        else { std::atomic_ref<T>{cell}.fetch_and(static_cast<T>(~mask), std::memory_order_relaxed); }
+        auto& cell{ *reinterpret_cast<value_type*>(static_cast<std::byte*>(method) + offset) };
+        if (set) { std::atomic_ref<value_type>{cell}.fetch_or(static_cast<value_type>(mask), std::memory_order_relaxed); }
+        else { std::atomic_ref<value_type>{cell}.fetch_and(static_cast<value_type>(~mask), std::memory_order_relaxed); }
     }
     inline auto load_word(const void* const method, const std::size_t offset, const std::size_t width) noexcept -> std::uint32_t
     {
@@ -14395,8 +14392,8 @@ export namespace vmhook
                     std::memcpy(&access_flags,
                                 reinterpret_cast<const std::uint8_t*>(k) + entry->offset,
                                 sizeof(access_flags));
-                    constexpr std::uint32_t JVM_ACC_INTERFACE{ 0x0200u };
-                    return (access_flags & JVM_ACC_INTERFACE) != 0u;
+                    constexpr std::uint32_t jvm_acc_interface{ 0x0200u };
+                    return (access_flags & jvm_acc_interface) != 0u;
                 }
 
                 // FALLBACK (only when _access_flags is unavailable): a non-positive
@@ -16302,15 +16299,15 @@ export namespace vmhook
 
     /*
         @brief Proxy for a Java method with descriptor-checked argument conversion.
-        @details New getMethod lookups provide checked access to this proxy;
+        @details Typed get_method lookups provide checked access to this proxy;
         legacy get_method lookups return an optional that must be checked.
         Invocation uses the active native_thread_context on the calling OS
         thread, or the validated Java detour backend, and returns value_t.
 
         Usage inside a wrapper class:
-            auto say_hi() -> void { getMethod("sayHi", *this)->call(); }
+            auto say_hi() -> void { get_method("sayHi")->call(); }
             auto say_string(const std::string& value) -> void {
-                getMethod("sayString", *this)->call(value);
+                get_method("sayString")->call(value);
             }
 
         Inspect was_invoked() and threw() when refusal or Java exceptions matter.
@@ -18588,7 +18585,7 @@ export namespace vmhook
         std::string signature_text;
         std::string method_name{};
         // True when this proxy was created via get_method(name, SIGNATURE) /
-        // getMethod(name, SIGNATURE): the caller pinned an EXACT overload, so
+        // get_method(name, SIGNATURE): the caller pinned an EXACT overload, so
         // resolve_compatible_method() must NOT re-pick a different overload from
         // the C++ argument types (which would silently dispatch e.g. combo(String)
         // for an explicit combo(CharSequence) request).  Name-only proxies leave
@@ -18628,7 +18625,7 @@ export namespace vmhook
 
     /*
         @brief Base of the non-owning Java object wrappers.
-        @details Typed wrappers derive from object<Derived>. The camelCase member
+        @details Typed wrappers derive from object<derived>. The camelCase member
         lookups use an explicit receiver for instance access; static access uses
         the registered Java class. Native-context results carry VM-scanned root
         tickets and refresh their address under a VM operation. Raw-pointer
@@ -18857,10 +18854,10 @@ export namespace vmhook
             @brief Legacy instance lookup by Java method name.
             @details Walks the runtime class hierarchy and returns an optional
             method proxy. Check the optional before dereferencing it. Wrapper
-            methods can use getMethod(name, *this) for a checked lookup:
-                auto say_hi() -> void { getMethod("sayHi", *this)->call(); }
+            methods can use get_method(name) for a checked lookup:
+                auto say_hi() -> void { get_method("sayHi")->call(); }
                 auto take_values(int a, const std::string& b) -> void {
-                    getMethod("takeValues", *this)->call(a, b);
+                    get_method("takeValues")->call(a, b);
                 }
         */
         /*
@@ -19224,12 +19221,12 @@ export namespace vmhook
         }
 
         /*
-            @brief Static-kind gate for the getMethod() resolution path without a receiver.
+            @brief Static-kind gate for static_members::get_method() resolution.
             @details
-            getMethod(name) without a receiver resolves only a STATIC Java method. Without
+            static_members::get_method(name) resolves only a STATIC Java method. Without
             this filter the name (+ optional descriptor) scan over the klass
             _methods array returned the FIRST name match regardless of kind, so
-            getMethod("instanceMethod") could otherwise return a proxy aimed at an
+            static_members::get_method("instanceMethod") could otherwise return a proxy aimed at an
             INSTANCE Method with object == nullptr.  call() then dispatches that
             instance method through the STATIC slot with no receiver pushed (slot 0
             becomes the first declared arg instead of 'this'), yielding a wrong
@@ -19580,8 +19577,8 @@ export namespace vmhook
     /*
         @brief Checked result of a Java member lookup.
         @details
-        Test with `if (auto member = getMethod(...))` when absence is expected.
-        The concise `getMethod(...)->call()` and `getField(...)->get()` forms
+        Test with `if (auto member = get_method(...))` when absence is expected.
+        The concise `get_method(...)->call()` and `get_field(...)->get()` forms
         throw vmhook::exception on a failed lookup instead of dereferencing an
         empty std::optional. A successful lookup owns its lightweight proxy.
     */
@@ -19663,104 +19660,89 @@ export namespace vmhook
         std::optional<proxy_type> member;
     };
 
-    /*
-        @brief CRTP base class for typed Java-object wrappers.
-        @details
-        Derive from vmhook::object<YourClass> and register YourClass once.
-
-        Static Java members use getMethod(name) and getField(name). Instance
-        members use the same names with a receiver: getMethod(name, *this) and
-        getField(name, *this). A bound receiver can also access static Java
-        members; the member's access flags select the actual storage/call kind.
-
-        C++ cannot infer an implicit receiver in a static wrapper function.
-        Making the receiver explicit avoids overloads that GCC selects before
-        diagnosing the missing object, and prevents a static lookup from silently
-        becoming an instance call.
-
-        The snake-case get_method/get_field instance accessors remain available
-        for existing wrappers. vmhook::any_object navigates an unregistered
-        object through its live Java class.
-    */
     inline auto return_value::set(const vmhook::object_base& value) noexcept -> void
     {
         if (const auto root{ value.get_native_root() })
         { (void)vmhook::detail::set_callback_reference(this->return_slot, root); }
     }
 
+    /*
+        @brief CRTP base class for typed Java-object wrappers.
+        @details
+        Derive from vmhook::object<wrapper_type> and register wrapper_type once.
+        Instance wrapper methods use get_field(name) and get_method(name), with
+        an optional JVM descriptor. The inherited nonstatic getter binds its
+        own object, including its native-context root, without a receiver argument.
+
+        Static wrapper methods use static_members::get_field(name) and
+        static_members::get_method(name). This inherited facade knows the CRTP
+        wrapper type and rejects Java instance members: a static C++ function
+        has no object to bind. An instance getter can also access Java statics;
+        the member's access flags select the actual storage or invocation kind.
+
+        Both routes return checked member_lookup proxies. No ambient receiver
+        or thread-local current object participates in member resolution.
+    */
     template<typename derived>
     class object : public object_base
     {
     public:
         using object_base::object_base;
-        using object_base::get_field;
-        using object_base::get_method;
 
         /* @brief Returns a lifetime-checked borrow of this wrapper's instance. */
         [[nodiscard]] auto self() const noexcept
             -> vmhook::borrowed<derived>;
 
-        /* @brief Looks up a static Java field without constructing a wrapper. */
-        [[nodiscard]] static auto getField(const std::string_view name)
+        /* @brief Binds an instance or static field to this wrapper. */
+        [[nodiscard]] auto get_field(const std::string_view name) const
             -> member_lookup<vmhook::field_proxy>
         {
             return member_lookup<vmhook::field_proxy>{
-                object_base::get_field(std::type_index{ typeid(derived) }, name) };
+                object_base::get_field(name) };
         }
 
-        /*
-            @brief Looks up an instance or static Java field through receiver.
-            @details Receiver must belong to this wrapper's CRTP hierarchy.
-        */
-        template<class receiver_type>
-            requires std::is_base_of_v<object<derived>, receiver_type>
-        [[nodiscard]] static auto getField(const std::string_view name,
-                                          const receiver_type& receiver)
-            -> member_lookup<vmhook::field_proxy>
-        {
-            return member_lookup<vmhook::field_proxy>{
-                static_cast<const object_base&>(receiver).get_field(name) };
-        }
-
-        /* @brief Looks up a static Java method without an object receiver. */
-        [[nodiscard]] static auto getMethod(const std::string_view name)
+        /* @brief Binds an instance or static method to this wrapper. */
+        [[nodiscard]] auto get_method(const std::string_view name) const
             -> member_lookup<vmhook::method_proxy>
         {
             return member_lookup<vmhook::method_proxy>{
-                object_base::get_method(std::type_index{ typeid(derived) }, name) };
+                object_base::get_method(name) };
         }
 
-        /* @brief Looks up an exact static method by JVM descriptor. */
-        [[nodiscard]] static auto getMethod(const std::string_view name,
-                                           const std::string_view signature)
+        /* @brief Binds an exact method to this wrapper by JVM descriptor. */
+        [[nodiscard]] auto get_method(const std::string_view name,
+                                     const std::string_view signature) const
             -> member_lookup<vmhook::method_proxy>
         {
             return member_lookup<vmhook::method_proxy>{
-                object_base::get_method(std::type_index{ typeid(derived) }, name, signature) };
+                object_base::get_method(name, signature) };
         }
 
-        /* @brief Looks up an instance or static Java method through receiver. */
-        template<class receiver_type>
-            requires std::is_base_of_v<object<derived>, receiver_type>
-        [[nodiscard]] static auto getMethod(const std::string_view name,
-                                           const receiver_type& receiver)
-            -> member_lookup<vmhook::method_proxy>
+        /* @brief Class-only lookups using the enclosing CRTP wrapper type. */
+        struct static_members final
         {
-            return member_lookup<vmhook::method_proxy>{
-                static_cast<const object_base&>(receiver).get_method(name) };
-        }
+            [[nodiscard]] static auto get_field(const std::string_view name)
+                -> member_lookup<vmhook::field_proxy>
+            {
+                return member_lookup<vmhook::field_proxy>{
+                    object_base::get_field(std::type_index{ typeid(derived) }, name) };
+            }
 
-        /* @brief Looks up an exact instance or static method through receiver. */
-        template<class receiver_type>
-            requires std::is_base_of_v<object<derived>, receiver_type>
-        [[nodiscard]] static auto getMethod(const std::string_view name,
-                                           const std::string_view signature,
-                                           const receiver_type& receiver)
-            -> member_lookup<vmhook::method_proxy>
-        {
-            return member_lookup<vmhook::method_proxy>{
-                static_cast<const object_base&>(receiver).get_method(name, signature) };
-        }
+            [[nodiscard]] static auto get_method(const std::string_view name)
+                -> member_lookup<vmhook::method_proxy>
+            {
+                return member_lookup<vmhook::method_proxy>{
+                    object_base::get_method(std::type_index{ typeid(derived) }, name) };
+            }
+
+            [[nodiscard]] static auto get_method(const std::string_view name,
+                                               const std::string_view signature)
+                -> member_lookup<vmhook::method_proxy>
+            {
+                return member_lookup<vmhook::method_proxy>{
+                    object_base::get_method(std::type_index{ typeid(derived) }, name, signature) };
+            }
+        };
     };
 
     // --- Built-in Java collection wrappers ------------------------------------
@@ -22722,7 +22704,7 @@ export namespace vmhook
         /*
             @brief Detects the card-table spelling this VM exports.
             @details
-            Derived from what RESOLVES, never from a version number:
+            derived from what RESOLVES, never from a version number:
             `CardTableModRefBS::byte_map_base` (no leading underscore) is the
             JDK 8 shape; `CardTable::_byte_map_base` together with the static
             `BarrierSet::_barrier_set` is the JDK 11+ shape.
@@ -25861,8 +25843,8 @@ private:
     inline static std::size_t name_offset_{},loader_offset_{},cld_loader_offset_{},mirror_offset_{},symbol_body_{},symbol_length_{};
     inline static bool combined_symbol_length_{};
     inline static thread_local unsigned callback_depth_{};
-    template<class T> static auto read(const void* base,std::size_t offset) noexcept -> T {
-        T result{};std::memcpy(&result,static_cast<const std::byte*>(base)+offset,sizeof result);return result;
+    template<class value_type> static auto read(const void* base,std::size_t offset) noexcept -> value_type {
+        value_type result{};std::memcpy(&result,static_cast<const std::byte*>(base)+offset,sizeof result);return result;
     }
     static auto emit(void* klass,phase point) noexcept -> void {
         if(!klass || callback_depth_)return;
@@ -26238,7 +26220,7 @@ export namespace vmhook::detail::field_backend
         std::vector<std::uint8_t> data{};
         auto emit(std::initializer_list<std::uint8_t> bytes) -> void
         { this->data.insert(this->data.end(),bytes); }
-        template<class T> auto value(const T value) -> void
+        template<class value_type> auto value(const value_type value) -> void
         { const auto* bytes=reinterpret_cast<const std::uint8_t*>(&value); this->data.insert(this->data.end(),bytes,bytes+sizeof value); }
         auto branch(std::initializer_list<std::uint8_t> operation) -> std::size_t
         { this->emit(operation); const auto at=this->data.size(); this->value<std::int32_t>(0); return at; }

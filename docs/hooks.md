@@ -14,9 +14,9 @@ competing entry patches cause registration to fail.
 ## Method hooks
 
 ```cpp
-const bool installed = vmhook::hook<Counter>("add", "(I)I",
+const bool installed = vmhook::hook<counter>("add", "(I)I",
     [](vmhook::return_value& result,
-       const std::unique_ptr<Counter>& self,
+       const std::unique_ptr<counter>& self,
        std::int32_t amount)
     {
         if (amount < 0)
@@ -87,7 +87,7 @@ restores the temporary compiler setting and the policy it owns.
 ## Static field hooks
 
 ```cpp
-const bool installed = vmhook::hook_field<Counter, std::int32_t>("total",
+const bool installed = vmhook::hook_field<counter, std::int32_t>("total",
     [](vmhook::field_access<std::int32_t>& event)
     {
         if (event.is_write() && event.value() < 0)
@@ -100,7 +100,7 @@ const bool installed = vmhook::hook_field<Counter, std::int32_t>("total",
         }
     });
 
-const bool removed = vmhook::unhook_field<Counter>("total");
+const bool removed = vmhook::unhook_field<counter>("total");
 ```
 
 `hook_field` returns true when installed and keeps the registration until
@@ -177,7 +177,7 @@ This API covers **Java `getstatic`/`putstatic` execution on primitive fields**.
 A compile-time constant can be embedded in bytecode without any field access.
 Reflection, Unsafe and VM/native accesses do not execute these templates.
 Reference-field replacement needs a collector-aware root and store protocol
-and is explicitly refused. C++ `getField` operations also access fields through
+and is explicitly refused. C++ `get_field` operations also access fields through
 their own backend and do not trigger this Java-bytecode hook.
 
 The compatibility `watch_static_field` API uses the same pre-write ASM path.
@@ -278,8 +278,9 @@ during concurrent JVM shutdown.
 
 ## Completed runtime validation
 
-The current frozen probes passed the complete Java 8–27 observation matrix
-under **Wine 10.0**, with no JVM tuning, agent or JIT arguments:
+The current receiver-bound snake_case API's frozen probes passed the complete
+Java 8–27 observation matrix under **Wine 10.0**, with no JVM tuning, agent or
+JIT arguments:
 
 | Interface and compiler | Cases | Strict assertions |
 | --- | ---: | ---: |
@@ -294,7 +295,14 @@ genuine GC frame scanner while keeping HotSpot's normal return epilogue.
 Virtual thread frames remain outside this platform-frame validation.
 Both source and probe hashes remain unchanged through their matrices.
 These results cover the manifest's exact images and default collectors.
-Native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The logs confirm all four observation fixtures in every Java 8–27 job for both interfaces. The older runs at `cdbf2e5` remain historical. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
+The tested callbacks use the receiver-bound API examples from the README.
+
+Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
+
+The preceding API at [commit 6de00ce](https://github.com/xxxnpno/vmhook/commit/6de00ce0d4dd46b404ff24a4358a00b9d4f5e9d9) passed native Windows CI **53/53 in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38015950857) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38015954009). Each run passed 36 callback stress repetitions; actual GC frame scans visited 628/582 synthetic return slots. These runs predate the receiver-bound snake_case API.
+
+
+Earlier native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The logs confirm all four observation fixtures in every Java 8–27 job for both interfaces. The older runs at `cdbf2e5` remain historical. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
 
 ## Reproduce the public observation fixtures
 

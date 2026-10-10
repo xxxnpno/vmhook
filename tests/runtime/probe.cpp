@@ -13,39 +13,39 @@ namespace
     {
     public:
         using vmhook::object<fixture>::object;
-        static auto total() -> std::int32_t { return getField("total")->get(); }
-        static auto arguments_mutated() -> bool { return getField("argumentMutation")->get(); }
-        static auto request_cancellation() -> void { getField("cancelRequested")->set(true); }
-        static auto cancellation_body() -> std::int32_t { return getField("cancelBody")->get(); }
+        static auto total() -> std::int32_t { return static_members::get_field("total")->get(); }
+        static auto arguments_mutated() -> bool { return static_members::get_field("argumentMutation")->get(); }
+        static auto request_cancellation() -> void { static_members::get_field("cancelRequested")->set(true); }
+        static auto cancellation_body() -> std::int32_t { return static_members::get_field("cancelBody")->get(); }
         static auto count_result() -> vmhook::method_proxy::value_t
         {
-            return getMethod("count", "()I")->call();
+            return static_members::get_method("count", "()I")->call();
         }
         auto add(std::int32_t amount) -> std::int32_t
         {
-            return getMethod("add", "(I)I", *this)->call(amount);
+            return get_method("add", "(I)I")->call(amount);
         }
-        auto value() const -> std::int32_t { return getField("value", *this)->get(); }
+        auto value() const -> std::int32_t { return get_field("value")->get(); }
         static auto touch(const std::unique_ptr<fixture>& other) -> std::int32_t
         {
-            return getMethod("touch", "(LVMHookFixture;)I")->call(other);
+            return static_members::get_method("touch", "(LVMHookFixture;)I")->call(other);
         }
         static auto touch_twice(const std::unique_ptr<fixture>& other) -> std::int32_t
         {
-            return getMethod("touchTwice", "(LVMHookFixture;LVMHookFixture;)I")->call(other, other);
+            return static_members::get_method("touchTwice", "(LVMHookFixture;LVMHookFixture;)I")->call(other, other);
         }
         static auto text_result() -> vmhook::method_proxy::value_t
         {
-            return getMethod("text", "()Ljava/lang/String;")->call();
+            return static_members::get_method("text", "()Ljava/lang/String;")->call();
         }
         static auto latin1_result() -> vmhook::method_proxy::value_t
         {
-            return getMethod("latin1", "()Ljava/lang/String;")->call();
+            return static_members::get_method("latin1", "()Ljava/lang/String;")->call();
         }
-        auto text_value() const -> std::string { return getField("textValue", *this)->get(); }
+        auto text_value() const -> std::string { return get_field("textValue")->get(); }
         static auto throw_result() -> vmhook::method_proxy::value_t
         {
-            return getMethod("fail", "()V")->call();
+            return static_members::get_method("fail", "()V")->call();
         }
     };
 

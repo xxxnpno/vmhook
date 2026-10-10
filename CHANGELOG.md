@@ -23,10 +23,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Dedicated injected-runtime fixtures for direct native calls, construction,
   Unicode Strings, idle GC, exceptions, compiled calls, repeated/concurrent
   attachment and context lifetime. Both interfaces have Java 8–27 CI coverage.
-- Persistent `hook_field<Wrapper, T>` callbacks before static primitive reads
+- Persistent `hook_field<wrapper, value_type>` callbacks before static primitive reads
   and writes, using generated ASM stubs in HotSpot's `getstatic`/`putstatic`
-  templates. `field_access<T>` supports replacement and prevention;
-  `unhook_field<Wrapper>` removes the registration. All eight primitive types
+  templates. `field_access<value_type>` supports replacement and prevention;
+  `unhook_field<wrapper>` removes the registration. All eight primitive types
   are supported; reference fields and accesses outside these bytecodes are
   refused or outside the observation scope.
 - Persistent class observer IDs with `remove_class_observer`, covering
@@ -61,10 +61,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - The module builder creates a build-directory libstdc++ overlay for affected
   GCC 16 Windows `import std` linkage, preserving the ABI and forwarding the
   required include path to consumers without changing installed headers.
-- Static and instance wrappers use `getMethod` and `getField`. Instance lookup
-  takes an explicit receiver, such as `getMethod("add", *this)`; static lookup
-  uses the same name without a receiver. Checked lookup arrows report missing
-  members through `vmhook::exception`.
+- **Breaking wrapper API:** use snake_case C++ names throughout. Instance
+  wrappers inherit receiver-bound `get_method` and `get_field` from
+  `object<wrapper>`; call `get_method("add", "(I)I")` or `get_field("value")`
+  without passing `this` or `*this`. Static members use
+  `static_members::get_method("count")` and `static_members::get_field("total")`
+  inside a wrapper, or qualify them with the wrapper class externally.
+  Checked lookup arrows report missing members through `vmhook::exception`.
+  Java class/member strings and external ABI names retain their exact spelling.
 - Native-context construction uses HotSpot's collector-aware allocator,
   initializes an already-loaded concrete class and invokes its real constructor.
   String arguments use the private VM String allocator, including Java 27's
@@ -109,8 +113,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - JNI and JVMTI API calls, including function-table invocations, attachment
   entry points, hidden JNI helpers and JNI global-reference fallbacks.
 - Scoped hooks and their RAII handles. Hooks have explicit persistent lifetime.
-- Separate `static_method` and `static_field` APIs; use receiver-free
-  `getMethod` and `getField`. Legacy snake_case instance lookups remain.
+- Separate static lookup functions and explicit-receiver wrapper overloads.
+  Use `get_method` and `get_field` on an instance, or the wrapper's
+  class-bound lookup functions under `static_members` for static members.
 - Compiler and operating-system branches outside Windows x64 G++.
 - Unchecked JIT entry rewrites and the hook-repair watchdog. Compilation
   exclusions and deoptimization now follow the verified safepoint protocol.
