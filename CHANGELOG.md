@@ -8,6 +8,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Passive exact-image capability reporting and offline DLL/PDB inspection.
+- Durable retained objects with explicit cross-context acquisition, exact
+  per-wrapper defining-loader bindings and generation-pinned proxies/caches.
+- Typed primitive/object/nested arrays, collection CRUD/builders, standard Java
+  wrappers, copied ByteBuffer access and optional class/JAR wrapper generation.
+- Checked primitive, object and void errors, retained Java Throwables, strict
+  UTF-8 and lossless UTF-16; allocation failure preserves `std::bad_alloc`.
+- Persistent ordered method observers with explicit removal, recursion control,
+  callback counters, bounded copied-data event queues and native deferred hooks.
+- Runtime, Java stack, memory-pool and per-thread allocated-byte observations.
+- Exact safepoint G1/Parallel instance snapshots with roots published before
+  the VM resumes; user visitors execute outside the safepoint.
+
 - Installed `find_package(vmhook COMPONENTS module)` support rebuilds module
   sources with the consumer's compiler, configuration and common options.
   Independent two-translation-unit consumers verify both installed interfaces.
@@ -130,9 +143,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `method_proxy::value_t::was_invoked()` distinguishes refused calls from real
   void, null or zero results. Java exceptions are reported and consumed by the
   native backend; construction rejects an object whose constructor did not run.
-- Public reference field stores require Epsilon until a correct write-barrier
-  backend exists. Typed references require verified compressed oops. Concurrent
-  relocating collectors such as ZGC and Shenandoah are refused.
+- Metadata-bound reference field stores use Java Unsafe methods and the VM's
+  collector barriers; volatile primitive/reference access and supported atomic
+  compare/exchange follow VM semantics. Final writes are refused. Raw reference
+  memory stores remain Epsilon-only. Typed references require verified compressed
+  oops; unverified concurrent relocating collectors are refused.
 - Java 8–27 metadata and ABI handling cover legacy thread alignment/TLS,
   attachment cleanup ownership, packed Symbol lengths, narrow-reference widths,
   compact headers, array layouts and method-handle calling conventions.
