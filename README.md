@@ -122,6 +122,11 @@ A registered wrapper can bind an exact defining loader using an already-rooted
 anchor. Existing proxies retain their binding across re-registration. See
 [retention and class loaders](docs/lifetime.md).
 
+For independent asynchronous work, [native_executor](docs/native-executor.md)
+provides bounded queues and persistent native workers. Tasks transfer copied
+C++ values or explicit retained resources; they support queued deadlines,
+cancellation and joined closure. They execute without waiting for a Java hook.
+
 Metadata-bound reference field writes execute the VM's collector-aware Java
 Unsafe methods. Volatile primitive/reference access and supported atomic
 compare/exchange follow VM semantics; unsupported final writes are refused.
@@ -157,6 +162,7 @@ include Java strings, class objects, class loaders, Throwables, enums, boxed
 primitives, Optional and copied heap/direct ByteBuffer access.
 The optional [class/JAR generator](docs/wrapper_generator.md) creates short
 wrappers for either interface with exact descriptors and owning object types.
+See [arrays and standard wrappers](docs/containers.md) for complete examples.
 
 ## Persistent hooks and observation
 
