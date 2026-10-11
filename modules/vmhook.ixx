@@ -1000,7 +1000,7 @@ export namespace vmhook
             }
         }
         inline auto container_class_assignable(vmhook::hotspot::klass*, vmhook::hotspot::klass*) -> bool;
-        inline auto prepare_durable_roots() noexcept -> bool;
+        inline auto prepare_durable_roots() -> bool;
         inline auto retain_durable_oop(void*) -> std::shared_ptr<void>;
         inline auto resolve_durable_oop(const std::shared_ptr<void>&) noexcept -> void*;
     }
@@ -27834,7 +27834,7 @@ public:
 };
 inline ticket::~ticket() { if (owner) { owner->release(slot); } }
 
-inline bool prepare() noexcept {
+inline bool prepare_checked() {
     try {
         auto& runtime = pn::rt();
         if (!runtime.ready || runtime.uses_external_symbols() || !vmhook::vm_capabilities().supported) { return false; }
@@ -27846,7 +27846,11 @@ inline bool prepare() noexcept {
         if (!pool.await_ready()) { return false; }
         prepared_keeper.store(&pool, std::memory_order_release);
         return true;
-    } catch (...) { return false; }
+    } catch (const std::bad_alloc&) { throw; }
+    catch (...) { return false; }
+}
+inline bool prepare() noexcept {
+    try { return prepare_checked(); } catch (...) { return false; }
 }
 inline std::shared_ptr<void> retain_klass(vmhook::hotspot::klass* klass) noexcept {
     if (!klass) { return {}; }
@@ -27896,11 +27900,11 @@ export namespace vmhook::detail {
 }
 export namespace vmhook::detail
 {
-    inline auto prepare_durable_roots() noexcept -> bool
+    inline auto prepare_durable_roots() -> bool
     {
         if (auto* pool{persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)})
         { return pool->ready(); }
-        return persistent_hook_roots::prepare();
+        return persistent_hook_roots::prepare_checked();
     }
     inline auto retain_durable_oop(void* oop) -> std::shared_ptr<void>
     {

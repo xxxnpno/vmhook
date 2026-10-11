@@ -7,6 +7,7 @@ public final class ExecutorFixture {
     public static Node create(int value) { return new Node(value); }
     public static String thread_name() { return Thread.currentThread().getName(); }
     public static void collect() { System.gc(); }
+    public static void fail() { throw new IllegalStateException("expected executor exception"); }
     public static void main(String[] arguments) throws Exception {
         new Node(0);
         System.out.println("PID=" + java.lang.management.ManagementFactory.getRuntimeMXBean().getName().split("@")[0]);

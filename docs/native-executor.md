@@ -58,6 +58,14 @@ already completed operation. Exceptions thrown by the body are rethrown by `get(
 APIs inside a task when Java failures should become C++ exceptions; the executor
 does not reinterpret unchecked call results.
 
+A propagated `vmhook::exception` preserves its copied error code, diagnostic,
+and Java exception class across the future. Its original Throwable root still
+belongs to the worker's context: `get_throwable()` on the receiving thread
+refuses that foreign root. The future does not automatically transfer it. When
+the receiver needs the actual Throwable, catch the failure inside the worker,
+call `retain(error.get_throwable())` there, and return the resulting retained
+resource. The receiver can then acquire its own rooted wrapper in its context.
+
 `ready()` and `wait_for(0ms)` allow nonblocking polling. Waiting on an unfinished
 task from a VM-state callback or any executor worker throws, including waits on
 another pool. This prevents workers from consuming their own capacity while
