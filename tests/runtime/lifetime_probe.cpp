@@ -80,6 +80,17 @@ namespace
                 auto created = vmhook::make_unique<copy_one>(std::int32_t{9});
                 if (!check(output, "constructor_identity", created->value() == 9
                     && copy_one::total() == 150 && copy_two::total() == 173)) { return 6; }
+                auto first_snapshot = vmhook::get_instances<copy_one>(64);
+                fixture::collect();
+                bool saw_first{}, saw_created{}, exact_first{!first_snapshot.empty()};
+                for (const auto& object : first_snapshot)
+                {
+                    const auto value = object->value();
+                    saw_first = saw_first || value == 41;
+                    saw_created = saw_created || value == 9;
+                    exact_first = exact_first && (value == 41 || value == 9);
+                }
+                if (!check(output, "loader_heap_snapshot", exact_first && saw_first && saw_created)) { return 6; }
                 expired = std::make_unique<copy_one>(first->get_instance());
                 expired->set_native_root(first->get_native_root());
                 retained = vmhook::retain(expired);
@@ -131,6 +142,16 @@ namespace
                     && vmhook::register_class<copy_one>("LifetimeFixture$Duplicate", other)
                     && copy_one::total() == 178 && static_cast<std::int32_t>(old_field->get()) == 150
                     && static_cast<std::int32_t>(old_method->call()) == 150)) { return 12; }
+                auto rebound_snapshot = vmhook::get_instances<copy_one>(64);
+                fixture::collect();
+                bool saw_other{}, exact_other{!rebound_snapshot.empty()};
+                for (const auto& object : rebound_snapshot)
+                {
+                    const auto value = object->value();
+                    saw_other = saw_other || value == 5;
+                    exact_other = exact_other && (value == 5 || value == 73);
+                }
+                if (!check(output, "rebound_heap_snapshot", exact_other && saw_other)) { return 12; }
             }
             if (!check(output, "unregister", vmhook::unregister_class<copy_one>()
                 && vmhook::unregister_class<copy_two>())) { return 12; }
