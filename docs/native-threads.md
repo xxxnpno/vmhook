@@ -51,6 +51,9 @@ An allocation failure in C++ name, context or session bookkeeping throws
 `std::bad_alloc`. Partial construction releases the attachment before the
 exception reaches the caller; the same OS thread can retry. Unsupported VM
 profiles and VM attachment refusals remain invalid contexts with an `error()`.
+Private-runtime initialization has a separate cached failure: a C++ allocation
+error while reading its profile or PDB is rethrown on later checked operations,
+and is never reported as an unsupported JVM. See [runtime diagnostics](runtime-diagnostics.md).
 
 Each wrapper operation enters VM state for the necessary work and returns to
 native state afterward. Normal C++ waits and sleeps therefore let HotSpot

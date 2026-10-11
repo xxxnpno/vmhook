@@ -38,6 +38,14 @@ a hook. A successful preflight does not replace the operation's checks: an
 instance reference still needs its live owning context, and a hook still needs
 its signature, root and JIT preparation.
 
+If private-runtime or PDB initialization encounters a C++ allocation failure,
+the passive report records the failure without attaching a thread. Checked
+context creation, class registration and class-observer registration rethrow
+the original `std::bad_alloc`; an unavailable ABI remains a separate refusal.
+The failed initialization is cached for that loaded VMHook image. It does not
+retry partially constructed metadata during a later operation. The report's
+own copied C++ strings can also raise `std::bad_alloc`.
+
 An entry callback or forced return is not an event for an original method's
 exit. The committed-normal-return capability requires the independently verified
 final-tail sites and records copied values or reference kinds; it does not

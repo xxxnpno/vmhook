@@ -10689,6 +10689,17 @@ class runtime final {
  std::vector<size_entry> fallback_sizes_;
  std::vector<enum_entry> fallback_enums_;
  std::string fallback_error_;
+ std::exception_ptr initialization_failure_{};
+ void capture_allocation_failure()noexcept{
+  initialization_failure_=std::current_exception();
+  private_pdb_.reset();profile=nullptr;ready=false;
+  reason="C++ allocation failed while initializing the private JVM runtime";
+ }
+ void copy_initialization_error(const std::exception& error)noexcept{
+  try{fallback_error_=error.what();reason=fallback_error_.c_str();}
+  catch(const std::bad_alloc&){capture_allocation_failure();}
+  catch(...){reason="Private JVM runtime diagnostic unavailable";}
+ }
  bool load_pdb(const IMAGE_NT_HEADERS64* nt,const unsigned char* rsds){
   try {
    std::vector<std::filesystem::path> paths;
@@ -10701,7 +10712,7 @@ class runtime final {
    std::memcpy(identity.guid.data(),rsds+4,16);identity.age=load<std::uint32_t>(rsds,20);identity.image_size=static_cast<std::uint32_t>(image_size);
    const auto* sections=reinterpret_cast<const IMAGE_SECTION_HEADER*>(reinterpret_cast<const std::byte*>(&nt->OptionalHeader)+nt->FileHeader.SizeOfOptionalHeader);
    for(std::size_t i=0;i<nt->FileHeader.NumberOfSections;++i)identity.section_rvas.push_back(sections[i].VirtualAddress);
-   for(const auto& path:paths){if(!std::filesystem::is_regular_file(path))continue;try{private_pdb_=std::make_unique<vmhook::private_metadata::private_profile>(path,identity);break;}catch(const std::exception& error){fallback_error_=error.what();}}
+   for(const auto& path:paths){if(!std::filesystem::is_regular_file(path))continue;try{private_pdb_=std::make_unique<vmhook::private_metadata::private_profile>(path,identity);break;}catch(const std::bad_alloc&){throw;}catch(const std::exception& error){fallback_error_=error.what();}}
    if(!private_pdb_)return false;
    auto& pdb=*private_pdb_;
    std::memcpy(fallback_.guid.data(),rsds+4,16);fallback_.age=identity.age;fallback_.image_size=identity.image_size;fallback_.pe_timestamp=nt->FileHeader.TimeDateStamp;
@@ -10721,7 +10732,8 @@ class runtime final {
     pdb.has_field("JavaThread","_monitor_owner_id"),fallback_.java_feature>=23,pdb.has_symbol("?call@JavaCalls@@SAXPEAVJavaValue@@VmethodHandle@@PEAVJavaCallArguments@@PEAVThread@@@Z"),
     pdb.has_symbol("?make_walkable@JavaFrameAnchor@@QEAAXPEAVJavaThread@@@Z")};
    return true;
-  }catch(const std::exception& error){fallback_error_=error.what();private_pdb_.reset();profile=nullptr;return false;}
+  }catch(const std::bad_alloc&){capture_allocation_failure();return false;}
+  catch(const std::exception& error){copy_initialization_error(error);private_pdb_.reset();profile=nullptr;return false;}
  }
  template<class value_type>value_type exported_value(const char* name)const{
   const auto address=GetProcAddress(module_,name);
@@ -10755,7 +10767,7 @@ public:
    for(const auto* p:all_profiles)if(!std::memcmp(b+4,p->guid.data(),16)&&load<std::uint32_t>(b,20)==p->age&&p->image_size==image_size&&p->pe_timestamp==nt->FileHeader.TimeDateStamp)profile=p;
   }
   const bool explicit_pdb=!native_symbols_path.empty()||GetEnvironmentVariableW(L"VMHOOK_PRIVATE_PDB",nullptr,0)!=0;
-  if((!profile||explicit_pdb)&&(!rsds||!load_pdb(nt,rsds))){reason=fallback_error_.empty()?"No matching verified DLL/PDB profile":fallback_error_.c_str();return;}
+  if((!profile||explicit_pdb)&&(!rsds||!load_pdb(nt,rsds))){if(!initialization_failure_)reason=fallback_error_.empty()?"No matching verified DLL/PDB profile":fallback_error_.c_str();return;}
   try{
    for(const char* n:{"JavaThread","Thread","JavaFrameAnchor","JNIHandleBlock"})if(type_size(n)!=size(n)){reason="VMTypes and PDB object sizes disagree";return;}
    for(const auto& f:profile->fields){
@@ -10792,8 +10804,14 @@ public:
    if(has_field("JavaCallArguments","_alternative_target")&&off("JavaCallArguments","_alternative_target")!=120)throw std::runtime_error("Unsupported private JVMCI argument ABI");
    if(size("AccessFlags")!=2&&size("AccessFlags")!=4)throw std::runtime_error("Unsupported Method access flag ABI");
    if(size("Handle")!=8||size("methodHandle")!=16||size("HandleMark")!=56||size("JavaValue")!=16||(size("JavaCallArguments")!=120&&size("JavaCallArguments")!=128)){reason="Unsupported private call ABI";return;}
-  }catch(const std::exception& error){fallback_error_=error.what();reason=fallback_error_.c_str();return;}
+  }catch(const std::bad_alloc&){capture_allocation_failure();return;}
+  catch(const std::exception& error){copy_initialization_error(error);return;}
   ready=true;reason="Verified HotSpot private runtime profile ready";
+ }
+ // Readiness probes keep the failed profile passive. Checked producers must
+ // rethrow the original C++ allocation failure before reporting ABI refusal.
+ void rethrow_initialization_failure()const{
+  if(initialization_failure_)std::rethrow_exception(initialization_failure_);
  }
  std::size_t size(std::string_view type)const{for(auto& e:profile->sizes)if(e.type==type)return e.size;throw std::runtime_error("Required PDB type missing");}
  std::size_t off(std::string_view type,std::string_view name)const{for(auto& e:profile->fields)if(e.type==type&&e.name==name)return e.offset;throw std::runtime_error("Required PDB member missing: "+std::string(type)+"::"+std::string(name));}
@@ -13030,6 +13048,7 @@ export namespace vmhook
             try
             {
                 auto& runtime{ private_native::rt() };
+                runtime.rethrow_initialization_failure();
                 if (!runtime.ready) { this->error_ = runtime.reason; return; }
                 if (!vmhook::detail::java_execution_supported())
                 { this->error_ = "Detected collector or VM metadata cannot support direct native access"; return; }
@@ -27563,6 +27582,7 @@ public:
     static auto ensure_installed() -> bool {
         if(callback_depth_)return false;
         auto& runtime=vmhook::detail::private_native::rt();
+        runtime.rethrow_initialization_failure();
         if(!runtime.ready || runtime.uses_external_symbols() || !vmhook::vm_capabilities().supported)return false;
         vmhook::windows::HMODULE pinned{};
         if(!vmhook::windows::GetModuleHandleExW(vmhook::windows::module_handle_from_address|vmhook::windows::module_handle_pin,
@@ -28641,6 +28661,7 @@ inline ticket::~ticket() { if (owner) { owner->release(slot); } }
 inline bool prepare_checked() {
     try {
         auto& runtime = pn::rt();
+        runtime.rethrow_initialization_failure();
         if (!runtime.ready || runtime.uses_external_symbols() || !vmhook::vm_capabilities().supported) { return false; }
         const auto flags = vmhook::detail::read_gc_flags();
         if (!flags.resolved || flags.use_z || flags.use_shenandoah || flags.use_epsilon
