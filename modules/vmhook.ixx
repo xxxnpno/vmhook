@@ -31,6 +31,7 @@ export namespace vmhook::detail
     inline auto prepare_hook_roots() noexcept -> bool;
     inline auto prepare_callback_return_roots() noexcept -> bool;
     inline auto mark_callback_return_root(void*, vmhook::hotspot::method*) noexcept -> bool;
+    inline auto callback_return_marker_resources() noexcept -> std::pair<std::size_t, std::size_t>;
     inline auto flush_hook_roots() noexcept -> void;
     inline auto retain_hook_klass(vmhook::hotspot::klass*) noexcept -> std::shared_ptr<void>;
     inline auto prepare_class_hooks(vmhook::hotspot::klass*) noexcept -> bool;
@@ -9462,6 +9463,7 @@ export namespace vmhook
     {
         std::size_t active_observers{}, retained_method_policies{}, physical_stubs{};
         std::size_t retained_snapshots{}, dispatch_readers{}, active_callbacks{};
+        std::size_t resident_return_markers{}, resident_return_marker_bytes{};
         std::uint64_t callback_failures{}, suppressed_recursions{};
         bool shutdown_requested{}, registry_sizes_available{};
         // Published code can remain on a Java return stack after callbacks drain.
@@ -9493,6 +9495,9 @@ export namespace vmhook
             }
         }
         catch (...) {}
+        const auto [markers, marker_bytes]{ detail::callback_return_marker_resources() };
+        result.resident_return_markers = markers;
+        result.resident_return_marker_bytes = marker_bytes;
         result.dispatch_readers = hotspot::g_hook_dispatch_readers.load(std::memory_order_seq_cst);
         result.active_callbacks = hotspot::g_active_hook_callbacks.load(std::memory_order_acquire);
         result.callback_failures = hotspot::g_hook_callback_failures.load(std::memory_order_relaxed);
@@ -26994,6 +26999,7 @@ struct marker final {
     marker(void* frame, marker* previous) noexcept : fp{frame}, local_previous{previous} {}
 };
 inline std::atomic<marker*> markers{};
+inline std::atomic<std::size_t> resident_markers{};
 static_assert(std::atomic<marker*>::is_always_lock_free && std::atomic<void*>::is_always_lock_free);
 thread_local marker* local_markers{};
 inline std::atomic<std::uint64_t> scanned_slots{};
@@ -27144,6 +27150,7 @@ inline auto mark(void* fp, void* method) noexcept -> bool {
             do { node->global_previous = head; }
             while (!markers.compare_exchange_weak(head, node, std::memory_order_seq_cst));
             local_markers = node;
+            resident_markers.fetch_add(1, std::memory_order_relaxed);
         }
         node->method.store(method, std::memory_order_seq_cst);
         return true;
@@ -27151,6 +27158,10 @@ inline auto mark(void* fp, void* method) noexcept -> bool {
 }
 }
 export namespace vmhook::detail {
+inline auto callback_return_marker_resources() noexcept -> std::pair<std::size_t, std::size_t> {
+    const auto count = callback_return_roots::resident_markers.load(std::memory_order_relaxed);
+    return {count, count * sizeof(callback_return_roots::marker)};
+}
 inline auto prepare_callback_return_roots() noexcept -> bool { return callback_return_roots::prepare(); }
 inline auto mark_callback_return_root(void* fp, vmhook::hotspot::method* method) noexcept -> bool { return callback_return_roots::mark(fp, method); }
 }

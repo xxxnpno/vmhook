@@ -1,6 +1,7 @@
 public final class HookCompositionFixture {
     private static volatile int sink;
     public static int target(int value) { return value + 1; }
+    public static Object target_object() { return null; }
     public static void main(String[] args) throws Exception {
         for (int i = 0; i < 300000; ++i) sink = target(i);
         System.out.println("PID=" + java.lang.management.ManagementFactory.getRuntimeMXBean().getName().split("@")[0]);

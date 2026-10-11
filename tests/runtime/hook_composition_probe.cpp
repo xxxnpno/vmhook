@@ -14,6 +14,8 @@ namespace
         using vmhook::object<fixture>::object;
         static auto target(std::int32_t value) -> std::int32_t
         { return static_members::get_method("target")->call(value); }
+        static auto target_object() -> std::unique_ptr<vmhook::any_object>
+        { return static_members::get_method("target_object")->call(); }
     };
     auto worker(void*) -> DWORD
     {
@@ -69,11 +71,24 @@ namespace
             const auto disabled = vmhook::hook_resources();
             check("disabled_resources", disabled.active_observers == 0 && disabled.retained_method_policies == 1
                 && disabled.physical_stubs == 1 && disabled.dll_must_remain_loaded);
+            const auto marker_before = vmhook::hook_resources();
+            const auto object_hook = vmhook::add_hook<fixture>("target_object", "()Ljava/lang/Object;",
+                [](vmhook::return_value& result)
+                { const auto value = std::make_unique<vmhook::any_object>(nullptr); result.set(value); });
+            const auto returned = fixture::target_object();
+            const auto marker_after = vmhook::hook_resources();
+            check("resident_return_markers", object_hook && returned && !returned->get_instance()
+                && marker_after.resident_return_markers > marker_before.resident_return_markers
+                && marker_after.resident_return_marker_bytes == marker_after.resident_return_markers
+                    * sizeof(vmhook::detail::callback_return_roots::marker));
+            check("remove_object_hook", vmhook::remove_hook(object_hook));
             vmhook::shutdown_hooks();
             check("shutdown_original_body", fixture::target(8) == 9);
             const auto stopped = vmhook::hook_resources();
             check("shutdown_resources", stopped.active_observers == 0 && stopped.retained_method_policies == 0
                 && stopped.physical_stubs == 0 && stopped.dll_must_remain_loaded);
+            check("resident_markers_after_shutdown", stopped.resident_return_markers == marker_after.resident_return_markers
+                && stopped.resident_return_marker_bytes == marker_after.resident_return_marker_bytes);
             output << "hook_composition_proof=" << (valid ? "pass" : "fail") << '\n';
             return valid ? 0 : 2;
         }

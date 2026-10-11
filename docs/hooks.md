@@ -50,6 +50,14 @@ the final observer keeps the dormant method policy and stub until
 readers. Registry aggregate sizes are available only to native administrators;
 `registry_sizes_available` distinguishes that case. Counters do not authorize DLL
 unloading: published stub return PCs and the injecting DLL remain resident.
+`resident_return_markers` and `resident_return_marker_bytes` report permanent
+native marker nodes used by the forced-reference-return GC scanner. A thread
+reuses its node at each previously observed frame address; new frame addresses
+and previously unseen threads can increase this resident storage. The nodes
+contain frame and metadata identity pointers, rather than Java object handles.
+Removal and `shutdown_hooks()` do not reclaim them while the scanner can read
+its published list. The byte count covers node payloads, excluding allocator
+bookkeeping and the shared scanner stubs.
 
 Mounted virtual-thread frames do not enter a VMHook borrowed callback context.
 Method and field operations on those frames run their original Java behavior;
