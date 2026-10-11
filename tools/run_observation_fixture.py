@@ -34,6 +34,15 @@ CHECKS = {
                 "class_failed_definition", "class_callback_state", "class_removal",
                 "class_persistent", "class_shutdown", "classes_complete"],
     "callbacks": ["callback_proof"],
+    "callback_throw": ["context", "registration", "hooks", "same_throwable_primitive",
+                       "same_throwable_void", "same_throwable_reference", "body_skip_and_finally",
+                       "unrelated_object_refused", "java_null_refused", "exception_wins_return",
+                       "synchronized_resume_after_gc", "synchronized_early_return_after_gc",
+                       "synchronized_instance_throw_after_gc", "removal",
+                       "synchronized_original_after_remove", "callback_throw_proof"],
+    "executor": ["metadata", "backpressure", "queued_cancel", "worker_context", "queued_deadline",
+                 "retained_argument", "retained_result", "running_cancel", "self_wait_refused",
+                 "joined_close", "parallel_workers", "cancelled_close", "executor_complete"],
     "management": ["passive_preflight", "exact_runtime_identity", "preflight_no_attachment",
                    "memory_observation", "runtime_counters", "real_gc_counters", "memory_pool_observation",
                    "real_allocation_counters", "bounded_allocation_snapshot", "java_thread_identity",
@@ -41,7 +50,7 @@ CHECKS = {
                    "copied_observations_survive_close", "management_complete"],
     "lifetime": ["metadata", "native_attach", "ambiguous_name", "loader_binding", "constructor_identity",
                  "null_contract", "context_loader", "source_closed", "cross_context_gc",
-                 "released_resource", "proxy_binding_lifetime", "unregister", "lifetime_complete"],
+                 "released_resource", "proxy_binding_lifetime", "loader_heap_snapshot", "rebound_heap_snapshot", "root_accounting", "unregister", "lifetime_complete"],
     "event_stream": ["context", "queued_observer", "deferred_registration", "initial_wait",
                      "copied_class_record", "deferred_native_install", "deferred_callback",
                      "deferred_removal", "deferred_original_body", "deferred_reclamation",
@@ -64,6 +73,8 @@ FIXTURES = {
     "lifetime": "LifetimeFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
+    "executor": "ExecutorFixture",
+    "callback_throw": "CallbackThrowFixture",
 }
 
 
@@ -73,9 +84,12 @@ OPTIONAL_PROBES = {
     "lifetime": "lifetime_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
+    "executor": "executor_probe",
+    "callback_throw": "callback_throw_probe",
 }
 TERMINAL_CHECK = {
     "callbacks": "callback_proof",
+    "callback_throw": "callback_throw_proof",
     "hook_composition": "hook_composition_proof",
     "event_stream": "event_stream_proof",
 }
@@ -143,7 +157,8 @@ def execute_mode(args, mode, directory):
                        VMHOOK_HOOK_COMPOSITION_REPORT=windows_path(result),
                        VMHOOK_EVENT_STREAM_REPORT=windows_path(result),
                        VMHOOK_TEST_RESULT=windows_path(result),
-                       VMHOOK_MANAGEMENT_REPORT=windows_path(result))
+                       VMHOOK_MANAGEMENT_REPORT=windows_path(result),
+                       VMHOOK_CALLBACK_THROW_REPORT=windows_path(result))
     command = prefix + [str(args.java), "-cp", windows_path(directory), FIXTURES[mode]]
     process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
