@@ -17,6 +17,11 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   UTF-8 and lossless UTF-16; allocation failure preserves `std::bad_alloc`.
 - Persistent ordered method observers with explicit removal, recursion control,
   callback counters, bounded copied-data event queues and native deferred hooks.
+- Committed normal-return telemetry records copied primitive bits or reference
+  kinds after monitor/poll cleanup, distinguishes entry-forced returns, and
+  exposes bounded queue/origin storage and explicit observer reclamation.
+- Bounded loaded-class snapshots use the verified CLDG keepalive iterator,
+  preserve independent defining loaders, and return rooted `Class` owners.
 - Runtime, Java stack, memory-pool and per-thread allocated-byte observations.
 - Exact safepoint G1/Parallel instance snapshots with roots published before
   the VM resumes; user visitors execute outside the safepoint.
@@ -57,6 +62,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   are supported; reference values use owning wrappers and VM-scanned ASM
   transport. Instance fields and accesses outside these bytecodes remain
   outside the observation scope.
+- Reference field hooks verify the declared `Class` identity before publication
+  and preserve captured owner/value/array-component bindings across global
+  rebinding and nested callbacks.
 - Persistent class observer IDs with `remove_class_observer`, covering
   successful ordinary, bootstrap, ByteBuffer, hidden/anonymous and array
   definition paths. Events expose actual defining loader-data identity and

@@ -39,6 +39,8 @@ allows at most 4,096 retained observers, including inactive observers awaiting
 native reclamation, which also bounds each leaf snapshot scan. `method_exit_resources()`
 reports admitted records, drops, active observers, resident code, snapshots and
 origin storage. Saturation loses telemetry and preserves the Java method result.
+Resident stub bytes count emitted instructions, excluding rounded executable
+pages and allocator overhead; origin bytes report the fixed map's exact size.
 Multiple observers for the same method receive separate records with the same
 event ID. This stream does not make a duration around an entry callback an exit
 measurement: method entry and the final return are distinct sites.

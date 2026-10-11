@@ -204,6 +204,12 @@ an ordinarily loaded Java `InvocationHandler`, JDK proxies and method hooks.
 Java interface calls invoke a rooted C++ callback synchronously, with explicit
 closure and normal Java result/exception semantics.
 
+`observe_method_exits` records committed normal returns into a bounded queue
+after monitor and return-poll processing. Native consumers receive primitive
+bits or a reference-result kind, with entry-forced returns identified separately.
+See [method returns and exception flow](docs/advanced-events.md) for the exact
+sites, resource bounds and remaining exception-event work.
+
 Method entry is distinct from original method exit, and Throwable stack-trace
 construction is distinct from a throw/catch event. The [hook guide](docs/hooks.md)
 defines exact routes, JIT cost, borrowed callback lifetime and resource reclamation.
@@ -222,6 +228,10 @@ contains allocated objects, including objects not yet reclaimed, and does not
 establish a reachability graph. Unsupported profiles or collectors are refused.
 See [heap snapshots and GC barriers](docs/heap-memory.md) for the locking and
 root-publication protocol.
+
+`get_loaded_classes()` takes a bounded safepoint snapshot of rooted `Class`
+wrappers and copied names. Different loaders defining the same name remain
+distinct. See [loaded classes](docs/class-inventory.md) for lifetime and bounds.
 
 ## Build and install
 

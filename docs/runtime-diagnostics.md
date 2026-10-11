@@ -39,7 +39,11 @@ instance reference still needs its live owning context, and a hook still needs
 its signature, root and JIT preparation.
 
 An entry callback or forced return is not an event for an original method's
-exit. The instance snapshot backend uses the verified G1/Parallel object iterator at
+exit. The committed-normal-return capability requires the independently verified
+final-tail sites and records copied values or reference kinds; it does not
+provide exceptional exits or owning object results. Loaded-class inventory has
+its own bounded, rooted safepoint traversal capability.
+The instance snapshot backend uses the verified G1/Parallel object iterator at
 a VM safepoint and roots selected objects before Java resumes. Its capability
 still requires a standalone native context and successful snapshot preparation.
 Java monitor guards and static primitive/reference field hooks have separate
