@@ -9,6 +9,7 @@ import vmhook.windows;
 namespace
 {
     std::atomic<bool> fail_next_allocation{};
+    struct deliberately_long_type_name_for_allocation_failure {};
 }
 
 [[gnu::noinline]] void* operator new(const std::size_t size)
@@ -141,5 +142,15 @@ int main()
     try { (void)copied.as_string(); }
     catch (const std::bad_alloc&) { copy_allocation = true; }
     check(copy_allocation, "String-copy allocation failure propagates without terminate or Java null");
+    bool descriptor_allocation{};
+    fail_next_allocation.store(true);
+    try { (void)vmhook::detail::jvm_descriptor_for_arg<std::string>(); }
+    catch (const std::bad_alloc&) { descriptor_allocation = true; }
+    check(descriptor_allocation, "descriptor allocation failure remains a C++ allocation failure");
+    bool diagnostic_allocation{};
+    fail_next_allocation.store(true);
+    try { (void)vmhook::detail::type_name<deliberately_long_type_name_for_allocation_failure>(); }
+    catch (const std::bad_alloc&) { diagnostic_allocation = true; }
+    check(diagnostic_allocation, "type-name diagnostics do not terminate on C++ allocation failure");
     return failures ? 1 : 0;
 }

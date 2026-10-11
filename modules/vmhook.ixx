@@ -1164,7 +1164,7 @@ export namespace vmhook
     inline auto decode_array_oop(std::uint32_t compressed)
         -> void*;
 
-    inline auto set_str_field(const field_proxy& field, std::string_view value) noexcept
+    inline auto set_str_field(const field_proxy& field, std::string_view value)
         -> void;
 
     inline auto field_oop(const field_proxy& field) noexcept
@@ -1173,7 +1173,7 @@ export namespace vmhook
     inline auto set_bool_array(const field_proxy& field, const std::vector<bool>& values) noexcept
         -> void;
 
-    inline auto set_str_array(const field_proxy& field, const std::vector<std::string>& values) noexcept
+    inline auto set_str_array(const field_proxy& field, const std::vector<std::string>& values)
         -> void;
 
     template<typename element_type>
@@ -1315,7 +1315,7 @@ export namespace vmhook
             @details Module attachment suffixes are stripped from the displayed spelling.
         */
         template<typename type>
-        inline auto type_name() noexcept
+        inline auto type_name()
             -> std::string
         {
             // display_string_of() over identifier_of(): the former handles
@@ -2182,6 +2182,47 @@ export namespace vmhook
         */
         struct symbol
         {
+            // Metadata geometry checks need only a fixed prefix. Copying those
+            // bytes avoids allocating a complete class name in noexcept paths.
+            template<std::size_t count>
+            auto first_bytes() const noexcept -> std::optional<std::array<std::uint8_t, count>>
+            {
+                static_assert(count <= (std::numeric_limits<std::uint16_t>::max)());
+                static const auto* const length_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_length") };
+                static const auto* const packed_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_length_and_refcount") };
+                static const auto* const body_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_body") };
+                if (!vmhook::hotspot::is_valid_pointer(this) || !body_entry
+                    || body_entry->is_static != 0 || (!length_entry && !packed_entry))
+                { return {}; }
+                std::uint16_t length{};
+                if (length_entry)
+                {
+                    if (length_entry->is_static != 0 || !length_entry->type_string
+                        || (std::string_view{length_entry->type_string} != "unsigned short"
+                            && std::string_view{length_entry->type_string} != "u2")
+                        || !vmhook::os::safe_read(&length,
+                            reinterpret_cast<const std::uint8_t*>(this) + length_entry->offset, sizeof(length)))
+                    { return {}; }
+                }
+                else
+                {
+                    std::uint32_t packed{};
+                    if (packed_entry->is_static != 0 || !packed_entry->type_string
+                        || (std::string_view{packed_entry->type_string} != "unsigned int"
+                            && std::string_view{packed_entry->type_string} != "uint32_t")
+                        || !vmhook::os::safe_read(&packed,
+                            reinterpret_cast<const std::uint8_t*>(this) + packed_entry->offset, sizeof(packed)))
+                    { return {}; }
+                    length = static_cast<std::uint16_t>(packed >> 16);
+                }
+                if (length < count) { return {}; }
+                std::array<std::uint8_t, count> result{};
+                if (!vmhook::os::safe_read(result.data(),
+                    reinterpret_cast<const std::uint8_t*>(this) + body_entry->offset, count))
+                { return {}; }
+                return result;
+            }
+
             /*
                 @brief Converts this HotSpot Symbol to a std::string.
                 @return A std::string containing a copy of the symbol's character data,
@@ -2261,6 +2302,7 @@ export namespace vmhook
 
                     return value;
                 }
+                catch (const std::bad_alloc&) { throw; }
                 catch (const std::exception& exception)
                 {
                     ::vmhook::detail::log_line("{} symbol.to_string() {}", vmhook::error_tag, exception.what());
@@ -2762,6 +2804,7 @@ export namespace vmhook
 
                     return symbol_pointer->to_string();
                 }
+                catch (const std::bad_alloc&) { throw; }
                 catch (const std::exception& exception)
                 {
                     ::vmhook::detail::log_line("{} method.get_name() {}", vmhook::error_tag, exception.what());
@@ -2799,6 +2842,7 @@ export namespace vmhook
 
                     return symbol_pointer->to_string();
                 }
+                catch (const std::bad_alloc&) { throw; }
                 catch (const std::exception& exception)
                 {
                     ::vmhook::detail::log_line("{} method.get_signature() {}", vmhook::error_tag, exception.what());
@@ -3481,7 +3525,7 @@ export namespace vmhook
                            [group        if field_flags & 0x10]
                 All integers encoded with UNSIGNED5 (see decode_u5).
             */
-            auto find_field_in_stream(const std::string_view name, void** constant_pool_base, const std::int32_t cp_length) const noexcept
+            auto find_field_in_stream(const std::string_view name, void** constant_pool_base, const std::int32_t cp_length) const
                 -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const fis_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fieldinfo_stream") };
@@ -3595,7 +3639,7 @@ export namespace vmhook
                 @note Searches only fields declared directly on this class.
                       Walk the superclass chain to find inherited fields.
             */
-            auto find_field(const std::string_view name) const noexcept
+            auto find_field(const std::string_view name) const
                 -> std::optional<vmhook::hotspot::field_entry_t>
             {
                 static const vmhook::hotspot::vm_struct_entry_t* const fields_entry{ vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_fields") };
@@ -6927,7 +6971,7 @@ export namespace vmhook
     namespace detail::native_backend
     {
         inline auto active() noexcept -> bool;
-        inline auto loaded_class(std::string_view, vmhook::hotspot::klass* = nullptr) noexcept -> vmhook::hotspot::klass*;
+        inline auto loaded_class(std::string_view, vmhook::hotspot::klass* = nullptr) -> vmhook::hotspot::klass*;
     }
 
     /* True in a validated detour or an active native-thread context. */
@@ -7028,6 +7072,7 @@ export namespace vmhook
             vmhook::detail::capture_host_classloader_klass(found_klass);
             return found_klass;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (const std::exception& exception)
         {
             ::vmhook::detail::log_line("{} vmhook::find_class() for {}: {}", vmhook::error_tag, class_name, exception.what());
@@ -9941,13 +9986,13 @@ export namespace vmhook
             ever JNI-specific — a descriptor is a class-file construct — and the
             old name outlived the JNI layer it was named after.
 
-            Exception safety: noexcept — compile-time dispatch only.
+            Exception safety: descriptor storage may propagate std::bad_alloc.
 
             @tparam arg_type  The C++ argument type.
             @return  JVM type descriptor string.
         */
         template<typename arg_type>
-        inline auto jvm_descriptor_for_arg() noexcept
+        inline auto jvm_descriptor_for_arg()
             -> std::string
         {
             using clean_t = std::decay_t<arg_type>;
@@ -12770,7 +12815,7 @@ export namespace vmhook::detail::native_backend
     };
 
     inline auto loaded_class(const std::string_view name,
-                            vmhook::hotspot::klass* const preferred) noexcept -> vmhook::hotspot::klass*
+                            vmhook::hotspot::klass* const preferred) -> vmhook::hotspot::klass*
     {
         operation access{};
         if (!access || name.empty()) { return nullptr; }
@@ -12793,6 +12838,7 @@ export namespace vmhook::detail::native_backend
             });
             return found_preferred || !ambiguous ? result : nullptr;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (...) { return nullptr; }
     }
 
@@ -13900,12 +13946,12 @@ export namespace vmhook
             { return std::nullopt; }
             const auto* const symbol{ klass->get_name() };
             if (!symbol) { return std::nullopt; }
-            const std::string name{ symbol->to_string() };
-            if (name.size() < 2 || name.front() != '['
-                || std::string_view{"ZBCSIJFDL["}.find(name[1]) == std::string_view::npos)
+            const auto prefix{ symbol->first_bytes<2>() };
+            if (!prefix || (*prefix)[0] != '['
+                || std::string_view{"ZBCSIJFDL["}.find(static_cast<char>((*prefix)[1])) == std::string_view::npos)
             { return std::nullopt; }
             return array_layout_t{ length_offset, header, std::size_t{1} << log_width,
-                name[1] == 'L' || name[1] == '[' };
+                (*prefix)[1] == 'L' || (*prefix)[1] == '[' };
         }
     }
 
@@ -14169,7 +14215,7 @@ export namespace vmhook
     */
     inline auto make_java_array(const std::string_view class_name, const std::int32_t length,
                                const std::size_t element_size,
-                               [[maybe_unused]] const bool retained_for_abi = true) noexcept -> void*
+                               [[maybe_unused]] const bool retained_for_abi = true) -> void*
     {
         if (length < 0 || !vmhook::hotspot::in_java_detour()) { return nullptr; }
         auto* const array_klass{ vmhook::find_class(class_name) };
@@ -14200,7 +14246,7 @@ export namespace vmhook
     {
         inline auto initialize_unpublished_reference(void* const object,
             vmhook::hotspot::klass* const klass, const std::string_view name,
-            void* const value) noexcept -> bool
+            void* const value) -> bool
         {
             if (!object || !klass || !vmhook::hotspot::ensure_current_java_thread())
             {
@@ -18346,9 +18392,9 @@ export namespace vmhook
             Native contexts re-resolve the method under a VM guard and refuse
             expired or foreign-context proxies.
             Complexity: O(N) in a native context; O(1) for a legacy proxy.
-            Exception safety: noexcept.
+            Exception safety: metadata strings may propagate std::bad_alloc.
         */
-        auto is_static() const noexcept
+        auto is_static() const
             -> bool
         {
             vmhook::detail::native_backend::operation access{};
@@ -18424,7 +18470,7 @@ export namespace vmhook
             @return The HotSpot Method*, or nullptr if the proxy holds no method
                     (e.g. constructed with a null method pointer).
         */
-        auto raw_method() const noexcept
+        auto raw_method() const
             -> vmhook::hotspot::method*
         {
             vmhook::detail::native_backend::operation access{};
@@ -18448,12 +18494,12 @@ export namespace vmhook
         auto current_native_signature(const std::string_view name,
                                       const std::string_view signature,
                                       vmhook::hotspot::klass* const holder,
-                                      const bool virtual_dispatch) const noexcept
+                                      const bool virtual_dispatch) const
             -> vmhook::hotspot::method*
         {
             auto* const receiver_class{ this->native_receiver_root
                 ? vmhook::klass_from_oop(this->native_receiver_root->resolve_under_vm()) : nullptr };
-            const auto search = [&](vmhook::hotspot::klass* start, const bool inherited) noexcept
+            const auto search = [&](vmhook::hotspot::klass* start, const bool inherited)
                 -> vmhook::hotspot::method*
             {
                 for (auto* klass{ start }; klass; klass = inherited ? klass->get_super() : nullptr)
@@ -18495,7 +18541,7 @@ export namespace vmhook
             return search(holder ? holder : this->native_declaring_class, false);
         }
 
-        auto current_native_method(vmhook::hotspot::method* const candidate) const noexcept -> bool
+        auto current_native_method(vmhook::hotspot::method* const candidate) const -> bool
         {
             for (auto* klass{ this->native_declaring_class }; klass; klass = klass->get_super())
             {
@@ -18510,7 +18556,7 @@ export namespace vmhook
 
         // Re-resolve the selected metadata while the declaring class mirror is
         // rooted. A cached Method* may have become obsolete after redefinition.
-        auto refresh_native_method() const noexcept -> bool
+        auto refresh_native_method() const -> bool
         {
             if (!this->native_class_root || !this->native_class_root->valid()
                 || !this->native_class_root->resolve_under_vm() || !this->native_declaring_class)
@@ -18688,7 +18734,7 @@ export namespace vmhook
             Used by signature_matches_arguments() to select the correct overloaded method.
 
             Complexity: O(1) — compile-time trait dispatch.
-            Exception safety: noexcept.
+            Exception safety: metadata strings may propagate std::bad_alloc.
 
             @tparam argument_type  The C++ argument type to test.
             @param descriptor      One JVM type descriptor token from a method signature.
@@ -18696,7 +18742,7 @@ export namespace vmhook
         */
         template<typename argument_type>
         static auto argument_matches_descriptor(const std::string_view descriptor,
-                                                const bool allow_reference_upcasts = false) noexcept
+                                                const bool allow_reference_upcasts = false)
             -> bool
         {
             using clean_type = std::remove_cvref_t<argument_type>;
@@ -18876,7 +18922,7 @@ export namespace vmhook
             are no leftover descriptor tokens.
 
             Complexity: O(P) where P = number of parameters.
-            Exception safety: noexcept.
+            Exception safety: metadata strings may propagate std::bad_alloc.
 
             @tparam args_t  C++ argument types to test against the signature.
             @param signature  Full JVM method signature.
@@ -18884,7 +18930,7 @@ export namespace vmhook
         */
         template<typename... args_t>
         static auto signature_matches_arguments(const std::string_view signature,
-                                                [[maybe_unused]] const bool allow_reference_upcasts = false) noexcept
+                                                [[maybe_unused]] const bool allow_reference_upcasts = false)
             -> bool
         {
             const std::size_t open_paren{ signature.find('(') };
@@ -18924,13 +18970,13 @@ export namespace vmhook
 
             Complexity: O(N * M) where N = number of methods in the class hierarchy,
                         M = signature parse cost per method.
-            Exception safety: noexcept — rejects unreadable or incompatible methods.
+            Exception safety: rejects unreadable or incompatible metadata; string allocation may propagate std::bad_alloc.
 
             @tparam args_t  C++ argument types from the call<>() invocation.
             @return The compatible Method*, or nullptr on failure.
         */
         template<typename... args_t>
-        auto resolve_compatible_method() const noexcept
+        auto resolve_compatible_method() const
             -> vmhook::hotspot::method*
         {
             // Pinned descriptors identify one overload. Validate argument count
@@ -21760,7 +21806,7 @@ export namespace vmhook
         strings, copies the full UTF-8 input, and obeys reference-store guards.
     */
     inline auto set_str_field(const vmhook::field_proxy& field,
-                              const std::string_view value) noexcept -> void
+                              const std::string_view value) -> void
     {
         if (field.signature() != "Ljava/lang/String;") { return; }
         field.set(value);
@@ -21888,7 +21934,7 @@ export namespace vmhook
         @param field   A field_proxy whose field holds a String[] reference.
         @param values  New string contents for each slot.
     */
-    inline auto set_str_array(const vmhook::field_proxy& field, const std::vector<std::string>& values) noexcept
+    inline auto set_str_array(const vmhook::field_proxy& field, const std::vector<std::string>& values)
         -> void
     {
         if (field.signature() != "[Ljava/lang/String;"
@@ -25300,8 +25346,8 @@ namespace hotspot
             return this->elements_[index];
         }
 
-        /* @brief Bounds-checked element access; an out-of-range index yields an
-           EMPTY ref rather than throwing (the library never throws outward). */
+        /* Bounds-checked diagnostic path access; out-of-range yields an empty
+           path. This does not describe owning object values or checked Java calls. */
         auto at(const size_type index) const
             -> value_type
         {

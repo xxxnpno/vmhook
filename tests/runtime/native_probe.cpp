@@ -624,7 +624,7 @@ namespace
                     && virtual_call->raw_method() == nullptr
                     && virtual_call->get_compressed_oop() == 0
                     && !static_call->is_static()
-                    && refused && (!field || static_cast<std::int32_t>(field->get()) == 0)
+                    && refused && (!field || field->try_get().status() == vmhook::error_code::refused)
                     && static_holder.get()->get_instance() != nullptr;
             });
             foreign.join();
@@ -682,7 +682,7 @@ namespace
             && !escaped_players[1]->get_instance() && escaped_players[2]
             && conversion_refused([&] { (void)escaped_players[0]->get_instance(); })
             && conversion_refused([&] { (void)escaped_players[2]->get_instance(); })
-            && (!escaped_field || static_cast<std::int32_t>(escaped_field->get()) == 0));
+            && (!escaped_field || escaped_field->try_get().status() == vmhook::error_code::refused));
     }
 
     auto check_repeated_attachment() -> bool
