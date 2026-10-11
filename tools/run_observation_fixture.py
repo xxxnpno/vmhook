@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,9 @@ CHECKS = {
                 "class_failed_definition", "class_callback_state", "class_removal",
                 "class_persistent", "class_shutdown", "classes_complete"],
     "callbacks": ["callback_proof"],
+    "virtual_thread": ["context", "registration", "hooks", "real_virtual_thread",
+                       "virtual_original_method", "virtual_original_fields", "refusal_count",
+                       "platform_callbacks", "removal", "originals_after_remove", "virtual_thread_proof"],
     "callback_throw": ["context", "registration", "hooks", "same_throwable_primitive",
                        "same_throwable_void", "same_throwable_reference", "body_skip_and_finally",
                        "unrelated_object_refused", "java_null_refused", "exception_wins_return", "allocation_failure_propagated",
@@ -75,6 +79,7 @@ FIXTURES = {
     "management": "ManagementFixture",
     "executor": "ExecutorFixture",
     "callback_throw": "CallbackThrowFixture",
+    "virtual_thread": "VirtualThreadFixture",
 }
 
 
@@ -86,10 +91,12 @@ OPTIONAL_PROBES = {
     "management": "management_probe",
     "executor": "executor_probe",
     "callback_throw": "callback_throw_probe",
+    "virtual_thread": "virtual_thread_probe",
 }
 TERMINAL_CHECK = {
     "callbacks": "callback_proof",
     "callback_throw": "callback_throw_proof",
+    "virtual_thread": "virtual_thread_proof",
     "hook_composition": "hook_composition_proof",
     "event_stream": "event_stream_proof",
 }
@@ -158,7 +165,8 @@ def execute_mode(args, mode, directory):
                        VMHOOK_EVENT_STREAM_REPORT=windows_path(result),
                        VMHOOK_TEST_RESULT=windows_path(result),
                        VMHOOK_MANAGEMENT_REPORT=windows_path(result),
-                       VMHOOK_CALLBACK_THROW_REPORT=windows_path(result))
+                       VMHOOK_CALLBACK_THROW_REPORT=windows_path(result),
+                       VMHOOK_VIRTUAL_THREAD_REPORT=windows_path(result))
     command = prefix + [str(args.java), "-cp", windows_path(directory), FIXTURES[mode]]
     process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
@@ -254,6 +262,24 @@ def execute_mode(args, mode, directory):
             process.wait()
 
 
+
+def java_feature(java, prefix):
+    """Read the supplied runtime's feature version before choosing Java sources."""
+    release = java.resolve().parent.parent / "release"
+    if release.is_file():
+        version = re.search(r'^JAVA_VERSION="([^"]+)"', release.read_text(encoding="utf-8"), re.MULTILINE)
+        if version:
+            match = re.match(r"(?:1\.)?(\d+)", version.group(1))
+            if match:
+                return int(match.group(1))
+    # This separate launcher probe does not add a flag to the injected fixture.
+    result = subprocess.run(prefix + [str(java), "-version"], check=True, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    match = re.search(r'(?:openjdk|java)\s+version\s+"(?:1\.)?(\d+)', result.stdout)
+    if not match:
+        raise RuntimeError("cannot identify the supplied Java runtime's feature version")
+    return int(match.group(1))
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--java", type=Path, default=Path("java"))
@@ -284,6 +310,13 @@ def main():
     prefix = [str(args.emulator)] if args.emulator else []
     modes = [mode for mode in FIXTURES if mode not in OPTIONAL_PROBES
              or getattr(args, OPTIONAL_PROBES[mode])] if args.mode == "all" else [args.mode]
+    if "virtual_thread" in modes:
+        feature = java_feature(args.java, prefix)
+        if feature < 21:
+            if args.mode == "virtual_thread":
+                parser.error("virtual_thread requires Java 21 or newer without preview arguments")
+            modes.remove("virtual_thread")
+            print(f"virtual_thread skipped: Java {feature} is below the stable Java 21 API", flush=True)
     source = Path(__file__).resolve().parents[1] / "tests" / "runtime"
     results = []
     with tempfile.TemporaryDirectory(prefix="vmhook-observation-") as temporary:
