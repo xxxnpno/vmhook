@@ -157,6 +157,7 @@ namespace vmhook::windows
 
 static_assert(sizeof(void*) == 8, "VMHook requires Windows x64.");
 
+namespace vmhook { class any_object; }
 namespace vmhook::hotspot { struct method; struct klass; }
 namespace vmhook::detail::jit_backend
 {
@@ -245,6 +246,7 @@ namespace vmhook::detail
     inline auto resolve_callback_oop_snapshot(void*) noexcept -> void*;
     inline auto set_callback_reference(hotspot::return_slot*, const native_backend::root&) noexcept -> bool;
     inline auto set_callback_reference_snapshot(hotspot::return_slot*, void*) noexcept -> bool;
+    inline auto ensure_bootstrap_class(std::string_view, bool) -> std::pair<hotspot::klass*, native_backend::root>;
     template<typename value_type>
     consteval auto hook_write_argument_supported() noexcept -> bool;
 }
@@ -834,6 +836,11 @@ namespace vmhook
                       && !std::is_const_v<wrapper_type> && !std::is_volatile_v<wrapper_type>)
         auto set(const std::unique_ptr<wrapper_type>& value) -> void;
 
+        // Delivers this same Java Throwable through the interpreter's genuine
+        // exception continuation. Valid only in this active method callback.
+        // A null Java reference, empty owner or unrelated Java object is refused.
+        auto throw_exception(const std::unique_ptr<vmhook::any_object>& throwable) -> void;
+
         auto cancel() noexcept
             -> void
         {
@@ -1141,7 +1148,7 @@ namespace vmhook
             }
         }
         inline auto container_class_assignable(vmhook::hotspot::klass*, vmhook::hotspot::klass*) -> bool;
-        inline auto prepare_durable_roots() noexcept -> bool;
+        inline auto prepare_durable_roots() -> bool;
         inline auto retain_durable_oop(void*) -> std::shared_ptr<void>;
         inline auto resolve_durable_oop(const std::shared_ptr<void>&) noexcept -> void*;
     }
@@ -9223,13 +9230,14 @@ namespace vmhook
                 std::shared_ptr<void> pin{};
                 std::uint16_t access_flags{};
                 bool duplicate{};
+                std::exception_ptr allocation_failure{};
             } lookup{ &registered_name, method_name, method_signature };
             const bool looked_up{ vmhook::detail::jit_backend::with_vm_state([](void* const opaque) noexcept
             {
                 auto& request{ *static_cast<metadata_lookup*>(opaque) };
                 try
                 {
-                    auto* const klass{ vmhook::find_class(*request.class_name) };
+                    auto* const klass{ vmhook::detail::registered_class_klass<wrapper_type>() };
                     vmhook::hotspot::method** methods{}; std::int32_t count{};
                     if (!klass || !vmhook::detail::jit_backend::holder_linked(klass)
                         || !vmhook::hotspot::safe_klass_methods(klass, methods, count)) { return; }
@@ -9249,8 +9257,10 @@ namespace vmhook
                     request.pin = vmhook::detail::retain_hook_klass(klass);
                     if (!request.pin) { request.method = nullptr; }
                 }
+                catch (const std::bad_alloc&) { request.method = nullptr; request.allocation_failure = std::current_exception(); }
                 catch (...) { request.method = nullptr; }
             }, &lookup) };
+            if (lookup.allocation_failure) { std::rethrow_exception(lookup.allocation_failure); }
             if (lookup.duplicate) { throw vmhook::exception{ "Overloaded method: pass its JVM descriptor to hook()." }; }
             if (!looked_up || !lookup.method || !lookup.pin)
             { throw vmhook::exception{ "Java method is unavailable or unsupported; native, abstract and constructor hooks are refused." }; }
@@ -9381,6 +9391,7 @@ namespace vmhook
             vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
             return observer_id;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (const std::exception& exception)
         {
             ::vmhook::detail::log_line("{} hook('{}'): {}", vmhook::error_tag, method_name, exception.what());
@@ -20921,6 +20932,42 @@ namespace vmhook
             { throw vmhook::exception{ std::format("Java object is not an instance of '{}'", class_name) }; }
         }
 
+        inline auto raise_callback_exception(hotspot::return_slot* const slot,
+            hotspot::frame* const frame, const std::unique_ptr<vmhook::any_object>& throwable) -> void
+        {
+            if (!slot || !frame || frame != hotspot::current_interpreter_frame
+                || !callback_backend::current || !throwable)
+            { throw vmhook::exception{ "A Java exception requires the active method callback and an allocated wrapper owner." }; }
+            native_backend::operation access{};
+            if (!access)
+            { throw vmhook::exception{ "The Java exception requires its own rooted callback context." }; }
+            const auto root{ throwable->get_native_root() };
+            if (!root || !root->valid() || !root->resolve_under_vm())
+            { throw vmhook::exception{ "A Java exception requires a retained non-null Throwable reference." }; }
+            const auto [throwable_class, class_root]{ ensure_bootstrap_class("java/lang/Throwable", false) };
+            if (!throwable_class || !class_root || !container_class_assignable(
+                    vmhook::klass_from_oop(root->resolve_under_vm()), throwable_class))
+            { throw vmhook::exception{ "The Java exception is not a bootstrap Throwable instance." }; }
+            auto* const context{ native_backend::current_context_lifetime() };
+            auto& runtime{ private_native::rt() };
+            if (!context || runtime.current_thread() != context->thread
+                || private_native::thread_state(context->thread) != 6)
+            { throw vmhook::exception{ "A Java exception requires this callback's VM state." }; }
+            const auto pending_offset{ runtime.off("JavaThread", "_pending_exception") };
+            const auto file_offset{ runtime.off("ThreadShadow", "_exception_file") };
+            const auto line_offset{ runtime.off("ThreadShadow", "_exception_line") };
+            if (private_native::load<void*>(context->thread, pending_offset))
+            { throw vmhook::exception{ "The callback already has a pending Java exception." }; }
+            // ThreadShadow's pending exception is a VM-scanned oop. Publish it
+            // in VM state before session HandleArea roots retire. No Java call
+            // or safepoint occurs between resolving this ticket and the store.
+            private_native::store(context->thread, pending_offset, root->resolve_under_vm());
+            private_native::store(context->thread, file_offset, "VMHook method callback");
+            private_native::store(context->thread, line_offset, std::int32_t{ 0 });
+            slot->cancel = true;
+            slot->retval = 0;
+        }
+
         template<typename... argument_types>
         [[nodiscard]] inline auto call_container_method(const native_backend::root& root,
             const std::string_view name, const std::string_view signature,
@@ -21099,6 +21146,9 @@ namespace vmhook
     inline auto hotspot::method_args::operator[](const std::size_t index) const
         -> std::unique_ptr<vmhook::any_object>
     { return this->as<vmhook::any_object>(index); }
+
+    inline auto return_value::throw_exception(const std::unique_ptr<vmhook::any_object>& throwable) -> void
+    { vmhook::detail::raise_callback_exception(this->return_slot, this->stack_frame, throwable); }
 
     /* Java Collection wrappers use the public toArray contract. Snapshot order
        and concurrent-mutation semantics are those of the Java implementation.
@@ -25778,6 +25828,259 @@ namespace hotspot
         return vmhook::detail::materialize_object<wrapper_type>(0, root);
     }
 
+    // Optional interface callbacks use an ordinary application-loaded Java
+    // InvocationHandler. The JDK creates and owns its ordinary Proxy class.
+    class reflection_method final : public vmhook::oop_reflective_base
+    {
+    public:
+        using vmhook::oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/lang/reflect/Method" };
+        auto name() const -> std::string
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            return detail::call_container_method(get_native_root(), "getName", "()Ljava/lang/String;").as_string();
+        }
+        auto declaring_class_name() const -> std::string
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            const std::unique_ptr<any_object> declaring = detail::call_container_method(
+                get_native_root(), "getDeclaringClass", "()Ljava/lang/Class;");
+            if (!declaring->get_instance()) { throw exception{"Java Method has no declaring class"}; }
+            return declaring->get_method("getName", "()Ljava/lang/String;")->call().as_string();
+        }
+        auto parameter_types() const -> std::unique_ptr<array<any_object>>
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            return detail::call_container_method(get_native_root(), "getParameterTypes", "()[Ljava/lang/Class;");
+        }
+        auto return_type() const -> std::unique_ptr<any_object>
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            return detail::call_container_method(get_native_root(), "getReturnType", "()Ljava/lang/Class;");
+        }
+    };
+
+    namespace detail
+    {
+        class interface_handler_binding : public vmhook::object<interface_handler_binding>
+        { public: using vmhook::object<interface_handler_binding>::object; };
+        inline std::mutex interface_binding_mutex{};
+
+        template<container_wrapper interface_type>
+        struct interface_proxy_control
+        {
+            retained_object<any_object> handler{};
+            retained_object<interface_type> proxy{};
+            std::atomic<bool> closed{};
+            method_hook_id observer{};
+            virtual ~interface_proxy_control() = default;
+        };
+        template<container_wrapper interface_type, typename callback_type>
+        struct interface_callback_control final : interface_proxy_control<interface_type>
+        {
+            callback_type callback;
+            explicit interface_callback_control(callback_type callback)
+                : callback{std::move(callback)} {}
+        };
+
+        inline auto forward_interface_failure(return_value& result,
+            const std::unique_ptr<any_object>& receiver, const std::int32_t kind,
+            const std::string_view message) noexcept -> void
+        {
+            // If even error transport is unavailable, leave the ordinary Java
+            // handler body to raise its explicit unavailable/closed exception.
+            try
+            {
+                const auto factory{receiver->get_method("new_failure", "(ILjava/lang/String;)Ljava/lang/Throwable;")};
+                if (!factory) { return; }
+                const std::unique_ptr<any_object> error = factory->call(kind, message);
+                result.throw_exception(error);
+            }
+            catch (...) {}
+        }
+    }
+
+    // A move-only resource. close() prevents new user callbacks; an invocation
+    // already selected may finish with its own roots and shared control. The
+    // embedding DLL follows the existing hook engine's resident-code lifetime.
+    template<detail::container_wrapper interface_type>
+    class interface_proxy final
+    {
+        std::atomic<std::shared_ptr<detail::interface_proxy_control<interface_type>>> control_{};
+    public:
+        interface_proxy() noexcept = default;
+        explicit interface_proxy(std::shared_ptr<detail::interface_proxy_control<interface_type>> control) noexcept
+            : control_{std::move(control)} {}
+        interface_proxy(const interface_proxy&) = delete;
+        auto operator=(const interface_proxy&) -> interface_proxy& = delete;
+        interface_proxy(interface_proxy&& other) noexcept
+            : control_{other.control_.exchange({})} {}
+        auto operator=(interface_proxy&& other) noexcept -> interface_proxy&
+        {
+            if (this != &other) { close(); control_.store(other.control_.exchange({})); }
+            return *this;
+        }
+        ~interface_proxy() { close(); }
+        [[nodiscard]] auto valid() const noexcept -> bool
+        {
+            const auto state{control_.load()};
+            return state && !state->closed.load(std::memory_order_acquire);
+        }
+        explicit operator bool() const noexcept { return valid(); }
+        [[nodiscard]] auto acquire() const -> std::unique_ptr<interface_type>
+        {
+            const auto state{control_.load()};
+            if (!state || state->closed.load(std::memory_order_acquire))
+            { throw exception{"Java interface callback resource is closed"}; }
+            return state->proxy.acquire();
+        }
+        auto close() noexcept -> bool
+        {
+            const auto state{control_.exchange({})};
+            if (!state) { return false; }
+            state->closed.store(true, std::memory_order_release);
+            (void)remove_hook(state->observer);
+            // The hook captures only a weak reference. Active callbacks keep a
+            // strong reference; handler/proxy roots release after the last one.
+            return true;
+        }
+    };
+
+    /* Create one ordinary Java Proxy for a registered Java interface. Supply a
+       rooted instance of java/vmhook/callback_handler.java, loaded through the
+       application's normal ClassLoader, or an equivalent declared handler
+       exposing create_proxy(Class) and new_failure(int,String).
+
+       The C++ callable receives owning Method and Object[] wrappers by const
+       reference and returns an allocated unique_ptr to any Java wrapper. For
+       zero arguments, Object[] has a null Java instance. Java void uses an
+       allocated Java-null result. Primitive interface returns use ordinary
+       Java boxed objects; Proxy performs its normal cast/unboxing checks.
+       Construction requires a native administrator context, outside callbacks.
+       Callbacks run synchronously and may occur concurrently on Java threads. */
+    template<detail::container_wrapper interface_type, detail::container_wrapper handler_type, typename callback_type>
+        requires std::invocable<std::decay_t<callback_type>&,
+            const std::unique_ptr<reflection_method>&, const std::unique_ptr<array<any_object>>&>
+    [[nodiscard]] auto make_interface_proxy(const std::unique_ptr<handler_type>& handler,
+        callback_type&& callback, const hook_options options = {}) -> interface_proxy<interface_type>
+    {
+        using callback_result = std::invoke_result_t<std::decay_t<callback_type>&,
+            const std::unique_ptr<reflection_method>&, const std::unique_ptr<array<any_object>>&>;
+        static_assert(detail::is_java_object_pointer_v<callback_result>,
+            "An interface callback must return an allocated unique_ptr to a Java wrapper.");
+        if (hotspot::in_java_detour() || detail::class_event_notification_active()
+            || !detail::native_backend::active())
+        { throw exception{"Create interface callbacks from a native administrator context"}; }
+        if (!handler) { throw exception{"An interface callback requires an allocated handler wrapper"}; }
+        if (!detail::prepare_durable_roots())
+        { throw exception{"Persistent Java callback roots are unavailable for this VM profile"}; }
+
+        std::unique_ptr<any_object> receiver;
+        std::unique_ptr<any_object> interface_mirror;
+        std::shared_ptr<detail::class_binding> declaring_binding;
+        constexpr std::string_view invoke_descriptor{
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;"};
+        {
+            detail::native_backend::operation access{};
+            if (!access || !handler->get_instance())
+            { throw exception{"Java null cannot be an interface callback handler", error_code::null_reference}; }
+            if (!handler->get_native_root() || !handler->get_native_root()->valid())
+            { throw exception{"An interface callback handler requires a live VM-scanned root"}; }
+            detail::require_object_wrapper_type<handler_type>(handler->get_instance());
+            receiver = detail::materialize_object<any_object>(0, handler->get_native_root());
+            const auto invoke{receiver->get_method("invoke", invoke_descriptor)};
+            auto* const method{invoke ? invoke->raw_method() : nullptr};
+            auto* const declaring{method ? detail::callback_declaring_class(method) : nullptr};
+            if (!declaring || !declaring->get_name())
+            { throw exception{"The supplied handler has no ordinary Java invoke method"}; }
+            detail::require_reference_argument(receiver->get_instance(),
+                "Ljava/lang/reflect/InvocationHandler;", declaring);
+            // Preserve the actual declaring Method holder, including inherited
+            // handlers whose parent class has a different defining loader.
+            declaring_binding = std::make_shared<detail::class_binding>();
+            declaring_binding->name = declaring->get_name()->to_string();
+            declaring_binding->identity = declaring;
+            declaring_binding->mirror = detail::retain_durable_oop(declaring->get_java_mirror());
+            if (!declaring_binding->mirror)
+            { throw exception{"The exact Java handler class could not be retained"}; }
+            auto* const interface_class{detail::registered_class_klass<interface_type>()};
+            if (!interface_class)
+            { throw exception{"Register the exact Java interface before creating its proxy"}; }
+            const auto mirror_root{detail::native_backend::retain_class(interface_class)};
+            if (!mirror_root) { throw exception{"The Java interface mirror could not be retained"}; }
+            interface_mirror = detail::materialize_object<any_object>(0, mirror_root);
+            const bool is_interface = interface_mirror->get_method("isInterface", "()Z")->call();
+            if (!is_interface)
+            { throw exception{"Register a Java interface before creating its proxy"}; }
+        }
+        const auto factory{receiver->get_method("create_proxy", "(Ljava/lang/Class;)Ljava/lang/Object;")};
+        if (!factory) { throw exception{"The handler does not expose create_proxy(Class)"}; }
+        using control_type = detail::interface_callback_control<interface_type, std::decay_t<callback_type>>;
+        auto state{std::make_shared<control_type>(std::forward<callback_type>(callback))};
+        state->handler = retain(receiver);
+        const std::weak_ptr<control_type> weak{state};
+        {
+            std::lock_guard install_lock{detail::interface_binding_mutex};
+            detail::install_class_binding(std::type_index{typeid(detail::interface_handler_binding)},
+                std::move(declaring_binding));
+            try
+            {
+                state->observer = add_hook<detail::interface_handler_binding>("invoke", invoke_descriptor,
+                    [weak](return_value& result, const std::unique_ptr<any_object>& self,
+                        const std::unique_ptr<any_object>&, const std::unique_ptr<reflection_method>& method,
+                        const std::unique_ptr<array<any_object>>& arguments)
+                    {
+                        const auto current{weak.lock()};
+                        if (!current || current->closed.load(std::memory_order_acquire)) { return; }
+                        try
+                        {
+                            if (!current->handler.is_same_object(self)) { return; }
+                            const auto name{method->name()};
+                            if ((name == "equals" || name == "hashCode" || name == "toString")
+                                && method->declaring_class_name() == "java.lang.Object") { return; }
+                            const auto value{std::invoke(current->callback, method, arguments)};
+                            result.set(value);
+                        }
+                        catch (const std::bad_alloc&)
+                        { detail::forward_interface_failure(result, self, 1, "Native C++ allocation failed"); }
+                        catch (const exception& error)
+                        {
+                            if (error.has_throwable())
+                            {
+                                try { result.throw_exception(error.get_throwable()); return; }
+                                catch (...) {}
+                            }
+                            detail::forward_interface_failure(result, self, 0, error.what());
+                        }
+                        catch (const std::exception& error)
+                        { detail::forward_interface_failure(result, self, 0, error.what()); }
+                        catch (...)
+                        { detail::forward_interface_failure(result, self, 0, "Unknown native callback failure"); }
+                    }, options);
+                unregister_class<detail::interface_handler_binding>();
+            }
+            catch (...) { unregister_class<detail::interface_handler_binding>(); throw; }
+        }
+        if (!state->observer) { throw exception{"The handler's ordinary Java invoke hook was refused"}; }
+        try
+        {
+            const std::unique_ptr<interface_type> proxy = factory->call(interface_mirror);
+            if (!proxy->get_instance()) { throw exception{"The normal Java proxy factory returned Java null"}; }
+            state->proxy = retain(proxy);
+        }
+        catch (...)
+        {
+            state->closed.store(true, std::memory_order_release);
+            (void)remove_hook(state->observer);
+            throw;
+        }
+        return interface_proxy<interface_type>{std::move(state)};
+    }
+
     inline auto exception::get_throwable() const -> std::unique_ptr<vmhook::any_object>
     {
         if (!this->throwable_)
@@ -27884,7 +28187,7 @@ public:
 };
 inline ticket::~ticket() { if (owner) { owner->release(slot); } }
 
-inline bool prepare() noexcept {
+inline bool prepare_checked() {
     try {
         auto& runtime = pn::rt();
         if (!runtime.ready || runtime.uses_external_symbols() || !vmhook::vm_capabilities().supported) { return false; }
@@ -27896,7 +28199,11 @@ inline bool prepare() noexcept {
         if (!pool.await_ready()) { return false; }
         prepared_keeper.store(&pool, std::memory_order_release);
         return true;
-    } catch (...) { return false; }
+    } catch (const std::bad_alloc&) { throw; }
+    catch (...) { return false; }
+}
+inline bool prepare() noexcept {
+    try { return prepare_checked(); } catch (...) { return false; }
 }
 inline std::shared_ptr<void> retain_klass(vmhook::hotspot::klass* klass) noexcept {
     if (!klass) { return {}; }
@@ -27946,11 +28253,11 @@ namespace vmhook::detail {
 }
 namespace vmhook::detail
 {
-    inline auto prepare_durable_roots() noexcept -> bool
+    inline auto prepare_durable_roots() -> bool
     {
         if (auto* pool{persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)})
         { return pool->ready(); }
-        return persistent_hook_roots::prepare();
+        return persistent_hook_roots::prepare_checked();
     }
     inline auto retain_durable_oop(void* oop) -> std::shared_ptr<void>
     {
@@ -28016,6 +28323,7 @@ namespace vmhook::detail
 namespace vmhook::detail
 {
     inline auto verified_heap_iteration_available() noexcept -> bool;
+    inline auto verified_monitor_locks_available() noexcept -> bool;
 }
 namespace vmhook
 {
@@ -28026,7 +28334,7 @@ namespace vmhook
         native_calls, object_construction, rooted_object_access, reference_field_writes,
         persistent_references, method_entry_hooks, static_primitive_field_hooks,
         class_definition_events, original_method_exit_events, exact_heap_iteration,
-        mixed_stack_sampling, virtual_thread_hooks, count
+        mixed_stack_sampling, virtual_thread_hooks, java_monitors, count
     };
 
     struct feature_support final
@@ -28129,6 +28437,9 @@ namespace vmhook
             "No verified Windows mixed-stack sampling backend");
         set(runtime_feature::virtual_thread_hooks, feature_state::unavailable,
             "Carrier, continuation and virtual-thread root transitions are not verified");
+        set(runtime_feature::java_monitors,
+            detail::verified_monitor_locks_available() ? feature_state::conditional : feature_state::unavailable,
+            "Verified ObjectLocker ABI; requires a rooted non-null object and an owner-stack native context");
         return report;
     }
 }
@@ -29134,3 +29445,173 @@ namespace vmhook
     }
 }
 // VMHOOK_ROOT_RESOURCES_END
+
+// VMHOOK_MONITOR_LOCKS_BEGIN
+namespace vmhook::detail::monitor_backend
+{
+    namespace pn = vmhook::detail::private_native;
+    namespace nb = vmhook::detail::native_backend;
+    using construct = void(*)(void*, void**, void*);
+    using construct_bool = void(*)(void*, void**, void*, bool);
+    using destroy = void(*)(void*);
+    struct configuration final
+    {
+        bool ready{}, boolean_argument{};
+        std::size_t size{};
+        construct create{};
+        construct_bool create_with_flag{};
+        destroy release{};
+    };
+    inline auto config() noexcept -> const configuration&
+    {
+        static const configuration value = []() noexcept
+        {
+            configuration result{};
+            try
+            {
+                auto& runtime{ pn::rt() };
+                if (!runtime.ready || runtime.uses_external_symbols()
+                    || !vmhook::detail::java_execution_supported()) { return result; }
+                const auto collector{ vmhook::vm_capabilities().collector };
+                if (collector != vmhook::gc_collector::g1 && collector != vmhook::gc_collector::parallel)
+                { return result; }
+                result.size = runtime.size("ObjectLocker");
+                if (result.size != 24 && result.size != 32 && result.size != 40 && result.size != 48)
+                { return result; }
+                for (const auto member : {"_thread", "_obj", "_lock"})
+                {
+                    if (runtime.enum_value("ObjectLocker", std::string{"storage_size_"} + member) != 8
+                        || runtime.off("ObjectLocker", member) + 8 > result.size) { return configuration{}; }
+                }
+                result.boolean_argument = runtime.has_function("monitor_lock_construct_bool");
+                if (result.boolean_argument)
+                { result.create_with_flag = runtime.fn<construct_bool>("monitor_lock_construct_bool"); }
+                else { result.create = runtime.fn<construct>("monitor_lock_construct"); }
+                result.release = runtime.fn<destroy>("monitor_lock_destroy");
+                result.ready = result.release && (result.create || result.create_with_flag);
+            }
+            catch (...) { return configuration{}; }
+            return result;
+        }();
+        return value;
+    }
+
+    inline auto on_owner_stack(void* const thread, const void* const record, const std::size_t size) -> bool
+    {
+        auto& runtime{ pn::rt() };
+        const auto top{ pn::load<std::uintptr_t>(thread, runtime.off("JavaThread", "_stack_base")) };
+        const auto extent{ pn::load<std::size_t>(thread, runtime.off("JavaThread", "_stack_size")) };
+        const auto position{ reinterpret_cast<std::uintptr_t>(record) };
+        return extent <= top && position >= top - extent && position <= top && size <= top - position;
+    }
+}
+
+namespace vmhook
+{
+    /* The lock participates in Java synchronized/Thread.holdsLock semantics.
+       It must remain on its owner's stack inside a live native_thread_context.
+       C++ code between acquisition and release stays in native state so GC can
+       proceed. Copy, move, heap storage and cross-thread release are refused. */
+    class monitor_lock final
+    {
+        alignas(8) std::array<std::byte, 64> record_{};
+        std::shared_ptr<vmhook::detail::native_backend::context_lifetime> context_{};
+        vmhook::detail::native_backend::root object_{};
+        const vmhook::detail::monitor_backend::configuration* runtime_{};
+        bool locked_{};
+
+    public:
+        template<typename wrapper_type>
+        explicit monitor_lock(const std::unique_ptr<wrapper_type>& object)
+        {
+            static_assert(vmhook::detail::is_java_wrapper_v<wrapper_type>);
+            namespace nb = vmhook::detail::native_backend;
+            namespace pn = vmhook::detail::private_native;
+            nb::operation access{};
+            this->context_ = nb::active_context_lifetime();
+            if (!access || !this->context_ || vmhook::hotspot::in_java_detour())
+            { throw vmhook::exception{"Monitor locking requires a standalone native_thread_context"}; }
+            this->runtime_ = &vmhook::detail::monitor_backend::config();
+            if (!this->runtime_->ready)
+            { throw vmhook::exception{"This exact VM profile has no verified ObjectLocker ABI"}; }
+            if (!object) { throw vmhook::exception{"Monitor locking requires an allocated C++ wrapper"}; }
+            void* const instance{ object->get_instance() };
+            if (!instance)
+            { throw vmhook::exception{"A Java null has no monitor", vmhook::error_code::null_reference}; }
+            if (!object->get_native_root() || !object->get_native_root()->valid())
+            { throw vmhook::exception{"Monitor locking requires a rooted Java object"}; }
+            if (!vmhook::detail::monitor_backend::on_owner_stack(
+                    this->context_->thread, this->record_.data(), this->runtime_->size))
+            { throw vmhook::exception{"A monitor_lock must reside on the owning native thread's stack"}; }
+            if (pn::pending_exception(this->context_->thread))
+            { throw vmhook::exception{"Handle the pending Java exception before acquiring a monitor"}; }
+            this->object_ = nb::retain_oop(instance);
+            if (!this->object_) { throw vmhook::exception{"The monitor object could not be rooted"}; }
+            if (this->runtime_->boolean_argument)
+            { this->runtime_->create_with_flag(this->record_.data(), this->object_->slot, this->context_->thread, true); }
+            else { this->runtime_->create(this->record_.data(), this->object_->slot, this->context_->thread); }
+            this->locked_ = true;
+            // This lease forbids context close/detach without keeping the thread
+            // in VM state across arbitrary C++ work or a native blocking call.
+            ++this->context_->operation_depth;
+            try
+            {
+                if (void* const pending{ pn::pending_exception(this->context_->thread) })
+                {
+                    auto throwable{ nb::retain_oop(pending) };
+                    std::string name{};
+                    if (auto* const klass{ vmhook::klass_from_oop(pending) }; klass && klass->get_name())
+                    { name = klass->get_name()->to_string(); }
+                    pn::clear_pending_exception(this->context_->thread);
+                    this->unlock();
+                    throw vmhook::exception{"Java monitor acquisition threw", vmhook::error_code::java_exception,
+                                            std::move(name), std::move(throwable)};
+                }
+            }
+            catch (...) { if (this->locked_) { this->unlock(); } throw; }
+        }
+        ~monitor_lock() noexcept
+        {
+            if (!this->locked_) { return; }
+            try { this->unlock(); }
+            catch (...) { std::terminate(); }
+        }
+        monitor_lock(const monitor_lock&) = delete;
+        monitor_lock(monitor_lock&&) = delete;
+        auto operator=(const monitor_lock&) -> monitor_lock& = delete;
+        auto operator=(monitor_lock&&) -> monitor_lock& = delete;
+        static auto operator new(std::size_t) -> void* = delete;
+        static auto operator new[](std::size_t) -> void* = delete;
+        [[nodiscard]] auto owns_lock() const noexcept -> bool { return this->locked_; }
+        auto unlock() -> void
+        {
+            if (!this->locked_) { return; }
+            namespace nb = vmhook::detail::native_backend;
+            namespace pn = vmhook::detail::private_native;
+            if (nb::active_context_lifetime() != this->context_
+                || pn::rt().current_thread() != this->context_->thread)
+            { throw vmhook::exception{"A monitor must be released by its owning native OS thread"}; }
+            nb::operation access{};
+            if (!access) { throw vmhook::exception{"The monitor owner's native context is no longer usable"}; }
+            this->runtime_->release(this->record_.data());
+            this->locked_ = false;
+            --this->context_->operation_depth;
+        }
+    };
+
+    template<typename wrapper_type, typename function_type>
+    inline decltype(auto) with_monitor(const std::unique_ptr<wrapper_type>& object, function_type&& function)
+    {
+        vmhook::monitor_lock lock{object};
+        return std::invoke(std::forward<function_type>(function));
+    }
+
+    [[nodiscard]] inline auto monitor_locks_supported() noexcept -> bool
+    { return vmhook::detail::monitor_backend::config().ready; }
+}
+// VMHOOK_MONITOR_LOCKS_END
+namespace vmhook::detail
+{
+    inline auto verified_monitor_locks_available() noexcept -> bool
+    { return monitor_backend::config().ready; }
+}
