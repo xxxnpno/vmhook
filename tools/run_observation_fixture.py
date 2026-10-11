@@ -54,7 +54,7 @@ CHECKS = {
                    "copied_observations_survive_close", "management_complete"],
     "lifetime": ["metadata", "native_attach", "ambiguous_name", "loader_binding", "constructor_identity",
                  "null_contract", "context_loader", "source_closed", "cross_context_gc",
-                 "released_resource", "proxy_binding_lifetime", "loader_heap_snapshot", "rebound_heap_snapshot", "root_accounting", "builtin_identity", "builtin_heap", "unregister", "lifetime_complete"],
+                 "released_resource", "proxy_binding_lifetime", "loader_heap_snapshot", "rebound_heap_snapshot", "root_accounting", "builtin_identity", "builtin_heap", "empty_array_loader_identity", "loader_array_heap_snapshot", "unregister", "lifetime_complete"],
     "class_inventory": ["metadata", "native_attach", "inventory_bounds", "duplicate_loaders",
                         "rooted_mirrors", "inventory_context", "inventory_complete"],
     "runtime_init": ["fresh_runtime", "fault_consumed", "passive_preflight",
