@@ -50,7 +50,12 @@ auto main() -> int
     if (std::string{copied_error.what()} != "consumer" || std::string{moved_error.what()} != "consumer"
         || std::string{copied_runtime.what()} != "runtime" || std::string{moved_runtime.what()} != "runtime")
     { return 6; }
+#if defined(VMHOOK_CONSUMER_MODULE)
+    // Debug formatting exercises GNU16's replacement-view COMDAT regression.
     if (std::format("{:?}", std::string{"a\n"}) != "\"a\\n\"") { return 10; }
+#else
+    if (std::format("{}:{}", std::string{"consumer"}, 42) != "consumer:42") { return 10; }
+#endif
     std::filesystem::path path{"installed-consumer"};
     auto future = std::async(std::launch::deferred, [] { return 42; });
     return path.filename() == "installed-consumer" && future.get() == 42 ? 0 : 5;

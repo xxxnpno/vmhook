@@ -116,12 +116,12 @@ namespace
     }
 }
 
-extern "C" BOOL WINAPI DllMain(HMODULE module, DWORD reason, void*)
+extern "C" BOOL __attribute__((ms_abi)) DllMain(HMODULE module, DWORD reason, void*)
 {
-    if (reason == DLL_PROCESS_ATTACH)
+    if (reason == 1)
     {
         DisableThreadLibraryCalls(module);
         if (const HANDLE thread{ CreateThread(nullptr, 0, worker, nullptr, 0, nullptr) }) { CloseHandle(thread); }
     }
-    return TRUE;
+    return true;
 }
