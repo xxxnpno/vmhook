@@ -51,7 +51,9 @@ def prepare_standard_overlay(standard: Path, output: Path, compiler: str, flags:
     constexpr exception copy/move constructors also need the same gnu_inline
     annotation already used by their other constructors; otherwise the C2
     alias collides with the compiler's own static runtime at -O0. Only exact
-    recognized layouts are changed, in a build-directory overlay.
+    recognized layouts are changed, in a build-directory overlay. The variant
+    error table has the same local-static import linkage defect as the tag;
+    its exact ABI symbol and four diagnostic strings are preserved.
     """
     header = standard.parent / "shared_ptr_base.h"
     if not header.is_file():
@@ -74,7 +76,7 @@ def prepare_standard_overlay(standard: Path, output: Path, compiler: str, flags:
     if before in original:
         if original.count(before) != 1:
             raise ValueError("unrecognized libstdc++ shared_ptr tag layout; review the GNU workaround")
-        overlays["shared_ptr_base.h"] = original.replace(before, after)
+        overlays["bits/shared_ptr_base.h"] = original.replace(before, after)
     elif re.search(r"alignas\s*\(\s*type_info\s*\)\s*static\s+constexpr\s+char\s+__tag", original):
         raise ValueError("unrecognized libstdc++ shared_ptr tag layout; review the GNU workaround")
 
@@ -97,13 +99,48 @@ def prepare_standard_overlay(standard: Path, output: Path, compiler: str, flags:
             for declaration in matches:
                 original_exceptions = original_exceptions.replace(declaration,
                     "[[__gnu__::__gnu_inline__]] " + declaration.replace("constexpr ", "constexpr inline "))
-            overlays["stdexcept_except.h"] = original_exceptions
+            overlays["bits/stdexcept_except.h"] = original_exceptions
+    variant_header = standard.parent.parent / "variant"
+    if macros.get("__GNUC__") == "16" and variant_header.is_file():
+        variant = variant_header.read_text(encoding="utf-8")
+        local_table = """      [[maybe_unused]] static constexpr const char* __reasons[] = {
+\t"std::get: wrong index for variant",
+\t"std::get: variant is valueless",
+\t"std::visit: variant is valueless",
+\t"std::visit<R>: variant is valueless",
+      };"""
+        friend_declaration = """    friend _GLIBCXX_CONSTEXPR_BAD_VARIANT_ACCESS void
+    __throw_bad_variant_access([[maybe_unused]] unsigned __n)"""
+        if "static constexpr const char* __reasons[]" in variant:
+            if variant.count(local_table) != 1 or variant.count(friend_declaration) != 1:
+                raise ValueError("unrecognized GNU 16 variant reason table; review the module ABI workaround")
+            inline_table = local_table.replace("[[maybe_unused]] static constexpr", "static inline constexpr")
+            inline_table = inline_table.replace("__reasons[] =", '__reasons[]\n      __asm__("_ZZSt26__throw_bad_variant_accessjE9__reasons") =')
+            variant = variant.replace(local_table + "\n", "")
+            overlays["variant"] = variant.replace(friend_declaration,
+                inline_table + "\n\n" + friend_declaration)
+    format_header = standard.parent.parent / "format"
+    if macros.get("__GNUC__") == "16" and format_header.is_file():
+        formatting = format_header.read_text(encoding="utf-8")
+        declarations = (
+            "      static constexpr char32_t __replace = U'\\uFFFD';",
+            "      static constexpr _Str_view __replace_rep = []",
+        )
+        if any(declaration in formatting for declaration in declarations):
+            if any(formatting.count(declaration) != 1 for declaration in declarations):
+                raise ValueError("unrecognized GNU 16 format replacement table; review the module workaround")
+            # Both values are used only during this function call. The view
+            # still refers to the same static string literals; removing its
+            # local-static storage avoids duplicate imported instantiations.
+            for declaration in declarations:
+                formatting = formatting.replace(declaration, declaration.replace("static constexpr", "constexpr"))
+            overlays["format"] = formatting
     if overlays and (macros.get("_GLIBCXX_INLINE_VERSION") != "0"
                      or "_WIN64" not in macros or "__x86_64__" not in macros):
         raise ValueError("the GNU ABI workarounds require unversioned libstdc++ on Windows x64")
     overlay = output / "stdlib-overlay"
-    for name in ("shared_ptr_base.h", "stdexcept_except.h"):
-        copied = overlay / "bits" / name
+    for name in ("bits/shared_ptr_base.h", "bits/stdexcept_except.h", "variant", "format"):
+        copied = overlay / name
         if name in overlays:
             copied.parent.mkdir(parents=True, exist_ok=True)
             copied.write_text(overlays[name], encoding="utf-8", newline="\n")
@@ -189,7 +226,7 @@ def build(args: argparse.Namespace) -> None:
         "stdlib_overlay": standard_overlay is not None,
         "stdlib_overlay_sha256": {
             path.relative_to(standard_overlay).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in sorted(standard_overlay.rglob("*.h"))
+            for path in sorted(path for path in standard_overlay.rglob("*") if path.is_file())
         } if standard_overlay else {},
         "scope": "Compiler/configuration-specific local build; no runtime compatibility claim",
     }

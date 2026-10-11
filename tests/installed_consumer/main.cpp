@@ -27,6 +27,14 @@ auto main() -> int
     if (!java_null || java_null->get_instance() != nullptr) { return 1; }
     if (vmhook::version_string.empty() || !second_translation_unit()) { return 2; }
     if (vmhook::register_class<counter>("example/Counter")) { return 3; }
+    bool heap_refused{};
+    try { (void)vmhook::get_instances<counter>(1); }
+    catch (const vmhook::exception&) { heap_refused = true; }
+    if (!heap_refused) { return 7; }
+    const std::variant<int, std::string> variant{42};
+    try { (void)std::get<std::string>(variant); return 8; }
+    catch (const std::bad_variant_access& error)
+    { if (std::string{error.what()} != "std::get: wrong index for variant") { return 9; } }
     vmhook::native_thread_context context{"VMHook-installed-consumer"};
     if (context.valid()) { return 4; }
     // GNU C++26 constexpr exception constructors must retain the runtime's
@@ -42,6 +50,7 @@ auto main() -> int
     if (std::string{copied_error.what()} != "consumer" || std::string{moved_error.what()} != "consumer"
         || std::string{copied_runtime.what()} != "runtime" || std::string{moved_runtime.what()} != "runtime")
     { return 6; }
+    if (std::format("{:?}", std::string{"a\n"}) != "\"a\\n\"") { return 10; }
     std::filesystem::path path{"installed-consumer"};
     auto future = std::async(std::launch::deferred, [] { return 42; });
     return path.filename() == "installed-consumer" && future.get() == 42 ? 0 : 5;

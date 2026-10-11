@@ -69,7 +69,11 @@ override when the compiler's `libstdc++.modules.json` needs one.
 For affected GNU Windows builds, the orchestrator creates a libstdc++ header
 overlay inside this build directory to preserve the shared-pointer COMDAT
 symbol. A second narrowly matched GNU 16 overlay preserves constexpr exception
-copy/move constructor linkage in unoptimized static builds. The compiler
+copy/move constructor linkage in unoptimized static builds. Exact-layout
+GNU 16 overlays also give the variant diagnostic table module-safe inline
+storage and make two formatting constants local to each call. Their diagnostic
+strings and static string literals are preserved. Unknown layouts fail rather
+than guessing; duplicate linker definitions are never suppressed. The compiler
 installation remains untouched. The generated
 `vmhook-module/<configuration>/build-info.json` records compiler version and
 target, options, source hashes, artifact hashes and overlay use. These are
@@ -79,7 +83,10 @@ in [native threads](native-threads.md).
 ## Verify an installation
 
 The repository's independent consumer has two translation units and exercises
-owning Java-null wrappers, no-JVM refusal, `std::filesystem` and `std::future`.
+owning Java-null wrappers, no-JVM invocation/heap-snapshot refusal, exception
+copy/move, variant exceptions, string formatting, `std::filesystem` and
+`std::future`. Both translation units instantiate the heap API to exercise
+module import linkage.
 It is copied outside the checkout and uses only `find_package`:
 
 ```sh
