@@ -78,6 +78,8 @@ CHECKS = {
                      "copied_class_record", "deferred_native_install", "deferred_callback",
                      "deferred_removal", "deferred_original_body", "deferred_reclamation",
                      "throwable_observer", "exact_stack_trace_semantics", "throwable_removal",
+                     "shared_nonsynchronized_observer", "shared_cds_physical_stub",
+                     "shared_nonsynchronized_body", "shared_nonsynchronized_removal", "synchronized_entry_gc",
                      "class_removal", "class_capture_reclamation", "event_stream_proof"],
     "hook_composition": ["context", "three_observers", "shared_policy", "priority_and_first_return",
                          "remove_one", "remaining_original_body", "remove_remaining", "original_body",
