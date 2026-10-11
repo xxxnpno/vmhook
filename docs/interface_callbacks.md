@@ -51,7 +51,8 @@ Callbacks match both the retained handler and the created proxy by Java object
 identity. Another application-created proxy sharing that handler reaches the
 ordinary helper body. Callbacks begin after the proxy resource is constructed.
 
-The callback receives rooted owning wrappers through constant references. A
+The callback receives rooted owning wrappers through constant references and
+returns its owning `unique_ptr` by value. A
 zero-argument Java method has an allocated `arguments` wrapper whose
 `get_instance()` is null. Java-null arguments and results also use allocated
 wrappers with null Java instances. Returning an empty C++ `unique_ptr` is a
@@ -82,6 +83,9 @@ context. Java calls execute the callback synchronously on their calling thread;
 callbacks can run concurrently, so captured C++ state must support that use.
 The callback should return promptly. The existing VM profile, collector and
 thread support restrictions of the hook engine still apply.
+The optional `hook_options` argument uses the [method hook](hooks.md) priority
+and recursion policy. Recursion through the same observer is suppressed by
+default; use its explicit recursion option when the callback needs it.
 
 `close()` disables future user callbacks and releases durable roots after any
 callback already in progress finishes. Already acquired Java proxies remain

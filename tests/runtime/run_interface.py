@@ -63,7 +63,8 @@ def main() -> int:
                 if result.is_file():
                     values = dict(line.split('=', 1) for line in result.read_text().splitlines()
                                   if '=' in line)
-                    if 'interface_proof' in values or 'exception' in values:
+                    if ('interface_proof' in values or 'exception' in values
+                            or any(value in ('fail', 'timeout') for value in values.values())):
                         break
                 if process.poll() is not None:
                     raise RuntimeError(f'Java exited during the interface probe: {process.returncode}')
