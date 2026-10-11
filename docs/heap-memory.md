@@ -51,3 +51,16 @@ and invokes its objects afterward. This verifies that the captured roots and
 locking protocol work in those runs. It does not by itself prove that a
 concurrent marking phase occurred; SATB queue safety additionally follows the
 exact source and ABI audits.
+
+Typed arrays use their exact component class and defining loader.
+`get_instances<vmhook::array<player>>()` selects that loaded `player[]` class;
+a same-named component from another loader is excluded. If the valid component
+binding has no array class yet, the exact snapshot is empty. The query does not
+load an array class merely to search for its instances.
+
+`is<vmhook::array<player>>()` uses Java component assignability, so it also
+accepts compatible subclass arrays. The same check applies to nested arrays,
+rooted refs and borrows, including empty arrays with no elements to inspect.
+Java null still answers false. An unregistered, stale or foreign-context source
+remains an error. `is<vmhook::any_object>()` accepts any non-null rooted Java
+object without requiring an additional registry entry.

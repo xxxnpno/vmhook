@@ -19316,9 +19316,7 @@ export namespace vmhook
             if (!address) { return false; }
             if (!access || !native_root_ || !native_root_->valid())
             { throw vmhook::exception{"A typed instance test requires a live VM-scanned object reference"}; }
-            auto* const expected{vmhook::detail::registered_class_klass<wrapper_type>()};
-            if (!expected) { throw vmhook::exception{"Typed instance test wrapper is not bound to a loaded Java class"}; }
-            return vmhook::detail::container_class_assignable(vmhook::klass_from_oop(get_instance()), expected);
+            return vmhook::detail::object_matches_wrapper_type<wrapper_type>(native_root_);
         }
 
         /*
@@ -25154,9 +25152,7 @@ namespace hotspot
             const auto root{this->get_native_root()};
             if (!access || !root || !root->valid())
             { throw vmhook::exception{"A typed reference test requires a live VM-scanned reference"}; }
-            auto* const expected{vmhook::detail::registered_class_klass<other_wrapper>()};
-            if (!expected) { throw vmhook::exception{"Typed reference wrapper is not bound to a loaded Java class"}; }
-            return vmhook::detail::container_class_assignable(vmhook::klass_from_oop(this->resolve()), expected);
+            return vmhook::detail::object_matches_wrapper_type<other_wrapper>(root);
         }
 
         /* @brief Tests exact class/interface identity by an unambiguous loaded name. */
@@ -25596,9 +25592,7 @@ namespace hotspot
             if (!address) { return false; }
             if (!access || !native_root_ || !native_root_->valid())
             { throw vmhook::exception{"A typed borrow test requires a live VM-scanned reference"}; }
-            auto* const expected{vmhook::detail::registered_class_klass<other_wrapper>()};
-            if (!expected) { throw vmhook::exception{"Typed borrow wrapper is not bound to a loaded Java class"}; }
-            return vmhook::detail::container_class_assignable(vmhook::klass_from_oop(this->resolve()), expected);
+            return vmhook::detail::object_matches_wrapper_type<other_wrapper>(native_root_);
         }
 
         auto instance_of(const std::string_view class_name) const
@@ -29920,7 +29914,15 @@ export namespace vmhook
     {
         static_assert(vmhook::detail::is_java_wrapper_v<value_type>);
         vmhook::detail::native_backend::operation access{};
-        auto* const target{ vmhook::detail::registered_class_klass<value_type>() };
+        vmhook::hotspot::klass* target{};
+        if constexpr (requires { value_type::java_array_wrapper; })
+        {
+            target = vmhook::detail::loaded_array_wrapper_class<value_type>();
+            // Valid leaf binding, but this exact array metadata has not been
+            // created: no instance of that exact array class can exist yet.
+            if (!target) { return {}; }
+        }
+        else { target = vmhook::detail::registered_class_klass<value_type>(); }
         auto roots{ vmhook::detail::heap_iteration::capture(target, max_visits) };
         std::vector<std::unique_ptr<value_type>> result{};
         result.reserve(roots.size());

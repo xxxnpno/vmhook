@@ -41,6 +41,10 @@ public final class LifetimeFixture {
 
     public static Object first() { return first; }
     public static Object second() { return second; }
+    public static Object first_empty_array() { return java.lang.reflect.Array.newInstance(first.getClass(), 0); }
+    public static Object second_empty_array() { return java.lang.reflect.Array.newInstance(second.getClass(), 0); }
+    public static Object first_empty_matrix() { return java.lang.reflect.Array.newInstance(first.getClass(), new int[]{0, 0}); }
+    public static Object second_empty_matrix() { return java.lang.reflect.Array.newInstance(second.getClass(), new int[]{0, 0}); }
     public static ClassLoader first_loader() { return first_loader; }
     public static boolean current_loader_matches(ClassLoader expected) {
         return Thread.currentThread().getContextClassLoader() == expected;

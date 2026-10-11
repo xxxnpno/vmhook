@@ -33,6 +33,14 @@ namespace
         { return static_members::get_method("builtin_string")->call(); }
         static auto builtin_class() -> std::unique_ptr<vmhook::class_object>
         { return static_members::get_method("builtin_class")->call(); }
+        static auto first_empty_array() -> std::unique_ptr<vmhook::any_object>
+        { return static_members::get_method("first_empty_array")->call(); }
+        static auto second_empty_array() -> std::unique_ptr<vmhook::any_object>
+        { return static_members::get_method("second_empty_array")->call(); }
+        static auto first_empty_matrix() -> std::unique_ptr<vmhook::any_object>
+        { return static_members::get_method("first_empty_matrix")->call(); }
+        static auto second_empty_matrix() -> std::unique_ptr<vmhook::any_object>
+        { return static_members::get_method("second_empty_matrix")->call(); }
     };
     class copy_one : public vmhook::object<copy_one>
     {
@@ -98,6 +106,36 @@ namespace
                 auto created = vmhook::make_unique<copy_one>(std::int32_t{9});
                 if (!check(output, "constructor_identity", created->value() == 9
                     && copy_one::total() == 150 && copy_two::total() == 173)) { return 6; }
+                const auto first_array = fixture::first_empty_array();
+                const auto second_array = fixture::second_empty_array();
+                const auto first_matrix = fixture::first_empty_matrix();
+                const auto second_matrix = fixture::second_empty_matrix();
+                using first_array_type = vmhook::array<copy_one>;
+                using second_array_type = vmhook::array<copy_two>;
+                using first_matrix_type = vmhook::array<first_array_type>;
+                const auto first_typed = vmhook::detail::materialize_object<first_array_type>(0, first_array->get_native_root());
+                const auto first_nested = vmhook::detail::materialize_object<first_matrix_type>(0, first_matrix->get_native_root());
+                const auto first_array_ref = vmhook::ref<vmhook::any_object>::from_native_root(first_array->get_native_root());
+                const auto second_array_borrow = vmhook::borrowed<vmhook::any_object>{second_array->get_instance(), second_array->get_native_root()};
+                if (!check(output, "empty_array_loader_identity", first_typed && first_typed->size() == 0
+                    && first_nested && first_nested->size() == 0
+                    && first_array->is<first_array_type>() && !first_array->is<second_array_type>()
+                    && second_array->is<second_array_type>() && !second_array->is<first_array_type>()
+                    && first_array->is<vmhook::array<vmhook::any_object>>() && first_array->is<vmhook::any_object>()
+                    && first_matrix->is<first_matrix_type>() && !second_matrix->is<first_matrix_type>()
+                    && !first_array->is<first_matrix_type>()
+                    && first_array_ref.is<first_array_type>() && !second_array_borrow.is<first_array_type>()
+                    && refused([&]{(void)vmhook::detail::materialize_object<first_array_type>(0, second_array->get_native_root());})
+                    && refused([&]{(void)vmhook::detail::materialize_object<first_matrix_type>(0, second_matrix->get_native_root());}))) { return 6; }
+                const auto first_arrays = vmhook::get_instances<first_array_type>(64);
+                const auto second_arrays = vmhook::get_instances<second_array_type>(64);
+                fixture::collect();
+                bool array_snapshot{!first_arrays.empty() && !second_arrays.empty()};
+                for (const auto& array : first_arrays)
+                { array_snapshot = array_snapshot && array->is<first_array_type>() && !array->is<second_array_type>(); }
+                for (const auto& array : second_arrays)
+                { array_snapshot = array_snapshot && array->is<second_array_type>() && !array->is<first_array_type>(); }
+                if (!check(output, "loader_array_heap_snapshot", array_snapshot)) { return 6; }
                 auto first_snapshot = vmhook::get_instances<copy_one>(64);
                 fixture::collect();
                 bool saw_first{}, saw_created{}, exact_first{!first_snapshot.empty()};
