@@ -74,6 +74,12 @@ CHECKS = {
                    "field_policy_cpp_oom", "failure_cleanup", "method_retry", "method_original",
                    "field_retry", "field_original", "closed", "contextless_cpp_oom",
                    "contextless_retry", "hook_roots_complete"],
+    "method_binding": ["context", "registration", "two_loader_identity",
+                       "wrong_loader_receiver_refusal", "wrong_loader_argument_refusal",
+                       "wrong_loader_array_refusal", "base_to_subtype_refusal", "hook_a",
+                       "captured_rebinding", "hook_b", "array_argument_scope", "nested_binding_scope",
+                       "callback_constructor_scope", "java_null_wrapper", "callback_tls_restored",
+                       "original_after_removal", "reclamation", "method_binding_proof"],
     "method_exit": ["context", "registration", "observers", "original_results_and_monitors",
                     "all_primitive_bits", "reference_kind_only", "empty_void_original",
                     "exception_has_no_normal_exit", "resident_stubs", "composition",
@@ -113,6 +119,7 @@ FIXTURES = {
     "heap_concurrent": "HeapConcurrentFixture",
     "special_reference": "SpecialReferenceFixture",
     "hook_roots": "RootFixture",
+    "method_binding": "MethodBindingFixture",
     "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
@@ -133,6 +140,7 @@ OPTIONAL_PROBES = {
     "heap_concurrent": "heap_concurrent_probe",
     "special_reference": "special_reference_probe",
     "hook_roots": "hook_roots_probe",
+    "method_binding": "method_binding_probe",
     "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
@@ -153,6 +161,7 @@ TERMINAL_CHECK = {
     "heap_concurrent": "native_complete",
     "special_reference": "native_complete",
     "hook_roots": "hook_roots_complete",
+    "method_binding": "method_binding_proof",
     "method_exit": "method_exit_proof",
 }
 
@@ -226,6 +235,7 @@ def execute_mode(args, mode, directory):
                        VMHOOK_MANAGEMENT_REPORT=windows_path(result),
                        VMHOOK_CALLBACK_THROW_REPORT=windows_path(result),
                        VMHOOK_METHOD_EXIT_REPORT=windows_path(result),
+                       VMHOOK_METHOD_BINDING_REPORT=windows_path(result),
                        VMHOOK_VIRTUAL_THREAD_REPORT=windows_path(result))
     java_flags = (["-XX:-ClassUnloadingWithConcurrentMark"]
                   if mode == "heap_liveness" and args.heap_liveness_class_unloading_disabled else [])
