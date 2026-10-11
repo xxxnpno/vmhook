@@ -4,6 +4,8 @@ import java.lang.ref.WeakReference;
 
 /** Independent-loader and cross-context root regression fixture. */
 public final class LifetimeFixture {
+    public static String builtin_string() { return "builtin identity"; }
+    public static Class<?> builtin_class() { return String.class; }
     public static final class Duplicate {
         public static int total = 100;
         public int value;

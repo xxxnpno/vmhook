@@ -983,9 +983,24 @@ export namespace vmhook
         }
         inline auto registered_class_klass(std::type_index, const std::shared_ptr<class_binding>&) -> vmhook::hotspot::klass*;
         inline auto registered_class_klass(std::type_index) -> vmhook::hotspot::klass*;
+        inline auto registered_bootstrap_klass(std::string_view) -> vmhook::hotspot::klass*;
         template<typename wrapper_type>
         inline auto registered_class_klass() -> vmhook::hotspot::klass*
-        { return registered_class_klass(std::type_index{typeid(wrapper_type)}); }
+        {
+            const std::type_index type{typeid(wrapper_type)};
+            const auto binding{registered_class_binding(type)};
+            if (binding) { return registered_class_klass(type, binding); }
+            if constexpr (requires { std::string_view{wrapper_type::java_contract}; })
+            {
+                if constexpr (!requires { wrapper_type::java_array_wrapper; })
+                { return registered_bootstrap_klass(wrapper_type::java_contract); }
+                else if constexpr (wrapper_type::java_contract.size() == 2)
+                { return registered_bootstrap_klass(wrapper_type::java_contract); }
+                // A generic Object[] contract cannot select the defining
+                // loader/component identity of array<registered_wrapper>.
+            }
+            return registered_class_klass(type, binding);
+        }
         inline auto install_class_binding(std::type_index type, std::shared_ptr<class_binding> binding) -> void
         {
             std::unordered_map<std::type_index, std::string> names{};
@@ -21447,6 +21462,46 @@ export namespace vmhook
             else { target_root = native_backend::retain_class(target); }
             if (!target_root) { throw vmhook::exception{ "Bootstrap class mirror could not be retained" }; }
             return { target, std::move(target_root) };
+        }
+
+        inline auto registered_bootstrap_klass(const std::string_view class_name) -> vmhook::hotspot::klass*
+        {
+            native_backend::operation access{};
+            if (!access || class_name.empty()) { return nullptr; }
+            // Builtin contracts resolve through the ordinary bootstrap loader,
+            // even if an application has defined a same-named helper class.
+            auto* const class_class{vmhook::find_class("java/lang/Class")};
+            if (!class_class) { throw vmhook::exception{"java.lang.Class is unavailable"}; }
+            const auto class_root{native_backend::retain_class(class_class)};
+            if (!class_root) { throw vmhook::exception{"Bootstrap Class mirror could not be retained"}; }
+            auto* target{vmhook::find_class_via_oop(container_address(class_root), class_name)};
+            if (target)
+            {
+                if (!native_backend::retain_class(target))
+                { throw vmhook::exception{"Bootstrap class identity could not be retained"}; }
+                return target;
+            }
+            constexpr std::string_view signature{"(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"};
+            vmhook::hotspot::method* lookup{};
+            auto** const methods{class_class->get_methods_ptr()};
+            const auto count{class_class->get_methods_count()};
+            for (std::int32_t index{}; methods && index < count; ++index)
+            {
+                auto* const candidate{methods[index]};
+                if (candidate && candidate->get_name() == "forName" && candidate->get_signature() == signature)
+                { lookup = candidate; break; }
+            }
+            if (!lookup || !class_root) { throw vmhook::exception{"Bootstrap class identity lookup is unavailable"}; }
+            std::string binary_name{class_name};
+            std::replace(binary_name.begin(), binary_name.end(), '/', '.');
+            const auto loader{wrap_object<vmhook::any_object>(nullptr)};
+            const vmhook::method_proxy resolver{nullptr, lookup, std::string{signature}, true};
+            const auto mirror{container_result_root(resolver.call(binary_name, false, loader))};
+            const auto oop{container_address(mirror)};
+            target = vmhook::find_class_via_oop(container_address(class_root), class_name);
+            if (!target || target->get_java_mirror() != oop || !native_backend::retain_class(target))
+            { throw vmhook::exception{"Bootstrap class identity could not be retained"}; }
+            return target;
         }
 
         template<typename... argument_types>

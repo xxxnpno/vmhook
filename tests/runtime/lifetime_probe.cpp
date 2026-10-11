@@ -29,6 +29,10 @@ namespace
         static auto collect() -> void
         { const auto result = static_members::get_method("collect")->call();
           if (!result.was_invoked() || result.threw()) { throw vmhook::exception{"Collection failed"}; } }
+        static auto builtin_string() -> std::unique_ptr<vmhook::java_string>
+        { return static_members::get_method("builtin_string")->call(); }
+        static auto builtin_class() -> std::unique_ptr<vmhook::class_object>
+        { return static_members::get_method("builtin_class")->call(); }
     };
     class copy_one : public vmhook::object<copy_one>
     {
@@ -68,6 +72,20 @@ namespace
             {
                 vmhook::native_thread_context source{"VMHook-lifetime-source"};
                 if (!check(output, "native_attach", source.valid())) { return 3; }
+                const auto string = fixture::builtin_string();
+                const auto mirror = fixture::builtin_class();
+                if (!check(output, "builtin_identity", string->is<vmhook::java_string>()
+                    && mirror->is<vmhook::class_object>() && !string->is<vmhook::class_object>()
+                    && !mirror->is<vmhook::java_string>()
+                    && vmhook::borrowed<vmhook::any_object>{string->get_instance(), string->get_native_root()}.is<vmhook::java_string>()
+                    && string->to_string() == "builtin identity" && mirror->name() == "java.lang.String")) { return 3; }
+                const auto builtin_strings = vmhook::get_instances<vmhook::java_string>(8);
+                const auto builtin_classes = vmhook::get_instances<vmhook::class_object>(8);
+                fixture::collect();
+                bool builtin_heap{!builtin_strings.empty() && !builtin_classes.empty()};
+                for (const auto& value : builtin_strings) { builtin_heap = builtin_heap && value->is<vmhook::java_string>(); }
+                for (const auto& value : builtin_classes) { builtin_heap = builtin_heap && value->is<vmhook::class_object>(); }
+                if (!check(output, "builtin_heap", builtin_heap)) { return 3; }
                 auto first = fixture::first();
                 auto second = fixture::second();
                 if (!check(output, "ambiguous_name", vmhook::find_class("LifetimeFixture$Duplicate") == nullptr)) { return 4; }
