@@ -60,6 +60,8 @@ CHECKS = {
     "runtime_init": ["fresh_runtime", "fault_consumed", "passive_preflight",
                      "native_context_result", "registration_result", "observer_result",
                      "failure_cleanup", "runtime_init_complete"],
+    "monitor_fault": ["monitor_cpp_allocation", "monitor_pending_cleanup",
+                      "monitor_fault_balance", "monitor_fault_retry", "native_complete"],
     "method_exit": ["context", "registration", "observers", "original_results_and_monitors",
                     "all_primitive_bits", "reference_kind_only", "empty_void_original",
                     "exception_has_no_normal_exit", "resident_stubs", "composition",
@@ -92,6 +94,7 @@ FIXTURES = {
     "lifetime": "LifetimeFixture",
     "class_inventory": "LifetimeFixture",
     "runtime_init": "ExecutorFixture",
+    "monitor_fault": "NativeFixture",
     "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
@@ -107,6 +110,7 @@ OPTIONAL_PROBES = {
     "lifetime": "lifetime_probe",
     "class_inventory": "class_inventory_probe",
     "runtime_init": "runtime_init_probe",
+    "monitor_fault": "monitor_fault_probe",
     "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
@@ -122,6 +126,7 @@ TERMINAL_CHECK = {
     "event_stream": "event_stream_proof",
     "class_inventory": "inventory_complete",
     "runtime_init": "runtime_init_complete",
+    "monitor_fault": "native_complete",
     "method_exit": "method_exit_proof",
 }
 

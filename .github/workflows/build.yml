@@ -214,6 +214,7 @@ jobs:
             class_inventory_probe: vmhook_class_inventory_probe.dll
             method_exit_probe: vmhook_method_exit_probe.dll
             runtime_init_probe: vmhook_runtime_init_probe.dll
+            monitor_fault_probe: vmhook_monitor_fault_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
             observation_probe: vmhook_module_observation_probe.dll
@@ -231,6 +232,7 @@ jobs:
             class_inventory_probe: vmhook_module_class_inventory_probe.dll
             method_exit_probe: vmhook_module_method_exit_probe.dll
             runtime_init_probe: vmhook_module_runtime_init_probe.dll
+            monitor_fault_probe: vmhook_module_monitor_fault_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -307,6 +309,7 @@ jobs:
           --class-inventory-probe runtime-binaries/${{ matrix.class_inventory_probe }}
           --method-exit-probe runtime-binaries/${{ matrix.method_exit_probe }}
           --runtime-init-probe runtime-binaries/${{ matrix.runtime_init_probe }}
+          --monitor-fault-probe runtime-binaries/${{ matrix.monitor_fault_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify fresh-runtime faults and unavailable backends
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[8,21,27]'), matrix.java) }}
