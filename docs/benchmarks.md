@@ -40,7 +40,11 @@ clears both links and requests GC through an ordinary method invocation.
 Every constructor/field/list result is checked afterwards, including allocated
 C++ wrappers for Java-null values. Real collector counts must increase.
 The worker keeps its native context open throughout the cycle workload.
-After the first cycle, durable allocated capacity/lease counts and context\nallocated capacity/live ticket counts must remain unchanged in each subsequent\ncycle. A normal Java operation and a temporary retain explicitly drain deferred\nreleases before these comparisons; the diagnostic getter itself never drains.\nA separate durable object is acquired after that context closes and another
+After the first cycle, durable allocated capacity/lease counts and context
+allocated capacity/live ticket counts must remain unchanged in each subsequent
+cycle. A normal Java operation and a temporary retain explicitly drain deferred
+releases before these comparisons; the diagnostic getter itself never drains.
+A separate durable object is acquired after that context closes and another
 context triggers collection.
 
 The first context sample includes backend discovery. Other first samples
