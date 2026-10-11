@@ -315,6 +315,8 @@ namespace
         return true;
     }
 
+    #include "field_memory_cases.hpp"
+
     auto check_object_contract(const std::unique_ptr<native_fixture>& first,
                                const std::unique_ptr<native_fixture>& second) -> bool
     {
@@ -349,18 +351,12 @@ namespace
             || string_result.as_string() != unicode_text())
         { return false; }
 
-        // The unique_ptr setter still respects the collector barrier gate.
-        // Moving collectors must refuse it without changing the Java field;
-        // a separately configured Epsilon run may test the supported store.
-        if (vmhook::detail::reference_stores_supported())
-        {
-            second->child_object(java_null);
-            const auto stored_null = second->child_object();
-            if (!stored_null || stored_null->get_instance()) { return false; }
-            second->child_object(first);
-        }
-        else if (!conversion_refused([&] { second->child_object(java_null); }))
-        { return false; }
+        // The rooted accessor executes the VM's real collector barriers.
+        // Java null and non-null references must work with ordinary GC defaults.
+        second->child_object(java_null);
+        const auto stored_null = second->child_object();
+        if (!stored_null || stored_null->get_instance()) { return false; }
+        second->child_object(first);
         if (!conversion_refused([&] { second->child_object(forged_type); })) { return false; }
         const auto after_store = second->child_object();
         if (!after_store || !after_store->get_instance() || after_store->value() != 10)
@@ -502,10 +498,9 @@ namespace
                 conversion_refused([] { (void)vmhook::make_unique<native_fixture>(true); })
                 && conversion_refused([] { (void)vmhook::make_unique<native_fixture>(std::int32_t{-100}); })))
             { return false; }
-            output << "object_stores="
-                   << (vmhook::detail::reference_stores_supported()
-                       ? "epsilon_supported" : "moving_gc_refused") << '\n';
+            output << "object_stores=collector_barrier_accessor" << '\n';
             if (!passed(output, "object_contract", check_object_contract(first, second))) { return false; }
+            if (!passed(output, "field_memory", check_field_memory(first, second))) { return false; }
 
             const auto virtual_call = base_method(*first, "virtualValue");
             const auto private_call = base_method(*first, "privateValue");

@@ -2906,6 +2906,9 @@ export namespace vmhook
             // per-klass klass::find_field() helper directly (the field is then
             // known to be declared on that very klass).
             vmhook::hotspot::klass* declaring_klass{ nullptr };
+            // Class-file field modifiers: FINAL and VOLATILE affect writes and
+            // publication independently of the storage width.
+            std::uint16_t access_flags{};
         };
 
         /*
@@ -3505,7 +3508,7 @@ export namespace vmhook
                             {
                                 signature = signature_symbol->to_string();
                             }
-                            return vmhook::hotspot::field_entry_t{ field_offset, is_static, signature };
+                            return vmhook::hotspot::field_entry_t{ field_offset, is_static, signature, nullptr, static_cast<std::uint16_t>(access_flags) };
                         }
                     }
                 }
@@ -3651,7 +3654,7 @@ export namespace vmhook
                     const vmhook::hotspot::symbol* const signature_symbol{ vmhook::hotspot::klass::resolve_constant_pool_symbol(constant_pool_base, sig_index, cp_length) };
                     const std::string signature{ vmhook::hotspot::is_valid_pointer(signature_symbol) ? signature_symbol->to_string() : std::string{} };
 
-                    return vmhook::hotspot::field_entry_t{ offset, is_static, signature };
+                    return vmhook::hotspot::field_entry_t{ offset, is_static, signature, nullptr, access_flags };
                 }
 
                 return std::nullopt;
@@ -13670,6 +13673,10 @@ export namespace vmhook
             {
                 throw vmhook::exception{ "Field access uses an unsupported or mismatched storage width." };
             }
+            if ((entry->access_flags & 0x0010u) != 0)
+            { throw vmhook::exception{ "Raw field writes cannot mutate a final Java field" }; }
+            if ((entry->access_flags & 0x0040u) != 0)
+            { throw vmhook::exception{ "Volatile field writes require the rooted field_proxy accessor" }; }
             if (reference && !vmhook::detail::reference_stores_supported())
             {
                 throw vmhook::exception{ "Reference stores require a verified collector write-barrier backend." };
@@ -14192,6 +14199,110 @@ export namespace vmhook
             + static_cast<std::size_t>(index) * layout->element_width, &value, sizeof(value));
     }
 
+    // --- Collector-aware field access ----------------------------------------
+    namespace detail::field_memory_backend
+    {
+        /* Unsafe is an already-loaded Java class. Calling its Java methods
+           through JavaCalls executes HotSpot's real Access<...> collector and
+           volatile barriers. No native interface table or Unsafe native symbol
+           is called by VMHook. The singleton, holder and arguments are retained
+           before the call; none of their addresses survives a safepoint. */
+        inline auto invoke(const native_backend::root& holder, const std::size_t offset,
+                           const std::string_view method_name,
+                           const std::string_view fallback_name,
+                           const std::string_view descriptor,
+                           const std::uint64_t value_bits = 0,
+                           const native_backend::root& object = {},
+                           const bool write = false,
+                           const bool compare = false,
+                           const std::uint64_t expected_bits = 0,
+                           const native_backend::root& expected_object = {})
+            -> native_backend::native_call_result
+        {
+            native_backend::operation access{};
+            if (!access || !holder || !holder->valid()
+                || !vmhook::detail::java_execution_supported())
+            { throw vmhook::exception{ "Field barriers require a rooted field and a supported native or callback context" }; }
+            for (const std::string_view class_name : { "jdk/internal/misc/Unsafe", "sun/misc/Unsafe" })
+            {
+                auto* const unsafe_class{ vmhook::find_class(class_name) };
+                if (!unsafe_class || !vmhook::detail::class_initialized(unsafe_class)) { continue; }
+                const auto metadata{ native_backend::retain_class(unsafe_class) };
+                const auto singleton_field{ vmhook::find_field(unsafe_class, "theUnsafe") };
+                if (!metadata || !singleton_field || !singleton_field->is_static) { continue; }
+                void* const mirror{ metadata->resolve_under_vm() };
+                if (!mirror) { continue; }
+                std::uint32_t encoded{};
+                if (vmhook::detail::reference_storage_width() != sizeof(encoded)
+                    || !vmhook::os::safe_read(&encoded,
+                        reinterpret_cast<const std::byte*>(mirror) + singleton_field->offset, sizeof(encoded)))
+                { continue; }
+                void* const singleton{ vmhook::hotspot::decode_oop_pointer(encoded) };
+                if (!singleton || vmhook::klass_from_oop(singleton) != unsafe_class) { continue; }
+                const auto receiver{ native_backend::retain_oop(singleton) };
+                if (!receiver) { throw vmhook::exception{ "Java field accessor receiver could not be retained" }; }
+                vmhook::hotspot::method** methods{};
+                std::int32_t count{};
+                if (!vmhook::hotspot::safe_klass_methods(unsafe_class, methods, count)) { continue; }
+                vmhook::hotspot::method* selected{};
+                for (std::int32_t index{}; index < count; ++index)
+                {
+                    auto* const method{ methods[index] };
+                    if (!method || method->get_signature() != descriptor) { continue; }
+                    const auto name{ method->get_name() };
+                    if (name == method_name) { selected = method; break; }
+                    if (!selected && ((!fallback_name.empty() && name == fallback_name)
+                        || (method_name == "compareAndSetReference" && name == "compareAndSetObject")))
+                    { selected = method; }
+                }
+                if (!selected) { continue; }
+                std::array<std::intptr_t, 8> parameters{};
+                parameters[0] = reinterpret_cast<std::intptr_t>(receiver->resolve_under_vm());
+                parameters[1] = reinterpret_cast<std::intptr_t>(holder->resolve_under_vm());
+                // A Java long occupies two interpreter slots: padding, value.
+                parameters[3] = static_cast<std::intptr_t>(offset);
+                std::size_t slots{4};
+                if (write)
+                {
+                    const auto value_kind{ descriptor.size() > 20 ? descriptor[20] : '\0' };
+                    if (value_kind == 'L' || value_kind == '[')
+                    {
+                        parameters[compare ? 5 : 4] = reinterpret_cast<std::intptr_t>(object ? object->resolve_under_vm() : nullptr);
+                        if (object && !parameters[compare ? 5 : 4])
+                        { throw vmhook::exception{ "Field reference argument lost its owning context" }; }
+                        if (compare)
+                        {
+                            parameters[4] = reinterpret_cast<std::intptr_t>(expected_object
+                                ? expected_object->resolve_under_vm() : nullptr);
+                            if (expected_object && !parameters[4])
+                            { throw vmhook::exception{ "Expected field reference lost its owning context" }; }
+                        }
+                        slots = compare ? 6 : 5;
+                    }
+                    else if (value_kind == 'J' || value_kind == 'D')
+                    {
+                        parameters[compare ? 7 : 5] = static_cast<std::intptr_t>(value_bits);
+                        if (compare) { parameters[5] = static_cast<std::intptr_t>(expected_bits); }
+                        slots = compare ? 8 : 6;
+                    }
+                    else
+                    {
+                        parameters[compare ? 5 : 4] = static_cast<std::intptr_t>(value_bits);
+                        if (compare) { parameters[4] = static_cast<std::intptr_t>(expected_bits); }
+                        slots = compare ? 6 : 5;
+                    }
+                }
+                const auto called{ native_backend::invoke_packed(selected, descriptor,
+                    parameters.data(), slots, nullptr, nullptr) };
+                if (!called.invoked || called.threw || !called.error.empty())
+                { throw vmhook::exception{ called.threw ? "Java field accessor threw an exception"
+                    : !called.error.empty() ? called.error : "Java field accessor refused invocation" }; }
+                return called;
+            }
+            throw vmhook::exception{ "No already-initialized Java Unsafe field accessor matches this JVM" };
+        }
+    }
+
     // --- Field proxy ----------------------------------------------------------
 
         /*
@@ -14556,12 +14667,14 @@ export namespace vmhook
             subsequent access from GC or class unloading.
         */
         field_proxy(void* field_pointer, std::string sig, const bool is_static_flag,
-                    vmhook::hotspot::klass* mirror_klass, const std::size_t field_offset) noexcept
+                    vmhook::hotspot::klass* mirror_klass, const std::size_t field_offset,
+                    const std::uint16_t access_flags = 0) noexcept
             : field_pointer{ field_pointer }
             , signature_text{ std::move(sig) }
             , static_field{ is_static_flag }
             , mirror_klass{ mirror_klass }
             , field_offset{ field_offset }
+            , field_flags{ access_flags }
         {
             this->reference_declaring_class = mirror_klass;
             vmhook::detail::native_backend::operation access{};
@@ -14574,9 +14687,11 @@ export namespace vmhook
 
         field_proxy(void* field_pointer, std::string sig, const bool is_static_flag,
                     vmhook::detail::native_backend::root holder, const std::size_t offset,
-                    vmhook::hotspot::klass* const declaring_class = nullptr) noexcept
+                    vmhook::hotspot::klass* const declaring_class = nullptr,
+                    const std::uint16_t access_flags = 0) noexcept
             : field_pointer{ field_pointer }, signature_text{ std::move(sig) }, static_field{ is_static_flag },
-              field_offset{ offset }, holder_root{ std::move(holder) }, reference_declaring_class{ declaring_class }
+              field_offset{ offset }, holder_root{ std::move(holder) }, reference_declaring_class{ declaring_class },
+              field_flags{ access_flags }
         {
             this->native_bound = this->holder_root != nullptr || vmhook::detail::native_backend::active();
         }
@@ -14588,10 +14703,11 @@ export namespace vmhook
             or the context closes. Legacy detour results remain non-owning snapshots.
             Typed heap-field decoding requires verified narrow-oop support.
         */
-        auto get() const noexcept
+        auto get() const
             -> value_t
         {
             vmhook::detail::native_backend::operation access{};
+            if (this->is_volatile()) { return this->read_volatile(); }
             if (this->is_reference()
                 && (vmhook::detail::reference_storage_width() != sizeof(std::uint32_t)
                     || !vmhook::detail::reference_reads_supported()))
@@ -14718,6 +14834,22 @@ export namespace vmhook
         {
             vmhook::detail::require_object_argument(value);
             vmhook::detail::native_backend::operation access{};
+            if (this->is_final())
+            { throw vmhook::exception{ "Final Java fields cannot be mutated through a VMHook field setter" }; }
+
+            if constexpr (std::is_arithmetic_v<std::remove_cvref_t<value_type>>)
+            {
+                if (this->is_volatile())
+                {
+                    const auto width{ vmhook::detail::jvm_primitive_byte_width(this->signature_text) };
+                    if (width != sizeof(value_type))
+                    { throw vmhook::exception{ "Volatile field write requires the matching JVM primitive width" }; }
+                    std::uint64_t bits{};
+                    std::memcpy(&bits, &value, sizeof(value));
+                    this->write_volatile(bits);
+                    return;
+                }
+            }
 
             if constexpr (vmhook::detail::is_java_object_pointer_v<value_type>)
             {
@@ -14740,10 +14872,24 @@ export namespace vmhook
         template<typename value_type>
             requires (vmhook::detail::supported_field_value_v<value_type>
                       && !vmhook::detail::is_java_object_pointer_v<value_type>)
-        auto set_non_object(const value_type& value) const noexcept
+        auto set_non_object(const value_type& value) const
             -> void
         {
             using clean_value_type = std::remove_cvref_t<value_type>;
+            if (this->is_final())
+            { throw vmhook::exception{ "Final Java fields cannot be mutated through a VMHook field setter" }; }
+            if constexpr (std::is_arithmetic_v<clean_value_type>)
+            {
+                if (this->is_volatile())
+                {
+                    if (vmhook::detail::jvm_primitive_byte_width(this->signature_text) != sizeof(value_type))
+                    { throw vmhook::exception{ "Volatile field write requires the matching JVM primitive width" }; }
+                    std::uint64_t bits{};
+                    std::memcpy(&bits, &value, sizeof(value));
+                    this->write_volatile(bits);
+                    return;
+                }
+            }
             if constexpr (vmhook::detail::is_vector_v<clean_value_type>
                           && !std::is_same_v<clean_value_type, std::vector<std::string>>)
             {
@@ -14752,7 +14898,8 @@ export namespace vmhook
             }
             else
             {
-                if (this->is_reference() && !vmhook::detail::reference_stores_supported())
+                if (this->is_reference() && !this->holder_root
+                    && !vmhook::detail::reference_stores_supported())
                 {
                     ::vmhook::detail::log_line("{} reference store refused: collector write barriers are unavailable.", vmhook::error_tag);
                     return;
@@ -14954,6 +15101,67 @@ export namespace vmhook
             return this->static_field;
         }
 
+        /* Field modifiers are obtained from the declaring class metadata.
+           A volatile access executes the VM's Java Memory Model barriers.
+           Final fields are readable; mutation is refused even on Epsilon. */
+        auto is_volatile() const noexcept -> bool { return (this->field_flags & 0x0040u) != 0; }
+        auto is_final() const noexcept -> bool { return (this->field_flags & 0x0010u) != 0; }
+
+        /* Strong CAS uses HotSpot's atomic accessor, with volatile ordering and
+           collector barriers for references. It does not mutate the C++
+           expected value. Java null uses an allocated wrapper as elsewhere. */
+        template<typename value_type>
+            requires (std::is_same_v<std::remove_cvref_t<value_type>, std::int32_t>
+                || std::is_same_v<std::remove_cvref_t<value_type>, std::int64_t>
+                || vmhook::detail::is_java_object_pointer_v<value_type>)
+        auto compare_exchange(const value_type& expected, const value_type& desired) const -> bool
+        {
+            vmhook::detail::native_backend::operation access{};
+            if (this->is_final())
+            { throw vmhook::exception{ "Final Java fields cannot be mutated through compare_exchange" }; }
+            if constexpr (vmhook::detail::is_java_object_pointer_v<value_type>)
+            {
+                if (!this->is_reference())
+                { throw vmhook::exception{ "Atomic reference access requires a Java object field" }; }
+                vmhook::detail::require_object_argument(expected);
+                vmhook::detail::require_object_argument(desired);
+                void* const expected_oop{ expected->vmhook::object_base::get_instance() };
+                void* const desired_oop{ desired->vmhook::object_base::get_instance() };
+                using wrapper_type = typename value_type::element_type;
+                if (expected_oop) { vmhook::detail::require_object_wrapper_type<wrapper_type>(expected_oop); }
+                if (desired_oop) { vmhook::detail::require_object_wrapper_type<wrapper_type>(desired_oop); }
+                vmhook::detail::require_reference_argument(expected_oop, this->signature_text, this->reference_declaring_class);
+                // The first type check can run Java and relocate both roots.
+                vmhook::detail::require_reference_argument(desired->vmhook::object_base::get_instance(),
+                    this->signature_text, this->reference_declaring_class);
+                auto expected_root{ vmhook::detail::native_backend::retain_oop(expected->vmhook::object_base::get_instance()) };
+                auto desired_root{ vmhook::detail::native_backend::retain_oop(desired->vmhook::object_base::get_instance()) };
+                if ((expected->vmhook::object_base::get_instance() && !expected_root)
+                    || (desired->vmhook::object_base::get_instance() && !desired_root))
+                { throw vmhook::exception{ "Atomic field reference arguments could not be retained" }; }
+                const auto called{ vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
+                    "compareAndSetReference", "compareAndSwapObject",
+                    "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+                    0, desired_root, true, true, 0, expected_root) };
+                return called.bits != 0;
+            }
+            else
+            {
+                const bool wide{ sizeof(value_type) == sizeof(std::int64_t) };
+                if (this->signature_text != (wide ? "J" : "I"))
+                { throw vmhook::exception{ "Atomic field access requires its exact Java int or long type" }; }
+                std::uint64_t expected_bits{}, desired_bits{};
+                std::memcpy(&expected_bits, &expected, sizeof(expected));
+                std::memcpy(&desired_bits, &desired, sizeof(desired));
+                const auto called{ vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
+                    wide ? "compareAndSetLong" : "compareAndSetInt",
+                    wide ? "compareAndSwapLong" : "compareAndSwapInt",
+                    wide ? "(Ljava/lang/Object;JJJ)Z" : "(Ljava/lang/Object;JII)Z",
+                    desired_bits, {}, true, true, expected_bits) };
+                return called.bits != 0;
+            }
+        }
+
         /*
             @brief Returns true if this field's JVM descriptor is a reference / array (L or [).
             @details
@@ -15037,16 +15245,75 @@ export namespace vmhook
         }
 
     private:
+        auto primitive_accessor_name() const -> std::string_view
+        {
+            if (this->signature_text == "Z") { return "Boolean"; }
+            if (this->signature_text == "B") { return "Byte"; }
+            if (this->signature_text == "C") { return "Char"; }
+            if (this->signature_text == "S") { return "Short"; }
+            if (this->signature_text == "I") { return "Int"; }
+            if (this->signature_text == "J") { return "Long"; }
+            if (this->signature_text == "F") { return "Float"; }
+            if (this->signature_text == "D") { return "Double"; }
+            throw vmhook::exception{ "Volatile primitive field descriptor is invalid" };
+        }
+
+        auto read_volatile() const -> value_t
+        {
+            if (this->is_reference())
+            {
+                const auto result{ vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
+                    "getReferenceVolatile", "getObjectVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;") };
+                void* const object{ result.object ? result.object->resolve_under_vm() : nullptr };
+                return value_t{ vmhook::hotspot::encode_oop_pointer(object), this->signature_text, result.object };
+            }
+            const auto name{ std::string{"get"} + std::string{this->primitive_accessor_name()} + "Volatile" };
+            const auto descriptor{ std::string{"(Ljava/lang/Object;J)"} + this->signature_text };
+            const auto result{ vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
+                name, {}, descriptor) };
+            if (this->signature_text == "Z") { return value_t{ result.bits != 0, this->signature_text }; }
+            if (this->signature_text == "B") { return value_t{ static_cast<std::int8_t>(result.bits), this->signature_text }; }
+            if (this->signature_text == "C") { return value_t{ static_cast<std::uint16_t>(result.bits), this->signature_text }; }
+            if (this->signature_text == "S") { return value_t{ static_cast<std::int16_t>(result.bits), this->signature_text }; }
+            if (this->signature_text == "I") { return value_t{ static_cast<std::int32_t>(result.bits), this->signature_text }; }
+            if (this->signature_text == "J") { return value_t{ std::bit_cast<std::int64_t>(result.bits), this->signature_text }; }
+            if (this->signature_text == "F")
+            { return value_t{ std::bit_cast<float>(static_cast<std::uint32_t>(result.bits)), this->signature_text }; }
+            return value_t{ std::bit_cast<double>(result.bits), this->signature_text };
+        }
+
+        auto write_volatile(const std::uint64_t bits) const -> void
+        {
+            const auto name{ std::string{"put"} + std::string{this->primitive_accessor_name()} + "Volatile" };
+            const auto descriptor{ std::string{"(Ljava/lang/Object;J"} + this->signature_text + ")V" };
+            (void)vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
+                name, {}, descriptor, bits, {}, true);
+        }
+
         /*
-            @brief Writes a Java object reference only when the detected collector permits direct stores.
-            @details Currently requires Epsilon because this implementation has no collector write barriers.
+            @brief Publishes a Java object reference with the VM's collector barriers.
+            @details Rooted fields call an existing Java Unsafe accessor, including
+            its volatile variant when applicable. The raw-address escape hatch
+            retains its Epsilon-only direct-store policy.
             A heap field is a Java reachability edge, not an independently registered GC root.
             @return False on unsupported collector, descriptor, slot, width, or encoding.
         */
-        auto store_object_oop(void* const decoded_oop) const noexcept
+        auto store_object_oop(void* const decoded_oop) const
             -> bool
         {
             vmhook::detail::native_backend::operation access{};
+            if (!this->is_reference() || this->is_final()) { return false; }
+            if (access && this->holder_root)
+            {
+                auto argument{ vmhook::detail::native_backend::retain_oop(decoded_oop) };
+                if (decoded_oop && !argument)
+                { throw vmhook::exception{ "Field reference argument could not be retained" }; }
+                (void)vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
+                    this->is_volatile() ? "putReferenceVolatile" : "putReference",
+                    this->is_volatile() ? "putObjectVolatile" : "putObject",
+                    "(Ljava/lang/Object;JLjava/lang/Object;)V", 0, argument, true);
+                return true;
+            }
             if (!vmhook::detail::reference_stores_supported())
             {
                 ::vmhook::detail::log_line("{} reference store refused: collector write barriers are unavailable.", vmhook::error_tag);
@@ -15128,8 +15395,7 @@ export namespace vmhook
 
         /*
             @brief Constructs a Java String from UTF-8 and attempts a reference field store.
-            @details Reference stores require the detected Epsilon collector. The new object is
-            not independently rooted; adjacency of allocation and store is not a GC safety proof.
+            @details The new string is rooted before a collector-aware publication.
             @return True only when construction and the reference store succeed.
         */
         auto store_string(const std::string_view value) const
@@ -15140,7 +15406,11 @@ export namespace vmhook
             // surrogate pairs — a NUL-terminated modified-UTF-8 encoding would
             // truncate / mangle both.  make_java_string builds the oop directly
             // (TLAB allocation + UTF-16 value/coder encode).
-            void* const string_oop{ vmhook::make_java_string(value) };
+            auto root{ vmhook::detail::native_backend::active()
+                ? vmhook::detail::native_backend::make_string(value) : vmhook::detail::native_backend::root{} };
+            if (vmhook::detail::native_backend::active() && !root)
+            { throw vmhook::exception{ "Java String allocation failed before field publication" }; }
+            void* const string_oop{ root ? root->resolve_under_vm() : vmhook::make_java_string(value) };
             if (!string_oop)
             {
                 ::vmhook::detail::log_line("{} field_proxy::set: failed to build a java.lang.String for a "
@@ -15151,8 +15421,9 @@ export namespace vmhook
                 return false;
             }
 
-            // Attempt to publish the new String as a Java reference. The collector gate is enforced by store_object_oop.
-            const bool stored{ this->store_object_oop(string_oop) };
+            vmhook::detail::require_reference_argument(string_oop, this->signature_text, this->reference_declaring_class);
+            // Type resolution may safepoint; fetch the retained String again.
+            const bool stored{ this->store_object_oop(root ? root->resolve_under_vm() : string_oop) };
             if (!stored)
             {
                 ::vmhook::detail::log_line("{} field_proxy::set: built a java.lang.String but could not store "
@@ -15197,6 +15468,7 @@ export namespace vmhook
         // The field descriptor resolves in this declaring class's loader.
         // It supplies type identity only; it never selects the storage holder.
         vmhook::hotspot::klass* reference_declaring_class{ nullptr };
+        std::uint16_t field_flags{};
     };
 
     // --- detail helpers that depend on hotspot types -------------------------
@@ -18373,7 +18645,7 @@ export namespace vmhook
                 void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
                 // Native contexts retain the declaring mirror; access reconstructs
                 // the field address under a VM operation. Legacy access is observational.
-                return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
+                return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset, entry->access_flags };
             }
 
             if (!this->instance)
@@ -18385,7 +18657,7 @@ export namespace vmhook
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
             return vmhook::field_proxy{ field_pointer, entry->signature, false,
                                         this->native_root_, entry->offset,
-                                        entry->declaring_klass ? entry->declaring_klass : resolved_klass };
+                                        entry->declaring_klass ? entry->declaring_klass : resolved_klass, entry->access_flags };
         }
 
         /*
@@ -18445,7 +18717,7 @@ export namespace vmhook
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
             // Pass the declaring Klass and offset so access can read the mirror again.
             // This does not acquire a GC or class-lifetime guard.
-            return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
+            return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset, entry->access_flags };
         }
 
         /*
@@ -19541,7 +19813,7 @@ export namespace vmhook
                 void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
                 // Native contexts retain the declaring mirror; access reconstructs
                 // the field address under a VM operation. Legacy access is observational.
-                return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset };
+                return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset, entry->access_flags };
             }
             if (!this->instance)
             {
@@ -19550,7 +19822,7 @@ export namespace vmhook
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
             return vmhook::field_proxy{ field_pointer, entry->signature, false,
                                         this->get_native_root(), entry->offset,
-                                        entry->declaring_klass ? entry->declaring_klass : k };
+                                        entry->declaring_klass ? entry->declaring_klass : k, entry->access_flags };
         }
 
         /*
