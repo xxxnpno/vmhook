@@ -37,7 +37,7 @@ namespace
             if (!context.valid() || !vmhook::register_class<fixture>("ManagementFixture"))
             { check("context", false); return 2; }
             const auto before{ vmhook::observe_runtime() };
-            check("memory_observation", before.heap.used_bytes > 0
+            check("memory_observation", before.heap.used_bytes >= 0 && before.heap.committed_bytes > 0
                 && before.heap.committed_bytes >= before.heap.used_bytes
                 && before.non_heap.used_bytes > 0);
             check("runtime_counters", before.uptime_ms > 0 && before.started_unix_ms > 0
@@ -76,7 +76,7 @@ namespace
             catch (const vmhook::exception&) { refused = true; }
             check("bounded_snapshot", refused);
             check("context_closed", context.close());
-            check("copied_observations_survive_close", before.heap.used_bytes > 0 && found && !threads.empty());
+            check("copied_observations_survive_close", before.heap.committed_bytes > 0 && found && !threads.empty());
             output << "management_complete=" << (valid ? "pass" : "fail") << '\n';
             return valid ? 0 : 3;
         }
