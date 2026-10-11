@@ -122,3 +122,20 @@ license does not grant general commercial use; consult [LICENSE.txt](../LICENSE.
 for its permitted purposes and full terms. A separate commercial grant, if
 offered, must come from the copyright holder. Packaging does not change those
 terms.
+
+
+## Optional Java interface helper
+
+Installations include ordinary Java source at share/vmhook/java/vmhook/callback_handler.java.
+The package exposes its relocated absolute path as the CMake variable
+vmhook_java_helper_source. Compile it with the application's Java classes:
+
+~~~sh
+javac -d app-classes C:/libraries/vmhook/share/vmhook/java/vmhook/callback_handler.java
+~~~
+
+The application loads this class normally before creating an
+[interface callback](interface_callbacks.md). The source declares no native
+methods. CMake installation does not inject a class, start Java or require a
+JDK to consume the C++ header/module. The source archive includes the same
+helper source under the project's current license.

@@ -192,6 +192,9 @@ jobs:
             management_probe: vmhook_management_probe.dll
             executor_probe: vmhook_executor_probe.dll
             callback_throw_probe: vmhook_callback_throw_probe.dll
+            interface_probe: vmhook_interface_probe.dll
+            reference_field_probe: vmhook_reference_field_probe.dll
+            virtual_thread_probe: vmhook_virtual_thread_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
             observation_probe: vmhook_module_observation_probe.dll
@@ -203,6 +206,9 @@ jobs:
             management_probe: vmhook_module_management_probe.dll
             executor_probe: vmhook_module_executor_probe.dll
             callback_throw_probe: vmhook_module_callback_throw_probe.dll
+            interface_probe: vmhook_module_interface_probe.dll
+            reference_field_probe: vmhook_module_reference_field_probe.dll
+            virtual_thread_probe: vmhook_module_virtual_thread_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -238,6 +244,24 @@ jobs:
           --javac "$env:JAVA_HOME/bin/javac.exe"
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.interop_probe }}
+      - name: Verify ordinary Java interface callbacks
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
+        shell: pwsh
+        run: >-
+          python tests/runtime/run_interface.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.interface_probe }}
+      - name: Verify assembly reference-field hooks under moving GC
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
+        shell: pwsh
+        run: >-
+          python tests/runtime/run_reference_fields.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.reference_field_probe }}
       - name: Verify method hooks, field stubs, class notifications and rooted callbacks
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
@@ -254,6 +278,7 @@ jobs:
           --management-probe runtime-binaries/${{ matrix.management_probe }}
           --executor-probe runtime-binaries/${{ matrix.executor_probe }}
           --callback-throw-probe runtime-binaries/${{ matrix.callback_throw_probe }}
+          --virtual-thread-probe runtime-binaries/${{ matrix.virtual_thread_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Repeat rooted callback transitions on legacy JVMs
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[8,9,10,11,15,16]'), matrix.java) }}

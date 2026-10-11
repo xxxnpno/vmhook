@@ -123,6 +123,12 @@ foreach(_vmhook_optional_tool IN ITEMS inspect_runtime.py generate_wrappers.py)
         install(FILES "tools/${_vmhook_optional_tool}" DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/tools")
     endif()
 endforeach()
+# This optional helper is ordinary Java source. Applications compile/load it
+# through their own class loader; installing VMHook does not define a VM class.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/java/vmhook/callback_handler.java")
+    install(FILES java/vmhook/callback_handler.java
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/java/vmhook")
+endif()
 install(FILES data/native_profiles.json data/native_audits.json
     DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/data")
 install(TARGETS vmhook EXPORT vmhookTargets)
