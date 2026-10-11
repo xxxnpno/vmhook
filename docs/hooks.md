@@ -143,3 +143,26 @@ call it. Repeated throws/catches of an existing exception do not notify through
 this path. Exceptions with disabled or overridden stack-trace collection can
 avoid it. The compatibility `on_exception` watcher retains these same limits;
 it is not a general throw/catch event.
+
+## Reproduce the public observation fixtures
+
+Configure with `VMHOOK_BUILD_RUNTIME_TESTS=ON` and build the DLLs and injector.
+On Windows, run the normal Java launcher and the compiled observation probe:
+
+```sh
+python tools/run_observation_fixture.py --java path/to/jdk/bin/java.exe --javac path/to/jdk/bin/javac.exe --injector build/tests/vmhook_test_injector.exe --probe build/tests/vmhook_observation_probe.dll --mode all --evidence build/observation-results.json
+```
+
+The base probe checks actual JIT compilation/inlining, static primitive field
+access and class definitions. Additional DLL arguments enable rooted callbacks,
+observer composition, lifetime, management, executors, Throwable forwarding and
+virtual-thread refusal; `--help` lists their exact names. Select the corresponding
+`vmhook_module_*` DLLs to exercise `import vmhook` instead. The harness compiles
+its Java fixtures, injects only its own JVM subprocess and checks every required
+result. It never adds flags to disable compilation or change the collector.
+
+`tests/runtime/run_reference_fields.py` and `tests/runtime/run_interface.py`
+provide the separate reference-field and Java-interface callback fixtures. Their
+evidence records include artifact hashes and partial results on failure. For
+local Windows-binary checks on Linux, use the supported Wine/emulator option
+where provided; those runs remain distinct from native Windows CI evidence.
