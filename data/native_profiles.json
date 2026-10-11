@@ -776,6 +776,10 @@
       "?enqueue_preloaded@G1BarrierSet@@SAXPEAVoopDesc@@@Z",
       "?enqueue@G1BarrierSet@@SAXPEAVoopDesc@@@Z",
       "?enqueue@G1SATBCardTableModRefBS@@SAXPEAVoopDesc@@@Z"
+    ],
+    "loaded_class_walk": [
+      "?loaded_classes_do_keepalive@ClassLoaderDataGraph@@SAXPEAVKlassClosure@@@Z",
+      "?loaded_classes_do@ClassLoaderDataGraph@@SAXPEAVKlassClosure@@@Z"
     ]
   },
   "profile_types": [
@@ -873,7 +877,8 @@
     "frame",
     "OopClosure",
     "ObjectClosure",
-    "ObjectLocker"
+    "ObjectLocker",
+    "KlassClosure"
   ],
   "required_fields": {
     "JavaThread": [
@@ -1548,6 +1553,10 @@
       "storage_size__thread",
       "storage_size__obj",
       "storage_size__lock"
+    ],
+    "KlassClosure": [
+      "vtable_do_klass",
+      "vtable_count"
     ]
   },
   "alias_kinds": {
