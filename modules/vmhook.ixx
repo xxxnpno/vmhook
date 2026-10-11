@@ -92,6 +92,7 @@ export namespace vmhook::detail
 {
     using borrowed_callback = void(*)(void*);
     inline auto borrowed_callback_supported() noexcept -> bool;
+    inline auto platform_callback_supported(void*) noexcept -> bool;
     inline auto execute_borrowed_callback(hotspot::java_thread*, hotspot::detour_java_anchor_t,
                                          borrowed_callback, void*) noexcept -> bool;
     inline auto track_callback_oop_snapshot(void*, const native_backend::root&) noexcept -> void;
@@ -6551,7 +6552,8 @@ export namespace vmhook
                     [current_method, const_method](const auto& entry)
                     { return entry.method == current_method && entry.const_method_identity == const_method
                         && entry.detour && (!entry.observer || entry.observer->enabled.load(std::memory_order_acquire)); }) };
-                if (found == reader.snapshot->methods.end()) { return 0; }
+                if (found == reader.snapshot->methods.end()
+                    || !vmhook::detail::platform_callback_supported(thread)) { return 0; }
                 // Keep the immutable snapshot alive through the callback. No
                 // callback ownership operation takes a registry lock or frees
                 // captured user objects while this Java thread is dispatching.
@@ -9486,6 +9488,8 @@ export namespace vmhook
 
     // Read-only quiescence indication. It never claims that executable return
     // PCs have drained or that FreeLibrary is safe. Call after observer removal.
+    [[nodiscard]] inline auto rejected_hook_callback_frames() noexcept -> std::uint64_t;
+
     [[nodiscard]] inline auto hook_callbacks_idle() noexcept -> bool
     {
         return hotspot::g_hook_dispatch_readers.load(std::memory_order_seq_cst) == 0
@@ -13049,12 +13053,60 @@ export namespace vmhook::detail::callback_backend
     namespace pn = vmhook::detail::private_native;
     namespace nb = vmhook::detail::native_backend;
 
+    struct platform_callback_layout final
+    {
+        std::size_t platform_offset{}, mounted_offset{}, handle_slot_offset{};
+        bool ready{}, virtual_threads{};
+        platform_callback_layout() noexcept
+        {
+            try
+            {
+                auto& runtime{ pn::rt() };
+                if (!runtime.ready || runtime.uses_external_symbols()) { return; }
+                this->virtual_threads = runtime.profile->java_feature >= 19;
+                if (!this->virtual_threads) { this->ready = true; return; }
+                this->platform_offset = runtime.off("JavaThread", "_threadObj");
+                this->mounted_offset = runtime.off("JavaThread", "_vthread");
+                this->handle_slot_offset = runtime.off("OopHandle", "_obj");
+                const auto thread_size{ runtime.size("JavaThread") };
+                if (thread_size < sizeof(void*) || runtime.size("OopHandle") != sizeof(void*) || this->handle_slot_offset != 0
+                    || runtime.enum_value("JavaThread", "storage_size__threadObj") != sizeof(void*)
+                    || runtime.enum_value("JavaThread", "storage_size__vthread") != sizeof(void*)
+                    || this->platform_offset == this->mounted_offset
+                    || this->platform_offset > thread_size - sizeof(void*)
+                    || this->mounted_offset > thread_size - sizeof(void*)) { return; }
+                this->ready = true;
+            }
+            catch (...) {}
+        }
+        static auto get() noexcept -> const platform_callback_layout&
+        { static const platform_callback_layout value{}; return value; }
+    };
+    inline std::atomic<std::uint64_t> unsupported_callback_frames{};
+    inline auto is_platform_frame(void* const thread) noexcept -> bool
+    {
+        const auto& layout{ platform_callback_layout::get() };
+        if (!thread || !layout.ready) { return false; }
+        if (!layout.virtual_threads) { return true; }
+        void** carrier_slot{}; void** mounted_slot{}; void* carrier{}; void* mounted{};
+        // In this running Java state no safepoint or mount/unmount can occur
+        // between these reads. Resolve the two calibrated OopHandles without
+        // borrowing a Java context, allocating, polling or walking a stack.
+        return vmhook::os::safe_read(&carrier_slot, static_cast<std::byte*>(thread) + layout.platform_offset, sizeof(carrier_slot))
+            && vmhook::os::safe_read(&mounted_slot, static_cast<std::byte*>(thread) + layout.mounted_offset, sizeof(mounted_slot))
+            && carrier_slot && mounted_slot
+            && vmhook::os::safe_read(&carrier, carrier_slot, sizeof(carrier))
+            && vmhook::os::safe_read(&mounted, mounted_slot, sizeof(mounted))
+            && carrier && mounted && carrier == mounted;
+    }
+
     inline auto supported() noexcept -> bool
     {
         try
         {
             auto& runtime{ pn::rt() };
-            if (!runtime.ready || runtime.uses_external_symbols()) { return false; }
+            if (!runtime.ready || runtime.uses_external_symbols() || !platform_callback_layout::get().ready
+                || !vmhook::detail::java_execution_supported()) { return false; }
             bool exact{};
             for (const auto* profile : pn::all_profiles)
             { if (profile == runtime.profile) { exact = true; break; } }
@@ -13388,12 +13440,18 @@ export namespace vmhook::detail
 {
     inline auto borrowed_callback_supported() noexcept -> bool
     { return callback_backend::supported(); }
+    inline auto platform_callback_supported(void* const thread) noexcept -> bool
+    {
+        if (callback_backend::is_platform_frame(thread)) { return true; }
+        callback_backend::unsupported_callback_frames.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     inline auto execute_borrowed_callback(hotspot::java_thread* const thread,
         const hotspot::detour_java_anchor_t anchor, const borrowed_callback invoke,
         void* const opaque) noexcept -> bool
     {
-        if (!invoke) { return false; }
+        if (!invoke || !platform_callback_supported(thread)) { return false; }
         try
         {
             const hotspot::current_thread_guard thread_guard{ thread };
@@ -13437,6 +13495,12 @@ export namespace vmhook::detail
         return root && set_callback_reference(slot, root);
     }
 }
+export namespace vmhook
+{
+    [[nodiscard]] inline auto rejected_hook_callback_frames() noexcept -> std::uint64_t
+    { return detail::callback_backend::unsupported_callback_frames.load(std::memory_order_relaxed); }
+}
+
 // VMHOOK_BORROWED_CALLBACK_END
 
 

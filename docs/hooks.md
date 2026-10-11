@@ -51,6 +51,13 @@ readers. Registry aggregate sizes are available only to native administrators;
 `registry_sizes_available` distinguishes that case. Counters do not authorize DLL
 unloading: published stub return PCs and the injecting DLL remain resident.
 
+Mounted virtual-thread frames do not enter a VMHook borrowed callback context.
+Method and field operations on those frames run their original Java behavior;
+`rejected_hook_callback_frames()` counts these refused callback frames. Platform
+Java threads, including `native_thread_context` workers, retain their verified
+callback path. Unknown mounted-thread layouts and unsupported collectors refuse
+callback setup before publishing a Java anchor.
+
 ## Class notifications
 
 The original `class_load_event` borrows metadata only during its callback.
