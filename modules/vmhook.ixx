@@ -27583,7 +27583,9 @@ public:
 export namespace vmhook::detail {
     inline auto add_class_observer(std::function<void(const vmhook::class_load_event&)> callback)
         -> vmhook::class_observer_id {
-        try{return class_events::observer::subscribe(std::move(callback));}catch(...){return 0;}
+        try{return class_events::observer::subscribe(std::move(callback));}
+        catch(const std::bad_alloc&){throw;}
+        catch(...){return 0;}
     }
     inline auto erase_class_observer(vmhook::class_observer_id id) noexcept -> bool {
         return class_events::observer::remove(id);
