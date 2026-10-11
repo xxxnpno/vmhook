@@ -55,3 +55,30 @@ reflection, Unsafe, native VM accesses, and instance field bytecodes are outside
 this API's current coverage. In particular, warmed instance accesses may use
 quickened or fused interpreter templates with different TOS and BCP protocols;
 they are refused until all those paths are independently verified.
+
+The next instance-field backend needs separate verified sites for three
+interpreter paths, rather than extending the static patch's field filter:
+
+| Path | Required callback and continuation protocol |
+| --- | --- |
+| `getfield` / `putfield` and `nofast` variants | Retain the receiver as well as the pending reference value in the bytecode's real expression-stack cells. Skip/replacement continuations must consume both operands with the correct one- or two-slot value width. |
+| `fast_*getfield` / `fast_*putfield` | Spill the cached TOS value into the Java expression stack before publishing the frame anchor, and reload relocated receiver/value cells after nested Java calls. Saving an oop in the native register-save area does not make it a GC root. Resume the original reference-store template for its collector barriers. |
+| `fast_aaccess_0`, `fast_iaccess_0`, `fast_faccess_0` | These fuse `aload_0` with a field read. They load the receiver from a local and temporarily advance BCP to the following `getfield`. The callback must establish the expression-stack layout expected by that BCI's oop map, then restore the fused instruction's BCP/TOS/dispatch convention. |
+
+HotSpot rewrites cold instance accesses into those fast bytecodes and may fuse
+the preceding `aload_0`. Excluding an accessor from JIT compilation does not
+disable this interpreter rewriting. The current compilation-exclusion scanner
+targets static-field bytecodes; the instance extension must include all these
+families, existing inlined callers, and newly prepared classes. Installing only
+the cold `getfield`/`putfield` patches would silently miss warmed accesses.
+
+The source audit covers OpenJDK's x86 template and frame implementations for
+[Java 8](https://github.com/openjdk/jdk8u/blob/master/hotspot/src/cpu/x86/vm/templateTable_x86_64.cpp),
+[Java 21](https://github.com/openjdk/jdk21u/blob/master/src/hotspot/cpu/x86/templateTable_x86.cpp),
+and [Java 27](https://github.com/openjdk/jdk/blob/master/src/hotspot/cpu/x86/templateTable_x86.cpp).
+In particular `fast_accessfield`, `fast_storefield`, and `fast_xaccess` have
+different TOS transitions from `getfield_or_static`; `frame::oops_interpreted_do`
+uses the live BCI's `InterpreterOopMap` to scan locals and expression-stack
+slots. Each added site needs runtime instruction-boundary checks and moving-GC
+tests with warmed, synchronized, volatile, null, replacement, and prevented
+accesses before instance hooks can be enabled.
