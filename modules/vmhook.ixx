@@ -25726,6 +25726,247 @@ namespace hotspot
         return vmhook::detail::materialize_object<wrapper_type>(0, root);
     }
 
+    // Optional interface callbacks use an ordinary application-loaded Java
+    // InvocationHandler. The JDK creates and owns its ordinary Proxy class.
+    class reflection_method final : public vmhook::oop_reflective_base
+    {
+    public:
+        using vmhook::oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/lang/reflect/Method" };
+        auto name() const -> std::string
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            return detail::call_container_method(get_native_root(), "getName", "()Ljava/lang/String;").as_string();
+        }
+        auto declaring_class_name() const -> std::string
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            const std::unique_ptr<any_object> declaring = detail::call_container_method(
+                get_native_root(), "getDeclaringClass", "()Ljava/lang/Class;");
+            if (!declaring->get_instance()) { throw exception{"Java Method has no declaring class"}; }
+            return declaring->get_method("getName", "()Ljava/lang/String;")->call().as_string();
+        }
+    };
+
+    namespace detail
+    {
+        class interface_handler_binding : public vmhook::object<interface_handler_binding>
+        { public: using vmhook::object<interface_handler_binding>::object; };
+        inline std::mutex interface_binding_mutex{};
+
+        template<container_wrapper interface_type>
+        struct interface_proxy_control
+        {
+            retained_object<any_object> handler{};
+            retained_object<interface_type> proxy{};
+            std::atomic<bool> closed{};
+            method_hook_id observer{};
+            virtual ~interface_proxy_control() = default;
+        };
+        template<container_wrapper interface_type, typename callback_type>
+        struct interface_callback_control final : interface_proxy_control<interface_type>
+        {
+            callback_type callback;
+            explicit interface_callback_control(callback_type callback)
+                : callback{std::move(callback)} {}
+        };
+
+        inline auto forward_interface_failure(return_value& result,
+            const std::unique_ptr<any_object>& receiver, const std::int32_t kind,
+            const std::string_view message) noexcept -> void
+        {
+            // If even error transport is unavailable, leave the ordinary Java
+            // handler body to raise its explicit unavailable/closed exception.
+            try
+            {
+                const auto factory{receiver->get_method("new_failure", "(ILjava/lang/String;)Ljava/lang/Throwable;")};
+                if (!factory) { return; }
+                const std::unique_ptr<any_object> error = factory->call(kind, message);
+                result.throw_exception(error);
+            }
+            catch (...) {}
+        }
+    }
+
+    // A move-only resource. close() prevents new user callbacks; an invocation
+    // already selected may finish with its own roots and shared control. The
+    // embedding DLL follows the existing hook engine's resident-code lifetime.
+    template<detail::container_wrapper interface_type>
+    class interface_proxy final
+    {
+        std::atomic<std::shared_ptr<detail::interface_proxy_control<interface_type>>> control_{};
+    public:
+        interface_proxy() noexcept = default;
+        explicit interface_proxy(std::shared_ptr<detail::interface_proxy_control<interface_type>> control) noexcept
+            : control_{std::move(control)} {}
+        interface_proxy(const interface_proxy&) = delete;
+        auto operator=(const interface_proxy&) -> interface_proxy& = delete;
+        interface_proxy(interface_proxy&& other) noexcept
+            : control_{other.control_.exchange({})} {}
+        auto operator=(interface_proxy&& other) noexcept -> interface_proxy&
+        {
+            if (this != &other) { close(); control_.store(other.control_.exchange({})); }
+            return *this;
+        }
+        ~interface_proxy() { close(); }
+        [[nodiscard]] auto valid() const noexcept -> bool
+        {
+            const auto state{control_.load()};
+            return state && !state->closed.load(std::memory_order_acquire);
+        }
+        explicit operator bool() const noexcept { return valid(); }
+        [[nodiscard]] auto acquire() const -> std::unique_ptr<interface_type>
+        {
+            const auto state{control_.load()};
+            if (!state || state->closed.load(std::memory_order_acquire))
+            { throw exception{"Java interface callback resource is closed"}; }
+            return state->proxy.acquire();
+        }
+        auto close() noexcept -> bool
+        {
+            const auto state{control_.exchange({})};
+            if (!state) { return false; }
+            state->closed.store(true, std::memory_order_release);
+            (void)remove_hook(state->observer);
+            // The hook captures only a weak reference. Active callbacks keep a
+            // strong reference; handler/proxy roots release after the last one.
+            return true;
+        }
+    };
+
+    /* Create one ordinary Java Proxy for a registered Java interface. Supply a
+       rooted instance of java/vmhook/callback_handler.java, loaded through the
+       application's normal ClassLoader, or an equivalent declared handler
+       exposing create_proxy(Class) and new_failure(int,String).
+
+       The C++ callable receives owning Method and Object[] wrappers by const
+       reference and returns an allocated unique_ptr to any Java wrapper. For
+       zero arguments, Object[] has a null Java instance. Java void uses an
+       allocated Java-null result. Primitive interface returns use ordinary
+       Java boxed objects; Proxy performs its normal cast/unboxing checks.
+       Construction requires a native administrator context, outside callbacks.
+       Callbacks run synchronously and may occur concurrently on Java threads. */
+    template<detail::container_wrapper interface_type, detail::container_wrapper handler_type, typename callback_type>
+        requires std::invocable<std::decay_t<callback_type>&,
+            const std::unique_ptr<reflection_method>&, const std::unique_ptr<array<any_object>>&>
+    [[nodiscard]] auto make_interface_proxy(const std::unique_ptr<handler_type>& handler,
+        callback_type&& callback, const hook_options options = {}) -> interface_proxy<interface_type>
+    {
+        using callback_result = std::invoke_result_t<std::decay_t<callback_type>&,
+            const std::unique_ptr<reflection_method>&, const std::unique_ptr<array<any_object>>&>;
+        static_assert(detail::is_java_object_pointer_v<callback_result>,
+            "An interface callback must return an allocated unique_ptr to a Java wrapper.");
+        if (hotspot::in_java_detour() || detail::class_event_notification_active()
+            || !detail::native_backend::active())
+        { throw exception{"Create interface callbacks from a native administrator context"}; }
+        if (!handler) { throw exception{"An interface callback requires an allocated handler wrapper"}; }
+        if (!detail::prepare_durable_roots())
+        { throw exception{"Persistent Java callback roots are unavailable for this VM profile"}; }
+
+        std::unique_ptr<any_object> receiver;
+        std::unique_ptr<any_object> interface_mirror;
+        std::shared_ptr<detail::class_binding> declaring_binding;
+        constexpr std::string_view invoke_descriptor{
+            "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;"};
+        {
+            detail::native_backend::operation access{};
+            if (!access || !handler->get_instance())
+            { throw exception{"Java null cannot be an interface callback handler", error_code::null_reference}; }
+            if (!handler->get_native_root() || !handler->get_native_root()->valid())
+            { throw exception{"An interface callback handler requires a live VM-scanned root"}; }
+            detail::require_object_wrapper_type<handler_type>(handler->get_instance());
+            receiver = detail::materialize_object<any_object>(0, handler->get_native_root());
+            const auto invoke{receiver->get_method("invoke", invoke_descriptor)};
+            auto* const method{invoke ? invoke->raw_method() : nullptr};
+            auto* const declaring{method ? detail::callback_declaring_class(method) : nullptr};
+            if (!declaring || !declaring->get_name())
+            { throw exception{"The supplied handler has no ordinary Java invoke method"}; }
+            detail::require_reference_argument(receiver->get_instance(),
+                "Ljava/lang/reflect/InvocationHandler;", declaring);
+            // Preserve the actual declaring Method holder, including inherited
+            // handlers whose parent class has a different defining loader.
+            declaring_binding = std::make_shared<detail::class_binding>();
+            declaring_binding->name = declaring->get_name()->to_string();
+            declaring_binding->identity = declaring;
+            declaring_binding->mirror = detail::retain_durable_oop(declaring->get_java_mirror());
+            if (!declaring_binding->mirror)
+            { throw exception{"The exact Java handler class could not be retained"}; }
+            auto* const interface_class{detail::registered_class_klass<interface_type>()};
+            if (!interface_class)
+            { throw exception{"Register the exact Java interface before creating its proxy"}; }
+            const auto mirror_root{detail::native_backend::retain_class(interface_class)};
+            if (!mirror_root) { throw exception{"The Java interface mirror could not be retained"}; }
+            interface_mirror = detail::materialize_object<any_object>(0, mirror_root);
+            const bool is_interface = interface_mirror->get_method("isInterface", "()Z")->call();
+            if (!is_interface)
+            { throw exception{"Register a Java interface before creating its proxy"}; }
+        }
+        const auto factory{receiver->get_method("create_proxy", "(Ljava/lang/Class;)Ljava/lang/Object;")};
+        if (!factory) { throw exception{"The handler does not expose create_proxy(Class)"}; }
+        using control_type = detail::interface_callback_control<interface_type, std::decay_t<callback_type>>;
+        auto state{std::make_shared<control_type>(std::forward<callback_type>(callback))};
+        state->handler = retain(receiver);
+        const std::weak_ptr<control_type> weak{state};
+        {
+            std::lock_guard install_lock{detail::interface_binding_mutex};
+            detail::install_class_binding(std::type_index{typeid(detail::interface_handler_binding)},
+                std::move(declaring_binding));
+            try
+            {
+                state->observer = add_hook<detail::interface_handler_binding>("invoke", invoke_descriptor,
+                    [weak](return_value& result, const std::unique_ptr<any_object>& self,
+                        const std::unique_ptr<any_object>&, const std::unique_ptr<reflection_method>& method,
+                        const std::unique_ptr<array<any_object>>& arguments)
+                    {
+                        const auto current{weak.lock()};
+                        if (!current || current->closed.load(std::memory_order_acquire)) { return; }
+                        try
+                        {
+                            if (!current->handler.is_same_object(self)) { return; }
+                            const auto name{method->name()};
+                            if ((name == "equals" || name == "hashCode" || name == "toString")
+                                && method->declaring_class_name() == "java.lang.Object") { return; }
+                            const auto value{std::invoke(current->callback, method, arguments)};
+                            result.set(value);
+                        }
+                        catch (const std::bad_alloc&)
+                        { detail::forward_interface_failure(result, self, 1, "Native C++ allocation failed"); }
+                        catch (const exception& error)
+                        {
+                            if (error.has_throwable())
+                            {
+                                try { result.throw_exception(error.get_throwable()); return; }
+                                catch (...) {}
+                            }
+                            detail::forward_interface_failure(result, self, 0, error.what());
+                        }
+                        catch (const std::exception& error)
+                        { detail::forward_interface_failure(result, self, 0, error.what()); }
+                        catch (...)
+                        { detail::forward_interface_failure(result, self, 0, "Unknown native callback failure"); }
+                    }, options);
+                unregister_class<detail::interface_handler_binding>();
+            }
+            catch (...) { unregister_class<detail::interface_handler_binding>(); throw; }
+        }
+        if (!state->observer) { throw exception{"The handler's ordinary Java invoke hook was refused"}; }
+        try
+        {
+            const std::unique_ptr<interface_type> proxy = factory->call(interface_mirror);
+            if (!proxy->get_instance()) { throw exception{"The normal Java proxy factory returned Java null"}; }
+            state->proxy = retain(proxy);
+        }
+        catch (...)
+        {
+            state->closed.store(true, std::memory_order_release);
+            (void)remove_hook(state->observer);
+            throw;
+        }
+        return interface_proxy<interface_type>{std::move(state)};
+    }
+
     inline auto exception::get_throwable() const -> std::unique_ptr<vmhook::any_object>
     {
         if (!this->throwable_)
