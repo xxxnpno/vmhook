@@ -9,6 +9,7 @@ public final class LifetimeFixture {
         public int value;
         public Duplicate(int next) { value = next; total += next; }
         public int add(int amount) { return value + amount; }
+        public static int total_value() { return total; }
     }
 
     private static final class IsolatedLoader extends ClassLoader {

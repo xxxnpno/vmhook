@@ -965,6 +965,13 @@ export namespace vmhook
         };
         inline std::unordered_map<std::type_index, std::shared_ptr<class_binding>> class_bindings{};
         inline auto make_class_binding(std::string_view, void* = nullptr) -> std::shared_ptr<class_binding>;
+        inline auto registered_class_binding(std::type_index type) -> std::shared_ptr<class_binding>
+        {
+            std::lock_guard lock{vmhook::registration_mutex};
+            const auto found{class_bindings.find(type)};
+            return found == class_bindings.end() ? std::shared_ptr<class_binding>{} : found->second;
+        }
+        inline auto registered_class_klass(std::type_index, const std::shared_ptr<class_binding>&) -> vmhook::hotspot::klass*;
         inline auto registered_class_klass(std::type_index) -> vmhook::hotspot::klass*;
         template<typename wrapper_type>
         inline auto registered_class_klass() -> vmhook::hotspot::klass*
@@ -983,6 +990,7 @@ export namespace vmhook
                 class_bindings.swap(bindings);
             }
         }
+        inline auto container_class_assignable(vmhook::hotspot::klass*, vmhook::hotspot::klass*) -> bool;
         inline auto prepare_durable_roots() noexcept -> bool;
         inline auto retain_durable_oop(void*) -> std::shared_ptr<void>;
         inline auto resolve_durable_oop(const std::shared_ptr<void>&) noexcept -> void*;
@@ -13811,6 +13819,8 @@ export namespace vmhook
     */
     inline std::unordered_map<vmhook::hotspot::klass*, std::unordered_map<std::string, vmhook::hotspot::field_entry_t>> g_field_cache{};
     inline std::mutex g_field_cache_mutex{};
+    inline std::unordered_map<vmhook::hotspot::klass*, std::weak_ptr<vmhook::detail::class_binding>>
+        g_field_cache_lifetimes{};
 
     /*
         @brief Looks up a named field through a class's superclass chain.
@@ -13818,9 +13828,9 @@ export namespace vmhook
         @param name Exact Java field name.
         @return Field offset, descriptor, static flag, and declaring class;
                 nullopt when no readable match is found.
-        @details A cache keyed by the starting Klass and name avoids repeated
-        metadata walks. Its C++ mutex protects cache state only; class unloading
-        or redefinition can invalidate metadata without acquiring that mutex.
+        @details Runtime cache entries are tied to one live retained class-binding
+        generation. Unregistered runtime classes are parsed afresh; C++ locks and
+        readable raw pointers are not treated as class-lifetime guarantees.
     */
     inline auto find_field(vmhook::hotspot::klass* const target_klass, const std::string_view name)
         -> std::optional<vmhook::hotspot::field_entry_t>
@@ -13832,9 +13842,28 @@ export namespace vmhook
         }
 
         const std::string name_str{ name };
-
+        std::shared_ptr<vmhook::detail::class_binding> lifetime{};
+        {
+            std::lock_guard lock{vmhook::registration_mutex};
+            for (const auto& [type, binding] : vmhook::detail::class_bindings)
+            {
+                if (binding && binding->identity == target_klass && binding->mirror)
+                { lifetime = binding; break; }
+            }
+        }
+        // Runtime cache hits require the same live class-binding generation.
+        // Unregistered runtime classes are parsed afresh under the caller's VM
+        // operation. A readable raw pointer is never a cache lifetime proof.
         {
             std::lock_guard<std::mutex> lock{ vmhook::g_field_cache_mutex };
+            const auto epoch{vmhook::g_field_cache_lifetimes.find(target_klass)};
+            const bool same_generation{lifetime && epoch != vmhook::g_field_cache_lifetimes.end()
+                && epoch->second.lock() == lifetime};
+            if (!same_generation)
+            {
+                vmhook::g_field_cache.erase(target_klass);
+                vmhook::g_field_cache_lifetimes.erase(target_klass);
+            }
             if (const auto klass_entry{ vmhook::g_field_cache.find(target_klass) };
                 klass_entry != vmhook::g_field_cache.end())
             {
@@ -13861,8 +13890,15 @@ export namespace vmhook
                 // reading the latter returned garbage and could run off the end
                 // of the subclass mirror oop into adjacent heap (a fatal AV).
                 entry->declaring_klass = k;
-                std::lock_guard<std::mutex> lock{ vmhook::g_field_cache_mutex };
-                vmhook::g_field_cache[target_klass].emplace(name_str, *entry);
+                if (lifetime)
+                {
+                    std::lock_guard<std::mutex> lock{ vmhook::g_field_cache_mutex };
+                    const auto existing{vmhook::g_field_cache_lifetimes.find(target_klass)};
+                    if (existing == vmhook::g_field_cache_lifetimes.end() || existing->second.lock() != lifetime)
+                    { vmhook::g_field_cache.erase(target_klass); }
+                    vmhook::g_field_cache_lifetimes.insert_or_assign(target_klass, lifetime);
+                    vmhook::g_field_cache[target_klass].emplace(name_str, *entry);
+                }
                 return entry;
             }
         }
@@ -18413,7 +18449,11 @@ export namespace vmhook
 
     public:
         auto set_metadata_lifetime(std::shared_ptr<void> lifetime) noexcept -> void
-        { this->metadata_lifetime_ = std::move(lifetime); }
+        {
+            this->metadata_lifetime_ = std::move(lifetime);
+            if (this->metadata_lifetime_ && !this->native_declaring_class)
+            { this->native_declaring_class = declaring_class(this->method); }
+        }
 
         /*
             @brief Returns the method name.
@@ -18618,8 +18658,11 @@ export namespace vmhook
         // rooted. A cached Method* may have become obsolete after redefinition.
         auto refresh_native_method() const -> bool
         {
-            if (!this->native_class_root || !this->native_class_root->valid()
-                || !this->native_class_root->resolve_under_vm() || !this->native_declaring_class)
+            auto local_root{this->native_class_root};
+            if (!local_root && this->metadata_lifetime_ && this->native_declaring_class)
+            { local_root = vmhook::detail::native_backend::retain_class(this->native_declaring_class); }
+            if (!local_root || !local_root->valid()
+                || !local_root->resolve_under_vm() || !this->native_declaring_class)
             { return false; }
             if (this->native_receiver_root)
             {
@@ -19282,6 +19325,21 @@ export namespace vmhook
             return this->native_root_;
         }
 
+        /* Test exact registered class identity, including Java interfaces.
+           Checked type queries require a live context-scanned object root. */
+        template<typename wrapper_type>
+        [[nodiscard]] auto is() const -> bool
+        {
+            vmhook::detail::native_backend::operation access{};
+            auto* const address{get_instance()};
+            if (!address) { return false; }
+            if (!access || !native_root_ || !native_root_->valid())
+            { throw vmhook::exception{"A typed instance test requires a live VM-scanned object reference"}; }
+            auto* const expected{vmhook::detail::registered_class_klass<wrapper_type>()};
+            if (!expected) { throw vmhook::exception{"Typed instance test wrapper is not bound to a loaded Java class"}; }
+            return vmhook::detail::container_class_assignable(vmhook::klass_from_oop(address), expected);
+        }
+
         /*
             @brief Returns a field proxy for any field declared on this class.
             @param name Exact Java field name.
@@ -19373,7 +19431,9 @@ export namespace vmhook
             -> std::optional<vmhook::field_proxy>
         {
             vmhook::detail::native_backend::operation access{};
-            vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
+            const auto binding{vmhook::detail::registered_class_binding(wrapper_type)};
+            vmhook::hotspot::klass* const resolved_klass{
+                vmhook::detail::registered_class_klass(wrapper_type, binding) };
             if (!resolved_klass)
             {
                 ::vmhook::detail::log_line("{} object::get_field('{}') (static): klass not resolved for wrapper "
@@ -19410,8 +19470,10 @@ export namespace vmhook
 
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(mirror) + entry->offset };
             // Pass the declaring Klass and offset so access can read the mirror again.
-            // This does not acquire a GC or class-lifetime guard.
-            return vmhook::field_proxy{ field_pointer, entry->signature, true, mirror_klass, entry->offset, entry->access_flags };
+            // The proxy keeps this exact defining class through rebind/unregister.
+            auto proxy = vmhook::field_proxy{field_pointer, entry->signature, true, mirror_klass, entry->offset, entry->access_flags};
+            proxy.set_metadata_lifetime(binding);
+            return proxy;
         }
 
         /*
@@ -19585,7 +19647,9 @@ export namespace vmhook
             -> std::optional<vmhook::method_proxy>
         {
             vmhook::detail::native_backend::operation access{};
-            vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
+            const auto binding{vmhook::detail::registered_class_binding(wrapper_type)};
+            vmhook::hotspot::klass* const resolved_klass{
+                vmhook::detail::registered_class_klass(wrapper_type, binding) };
             if (!resolved_klass)
             {
                 ::vmhook::detail::log_line("{} object::get_method('{}') (static): klass not resolved for wrapper type.",
@@ -19611,7 +19675,9 @@ export namespace vmhook
                         && current_method->get_name() == method_name
                         && static_method_only(current_method))
                     {
-                        return vmhook::method_proxy{ nullptr, current_method, current_method->get_signature() };
+                        auto proxy = vmhook::method_proxy{nullptr, current_method, current_method->get_signature()};
+                        proxy.set_metadata_lifetime(binding);
+                        return proxy;
                     }
                 }
             }
@@ -19649,7 +19715,9 @@ export namespace vmhook
             -> std::optional<vmhook::method_proxy>
         {
             vmhook::detail::native_backend::operation access{};
-            vmhook::hotspot::klass* const resolved_klass{ resolve_klass(wrapper_type) };
+            const auto binding{vmhook::detail::registered_class_binding(wrapper_type)};
+            vmhook::hotspot::klass* const resolved_klass{
+                vmhook::detail::registered_class_klass(wrapper_type, binding) };
             if (!resolved_klass)
             {
                 ::vmhook::detail::log_line("{} object::get_method('{}{}') (static): klass not resolved for wrapper type.",
@@ -19680,8 +19748,9 @@ export namespace vmhook
                     if (current_method->get_name() == method_name && current_signature == method_signature
                         && static_method_only(current_method))
                     {
-                        return vmhook::method_proxy{ nullptr, current_method, current_signature,
-                                                     /*signature_pinned=*/true };
+                        auto proxy = vmhook::method_proxy{nullptr, current_method, current_signature, true};
+                        proxy.set_metadata_lifetime(binding);
+                        return proxy;
                     }
                 }
             }
@@ -24319,7 +24388,7 @@ namespace hotspot
             catch (...) { return {}; }
         }
 
-        [[nodiscard]] auto get_native_root() const noexcept -> vmhook::detail::native_backend::root
+        [[nodiscard]] auto get_native_root() const -> vmhook::detail::native_backend::root
         {
             auto node{ this->anchor_ };
             while (node && node->parent) { node = node->parent; }
@@ -24727,7 +24796,7 @@ namespace hotspot
             hard-coded string.
         */
         template<typename other_wrapper>
-        auto as() const noexcept
+        auto as() const
             -> vmhook::ref<other_wrapper>
         {
             if (!this->is<other_wrapper>())
@@ -24749,27 +24818,25 @@ namespace hotspot
             return result;
         }
 
-        /*
-            @brief Name-based superclass test, keyed on a REGISTERED wrapper type.
-            @details Resolves `other_wrapper`'s registered class name and walks the
-            live object's superclass chain.  Interfaces are NOT matched - the
-            secondary-super array is not walked (the same limitation
-            vmhook::is_instance_of documents).
-        */
+        /* @brief Tests the exact registered class identity, including interfaces. */
         template<typename other_wrapper>
-        auto is() const noexcept
-            -> bool
+        auto is() const -> bool
         {
-            const std::string name{ vmhook::detail::registered_class_name<other_wrapper>() };
-            if (name.empty())
-            {
-                return false;
-            }
-            return this->instance_of(name);
+            vmhook::detail::native_backend::operation access{};
+            if (this->invalid_native_root())
+            { throw vmhook::exception{"Reference belongs to a closed or different native context"}; }
+            auto* const address{this->resolve()};
+            if (!address) { return false; }
+            const auto root{this->get_native_root()};
+            if (!access || !root || !root->valid())
+            { throw vmhook::exception{"A typed reference test requires a live VM-scanned reference"}; }
+            auto* const expected{vmhook::detail::registered_class_klass<other_wrapper>()};
+            if (!expected) { throw vmhook::exception{"Typed reference wrapper is not bound to a loaded Java class"}; }
+            return vmhook::detail::container_class_assignable(vmhook::klass_from_oop(address), expected);
         }
 
         /* @brief Tests the superclass chain by internal ('/'-separated) class name. */
-        auto instance_of(const std::string_view class_name) const noexcept
+        auto instance_of(const std::string_view class_name) const
             -> bool
         {
             vmhook::detail::native_backend::operation access{};
@@ -25188,14 +25255,21 @@ namespace hotspot
         }
 
         template<typename other_wrapper>
-        auto is() const noexcept
-            -> bool
+        auto is() const -> bool
         {
-            const std::string name{ vmhook::detail::registered_class_name<other_wrapper>() };
-            return !name.empty() && this->instance_of(name);
+            vmhook::detail::native_backend::operation access{};
+            if (native_root_ && !native_root_->valid())
+            { throw vmhook::exception{"Borrowed reference belongs to a closed or different native context"}; }
+            auto* const address{this->resolve()};
+            if (!address) { return false; }
+            if (!access || !native_root_ || !native_root_->valid())
+            { throw vmhook::exception{"A typed borrow test requires a live VM-scanned reference"}; }
+            auto* const expected{vmhook::detail::registered_class_klass<other_wrapper>()};
+            if (!expected) { throw vmhook::exception{"Typed borrow wrapper is not bound to a loaded Java class"}; }
+            return vmhook::detail::container_class_assignable(vmhook::klass_from_oop(address), expected);
         }
 
-        auto instance_of(const std::string_view class_name) const noexcept
+        auto instance_of(const std::string_view class_name) const
             -> bool
         {
             vmhook::detail::native_backend::operation access{};
@@ -25250,6 +25324,23 @@ namespace hotspot
         [[nodiscard]] auto valid() const noexcept -> bool { return initialized_; }
         explicit operator bool() const noexcept { return valid(); }
         auto reset() noexcept -> void { root_.reset(); initialized_ = false; }
+        template<typename other_type>
+            requires vmhook::detail::container_wrapper<other_type>
+        [[nodiscard]] auto is_same_object(const std::unique_ptr<other_type>& other) const -> bool
+        {
+            if (!initialized_ || !other)
+            { throw vmhook::exception{"Object identity requires a retained resource and an allocated wrapper"}; }
+            vmhook::detail::native_backend::operation access{};
+            auto* const current{other->get_instance()};
+            if (!root_) { return current == nullptr; }
+            if (!access)
+            { throw vmhook::exception{"Retained object identity requires the receiving VM context"}; }
+            if (current && (!other->get_native_root() || !other->get_native_root()->valid()))
+            { throw vmhook::exception{"Object identity requires a live VM-scanned comparison reference"}; }
+            auto* const held{vmhook::detail::resolve_durable_oop(root_)};
+            if (!held) { throw vmhook::exception{"Retained object identity is unavailable in this JVM"}; }
+            return held == current;
+        }
         [[nodiscard]] auto acquire() const -> std::unique_ptr<wrapper_type>
         {
             if (!initialized_) { throw vmhook::exception{"Retained Java reference is empty or released"}; }
@@ -27660,14 +27751,9 @@ export namespace vmhook::detail
         // is cached as a class-lifetime guarantee.
         return result;
     }
-    inline auto registered_class_klass(std::type_index type) -> vmhook::hotspot::klass*
+    inline auto registered_class_klass(std::type_index type,
+        const std::shared_ptr<class_binding>& binding) -> vmhook::hotspot::klass*
     {
-        std::shared_ptr<class_binding> binding{};
-        {
-            std::lock_guard lock{vmhook::registration_mutex};
-            if (const auto found{class_bindings.find(type)}; found != class_bindings.end())
-            { binding = found->second; }
-        }
         if (binding && binding->mirror)
         {
             native_backend::operation access{};
@@ -27683,6 +27769,8 @@ export namespace vmhook::detail
         const auto name{registered_class_name(type)};
         return name.empty() ? nullptr : vmhook::find_class(name);
     }
+    inline auto registered_class_klass(std::type_index type) -> vmhook::hotspot::klass*
+    { return registered_class_klass(type, registered_class_binding(type)); }
 }
 // VMHOOK_PERSISTENT_ROOTS_END
 

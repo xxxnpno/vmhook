@@ -73,7 +73,10 @@ namespace
                 if (!check(output, "ambiguous_name", vmhook::find_class("LifetimeFixture$Duplicate") == nullptr)) { return 4; }
                 if (!check(output, "loader_binding", vmhook::register_class<copy_one>("LifetimeFixture$Duplicate", first)
                     && vmhook::register_class<copy_two>("LifetimeFixture$Duplicate", second)
-                    && copy_one::total() == 141 && copy_two::total() == 173)) { return 5; }
+                    && copy_one::total() == 141 && copy_two::total() == 173
+                    && first->is<copy_one>() && !first->is<copy_two>()
+                    && vmhook::borrowed<vmhook::any_object>{first->get_instance(), first->get_native_root()}.is<copy_one>()
+                    && !vmhook::borrowed<vmhook::any_object>{first->get_instance(), first->get_native_root()}.is<copy_two>())) { return 5; }
                 auto created = vmhook::make_unique<copy_one>(std::int32_t{9});
                 if (!check(output, "constructor_identity", created->value() == 9
                     && copy_one::total() == 150 && copy_two::total() == 173)) { return 6; }
@@ -83,7 +86,8 @@ namespace
                 auto java_null = std::make_unique<copy_one>(nullptr);
                 retained_null = vmhook::retain(java_null);
                 const std::unique_ptr<copy_one> empty{};
-                if (!check(output, "null_contract", retained_null.valid() && retained_null.acquire()
+                if (!check(output, "null_contract", retained.is_same_object(expired) && !retained.is_same_object(java_null)
+                    && retained_null.is_same_object(java_null) && retained_null.valid() && retained_null.acquire()
                     && !retained_null.acquire()->get_instance() && refused([&] { (void)vmhook::retain(empty); }))) { return 7; }
                 auto loader = fixture::first_loader();
                 source.set_context_class_loader(loader);
@@ -116,6 +120,18 @@ namespace
             vmhook::retained_object<copy_one> moved{std::move(retained_null)};
             if (!check(output, "released_resource", !retained_null.valid() && moved.acquire()
                 && !moved.acquire()->get_instance())) { return 11; }
+            // Created outside a local native context: these proxies own the
+            // exact binding mirror rather than an expiring context root.
+            auto old_field = copy_one::static_members::get_field("total");
+            auto old_method = copy_one::static_members::get_method("total_value");
+            {
+                vmhook::native_thread_context next{"VMHook-lifetime-rebind"};
+                auto other = vmhook::make_unique<copy_two>(std::int32_t{5});
+                if (!check(output, "proxy_binding_lifetime", next.valid()
+                    && vmhook::register_class<copy_one>("LifetimeFixture$Duplicate", other)
+                    && copy_one::total() == 178 && static_cast<std::int32_t>(old_field->get()) == 150
+                    && static_cast<std::int32_t>(old_method->call()) == 150)) { return 12; }
+            }
             if (!check(output, "unregister", vmhook::unregister_class<copy_one>()
                 && vmhook::unregister_class<copy_two>())) { return 12; }
             check(output, "lifetime_complete", true);

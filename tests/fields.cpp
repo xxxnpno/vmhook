@@ -15,8 +15,20 @@ int main()
     } object;
     alignas(8) std::array<std::byte, 64> klass_storage{};
     auto* klass = reinterpret_cast<vmhook::hotspot::klass*>(klass_storage.data());
+    struct metadata_lifetime_tag {};
+    const auto metadata_type{std::type_index{typeid(metadata_lifetime_tag)}};
+    auto metadata_owner{std::make_shared<vmhook::detail::class_binding>()};
+    metadata_owner->identity = klass;
+    // This unit fixture owns immutable fake metadata for the complete test.
+    // Runtime bindings instead retain the real java.lang.Class mirror.
+    metadata_owner->mirror = std::make_shared<int>(0);
+    {
+        std::lock_guard lock{vmhook::registration_mutex};
+        vmhook::detail::class_bindings.emplace(metadata_type, metadata_owner);
+    }
     {
         std::lock_guard lock{vmhook::g_field_cache_mutex};
+        vmhook::g_field_cache_lifetimes.emplace(klass, metadata_owner);
         vmhook::g_field_cache[klass].emplace("value",
             vmhook::hotspot::field_entry_t{0, false, "I", klass});
         vmhook::g_field_cache[klass].emplace("reference",
@@ -148,6 +160,11 @@ int main()
     {
         std::lock_guard lock{vmhook::g_field_cache_mutex};
         vmhook::g_field_cache.erase(klass);
+        vmhook::g_field_cache_lifetimes.erase(klass);
+    }
+    {
+        std::lock_guard lock{vmhook::registration_mutex};
+        vmhook::detail::class_bindings.erase(metadata_type);
     }
     return failures ? 1 : 0;
 }
