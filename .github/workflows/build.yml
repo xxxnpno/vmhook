@@ -207,6 +207,7 @@ jobs:
             reference_field_probe: vmhook_reference_field_probe.dll
             virtual_thread_probe: vmhook_virtual_thread_probe.dll
             class_inventory_probe: vmhook_class_inventory_probe.dll
+            method_exit_probe: vmhook_method_exit_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
             observation_probe: vmhook_module_observation_probe.dll
@@ -222,6 +223,7 @@ jobs:
             reference_field_probe: vmhook_module_reference_field_probe.dll
             virtual_thread_probe: vmhook_module_virtual_thread_probe.dll
             class_inventory_probe: vmhook_module_class_inventory_probe.dll
+            method_exit_probe: vmhook_module_method_exit_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -296,6 +298,7 @@ jobs:
           --callback-throw-probe runtime-binaries/${{ matrix.callback_throw_probe }}
           --virtual-thread-probe runtime-binaries/${{ matrix.virtual_thread_probe }}
           --class-inventory-probe runtime-binaries/${{ matrix.class_inventory_probe }}
+          --method-exit-probe runtime-binaries/${{ matrix.method_exit_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Repeat rooted callback transitions on legacy JVMs
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[8,9,10,11,15,16]'), matrix.java) }}

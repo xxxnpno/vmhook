@@ -57,6 +57,15 @@ CHECKS = {
                  "released_resource", "proxy_binding_lifetime", "loader_heap_snapshot", "rebound_heap_snapshot", "root_accounting", "builtin_identity", "builtin_heap", "unregister", "lifetime_complete"],
     "class_inventory": ["metadata", "native_attach", "inventory_bounds", "duplicate_loaders",
                         "rooted_mirrors", "inventory_context", "inventory_complete"],
+    "method_exit": ["context", "registration", "observers", "original_results_and_monitors",
+                    "all_primitive_bits", "reference_kind_only", "empty_void_original",
+                    "exception_has_no_normal_exit", "resident_stubs", "composition",
+                    "same_event_identity", "explicit_removal", "queue_capture_reclaimed",
+                    "bounded_drops", "forced_results", "forced_origin_distinguished",
+                    "original_after_forced", "nested_forced_result", "nested_origins",
+                    "new_thread", "virtual_refusal", "concurrent_gc", "concurrent_records",
+                    "origin_saturation", "forced_decision_saturation", "shutdown",
+                    "shutdown_original", "method_exit_proof"],
     "event_stream": ["context", "queued_observer", "deferred_registration", "initial_wait",
                      "copied_class_record", "deferred_native_install", "deferred_callback",
                      "deferred_removal", "deferred_original_body", "deferred_reclamation",
@@ -79,6 +88,7 @@ FIXTURES = {
     "hook_composition": "HookCompositionFixture",
     "lifetime": "LifetimeFixture",
     "class_inventory": "LifetimeFixture",
+    "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
     "executor": "ExecutorFixture",
@@ -92,6 +102,7 @@ OPTIONAL_PROBES = {
     "hook_composition": "composition_probe",
     "lifetime": "lifetime_probe",
     "class_inventory": "class_inventory_probe",
+    "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
     "executor": "executor_probe",
@@ -105,6 +116,7 @@ TERMINAL_CHECK = {
     "hook_composition": "hook_composition_proof",
     "event_stream": "event_stream_proof",
     "class_inventory": "inventory_complete",
+    "method_exit": "method_exit_proof",
 }
 
 
@@ -172,6 +184,7 @@ def execute_mode(args, mode, directory):
                        VMHOOK_TEST_RESULT=windows_path(result),
                        VMHOOK_MANAGEMENT_REPORT=windows_path(result),
                        VMHOOK_CALLBACK_THROW_REPORT=windows_path(result),
+                       VMHOOK_METHOD_EXIT_REPORT=windows_path(result),
                        VMHOOK_VIRTUAL_THREAD_REPORT=windows_path(result))
     command = prefix + [str(args.java), "-cp", windows_path(directory), FIXTURES[mode]]
     process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
