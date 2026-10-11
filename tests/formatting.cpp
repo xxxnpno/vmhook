@@ -45,6 +45,8 @@ int main()
     };
     static_assert(noexcept(vmhook::detail::log_line(std::declval<std::format_string<int>>(), 1)));
     static_assert(noexcept(vmhook::detail::log_line_runtime(std::string_view{"{}"}, 1)));
+    static_assert(noexcept(vmhook::detail::log_line<true>(std::declval<std::format_string<int>>(), 1)));
+    static_assert(noexcept(vmhook::detail::log_line_runtime<true>(std::string_view{"{}"}, 1)));
     check(vmhook::detail::format_log("{} {:016x} {:.2f} {{}}", std::string_view{"value"},
           std::uint64_t{0xabcdef}, 1.25) == "value 0000000000abcdef 1.25 {}",
           "literal formats preserve width, scalar precision, and escaped braces");
@@ -104,5 +106,24 @@ int main()
     check((rejected_allocations.load() != 0) == vmhook::debug_logs,
           "logging survives persistent allocation failure without an allocating fallback");
     vmhook::detail::log_line_runtime("{:bad}", 1);
+    // Force the enabled instantiations in permanent CTest coverage, including
+    // module consumers, without changing the library's default logging policy.
+    vmhook::detail::log_line<true>("Enabled formatting boundary ready");
+    fail_next_allocation.store(true);
+    vmhook::detail::log_line<true>("{}", long_value);
+    check(!fail_next_allocation.exchange(false),
+          "enabled literal logging contains the formatting allocation exception");
+    fail_next_allocation.store(true);
+    vmhook::detail::log_line_runtime<true>("{}", long_value);
+    check(!fail_next_allocation.exchange(false),
+          "enabled dynamic logging contains the formatting allocation exception");
+    rejected_allocations.store(0);
+    fail_every_allocation.store(true);
+    vmhook::detail::log_line<true>("Persistent allocation failure in diagnostic: {}", long_value);
+    vmhook::detail::log_line_runtime<true>("Persistent allocation failure in diagnostic: {}", long_value);
+    fail_every_allocation.store(false);
+    check(rejected_allocations.load() >= 2,
+          "both enabled logging boundaries survive persistent allocation failure");
+    vmhook::detail::log_line_runtime<true>("{:bad}", 1);
     return failures ? 1 : 0;
 }

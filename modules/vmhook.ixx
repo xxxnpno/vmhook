@@ -232,11 +232,11 @@ export namespace vmhook::detail
         noexcept logging boundary. Disabled logging does not format or allocate;
         its arguments are still evaluated normally by the caller.
     */
-    template<typename... argument_types>
+    template<bool enabled = vmhook::debug_logs, typename... argument_types>
     inline auto log_line(std::format_string<argument_types...> format,
                          argument_types&&... arguments) noexcept -> void
     {
-        if constexpr (vmhook::debug_logs)
+        if constexpr (enabled)
         {
             try { emit_log_line(format_log(format, std::forward<argument_types>(arguments)...)); }
             catch (...) { /* Logging must not escape into the VM or replace a caller's error. */ }
@@ -247,11 +247,11 @@ export namespace vmhook::detail
         }
     }
 
-    template<typename... argument_types>
+    template<bool enabled = vmhook::debug_logs, typename... argument_types>
     inline auto log_line_runtime(const std::string_view format,
                                  argument_types&&... arguments) noexcept -> void
     {
-        if constexpr (vmhook::debug_logs)
+        if constexpr (enabled)
         {
             try { emit_log_line(format_log_runtime(format, std::forward<argument_types>(arguments)...)); }
             catch (...) { /* Keep dynamic formatting failures inside the logging boundary. */ }
