@@ -83,6 +83,7 @@ export namespace vmhook::detail::native_backend
     };
     inline auto retain_oop(void*) -> root;
     inline auto active_context_lifetime() noexcept -> std::shared_ptr<context_lifetime>;
+    inline auto note_root_allocation(void*) noexcept -> void;
     inline auto refresh(void**, const root&) noexcept -> void*;
 }
 
@@ -10776,7 +10777,7 @@ inline void**root_oop(void*thread,void*oop){
  auto*top=load<std::byte*>(area,vm.off("Arena","_hwm"));auto*limit=load<std::byte*>(area,vm.off("Arena","_max"));void**slot{};
  if(top&&limit&&top<=limit&&static_cast<std::size_t>(limit-top)>=sizeof(void*)){slot=reinterpret_cast<void**>(top);top+=sizeof(void*);store(area,vm.off("Arena","_hwm"),top);}
  else slot=vm.fn<void**(*)(void*,std::size_t,int)>("arena_grow")(area,sizeof(void*),1);
- if(slot){std::memcpy(slot,&oop,sizeof oop);}
+ if(slot){std::memcpy(slot,&oop,sizeof oop);vmhook::detail::native_backend::note_root_allocation(thread);}
  return slot;
 }
 inline void*resolve_root(void**root){return root?load<void*>(root,0):nullptr;}
@@ -12394,6 +12395,7 @@ export namespace vmhook::detail::native_backend
         std::vector<void**> releases{};
         std::vector<void**> reusable{};
         std::unordered_map<void**, std::weak_ptr<root_ticket>> tickets{};
+        std::size_t allocated_slots{};
         std::size_t operation_depth{};
         std::size_t temporary_depth{};
         vmhook::detail::private_native::root_slot_provider previous_provider{};
@@ -12432,6 +12434,15 @@ export namespace vmhook::detail::native_backend
         if (!current || current->owner_id != vmhook::windows::GetCurrentThreadId()
             || !current->alive.load(std::memory_order_acquire)) { return {}; }
         return current->self_keepalive;
+    }
+
+    inline auto note_root_allocation(void* const thread) noexcept -> void
+    {
+        auto* const context{current_context_lifetime()};
+        if (context && context->thread == thread && context->temporary_depth == 0
+            && context->owner_id == vmhook::windows::GetCurrentThreadId()
+            && context->alive.load(std::memory_order_acquire))
+        { ++context->allocated_slots; }
     }
 
     inline auto active() noexcept -> bool
@@ -27603,6 +27614,10 @@ inline bool is_java_thread(void* current) noexcept {
 }
 class keeper;
 inline std::atomic<keeper*> prepared_keeper{};
+struct keeper_resources final {
+    std::size_t allocated_slots{}, leases{}, occupied_slots{}, reusable_slots{}, pending_releases{};
+    bool ready{};
+};
 struct ticket {
     keeper* owner{};
     void** slot{};
@@ -27621,6 +27636,7 @@ class keeper final {
     std::mutex slots_mutex_;
     std::vector<void**> released_;
     std::vector<void**> free_;
+    std::size_t allocated_slots_{}, leased_slots_{}, occupied_slots_{};
 
     void run() noexcept {
         try {
@@ -27673,6 +27689,7 @@ class keeper final {
             auto** slot = released_.back();
             free_.push_back(slot);
             pn::store<void*>(slot, 0, nullptr);
+            --occupied_slots_;
             released_.pop_back();
         }
     }
@@ -27693,6 +27710,10 @@ public:
         return *value;
     }
     bool ready() const noexcept { return status_.load(std::memory_order_acquire) == 1; }
+    auto statistics() -> keeper_resources {
+        std::lock_guard lock{slots_mutex_};
+        return {allocated_slots_, leased_slots_, occupied_slots_, free_.size(), released_.size(), ready()};
+    }
     void fail_class_preparation(void* thread) const noexcept {
         try {
             if (!ready() || !thread || thread != pn::rt().current_thread()
@@ -27724,10 +27745,12 @@ public:
             drain_locked();
             void** slot{};
             if (!free_.empty()) { slot = free_.back(); free_.pop_back(); pn::store(slot, 0, oop); }
-            else { slot = pn::detail::root_oop(thread_, oop); }
+            else { slot = pn::detail::root_oop(thread_, oop); if (slot) { ++allocated_slots_; } }
             if (!slot) { return {}; }
             result->owner = this;
             result->slot = slot;
+            ++leased_slots_;
+            ++occupied_slots_;
             return result;
         } catch (const std::bad_alloc&) { throw; }
         catch (...) { return {}; }
@@ -27745,7 +27768,12 @@ public:
         if (!slot) { return; }
         try {
             std::lock_guard lock{slots_mutex_};
-            if (writer_in_vm()) { pn::store<void*>(slot, 0, nullptr); free_.push_back(slot); }
+            --leased_slots_;
+            if (writer_in_vm()) {
+                pn::store<void*>(slot, 0, nullptr);
+                --occupied_slots_;
+                free_.push_back(slot);
+            }
             else { released_.push_back(slot); }
         } catch (...) { /* Retain the root if C++ bookkeeping cannot grow. */ }
     }
@@ -28945,3 +28973,64 @@ export namespace vmhook
     };
 }
 // VMHOOK_NATIVE_EXECUTOR_END
+// VMHOOK_ROOT_RESOURCES_BEGIN
+export namespace vmhook
+{
+    struct root_resource_snapshot final
+    {
+        bool durable_ready{};
+        std::size_t durable_allocated_slots{};
+        std::size_t durable_leases{};
+        std::size_t durable_occupied_slots{};
+        std::size_t durable_reusable_slots{};
+        std::size_t durable_pending_releases{};
+        std::size_t durable_unreclaimed_slots{};
+        std::size_t durable_internal_slots{};
+        bool context_active{};
+        std::size_t context_allocated_slots{};
+        std::size_t context_live_ticket_slots{};
+        std::size_t context_occupied_ticket_slots{};
+        std::size_t context_reusable_slots{};
+        std::size_t context_pending_releases{};
+    };
+
+    [[nodiscard]] inline auto root_resources() -> root_resource_snapshot
+    {
+        root_resource_snapshot result{};
+        if (auto* const keeper{detail::persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)})
+        {
+            const auto durable{keeper->statistics()};
+            result.durable_ready = durable.ready;
+            result.durable_allocated_slots = durable.allocated_slots;
+            result.durable_leases = durable.leases;
+            result.durable_occupied_slots = durable.occupied_slots;
+            result.durable_reusable_slots = durable.reusable_slots;
+            result.durable_pending_releases = durable.pending_releases;
+            result.durable_unreclaimed_slots = durable.occupied_slots - durable.leases - durable.pending_releases;
+            result.durable_internal_slots = durable.ready ? 1 : 0;
+        }
+        const auto context{detail::native_backend::active_context_lifetime()};
+        if (!context || context->temporary_depth != 0) { return result; }
+        auto& runtime{detail::private_native::rt()};
+        if (runtime.has_function("vm_exited")
+            && detail::private_native::load<bool>(runtime.function("vm_exited"), 0))
+        { return result; }
+        // The owner alone modifies this map/reuse list. Resolve slot contents
+        // only while in VM state; remote destructors only enqueue releases.
+        detail::private_native::vm_state_guard access{context->thread};
+        result.context_active = true;
+        result.context_allocated_slots = context->allocated_slots;
+        result.context_reusable_slots = context->reusable.size();
+        for (const auto& [slot, ticket] : context->tickets)
+        {
+            if (!ticket.expired()) { ++result.context_live_ticket_slots; }
+            if (detail::private_native::detail::resolve_root(slot)) { ++result.context_occupied_ticket_slots; }
+        }
+        {
+            std::lock_guard lock{context->releases_mutex};
+            result.context_pending_releases = context->releases.size();
+        }
+        return result;
+    }
+}
+// VMHOOK_ROOT_RESOURCES_END

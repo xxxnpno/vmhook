@@ -86,3 +86,36 @@ wrapper requests the bootstrap context loader. Empty C++ owners are rejected.
 Java permission checks and errors from `Thread.setContextClassLoader` are honored.
 No ThreadLocal state is implicitly copied from another thread, and application
 thread-affinity requirements still apply.
+
+## Root resource accounting
+
+`root_resources()` returns a copied `root_resource_snapshot`. The durable
+keeper's counters are copied under its own lock; context counters describe only
+the current owner thread and slot contents are inspected in VM state. Calling
+the getter does not initialize a keeper or drain pending releases. The two sets
+of counters are observed separately, rather than as a global JVM snapshot.
+
+`durable_allocated_slots` measures the keeper's allocated reusable storage, not
+the number of C++ owners. `durable_leases` counts live root tickets; multiple
+owners of one ticket still count once. `durable_occupied_slots` includes those
+leased roots, pending releases, and roots retained after a release-bookkeeping
+allocation failure. `durable_pending_releases` and `durable_unreclaimed_slots`
+distinguish the latter cases. `durable_reusable_slots` counts cleared available
+slots. The separately reported `durable_internal_slots` counts the keeper's one
+permanent failure-exception root. Object retention, class bindings, and hooks
+share this pool, so these counters cover all of their durable tickets.
+
+`context_allocated_slots` counts permanent slots allocated through VMHook's
+managed HandleArea path in the active context, excluding temporary HandleMarks.
+`context_live_ticket_slots` counts slots whose ticket remains live;
+`context_occupied_ticket_slots` counts non-null slots in the ticket map, including
+pending releases. `context_reusable_slots` measures cleared reusable storage and
+`context_pending_releases` counts destruction requests awaiting the owner's next
+operation. A live reserved result ticket can contain null and thus contribute to
+the live-ticket count without contributing an occupied root. No active context
+means `context_active == false`, with zero context counts.
+
+These are slot-resource counters, not a count of distinct Java objects, a byte
+measurement of HotSpot arenas, or an inventory of every root owned by the JVM.
+Allocated storage can remain after releases for reuse; a repeated retain/reset
+workload should compare occupied roots and pending releases as well as capacity.

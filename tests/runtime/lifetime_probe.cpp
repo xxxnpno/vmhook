@@ -94,6 +94,31 @@ namespace
                 expired = std::make_unique<copy_one>(first->get_instance());
                 expired->set_native_root(first->get_native_root());
                 retained = vmhook::retain(expired);
+                const auto resource_before = vmhook::root_resources();
+                auto transient = vmhook::retain(expired);
+                const auto resource_retained = vmhook::root_resources();
+                transient.reset();
+                const auto resource_released = vmhook::root_resources();
+                vmhook::detail::flush_hook_roots();
+                const auto resource_drained = vmhook::root_resources();
+                for (std::size_t iteration{}; iteration < 64; ++iteration)
+                { auto reused = vmhook::retain(expired); reused.reset(); }
+                vmhook::detail::flush_hook_roots();
+                const auto resource_reused = vmhook::root_resources();
+                if (!check(output, "root_accounting", resource_before.context_active && resource_before.durable_ready
+                    && resource_retained.durable_leases == resource_before.durable_leases + 1
+                    && resource_retained.durable_occupied_slots == resource_before.durable_occupied_slots + 1
+                    && resource_released.durable_leases == resource_before.durable_leases
+                    && resource_released.durable_pending_releases == resource_before.durable_pending_releases + 1
+                    && resource_drained.durable_occupied_slots == resource_before.durable_occupied_slots
+                    && resource_drained.durable_pending_releases == 0
+                    && resource_drained.durable_unreclaimed_slots == 0
+                    && resource_reused.durable_allocated_slots == resource_drained.durable_allocated_slots
+                    && resource_reused.durable_occupied_slots == resource_before.durable_occupied_slots
+                    && resource_reused.durable_leases == resource_before.durable_leases
+                    && resource_reused.durable_pending_releases == 0
+                    && resource_drained.context_allocated_slots >= resource_drained.context_live_ticket_slots
+                    && resource_drained.durable_internal_slots == 1)) { return 7; }
                 auto java_null = std::make_unique<copy_one>(nullptr);
                 retained_null = vmhook::retain(java_null);
                 const std::unique_ptr<copy_one> empty{};
@@ -106,7 +131,7 @@ namespace
                 fixture::drop_anchors();
             }
             if (!check(output, "source_closed", refused([&] { (void)expired->get_instance(); })
-                && refused([&] { (void)retained.acquire(); }))) { return 9; }
+                && refused([&] { (void)retained.acquire(); }) && !vmhook::root_resources().context_active)) { return 9; }
             ::Sleep(200);
             std::atomic<bool> correct{false};
             std::thread receiving([&]
