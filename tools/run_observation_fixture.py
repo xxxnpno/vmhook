@@ -74,6 +74,9 @@ CHECKS = {
                    "field_policy_cpp_oom", "failure_cleanup", "method_retry", "method_original",
                    "field_retry", "field_original", "closed", "contextless_cpp_oom",
                    "contextless_retry", "hook_roots_complete"],
+    "direct_array": ["direct_array_batch", "direct_array_cpp_allocation",
+                     "direct_array_recovery", "direct_array_refusal",
+                     "direct_array_string_policy", "native_complete"],
     "argument_descriptor": ["exact_descriptors", "string_constructor_upcasts",
                             "array_constructor_upcasts", "nested_constructor",
                             "collection_constructor_upcasts", "descriptor_refusals",
@@ -125,6 +128,7 @@ FIXTURES = {
     "hook_roots": "RootFixture",
     "method_binding": "MethodBindingFixture",
     "argument_descriptor": "ArgumentDescriptorFixture",
+    "direct_array": "DirectArrayFixture",
     "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
@@ -147,6 +151,7 @@ OPTIONAL_PROBES = {
     "hook_roots": "hook_roots_probe",
     "method_binding": "method_binding_probe",
     "argument_descriptor": "argument_descriptor_probe",
+    "direct_array": "direct_array_probe",
     "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
@@ -169,6 +174,7 @@ TERMINAL_CHECK = {
     "hook_roots": "hook_roots_complete",
     "method_binding": "method_binding_proof",
     "argument_descriptor": "descriptor_complete",
+    "direct_array": "native_complete",
     "method_exit": "method_exit_proof",
 }
 
