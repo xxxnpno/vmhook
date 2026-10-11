@@ -14602,11 +14602,8 @@ export namespace vmhook
         @param array_oop Decoded pointer to the Java array object (not compressed).
         @return Element count, or 0 if the pointer is invalid.
         @details
-        HotSpot Array object layout (x64, compressed OOPs):
-          +0  mark word (8 B)
-          +8  klass pointer (4 B)
-          +12 _length   (int)
-          +16 _data[0]
+        Length and storage offsets come from the verified array layout for
+        the actual class and object-header mode. No fixed body offset is used.
     */
     inline auto array_length(void* const array_oop) noexcept
         -> std::int32_t
