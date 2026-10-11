@@ -50,12 +50,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Dedicated injected-runtime fixtures for direct native calls, construction,
   Unicode Strings, idle GC, exceptions, compiled calls, repeated/concurrent
   attachment and context lifetime. Both interfaces have Java 8–27 CI coverage.
-- Persistent `hook_field<wrapper, value_type>` callbacks before static primitive reads
+- Persistent `hook_field<wrapper, value_type>` callbacks before static primitive/reference reads
   and writes, using generated ASM stubs in HotSpot's `getstatic`/`putstatic`
   templates. `field_access<value_type>` supports replacement and prevention;
   `unhook_field<wrapper>` removes the registration. All eight primitive types
-  are supported; reference fields and accesses outside these bytecodes are
-  refused or outside the observation scope.
+  are supported; reference values use owning wrappers and VM-scanned ASM
+  transport. Instance fields and accesses outside these bytecodes remain
+  outside the observation scope.
 - Persistent class observer IDs with `remove_class_observer`, covering
   successful ordinary, bootstrap, ByteBuffer, hidden/anonymous and array
   definition paths. Events expose actual defining loader-data identity and

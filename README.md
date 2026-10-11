@@ -192,8 +192,9 @@ and prevents target compilation/inlining while hooked. It covers already
 compiled and inlined callers and needs no JVM launch flags.
 
 `hook_field` uses ASM stubs before interpreter `getstatic`/`putstatic` primitive
-accesses, with replacement and prevention. It uses no polling. Reference fields
-and routes through reflection, Unsafe or native VM code have separate boundaries.
+and reference accesses, with replacement and prevention. Object callbacks use
+owning wrappers and VM-scanned transport through nested GC. It uses no polling.
+See [field hooks](docs/field_hooks.md) for access semantics and covered routes.
 `on_class_loaded` reports successful class definitions. Use copied class records,
 bounded event queues and `hook_when_loaded` for deferred native-side installation;
 class callbacks run in VM state and must stay short.

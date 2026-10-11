@@ -28455,7 +28455,8 @@ export namespace vmhook
         native_calls, object_construction, rooted_object_access, reference_field_writes,
         persistent_references, method_entry_hooks, static_primitive_field_hooks,
         class_definition_events, original_method_exit_events, exact_heap_iteration,
-        mixed_stack_sampling, virtual_thread_hooks, java_monitors, count
+        mixed_stack_sampling, virtual_thread_hooks, java_monitors,
+        static_reference_field_hooks, count
     };
 
     struct feature_support final
@@ -28545,6 +28546,8 @@ export namespace vmhook
                     "Target signature and JIT preparation must pass before publication");
                 set(runtime_feature::static_primitive_field_hooks, feature_state::conditional,
                     "Interpreter getstatic/putstatic routes only; each field and template is verified");
+                set(runtime_feature::static_reference_field_hooks, feature_state::conditional,
+                    "Verified getstatic/putstatic routes with VM-scanned object transport; each field requires preparation");
                 set(runtime_feature::class_definition_events, feature_state::conditional,
                     "Exact private definition routes; observer preparation must pass");
             }

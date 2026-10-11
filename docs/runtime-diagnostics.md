@@ -42,5 +42,9 @@ An entry callback or forced return is not an event for an original method's
 exit. The instance snapshot backend uses the verified G1/Parallel object iterator at
 a VM safepoint and roots selected objects before Java resumes. Its capability
 still requires a standalone native context and successful snapshot preparation.
-The report keeps unverified mixed-stack sampling and virtual-thread transitions
-explicit.
+Java monitor guards and static primitive/reference field hooks have separate
+capability entries and operation-specific checks. Mounted virtual-thread
+callbacks are skipped before entering the borrowed VM context; this preserves
+the original Java operation and does not provide virtual-thread hook support.
+The report keeps mixed-stack sampling and virtual-thread transitions unavailable
+until their distinct backends are verified.
