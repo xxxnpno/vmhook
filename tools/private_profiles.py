@@ -753,6 +753,21 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
             "deallocate_list_data_width": data["storage_size"],
             "deallocate_list_length_offset": length["offset"],
             "deallocate_list_length_width": length["storage_size"]})
+        if java_feature >= 25:
+            # The generated return tail clears this JFR byte after LEAVE.
+            # Derive its embedded JavaThread displacement from exact PDB
+            # aggregate/member types rather than a Java-major offset table.
+            thread_jfr = types["JavaThread"]["members"]["_jfr_thread_local"]
+            jfr = pdb.describe("JfrThreadLocal")
+            sampling = jfr["members"]["_sampling_critical_section"]
+            if not pdb.points_to(thread_jfr["type_index"], "JfrThreadLocal", 0) or \
+                    thread_jfr["storage_size"] != jfr["size"] or sampling["storage_size"] != 1 or \
+                    sampling["type_index"] != 0x30 or not 0 <= sampling["offset"] < jfr["size"] or \
+                    not 0 <= thread_jfr["offset"] <= types["JavaThread"]["size"] - jfr["size"]:
+                raise profile_error("Unexpected JFR sampling critical-section byte layout")
+            types["ObservationABI"]["enums"].update({
+                "normal_exit_jfr_clear_offset": thread_jfr["offset"] + sampling["offset"],
+                "normal_exit_jfr_clear_width": sampling["storage_size"]})
         if java_feature == 20:
             # Java20's VM-to-Java destructor is inlined. Its poll selector is
             # a static source constant, absent from TPI. Extract the actual

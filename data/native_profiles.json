@@ -1405,7 +1405,9 @@
       "deallocate_list_length_width",
       "frame_scan_legacy_cld_arg",
       "frame_scan_small_maps",
-      "frame_stack_slots_relative"
+      "frame_stack_slots_relative",
+      "normal_exit_jfr_clear_offset",
+      "normal_exit_jfr_clear_width"
     ],
     "Thread::SuspendFlags": [
       "_external_suspend",
@@ -1625,7 +1627,9 @@
         "deallocate_list_length_width": "Exact length storage width in bytes from TPI or independently audited9/10 machine loads/stores.",
         "frame_scan_legacy_cld_arg": "1 when the exact PDB signature takes OopClosure*,CLDClosure*,RegisterMap*,bool;0 for the four-machine-argument scanner. Stripped9/10 verified at exact caller and scanner bytes.",
         "frame_scan_small_maps": "1 when all three RegisterMap/SmallRegisterMapType<0>/<1> template instantiations are present in the matching PDB;0 for the ordinary scanner.",
-        "frame_stack_slots_relative": "1 when the exact PDB-named interpreter_frame_monitor_end getter unconditionally adds FP to the signed monitor-top slot multiplied by8;0 for absolute or heap-frame-only conditional conversion. Applies to physical monitor-end and nonzero last_sp slots; heap frames are excluded by the runtime."
+        "frame_stack_slots_relative": "1 when the exact PDB-named interpreter_frame_monitor_end getter unconditionally adds FP to the signed monitor-top slot multiplied by8;0 for absolute or heap-frame-only conditional conversion. Applies to physical monitor-end and nonzero last_sp slots; heap frames are excluded by the runtime.",
+        "normal_exit_jfr_clear_offset": "On Java25\u201327, exact matching PDB JavaThread::_jfr_thread_local aggregate offset plus JfrThreadLocal::_sampling_critical_section byte offset; validates generated normal-exit tail store after LEAVE.",
+        "normal_exit_jfr_clear_width": "On Java25\u201327, exact PDB storage width of JfrThreadLocal::_sampling_critical_section; runtime requires one-byte Boolean storage."
       }
     }
   },
