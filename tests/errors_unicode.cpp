@@ -157,5 +157,31 @@ int main()
     try { (void)vmhook::get_field<std::int32_t>(nullptr, nullptr, "allocation_missing_field"); }
     catch (const std::bad_alloc&) { field_diagnostic_allocation = true; }
     check(field_diagnostic_allocation, "raw field helpers do not hide diagnostic allocation failure as zero");
+    const auto field_failure{ vmhook::field_proxy::value_t::failed(
+        vmhook::exception{"stored field failure", vmhook::error_code::invalid_memory}) };
+    vmhook::method_proxy::value_t method_failure{};
+    method_failure.invoked = true;
+    method_failure.exception_thrown = true;
+    method_failure.exception_class = "java/lang/IllegalStateException";
+    const auto preserves_field_error = [&](auto convert)
+    {
+        try { convert(); }
+        catch (const vmhook::exception& error)
+        { return error.code() == vmhook::error_code::invalid_memory && std::string_view{error.what()} == "stored field failure"; }
+        return false;
+    };
+    const auto preserves_java_error = [&](auto convert)
+    {
+        try { convert(); }
+        catch (const vmhook::exception& error)
+        { return error.code() == vmhook::error_code::java_exception && error.exception_class() == "java/lang/IllegalStateException"; }
+        return false;
+    };
+    check(preserves_field_error([&] { (void)field_failure.to_vector(); })
+          && preserves_field_error([&] { (void)field_failure.to_entries<vmhook::any_object, vmhook::any_object>(); }),
+          "lazy and typed collection conversions preserve the stored field failure");
+    check(preserves_java_error([&] { (void)method_failure.to_entries(); })
+          && preserves_java_error([&] { (void)method_failure.to_vector<vmhook::any_object>(); }),
+          "lazy and typed collection conversions preserve the original Java exception");
     return failures ? 1 : 0;
 }

@@ -21642,6 +21642,7 @@ export namespace vmhook
     template<vmhook::detail::container_wrapper element_type>
     auto field_proxy::value_t::to_vector() const -> std::vector<std::unique_ptr<element_type>>
     {
+        this->require_success();
         if (!this->is_reference() || this->signature.empty()
             || (this->signature.front() != 'L' && this->signature.front() != '['))
         { throw vmhook::exception{ "Collection conversion requires a Java object or reference array field" }; }
@@ -21663,6 +21664,7 @@ export namespace vmhook
     auto field_proxy::value_t::to_entries() const
         -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
     {
+        this->require_success();
         if (!this->is_reference() || this->signature.empty() || this->signature.front() != 'L')
         { throw vmhook::exception{ "Map conversion requires a Java object field" }; }
         vmhook::detail::native_backend::operation access{};
@@ -21678,13 +21680,14 @@ export namespace vmhook
         -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
     { return this->to_entries<key_type, mapped_type>(); }
     inline auto field_proxy::value_t::to_vector() const -> vmhook::detail::vector_conversion<value_t>
-    { return vmhook::detail::vector_conversion<value_t>{ *this }; }
+    { this->require_success(); return vmhook::detail::vector_conversion<value_t>{ *this }; }
     inline auto field_proxy::value_t::to_entries() const -> vmhook::detail::vector_conversion<value_t, true>
-    { return vmhook::detail::vector_conversion<value_t, true>{ *this }; }
+    { this->require_success(); return vmhook::detail::vector_conversion<value_t, true>{ *this }; }
 
     template<vmhook::detail::container_wrapper element_type>
     auto method_proxy::value_t::to_vector() const -> std::vector<std::unique_ptr<element_type>>
     {
+        this->require_success();
         if (this->primitive_array_result)
         { throw vmhook::exception{ "Wrapper-vector conversion requires a Java reference array" }; }
         vmhook::detail::native_backend::operation access{};
@@ -21701,6 +21704,7 @@ export namespace vmhook
     auto method_proxy::value_t::to_entries() const
         -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
     {
+        this->require_success();
         if (this->reference_array_result)
         { throw vmhook::exception{ "Map conversion requires a Java object result" }; }
         vmhook::detail::native_backend::operation access{};
@@ -21716,9 +21720,9 @@ export namespace vmhook
         -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
     { return this->to_entries<key_type, mapped_type>(); }
     inline auto method_proxy::value_t::to_vector() const -> vmhook::detail::vector_conversion<value_t>
-    { return vmhook::detail::vector_conversion<value_t>{ *this }; }
+    { this->require_success(); return vmhook::detail::vector_conversion<value_t>{ *this }; }
     inline auto method_proxy::value_t::to_entries() const -> vmhook::detail::vector_conversion<value_t, true>
-    { return vmhook::detail::vector_conversion<value_t, true>{ *this }; }
+    { this->require_success(); return vmhook::detail::vector_conversion<value_t, true>{ *this }; }
 
     // --- Helper: read a Java String OOP to std::string ------------------------
 
