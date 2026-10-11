@@ -27,6 +27,12 @@ payload.active_before = pn::load<bool>(payload.barrier,payload.active_offset);
 hi::walk_at_safepoint(&payload.walk);
 payload.active_after = pn::load<bool>(payload.barrier,payload.active_offset);
 }
+auto active_marking(void* barrier, const std::size_t offset) -> bool {
+    bool active{};
+    if (!vmhook::os::safe_read(&active, static_cast<std::byte*>(barrier)+offset, sizeof(active)))
+        throw std::runtime_error("SATB activity diagnostic could not be read");
+    return active;
+}
 auto worker(void*) -> DWORD {
 char destination[4096]{};
 if (!::GetEnvironmentVariableA("VMHOOK_TEST_RESULT",destination,sizeof destination)) return 1;
@@ -50,7 +56,7 @@ std::size_t observed{}, captured{}, iterations{};
 std::vector<nb::root> held{};
 const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(45);
 while (std::chrono::steady_clock::now()<deadline && observed<1) {
-while (!std::atomic_ref<bool>(*reinterpret_cast<bool*>(static_cast<std::byte*>(barrier)+active_offset)).load(std::memory_order_acquire) && std::chrono::steady_clock::now()<deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+while (!active_marking(barrier,active_offset) && std::chrono::steady_clock::now()<deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 if (std::chrono::steady_clock::now()>=deadline) break;
 {
 nb::operation access{};
@@ -79,8 +85,8 @@ if (payload.active_before && payload.active_after) { roots.resize(std::min(roots
 std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 const auto completion_deadline=std::chrono::steady_clock::now()+std::chrono::seconds(15);
-while (std::atomic_ref<bool>(*reinterpret_cast<bool*>(static_cast<std::byte*>(barrier)+active_offset)).load(std::memory_order_acquire) && std::chrono::steady_clock::now()<completion_deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-const bool completed=!std::atomic_ref<bool>(*reinterpret_cast<bool*>(static_cast<std::byte*>(barrier)+active_offset)).load(std::memory_order_acquire);
+while (active_marking(barrier,active_offset) && std::chrono::steady_clock::now()<completion_deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+const bool completed=!active_marking(barrier,active_offset);
 {
 nb::operation access{};
 for (const auto& root : held) {
