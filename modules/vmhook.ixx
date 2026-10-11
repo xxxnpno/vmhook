@@ -917,6 +917,7 @@ export namespace vmhook
         inline auto reference_reads_supported() noexcept -> bool;
         inline auto reference_stores_supported() noexcept -> bool;
         inline auto ordinary_object_headers_supported() noexcept -> bool;
+        inline auto container_class_assignable(hotspot::klass*, hotspot::klass*) -> bool;
 
         struct array_layout_t final
         {
@@ -20288,47 +20289,26 @@ export namespace vmhook
     }
 
     /*
-        @brief Direct-memory "is `object_oop` an instance of the class named
-               `class_name`?"
-        @details
-        Reads the object's runtime klass out of its header (klass_from_oop), then
-        walks the superclass chain (Klass::_super via get_super) comparing each
-        Klass::_name (get_name()->to_string()) against class_name in JVM internal
-        '/'-separated form, e.g. "java/util/ArrayList". VMStructs reads only;
-        nothing is invoked. Matching compares names without defining-loader
-        identity, so same-name classes from different loaders are indistinguishable.
-        The JVM's full subtype test also considers class identity and interfaces.
-
-        Covers class inheritance only: interfaces live in the secondary-super
-        array rather than the _super chain, so an interface name is not matched.
-        Generic any_object, ref and borrowed helpers use this name-based walk.
-        A matching name alone does not establish exact JVM type assignability.
-
-        Complexity: O(chain depth), one Symbol::to_string() per level.
-        Exception safety: noexcept — an invalid pointer stops the walk (false).
-        @param object_oop  Decoded heap OOP of the object to test (may be null).
-        @param class_name  Internal ('/'-separated) name of the target class.
-        @return true if any klass on the object's super chain is named class_name.
+        @brief Checks assignability to the unique loaded class selected by name.
+        @details Uses exact Klass identity, superclass and interface metadata.
+        Ambiguous names from different defining loaders are refused by lookup.
+        The caller must supply a live oop in the current rooted VM context;
+        a readable address alone does not establish object lifetime. This
+        metadata-only operation neither calls Java nor creates a durable root.
+        Java null and an unavailable target class return false. Context and
+        allocation failures remain explicit errors.
     */
-    inline auto is_instance_of(void* const object_oop, const std::string_view class_name) noexcept
+    inline auto is_instance_of(void* const object_oop, const std::string_view class_name)
         -> bool
     {
         if (!object_oop || class_name.empty())
         {
             return false;
         }
-        for (vmhook::hotspot::klass* k{ vmhook::klass_from_oop(object_oop) };
-             k != nullptr && vmhook::hotspot::is_valid_pointer(k);
-             k = k->get_super())
-        {
-            const vmhook::hotspot::symbol* const name_symbol{ k->get_name() };
-            if (vmhook::hotspot::is_valid_pointer(name_symbol)
-                && name_symbol->to_string() == class_name)
-            {
-                return true;
-            }
-        }
-        return false;
+        vmhook::detail::native_backend::operation access{};
+        if (!access) { throw vmhook::exception{ "Instance query requires a rooted VM context" }; }
+        return vmhook::detail::container_class_assignable(
+            vmhook::klass_from_oop(object_oop), vmhook::find_class(class_name));
     }
 
     /*
