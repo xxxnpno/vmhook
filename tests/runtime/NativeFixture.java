@@ -57,6 +57,15 @@ public class NativeFixture extends NativeBase implements NativeOverride {
     public static int memory_payload;
     public static volatile int memory_command;
     public static volatile int memory_reply;
+    public static NativeFixture monitor_object;
+    public static volatile int monitor_request;
+    public static volatile int monitor_attempting;
+    public static volatile int monitor_acquired;
+    public static volatile int monitor_inside;
+    public static volatile int monitor_release;
+    public static volatile int monitor_seen;
+
+    public boolean monitor_held() { return Thread.holdsLock(this); }
 
     public NativeFixture() {
         value = 41;
@@ -310,6 +319,7 @@ public class NativeFixture extends NativeBase implements NativeOverride {
 
     public static void main(String[] arguments) throws Exception {
         holder = new NativeFixture();
+        monitor_object = new NativeFixture();
         collectionCases = new CollectionCases();
         Class.forName("NativeFixture$Lazy", false, NativeFixture.class.getClassLoader());
         Class.forName("java.lang.IllegalStateException");
@@ -325,6 +335,23 @@ public class NativeFixture extends NativeBase implements NativeOverride {
                 memory_reply = memory_payload == 0x12345678 ? 1 : -1;
                 memory_payload = 0x23456789;
                 memory_command = 2;
+            }
+            if (monitor_request == 1) {
+                monitor_attempting = 1;
+                synchronized (monitor_object) {
+                    monitor_seen = monitor_object.value;
+                    monitor_object.value += 1;
+                }
+                monitor_acquired = 1;
+                monitor_request = 0;
+            } else if (monitor_request == 2) {
+                synchronized (monitor_object) {
+                    monitor_inside = 1;
+                    while (monitor_release == 0) { Thread.yield(); }
+                    monitor_object.value = 9001;
+                }
+                monitor_inside = 0;
+                monitor_request = 0;
             }
             live[iteration++ % live.length] = new byte[1024 * 1024];
             if (iteration % 10 == 0) { System.gc(); ++gcEpoch; }

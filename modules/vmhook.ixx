@@ -29088,3 +29088,168 @@ export namespace vmhook
     }
 }
 // VMHOOK_ROOT_RESOURCES_END
+
+// VMHOOK_MONITOR_LOCKS_BEGIN
+export namespace vmhook::detail::monitor_backend
+{
+    namespace pn = vmhook::detail::private_native;
+    namespace nb = vmhook::detail::native_backend;
+    using construct = void(*)(void*, void**, void*);
+    using construct_bool = void(*)(void*, void**, void*, bool);
+    using destroy = void(*)(void*);
+    struct configuration final
+    {
+        bool ready{}, boolean_argument{};
+        std::size_t size{};
+        construct create{};
+        construct_bool create_with_flag{};
+        destroy release{};
+    };
+    auto config() noexcept -> const configuration&
+    {
+        static const configuration value = []() noexcept
+        {
+            configuration result{};
+            try
+            {
+                auto& runtime{ pn::rt() };
+                if (!runtime.ready || runtime.uses_external_symbols()
+                    || !vmhook::detail::java_execution_supported()) { return result; }
+                const auto collector{ vmhook::vm_capabilities().collector };
+                if (collector != vmhook::gc_collector::g1 && collector != vmhook::gc_collector::parallel)
+                { return result; }
+                result.size = runtime.size("ObjectLocker");
+                if (result.size != 24 && result.size != 32 && result.size != 40 && result.size != 48)
+                { return result; }
+                for (const auto member : {"_thread", "_obj", "_lock"})
+                {
+                    if (runtime.enum_value("ObjectLocker", std::string{"storage_size_"} + member) != 8
+                        || runtime.off("ObjectLocker", member) + 8 > result.size) { return configuration{}; }
+                }
+                result.boolean_argument = runtime.has_function("monitor_lock_construct_bool");
+                if (result.boolean_argument)
+                { result.create_with_flag = runtime.fn<construct_bool>("monitor_lock_construct_bool"); }
+                else { result.create = runtime.fn<construct>("monitor_lock_construct"); }
+                result.release = runtime.fn<destroy>("monitor_lock_destroy");
+                result.ready = result.release && (result.create || result.create_with_flag);
+            }
+            catch (...) { return configuration{}; }
+            return result;
+        }();
+        return value;
+    }
+
+    inline auto on_owner_stack(void* const thread, const void* const record, const std::size_t size) -> bool
+    {
+        auto& runtime{ pn::rt() };
+        const auto top{ pn::load<std::uintptr_t>(thread, runtime.off("JavaThread", "_stack_base")) };
+        const auto extent{ pn::load<std::size_t>(thread, runtime.off("JavaThread", "_stack_size")) };
+        const auto position{ reinterpret_cast<std::uintptr_t>(record) };
+        return extent <= top && position >= top - extent && position <= top && size <= top - position;
+    }
+}
+
+export namespace vmhook
+{
+    /* The lock participates in Java synchronized/Thread.holdsLock semantics.
+       It must remain on its owner's stack inside a live native_thread_context.
+       C++ code between acquisition and release stays in native state so GC can
+       proceed. Copy, move, heap storage and cross-thread release are refused. */
+    class monitor_lock final
+    {
+        alignas(8) std::array<std::byte, 64> record_{};
+        std::shared_ptr<vmhook::detail::native_backend::context_lifetime> context_{};
+        vmhook::detail::native_backend::root object_{};
+        const vmhook::detail::monitor_backend::configuration* runtime_{};
+        bool locked_{};
+
+    public:
+        template<typename wrapper_type>
+        explicit monitor_lock(const std::unique_ptr<wrapper_type>& object)
+        {
+            static_assert(vmhook::detail::is_java_wrapper_v<wrapper_type>);
+            namespace nb = vmhook::detail::native_backend;
+            namespace pn = vmhook::detail::private_native;
+            nb::operation access{};
+            this->context_ = nb::active_context_lifetime();
+            if (!access || !this->context_ || vmhook::hotspot::in_java_detour())
+            { throw vmhook::exception{"Monitor locking requires a standalone native_thread_context"}; }
+            this->runtime_ = &vmhook::detail::monitor_backend::config();
+            if (!this->runtime_->ready)
+            { throw vmhook::exception{"This exact VM profile has no verified ObjectLocker ABI"}; }
+            if (!object) { throw vmhook::exception{"Monitor locking requires an allocated C++ wrapper"}; }
+            void* const instance{ object->get_instance() };
+            if (!instance)
+            { throw vmhook::exception{"A Java null has no monitor", vmhook::error_code::null_reference}; }
+            if (!object->get_native_root() || !object->get_native_root()->valid())
+            { throw vmhook::exception{"Monitor locking requires a rooted Java object"}; }
+            if (!vmhook::detail::monitor_backend::on_owner_stack(
+                    this->context_->thread, this->record_.data(), this->runtime_->size))
+            { throw vmhook::exception{"A monitor_lock must reside on the owning native thread's stack"}; }
+            if (pn::pending_exception(this->context_->thread))
+            { throw vmhook::exception{"Handle the pending Java exception before acquiring a monitor"}; }
+            this->object_ = nb::retain_oop(instance);
+            if (!this->object_) { throw vmhook::exception{"The monitor object could not be rooted"}; }
+            if (this->runtime_->boolean_argument)
+            { this->runtime_->create_with_flag(this->record_.data(), this->object_->slot, this->context_->thread, true); }
+            else { this->runtime_->create(this->record_.data(), this->object_->slot, this->context_->thread); }
+            this->locked_ = true;
+            // This lease forbids context close/detach without keeping the thread
+            // in VM state across arbitrary C++ work or a native blocking call.
+            ++this->context_->operation_depth;
+            try
+            {
+                if (void* const pending{ pn::pending_exception(this->context_->thread) })
+                {
+                    auto throwable{ nb::retain_oop(pending) };
+                    std::string name{};
+                    if (auto* const klass{ vmhook::klass_from_oop(pending) }; klass && klass->get_name())
+                    { name = klass->get_name()->to_string(); }
+                    pn::clear_pending_exception(this->context_->thread);
+                    this->unlock();
+                    throw vmhook::exception{"Java monitor acquisition threw", vmhook::error_code::java_exception,
+                                            std::move(name), std::move(throwable)};
+                }
+            }
+            catch (...) { if (this->locked_) { this->unlock(); } throw; }
+        }
+        ~monitor_lock() noexcept
+        {
+            if (!this->locked_) { return; }
+            try { this->unlock(); }
+            catch (...) { std::terminate(); }
+        }
+        monitor_lock(const monitor_lock&) = delete;
+        monitor_lock(monitor_lock&&) = delete;
+        auto operator=(const monitor_lock&) -> monitor_lock& = delete;
+        auto operator=(monitor_lock&&) -> monitor_lock& = delete;
+        static auto operator new(std::size_t) -> void* = delete;
+        static auto operator new[](std::size_t) -> void* = delete;
+        [[nodiscard]] auto owns_lock() const noexcept -> bool { return this->locked_; }
+        auto unlock() -> void
+        {
+            if (!this->locked_) { return; }
+            namespace nb = vmhook::detail::native_backend;
+            namespace pn = vmhook::detail::private_native;
+            if (nb::active_context_lifetime() != this->context_
+                || pn::rt().current_thread() != this->context_->thread)
+            { throw vmhook::exception{"A monitor must be released by its owning native OS thread"}; }
+            nb::operation access{};
+            if (!access) { throw vmhook::exception{"The monitor owner's native context is no longer usable"}; }
+            this->runtime_->release(this->record_.data());
+            this->locked_ = false;
+            --this->context_->operation_depth;
+        }
+    };
+
+    template<typename wrapper_type, typename function_type>
+    inline decltype(auto) with_monitor(const std::unique_ptr<wrapper_type>& object, function_type&& function)
+    {
+        vmhook::monitor_lock lock{object};
+        return std::invoke(std::forward<function_type>(function));
+    }
+
+    [[nodiscard]] inline auto monitor_locks_supported() noexcept -> bool
+    { return vmhook::detail::monitor_backend::config().ready; }
+}
+// VMHOOK_MONITOR_LOCKS_END

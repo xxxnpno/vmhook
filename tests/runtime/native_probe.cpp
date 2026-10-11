@@ -316,6 +316,7 @@ namespace
     }
 
     #include "field_memory_cases.hpp"
+    #include "monitor_cases.hpp"
 
     auto check_heap_iteration() -> bool
     {
@@ -547,6 +548,8 @@ namespace
             if (!passed(output, "object_contract", check_object_contract(first, second))) { return false; }
             if (!passed(output, "field_memory", check_field_memory(first, second))) { return false; }
             if (!passed(output, "heap_iteration", check_heap_iteration())) { return false; }
+            if (!passed(output, "monitor_locks", check_monitor_locks(context, output))) { return false; }
+            output << "monitor_backend=" << (vmhook::monitor_locks_supported() ? "vm_object_locker" : "refused_profile") << '\n';
 
             const auto virtual_call = base_method(*first, "virtualValue");
             const auto private_call = base_method(*first, "privateValue");
