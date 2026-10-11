@@ -88,11 +88,16 @@ targets static-field bytecodes; the instance extension must include all these
 families, existing inlined callers, and newly prepared classes. Installing only
 the cold `getfield`/`putfield` patches would silently miss warmed accesses.
 
-The source audit covers OpenJDK's x86 template and frame implementations for
-[Java 8](https://github.com/openjdk/jdk8u/blob/master/hotspot/src/cpu/x86/vm/templateTable_x86_64.cpp),
-[Java 21](https://github.com/openjdk/jdk21u/blob/master/src/hotspot/cpu/x86/templateTable_x86.cpp),
-and [Java 27](https://github.com/openjdk/jdk/blob/master/src/hotspot/cpu/x86/templateTable_x86.cpp).
-In particular `fast_accessfield`, `fast_storefield`, and `fast_xaccess` have
+The source audit uses the revisions pinned to the supported runtime images in
+`data/native_profiles.json`, rather than a moving upstream branch:
+
+| Java | x86 field templates | Interpreter frame walker |
+| --- | --- | --- |
+| 8 | [jdk8u504-b01](https://github.com/adoptium/jdk8u/blob/jdk8u504-b01/hotspot/src/cpu/x86/vm/templateTable_x86_64.cpp) | [frame.cpp](https://github.com/adoptium/jdk8u/blob/jdk8u504-b01/hotspot/src/share/vm/runtime/frame.cpp) |
+| 21 | [1c417fbfc2f7](https://github.com/adoptium/jdk21u/blob/1c417fbfc2f7/src/hotspot/cpu/x86/templateTable_x86.cpp) | [frame.cpp](https://github.com/adoptium/jdk21u/blob/1c417fbfc2f7/src/hotspot/share/runtime/frame.cpp) |
+| 27 | [efe86855fd73](https://github.com/adoptium/jdk/blob/efe86855fd73/src/hotspot/cpu/x86/templateTable_x86.cpp) | [frame.cpp](https://github.com/adoptium/jdk/blob/efe86855fd73/src/hotspot/share/runtime/frame.cpp) |
+
+In those revisions, `fast_accessfield`, `fast_storefield`, and `fast_xaccess` have
 different TOS transitions from `getfield_or_static`; `frame::oops_interpreted_do`
 uses the live BCI's `InterpreterOopMap` to scan locals and expression-stack
 slots. Each added site needs runtime instruction-boundary checks and moving-GC
