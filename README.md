@@ -38,7 +38,7 @@ public:
     { get_field("value")->set(next); }
 
     auto add(std::int32_t amount) -> std::int32_t
-    { return get_method("add", "(I)I")->call(amount); }
+    { return get_method("add")->call(amount); }
 
     static auto get_total() -> std::int32_t
     { return static_members::get_field("total")->get(); }
@@ -47,8 +47,10 @@ public:
 
 The CRTP base knows `counter` and its Java binding. Instance lookups need no
 `this` argument. Static wrapper methods use the inherited `static_members`
-helper and are called normally as `counter::get_total()`. Method descriptors
-select overloaded Java methods exactly. C++ identifiers use snake_case; Java
+helper and are called normally as `counter::get_total()`. Typed arguments select
+compatible method overloads; add an explicit descriptor, such as
+`get_method("add", "(I)I")`, when you want one exact Java signature.
+C++ identifiers use snake_case; Java
 names in strings keep their original spelling.
 
 Run the wrapper on a DLL worker, outside `DllMain`:
