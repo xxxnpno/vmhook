@@ -152,6 +152,7 @@ jobs:
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.probe }}
           --metadata-only
+          --evidence smoke-metadata-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify method hooks and explicit callback dispatch
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
@@ -162,6 +163,7 @@ jobs:
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.probe }}
           --hooks-only
+          --evidence smoke-hooks-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify Java invocation, construction, and GC behavior
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
@@ -171,6 +173,15 @@ jobs:
           --javac "$env:JAVA_HOME/bin/javac.exe"
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.probe }}
+          --evidence smoke-runtime-${{ matrix.java }}-${{ matrix.toolchain }}.json
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: smoke-${{ matrix.java }}-${{ matrix.toolchain }}
+          path: smoke-*-${{ matrix.java }}-${{ matrix.toolchain }}.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   native_threads:
     needs: build
@@ -237,6 +248,7 @@ jobs:
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.probe }}
           --native-threads
+          --evidence native-threads-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify arrays, broad signatures and container mutation
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
@@ -338,6 +350,7 @@ jobs:
         with:
           name: observation-${{ matrix.java }}-${{ matrix.toolchain }}
           path: |
+            native-threads-${{ matrix.java }}-${{ matrix.toolchain }}.json
             observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
             callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-*.json
             examples-${{ matrix.java }}-${{ matrix.toolchain }}.json
