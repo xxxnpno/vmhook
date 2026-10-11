@@ -85,6 +85,10 @@ Temporary internal handles are released after each operation; surviving results
 are promoted into the context's roots. Released root slots can be reused, so a
 long-running stream of temporary method results does not require an ever-growing
 live root set.
+The older `ref`, `borrowed::pin()` and static `root` reference helpers also
+propagate C++ allocation failures as `std::bad_alloc`, including allocations
+during navigation. Their documented empty or expired states still describe
+missing paths and unavailable lifetimes; they do not represent C++ exhaustion.
 
 These references require their owning context and OS thread. Another context
 on another thread cannot use them, even if it belongs to the same JVM. Closing

@@ -24398,7 +24398,7 @@ namespace hotspot
             @brief Builds a static_root link.  Returns null on a bad klass.
         */
         inline auto make_static_anchor(vmhook::hotspot::klass* const declaring_klass,
-                                       const std::size_t offset) noexcept
+                                       const std::size_t offset)
             -> std::shared_ptr<const vmhook::detail::anchor_node>
         {
             if (!declaring_klass || !vmhook::hotspot::is_valid_pointer(declaring_klass))
@@ -24424,6 +24424,7 @@ namespace hotspot
                     ^ static_cast<std::uint64_t>(offset));
                 return node;
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception&)
             {
                 return {};
@@ -24440,7 +24441,7 @@ namespace hotspot
         inline auto make_hop_anchor(const std::shared_ptr<const vmhook::detail::anchor_node>& parent,
                                     const vmhook::anchor_kind kind,
                                     const std::size_t offset,
-                                    const std::int32_t index) noexcept
+                                    const std::int32_t index)
             -> std::shared_ptr<const vmhook::detail::anchor_node>
         {
             if (!parent || parent->depth >= vmhook::k_max_anchor_depth)
@@ -24465,6 +24466,7 @@ namespace hotspot
                                             ^ static_cast<std::uint64_t>(offset));
                 return node;
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception&)
             {
                 return {};
@@ -24501,7 +24503,7 @@ namespace hotspot
             @details Null input produces no node. Observed changes reject the address,
             but unchanged samples do not prove liveness or stop concurrent collection.
         */
-        inline auto make_ephemeral_anchor(const vmhook::oop_t address) noexcept
+        inline auto make_ephemeral_anchor(const vmhook::oop_t address)
             -> std::shared_ptr<const vmhook::detail::anchor_node>
         {
             if (!address)
@@ -24519,6 +24521,7 @@ namespace hotspot
                     address, node->born.collections);
                 return node;
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception&)
             {
                 return {};
@@ -24533,7 +24536,7 @@ namespace hotspot
         {
         public:
             explicit access(const vmhook::oop_t address,
-                            vmhook::detail::native_backend::root root = {}) noexcept
+                            vmhook::detail::native_backend::root root = {})
                 : wrapper_{ address }
             {
                 if (!root && this->lifetime_ && address)
@@ -24611,7 +24614,7 @@ namespace hotspot
         auto operator=(ref&&) noexcept -> ref& = default;
         ~ref() = default;
 
-        static auto from_native_root(vmhook::detail::native_backend::root root) noexcept -> ref
+        static auto from_native_root(vmhook::detail::native_backend::root root) -> ref
         {
             if (!root) { return {}; }
             try
@@ -24625,6 +24628,7 @@ namespace hotspot
                 result.anchor_ = std::move(node);
                 return result;
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (...) { return {}; }
         }
 
@@ -24648,7 +24652,7 @@ namespace hotspot
             value.  [ADV] - prefer the (class_name, field_name) overload.
         */
         static auto at_static(vmhook::hotspot::klass* const declaring_klass,
-                              const std::size_t offset) noexcept
+                              const std::size_t offset)
             -> ref
         {
             vmhook::detail::native_backend::operation access{};
@@ -24668,7 +24672,7 @@ namespace hotspot
             once through log_line(), so a typo is observable rather than silent.
         */
         static auto at_static(const std::string_view class_name,
-                              const std::string_view field_name) noexcept
+                              const std::string_view field_name)
             -> ref
         {
             vmhook::detail::native_backend::operation access{};
@@ -24709,6 +24713,7 @@ namespace hotspot
                     entry->declaring_klass ? entry->declaring_klass : target };
                 return ref::at_static(mirror_klass, static_cast<std::size_t>(entry->offset));
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception& ex)
             {
                 ::vmhook::detail::log_line("{} vmhook::ref::at_static('{}', '{}') failed: {}",
@@ -24722,7 +24727,7 @@ namespace hotspot
             @details An observed epoch change rejects the address. A hook callback or
             unchanged sample does not itself root the object or prevent concurrent GC.
         */
-        static auto ephemeral(const vmhook::oop_t address) noexcept
+        static auto ephemeral(const vmhook::oop_t address)
             -> ref
         {
             ref result{};
@@ -24838,7 +24843,7 @@ namespace hotspot
             check the ref (`if (!player) { ... }`) exactly once, as A6 intends,
             rather than after every field.
         */
-        auto operator->() const noexcept
+        auto operator->() const
             -> vmhook::detail::access<wrapper_type>
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
@@ -24850,7 +24855,7 @@ namespace hotspot
         }
 
         /* @brief Same as operator->, spelled for `(*ref).member`. */
-        auto operator*() const noexcept
+        auto operator*() const
             -> vmhook::detail::access<wrapper_type>
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
@@ -24869,7 +24874,7 @@ namespace hotspot
             null any_object.  See borrowed's twin for why the untyped case
             deserves a `->` at all.
         */
-        auto operator->() const noexcept
+        auto operator->() const
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
@@ -24880,7 +24885,7 @@ namespace hotspot
         }
 
         /* @brief Same as operator->, spelled for `(*ref).member`. */
-        auto operator*() const noexcept
+        auto operator*() const
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
@@ -24920,7 +24925,7 @@ namespace hotspot
                    byte offset.  [ADV] - prefer the by-name overload.
         */
         template<typename field_wrapper = void>
-        auto field_at(const std::size_t offset) const noexcept
+        auto field_at(const std::size_t offset) const
             -> vmhook::ref<field_wrapper>
         {
             vmhook::ref<field_wrapper> result{};
@@ -24939,7 +24944,7 @@ namespace hotspot
             Returns empty on lookup failure.
         */
         template<typename field_wrapper = void>
-        auto field(const std::string_view name) const noexcept
+        auto field(const std::string_view name) const
             -> vmhook::ref<field_wrapper>
         {
             vmhook::detail::native_backend::operation access{};
@@ -24999,6 +25004,7 @@ namespace hotspot
                     0);
                 return result;
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception& ex)
             {
                 ::vmhook::detail::log_line("{} vmhook::ref::field('{}') failed: {}", vmhook::error_tag, name, ex.what());
@@ -25014,7 +25020,7 @@ namespace hotspot
             An invalid index or unresolved parent yields no object.
         */
         template<typename element_wrapper = void>
-        auto element(const std::int32_t index) const noexcept
+        auto element(const std::int32_t index) const
             -> vmhook::ref<element_wrapper>
         {
             vmhook::ref<element_wrapper> result{};
@@ -25086,7 +25092,7 @@ namespace hotspot
 
         /*
             @brief Internal name of the object's RUNTIME class, or an empty string.
-            Exception safety: strong - returns empty on any failure.
+            C++ allocation failures propagate; unavailable metadata returns empty.
         */
         auto class_name() const
             -> std::string
@@ -25111,6 +25117,7 @@ namespace hotspot
                 }
                 return name_symbol->to_string();
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception&)
             {
                 return std::string{};
@@ -25266,21 +25273,21 @@ namespace hotspot
         }
 
         /* @brief The static field's current value address, or nullptr. */
-        auto resolve() const noexcept
+        auto resolve() const
             -> vmhook::oop_t
         {
             return this->anchor_ref().resolve();
         }
 
         /* @brief True when the root binds AND currently holds a live object. */
-        explicit operator bool() const noexcept
+        explicit operator bool() const
         {
             return this->resolve() != nullptr;
         }
 
         /* @brief True once the (class, field) pair has resolved to a real
            static reference field.  False before the class is loaded. */
-        auto bound() const noexcept
+        auto bound() const
             -> bool
         {
             return !this->anchor_ref().empty();
@@ -25306,7 +25313,7 @@ namespace hotspot
         }
 
     private:
-        auto anchor_ref() const noexcept
+        auto anchor_ref() const
             -> vmhook::ref<wrapper_type>
         {
             try
@@ -25336,6 +25343,7 @@ namespace hotspot
                 }
                 return this->bound_;
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception&)
             {
                 return vmhook::ref<wrapper_type>{};
@@ -25427,7 +25435,7 @@ namespace hotspot
                 this->address_, this->born_.collections) };
         }
 
-        auto operator->() const noexcept
+        auto operator->() const
             -> vmhook::detail::access<wrapper_type>
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
@@ -25436,7 +25444,7 @@ namespace hotspot
             return vmhook::detail::access<wrapper_type>{ this->resolve(), this->native_root_ };
         }
 
-        auto operator*() const noexcept
+        auto operator*() const
             -> vmhook::detail::access<wrapper_type>
             requires (!std::is_void_v<wrapper_type>
                       && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
@@ -25456,7 +25464,7 @@ namespace hotspot
             so an expired borrow binds a null any_object rather than the
             address it used to have.
         */
-        auto operator->() const noexcept
+        auto operator->() const
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
@@ -25465,7 +25473,7 @@ namespace hotspot
         }
 
         /* @brief Same as operator->, spelled for `(*handle).member`. */
-        auto operator*() const noexcept
+        auto operator*() const
             -> vmhook::detail::access<vmhook::any_object>
             requires (std::is_void_v<wrapper_type>)
         {
@@ -25479,7 +25487,7 @@ namespace hotspot
             It does NOT become durable, because no GC root exists to make it so;
             anchor it off a vmhook::root for that.
         */
-        auto pin() const noexcept
+        auto pin() const
             -> vmhook::ref<wrapper_type>
         {
             return this->native_root_ ? vmhook::ref<wrapper_type>::from_native_root(this->native_root_)
@@ -25488,7 +25496,7 @@ namespace hotspot
 
         /* @brief Anchors a child ref at the named reference field of this object. */
         template<typename field_wrapper = void>
-        auto field(const std::string_view name) const noexcept
+        auto field(const std::string_view name) const
             -> vmhook::ref<field_wrapper>
         {
             return this->pin().template field<field_wrapper>(name);
@@ -26644,7 +26652,7 @@ namespace hotspot
     */
     template<typename element_wrapper, typename array_wrapper>
     inline auto elements_of(const vmhook::ref<array_wrapper>& array_ref,
-                            const std::size_t max_elements = vmhook::k_max_safe_container_elems) noexcept
+                            const std::size_t max_elements = vmhook::k_max_safe_container_elems)
         -> vmhook::ref_vector<element_wrapper>
     {
         vmhook::ref_vector<element_wrapper> result{};
@@ -26674,6 +26682,7 @@ namespace hotspot
             }
             return result;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (const std::exception&)
         {
             return vmhook::ref_vector<element_wrapper>{};
@@ -26685,7 +26694,7 @@ namespace hotspot
     */
     template<typename wrapper_type>
     inline auto static_ref(const std::string_view class_name,
-                           const std::string_view field_name) noexcept
+                           const std::string_view field_name)
         -> vmhook::ref<wrapper_type>
     {
         return vmhook::ref<wrapper_type>::at_static(class_name, field_name);
@@ -26696,7 +26705,7 @@ namespace hotspot
                detour-scoped address.
     */
     template<typename wrapper_type>
-    inline auto ephemeral_ref(const vmhook::oop_t address) noexcept
+    inline auto ephemeral_ref(const vmhook::oop_t address)
         -> vmhook::ref<wrapper_type>
     {
         return vmhook::ref<wrapper_type>::ephemeral(address);

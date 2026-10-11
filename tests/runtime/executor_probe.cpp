@@ -125,6 +125,67 @@ namespace
         const auto retry_ok = check(output, "context_failure_retry", retry);
         return propagation_ok && cleanup_ok && retry_ok;
     }
+    auto legacy_reference_allocation_failures(std::ostream& output) -> bool
+    {
+        vmhook::native_thread_context context{"VMHook-reference-faults"};
+        if (!context.valid()) { throw vmhook::exception{context.error()}; }
+        const auto owner = fixture::create(37);
+        const vmhook::borrowed<node> borrowed{owner->get_instance(), owner->get_native_root()};
+        const auto reference = borrowed.pin();
+        const auto owner_class = vmhook::detail::registered_class_klass<fixture>();
+        const auto retained_field = vmhook::find_field(owner_class, "retained");
+        const auto child_field = vmhook::find_field(vmhook::detail::registered_class_klass<node>(), "child");
+        if (!child_field || !retained_field) { throw vmhook::exception{"Reference fixture metadata is absent"}; }
+        const auto nodes = vmhook::ref<void>::at_static("ExecutorFixture", "retained_nodes");
+        // Keep the raw diagnostic borrow and each faulted expression under one
+        // VM operation. The fixture's independent GC cannot invalidate them.
+        vmhook::detail::native_backend::operation access{};
+        const vmhook::borrowed<node> raw_borrowed{owner->get_instance()};
+        const vmhook::borrowed<void> raw_untyped_borrowed{owner->get_instance()};
+        auto fails = [](auto&& expression) -> bool
+        {
+            bool rejected{};
+            allocation_fault::context_budget = 0;
+            try { expression(); }
+            catch (const std::bad_alloc&) { rejected = true; }
+            allocation_fault::context_budget = -1;
+            return rejected;
+        };
+        // This boundary used to be noexcept. Failing root-ticket allocation
+        // must reach C++, without invoking terminate or crossing a JVM ABI.
+        check(output, "legacy_access_fault_begin", true);
+        const auto access_oom = fails([&] { (void)reference.operator->(); })
+            && fails([&] { (void)reference.operator*(); })
+            && fails([&] { (void)reference.erased().operator->(); })
+            && fails([&] { (void)reference.erased().operator*(); });
+        const auto borrowed_access_oom = fails([&] { (void)raw_borrowed.operator->(); })
+            && fails([&] { (void)raw_borrowed.operator*(); })
+            && fails([&] { (void)raw_untyped_borrowed.operator->(); })
+            && fails([&] { (void)raw_untyped_borrowed.operator*(); });
+        const auto anchor_oom = fails([&] { (void)borrowed.pin(); })
+            && fails([&] { (void)vmhook::ref<node>::from_native_root(owner->get_native_root()); })
+            && fails([&] { (void)vmhook::ephemeral_ref<node>(owner->get_instance()); })
+            && fails([&] { (void)reference.field_at<node>(child_field->offset); })
+            && fails([&] { (void)nodes.element<node>(0); })
+            && fails([&] { (void)vmhook::elements_of<node>(nodes); })
+            && fails([&] { (void)reference.field<node>("child"); })
+            && fails([&] { (void)borrowed.field<node>("child"); })
+            && fails([&] { (void)vmhook::static_ref<node>("ExecutorFixture", "retained"); })
+            && fails([&] { (void)vmhook::ref<node>::at_static(owner_class, retained_field->offset); });
+        const vmhook::root<node> static_root{"ExecutorFixture", "retained"};
+        const auto root_oom = fails([&] { (void)static_root.resolve(); })
+            && fails([&] { (void)static_root.bound(); })
+            && fails([&] { (void)static_cast<bool>(static_root); });
+        const auto diagnostics_oom = fails([&] { (void)reference.class_name(); });
+        const auto boundaries_ok = check(output, "legacy_access_cpp_oom", access_oom && borrowed_access_oom);
+        const auto anchors_ok = check(output, "legacy_anchor_cpp_oom", anchor_oom && root_oom && diagnostics_oom);
+        const auto retry_ok = check(output, "legacy_failure_retry", reference->value() == 37
+            && reference.field<node>("child")->value() == 37 && static_root->value() == 17
+            && vmhook::ref<node>::ephemeral(nullptr).empty()
+            && vmhook::ref<node>{}.field_at<node>(0).empty()
+            && vmhook::ref<node>{}.element<node>(-1).empty());
+        return boundaries_ok && anchors_ok && retry_ok;
+    }
     auto worker(void*) -> DWORD
     {
         char destination[4096]{};
@@ -148,7 +209,8 @@ namespace
                 && !vmhook::detail::persistent_hook_roots::prepared_keeper.load())) { return 2; }
             if (!check(output, "metadata", vmhook::register_class<fixture>("ExecutorFixture")
                 && vmhook::register_class<node>("ExecutorFixture$Node"))) { return 2; }
-            if (!context_allocation_failures(output)) { return 2; }
+            if (!legacy_reference_allocation_failures(output)
+                || !context_allocation_failures(output)) { return 2; }
             vmhook::retained_object<node> saved{};
             {
                 vmhook::native_thread_context source{"VMHook-executor-source"};

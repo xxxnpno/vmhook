@@ -1,9 +1,12 @@
 public final class ExecutorFixture {
     public static final class Node {
         public int value;
-        public Node(int value) { this.value = value; }
+        public Node child;
+        public Node(int value) { this.value = value; child = this; }
         public int add(int amount) { return value + amount; }
     }
+    public static Node retained = new Node(17);
+    public static Node[] retained_nodes = {retained};
     public static Node create(int value) { return new Node(value); }
     public static String thread_name() { return Thread.currentThread().getName(); }
     public static void collect() { System.gc(); }

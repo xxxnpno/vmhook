@@ -46,7 +46,7 @@ CHECKS = {
                        "synchronized_original_after_remove", "callback_throw_proof"],
     "executor": ["metadata", "backpressure", "queued_cancel", "worker_context", "queued_deadline",
                  "retained_argument", "retained_result", "running_cancel", "self_wait_refused",
-                 "joined_close", "parallel_workers", "cancelled_close", "preparation_cpp_oom", "copied_java_failure", "retained_throwable", "context_allocation_coverage", "context_cpp_oom", "context_failure_cleanup", "context_failure_retry", "executor_task_cpp_oom", "executor_complete"],
+                 "joined_close", "parallel_workers", "cancelled_close", "preparation_cpp_oom", "copied_java_failure", "retained_throwable", "context_allocation_coverage", "context_cpp_oom", "context_failure_cleanup", "context_failure_retry", "executor_task_cpp_oom", "legacy_access_cpp_oom", "legacy_anchor_cpp_oom", "legacy_failure_retry", "executor_complete"],
     "management": ["passive_preflight", "exact_runtime_identity", "preflight_no_attachment",
                    "memory_observation", "runtime_counters", "real_gc_counters", "memory_pool_observation",
                    "real_allocation_counters", "bounded_allocation_snapshot", "java_thread_identity",
