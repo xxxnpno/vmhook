@@ -18,7 +18,8 @@ import time
 
 from runtime_evidence import runtime_evidence, read_results
 
-REQUIRED = ('reference_install',)
+REQUIRED = ('reference_install', 'reference_install_allocation_failure',
+            'reference_loader_refusal', 'reference_binding_rebind')
 
 
 def main() -> int:
