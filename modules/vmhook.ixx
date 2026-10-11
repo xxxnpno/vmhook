@@ -25605,6 +25605,19 @@ namespace hotspot
                 vmhook::detail::container_address(component_array)));
             if (!component_mirror) { throw vmhook::exception{ "Nested Java array class could not be retained" }; }
         }
+        else if constexpr (vmhook::detail::container_wrapper<element_type>)
+        {
+            // An ordinary wrapper can bind one of several same-named classes.
+            // Use its exact retained class instead of a name-only Class.forName.
+            auto* const component_class{vmhook::detail::registered_class_klass<element_type>()};
+            if (component_class)
+            {
+                component_mirror = vmhook::detail::native_backend::retain_class(component_class);
+                if (!component_mirror) { throw vmhook::exception{"Java array component class could not be retained"}; }
+            }
+            else if constexpr (!requires { std::string_view{element_type::java_contract}; })
+            { throw vmhook::exception{"Java array component wrapper has no resolved class binding"}; }
+        }
         constexpr auto width{ vmhook::detail::container_wrapper<element_type>
             ? sizeof(std::uint32_t) : sizeof(element_type) };
         const auto result{ vmhook::detail::allocate_array_through_java(descriptor, length, width, component_mirror) };
