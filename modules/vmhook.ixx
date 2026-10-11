@@ -14481,6 +14481,35 @@ export namespace vmhook
     // --- Collector-aware field access ----------------------------------------
     namespace detail::field_memory_backend
     {
+        inline auto bootstrap_class(const std::string_view name) -> vmhook::hotspot::klass*
+        {
+            const auto* data_entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_class_loader_data") };
+            if (!data_entry)
+            { data_entry = vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_class_loader_data"); }
+            const auto* const loader_entry{ vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_class_loader") };
+            if (!data_entry || !loader_entry || !loader_entry->type_string) { return nullptr; }
+            vmhook::hotspot::klass* result{};
+            const vmhook::hotspot::class_loader_data_graph graph{};
+            graph.for_each_klass([&](const std::string_view observed, vmhook::hotspot::klass* const klass)
+            {
+                if (result || observed != name) { return; }
+                void* data{};
+                void* loader{};
+                if (!vmhook::os::safe_read(&data, reinterpret_cast<const std::byte*>(klass)
+                        + data_entry->offset, sizeof(data)) || !data
+                    || !vmhook::os::safe_read(&loader, static_cast<const std::byte*>(data)
+                        + loader_entry->offset, sizeof(loader))) { return; }
+                const std::string_view storage{ loader_entry->type_string };
+                if (storage == "OopHandle")
+                {
+                    if (loader && !vmhook::os::safe_read(&loader, loader, sizeof(loader))) { return; }
+                }
+                else if (storage != "oop") { return; }
+                if (!loader) { result = klass; }
+            });
+            return result;
+        }
+
         /* Unsafe is an already-loaded Java class. Calling its Java methods
            through JavaCalls executes HotSpot's real Access<...> collector and
            volatile barriers. No native interface table or Unsafe native symbol
@@ -14504,7 +14533,9 @@ export namespace vmhook
             { throw vmhook::exception{ "Field barriers require a rooted field and a supported native or callback context" }; }
             for (const std::string_view class_name : { "jdk/internal/misc/Unsafe", "sun/misc/Unsafe" })
             {
-                auto* const unsafe_class{ vmhook::find_class(class_name) };
+                // A user class-lookup override or a same-named application
+                // class cannot substitute for the VM's bootstrap accessor.
+                auto* const unsafe_class{ bootstrap_class(class_name) };
                 if (!unsafe_class || !vmhook::detail::class_initialized(unsafe_class)) { continue; }
                 const auto metadata{ native_backend::retain_class(unsafe_class) };
                 const auto singleton_field{ vmhook::find_field(unsafe_class, "theUnsafe") };
