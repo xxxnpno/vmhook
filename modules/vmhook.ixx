@@ -29933,7 +29933,17 @@ export namespace vmhook
                                             std::move(name), std::move(throwable)};
                 }
             }
-            catch (...) { if (this->locked_) { this->unlock(); } throw; }
+            catch (...)
+            {
+                // Retaining the Throwable or copying its class name can fail
+                // with C++ allocation failure. Consume only this acquisition's
+                // pending Java exception before balanced monitor cleanup, so
+                // a later call on the context cannot inherit a stale failure.
+                if (pn::pending_exception(this->context_->thread))
+                { pn::clear_pending_exception(this->context_->thread); }
+                if (this->locked_) { this->unlock(); }
+                throw;
+            }
         }
         ~monitor_lock() noexcept
         {
