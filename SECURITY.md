@@ -1,42 +1,30 @@
 # Security policy
 
-vmhook is a low-level reverse-engineering / runtime-instrumentation library.
-Misuse can crash, deadlock, or destabilise the target JVM.  That said, the
-library code itself can still contain memory-safety bugs that are worth
-reporting privately.
+VMHook accesses HotSpot metadata and executable memory inside a Windows x64
+process. Memory safety errors in the library should be reported privately.
 
 ## Reporting a vulnerability
 
-Please **do not** open a public issue for a security bug.  Instead:
+Open a [private security advisory](https://github.com/xxxnpno/vmhook/security/advisories/new)
+with a minimal reproducer, the VMHook revision, the G++ version, and the exact
+JDK build. Include the collector and any non-default JVM options when relevant,
+plus a crash log or stack trace with private application data removed.
 
-1. Open a private security advisory at
-   <https://github.com/xxxnpno/vmhook/security/advisories/new>.
-2. Include a minimal reproducer, a description of the impact, and any
-   suggested fix.
-
-You should expect a first response within a few days.  Once a fix is in
-place we will coordinate disclosure (typically by merging the fix to
-`master`, tagging a release, and credit-attributing the reporter in
-`CHANGELOG.md`).
+Report ordinary compatibility issues through GitHub issues. If an issue exposes
+memory corruption or sensitive process data, use a private advisory instead.
 
 ## Supported versions
 
-Only the most recent minor version on `master` receives security fixes.
-There are no LTS branches.  If you need a fix back-ported, please mention
-that in the advisory; we'll consider it case-by-case.
+Fixes target the current default branch. There are no maintained LTS branches;
+backport requests can be included in an advisory.
 
-## What counts as a security bug
+## Examples
 
-- Memory-safety bugs (use-after-free, OOB read/write) in the library code.
-- Logic bugs that allow a hooked Java method to escape the trampoline and
-  corrupt the JVM.
-- Misuses of OS APIs (`VirtualProtect`, `mprotect`, `mmap`) that leave
-  pages in an unintended state.
+- Out-of-bounds access, use-after-free, stale object references, or invalid
+  generated machine code caused by VMHook.
+- Incorrect use of Windows memory protection or exception handling.
+- Thread, collector, or object-lifetime mistakes that corrupt JVM state.
 
-## What does *not* count
-
-- "vmhook can be used to do X" — vmhook is intentionally a debugging /
-  injection library; the surface area is the threat model.
-- Compatibility breaks across JDK builds.
-- Crashes in code that explicitly accepts a raw `void*` from outside
-  vmhook (e.g. an OOP returned by user code).
+An unsupported JDK or collector can still reveal a reportable library bug;
+provide the reproducer so the failure can be distinguished from a refused
+operation.

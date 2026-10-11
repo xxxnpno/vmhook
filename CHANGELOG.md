@@ -4,6 +4,147 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `vmhook::native_thread_context` registers a DLL-created Windows OS thread with
+  HotSpot through private VM operations. Java methods and constructors execute
+  synchronously on that same OS thread, without JNI/JVMTI, a Java hook or a
+  dispatch queue. Contexts report attachment errors and have explicit closure.
+- Exact-image private ABI profiles spanning Java 8–27, plus a checked matching
+  full-PDB resolver for compatible unlisted builds. Thread lifecycle, private
+  signatures, type layouts and VM metadata are checked before attachment.
+- Context-bound VM roots for constructed objects, object-valued results,
+  reference field reads, wrapper copies and supported `borrowed`/`ref`
+  conversions. Roots survive moving GC while the native worker is idle;
+  foreign-thread use and use after context closure are refused. Temporary
+  internal handles are released and persistent root slots can be reused.
+- Dedicated injected-runtime fixtures for direct native calls, construction,
+  Unicode Strings, idle GC, exceptions, compiled calls, repeated/concurrent
+  attachment and context lifetime. Both interfaces have Java 8–27 CI coverage.
+- Persistent `hook_field<wrapper, value_type>` callbacks before static primitive reads
+  and writes, using generated ASM stubs in HotSpot's `getstatic`/`putstatic`
+  templates. `field_access<value_type>` supports replacement and prevention;
+  `unhook_field<wrapper>` removes the registration. All eight primitive types
+  are supported; reference fields and accesses outside these bytecodes are
+  refused or outside the observation scope.
+- Persistent class observer IDs with `remove_class_observer`, covering
+  successful ordinary, bootstrap, ByteBuffer, hidden/anonymous and array
+  definition paths. Events expose actual defining loader-data identity and
+  borrowed metadata; failed definitions and existing-class replay are excluded.
+- Public injected-runtime fixtures for compiled and inlined method hooks,
+  typed cancellation/returns, registry contention, future compilation, static
+  fields, newly loaded accessors, class notifications and rooted callbacks.
+
+### Changed
+
+- Object-valued method cancellation keeps its synthetic return stack cell
+  visible to HotSpot's real GC frame walker. Moving collectors update the
+  address consumed by the normal return epilogue, including its safepoint
+  polls and stack-watermark handling. Exact profiles cover Java 8's temporary
+  BCI representation, relative stack slots from Java 22 and all three scanner
+  specializations in Java 26/27. Frozen runtime probes report actual visits to
+  that additional root; virtual-thread frames remain outside verified scope.
+- Windows Java 8–11 callback return uses HotSpot's `transition_and_fence` with
+  the original stack-guard and special-exit handling. Java 9 guard and exit
+  aliases are verified against exact relative CALL targets. The Windows CI
+  repeats rooted callbacks during moving GC on Java 8–11, 15 and 16.
+
+- Windows x64 and MinGW-w64 G++ are the supported platform and compiler.
+  The standalone header remains C++23 permanently; the latest C++ module uses
+  static reflection. Both interfaces share the same runtime implementation.
+- The header lives in `include/vmhook/vmhook.hpp`; the canonical module source
+  lives in `modules/vmhook.ixx`. Neither module interface contains preprocessor
+  directives. The Windows bridge imports an SDK header unit, and
+  `tools/make_header.py` generates the C++23 header.
+- The module builder creates a build-directory libstdc++ overlay for affected
+  GCC 16 Windows `import std` linkage, preserving the ABI and forwarding the
+  required include path to consumers without changing installed headers.
+- **Breaking wrapper API:** use snake_case C++ names throughout. Instance
+  wrappers inherit receiver-bound `get_method` and `get_field` from
+  `object<wrapper>`; call `get_method("add", "(I)I")` or `get_field("value")`
+  without passing `this` or `*this`. Static members use
+  `static_members::get_method("count")` and `static_members::get_field("total")`
+  inside a wrapper, or qualify them with the wrapper class externally.
+  Checked lookup arrows report missing members through `vmhook::exception`.
+  Java class/member strings and external ABI names retain their exact spelling.
+- Collection and map conversions use Java `Collection.toArray()` and
+  `Map.entrySet().toArray()` rather than guessed private node layouts. Common
+  list, set, queue and map wrappers share this path, preserving Java encounter
+  order and null elements. A declared vector return type supplies wrapper
+  types for `to_vector()`; explicit templates remain available for `auto`
+  locals. Source snapshots and returned wrappers retain native-context roots;
+  invalid contexts, incompatible elements and failed calls are reported.
+- Native-context construction uses HotSpot's collector-aware allocator,
+  initializes an already-loaded concrete class and invokes its real constructor.
+  String arguments use the private VM String allocator, including Java 27's
+  default compact headers. Method and field callbacks use the same private
+  JavaCalls/allocation backend with temporary VM roots; raw array TLAB paths
+  retain narrower allocation requirements.
+- Method hook installation temporarily pauses compiler dispatch, drains older
+  compilation tasks and performs real VM-safepoint deoptimization before
+  publishing the callback. Already-compiled and inlined calls reach the
+  interpreter hook; the target stays excluded from compilation and inlining,
+  while unrelated JIT compilation resumes. Native, abstract, constructor,
+  class-initializer methods and methods with an active HotSpot intrinsic ID
+  remain refused. Registration requires an already-linked declaring class and
+  does not load or initialize it.
+- Static-field hook installation excludes methods containing static field
+  bytecodes from compilation and inlining until the last field hook is removed.
+  Accessor intrinsic IDs and specialized interpreter entries are temporarily
+  suppressed too, then restored with VMHook's owned exclusions on removal.
+  New class-definition paths apply that policy before exposing their methods.
+  Failed policy preparation reports a preallocated, rooted Java
+  `OutOfMemoryError` without allocating on the failure path.
+- `watch_static_field` now uses synchronous pre-write ASM callbacks. Its first
+  callback argument is zero and its second is the pending value; no sampled
+  old value or hardware debug-register watchpoint is involved.
+- `method_proxy::value_t::was_invoked()` distinguishes refused calls from real
+  void, null or zero results. Java exceptions are reported and consumed by the
+  native backend; construction rejects an object whose constructor did not run.
+- Public reference field stores require Epsilon until a correct write-barrier
+  backend exists. Typed references require verified compressed oops. Concurrent
+  relocating collectors such as ZGC and Shenandoah are refused.
+- Java 8–27 metadata and ABI handling cover legacy thread alignment/TLS,
+  attachment cleanup ownership, packed Symbol lengths, narrow-reference widths,
+  compact headers, array layouts and method-handle calling conventions.
+- `vmhook::dispatch` remains an optional route onto an existing hooked Java
+  thread; direct native-context calls do not depend on it.
+- README, native-thread and hook documentation describe the public API, GC lifetimes,
+  exact-build compatibility and validation limits. Historical benchmark numbers
+  are not current performance claims.
+
+### Removed
+
+- JNI and JVMTI API calls, including function-table invocations, attachment
+  entry points, hidden JNI helpers and JNI global-reference fallbacks.
+- Scoped hooks and their RAII handles. Hooks have explicit persistent lifetime.
+- Separate static lookup functions and explicit-receiver wrapper overloads.
+  Use `get_method` and `get_field` on an instance, or the wrapper's
+  class-bound lookup functions under `static_members` for static members.
+- Compiler and operating-system branches outside Windows x64 G++.
+- Unchecked JIT entry rewrites and the hook-repair watchdog. Compilation
+  exclusions and deoptimization now follow the verified safepoint protocol.
+- Build targets referring to missing examples, injectors or test trees.
+
+### Fixed
+
+- Interpreter trampoline allocation keeps its strict nearby-address contract.
+  A failed hint no longer falls back outside the relative jump's range.
+  Cancellation tests use a previously unused method, verify its body is skipped,
+  and verify normal execution resumes after shutdown.
+- Method dispatch uses an immutable published registry rather than dropping
+  callbacks when the installation mutex is busy. Method and field callbacks
+  enter native state with a walkable Java frame and VM-scanned roots, allowing
+  nested Java calls and collection before returning to the interpreter.
+
+The entries below preserve historical release notes. Earlier platform support,
+APIs, JNI paths, test counts, timing figures and claimed artifacts describe
+those entries as originally recorded; they have not been independently
+revalidated and are not guarantees for the current implementation. Use the
+README and current source for supported behavior.
+
 ## [7.0.0] — 2026-08-14
 
 ### Changed
