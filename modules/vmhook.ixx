@@ -13004,13 +13004,17 @@ export namespace vmhook
                 context->thread = context->attachment->get();
                 context->session = std::make_unique<private_native::java_session>(context->thread);
                 context->previous_provider = private_native::root_reuse_callback();
+                // Finish throwing bookkeeping before publishing the TLS owner
+                // or its self-keepalive. Partial construction then releases the
+                // Java session and attachment in their normal destruction order.
+                this->error_ = "Attached";
                 context->self_keepalive = context;
                 context->alive.store(true, std::memory_order_release);
                 this->lifetime_ = context;
                 native_backend::current_context_lifetime() = context.get();
                 private_native::root_reuse_callback() = &native_backend::reuse_root_slot;
-                this->error_ = "Attached";
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception& failure) { this->error_ = failure.what(); }
             catch (...) { this->error_ = "Native context initialization failed"; }
         }

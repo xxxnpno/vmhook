@@ -47,6 +47,10 @@ loaded. Check `valid()` or its boolean conversion and inspect `error()` on
 failure. The optional constructor argument sets the Java thread's name; the
 default includes its Windows thread ID. VMHook registers it as a daemon thread,
 so its presence does not keep the JVM alive after application threads finish.
+An allocation failure in C++ name, context or session bookkeeping throws
+`std::bad_alloc`. Partial construction releases the attachment before the
+exception reaches the caller; the same OS thread can retry. Unsupported VM
+profiles and VM attachment refusals remain invalid contexts with an `error()`.
 
 Each wrapper operation enters VM state for the necessary work and returns to
 native state afterward. Normal C++ waits and sleeps therefore let HotSpot

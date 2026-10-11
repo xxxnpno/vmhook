@@ -10,9 +10,15 @@ import vmhook.windows;
 namespace allocation_fault
 {
     inline std::atomic<std::size_t> rejected_size{};
+    inline thread_local std::int32_t context_budget{-1};
+    inline thread_local std::size_t context_allocations{};
+    inline thread_local bool count_context_allocations{};
 }
 [[gnu::noinline]] auto operator new(std::size_t size) -> void*
 {
+    if (allocation_fault::count_context_allocations) { ++allocation_fault::context_allocations; }
+    if (allocation_fault::context_budget >= 0 && allocation_fault::context_budget-- == 0)
+    { allocation_fault::context_budget = -1; throw std::bad_alloc{}; }
     auto expected = size;
     if (size && allocation_fault::rejected_size.compare_exchange_strong(expected, 0))
     { throw std::bad_alloc{}; }
@@ -81,6 +87,44 @@ namespace
         while (!flag.load() && std::chrono::steady_clock::now() < deadline) { ::Sleep(1); }
         return flag.load();
     }
+    auto context_allocation_failures(std::ostream& output) -> bool
+    {
+        // Warm profile/TLS and collector lookup independently of this test.
+        // The long name then makes the constructor's string allocation visible,
+        // followed by the context, attachment and Java-session allocations.
+        constexpr std::string_view name{
+            "VMHook-context-allocation-fault-with-a-long-name-for-real-attachment-cleanup"};
+        allocation_fault::context_allocations = 0;
+        allocation_fault::count_context_allocations = true;
+        {
+            vmhook::native_thread_context context{name};
+            allocation_fault::count_context_allocations = false;
+            if (!context.valid()) { throw vmhook::exception{context.error()}; }
+        }
+        const auto allocations = allocation_fault::context_allocations;
+        if (!check(output, "context_allocation_coverage", allocations >= 5)) { return false; }
+        bool propagated{true};
+        bool cleaned{true};
+        bool retry{true};
+        for (std::size_t index{}; index < allocations; ++index)
+        {
+            bool rejected{};
+            allocation_fault::context_budget = static_cast<std::int32_t>(index);
+            try { vmhook::native_thread_context context{name}; }
+            catch (const std::bad_alloc&) { rejected = true; }
+            allocation_fault::context_budget = -1;
+            propagated = propagated && rejected;
+            cleaned = cleaned && !vmhook::detail::native_backend::current_context_lifetime()
+                && !vmhook::detail::private_native::rt().current_thread()
+                && vmhook::detail::private_native::active_session_count == 0;
+            vmhook::native_thread_context context{name};
+            retry = retry && context.valid() && fixture::thread_name() == name;
+        }
+        const auto propagation_ok = check(output, "context_cpp_oom", propagated);
+        const auto cleanup_ok = check(output, "context_failure_cleanup", cleaned);
+        const auto retry_ok = check(output, "context_failure_retry", retry);
+        return propagation_ok && cleanup_ok && retry_ok;
+    }
     auto worker(void*) -> DWORD
     {
         char destination[4096]{};
@@ -104,6 +148,7 @@ namespace
                 && !vmhook::detail::persistent_hook_roots::prepared_keeper.load())) { return 2; }
             if (!check(output, "metadata", vmhook::register_class<fixture>("ExecutorFixture")
                 && vmhook::register_class<node>("ExecutorFixture$Node"))) { return 2; }
+            if (!context_allocation_failures(output)) { return 2; }
             vmhook::retained_object<node> saved{};
             {
                 vmhook::native_thread_context source{"VMHook-executor-source"};
@@ -162,6 +207,11 @@ namespace
                 }
             }
             if (!check(output, "copied_java_failure", failure_copied)) { return 8; }
+            auto cpp_failed = executor.submit([]() -> std::int32_t { throw std::bad_alloc{}; });
+            bool allocation_copied{};
+            try { (void)cpp_failed.get(); }
+            catch (const std::bad_alloc&) { allocation_copied = true; }
+            if (!check(output, "executor_task_cpp_oom", allocation_copied)) { return 8; }
             auto throwable = executor.submit([]() -> vmhook::retained_object<vmhook::any_object>
             {
                 try { fixture::fail(); }
