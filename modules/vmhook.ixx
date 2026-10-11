@@ -34,6 +34,20 @@ export namespace vmhook::detail
     inline auto prepare_class_hooks(vmhook::hotspot::klass*) noexcept -> bool;
     inline auto finish_class_hooks(vmhook::hotspot::klass*, bool) noexcept -> void;
     inline auto fail_class_hook_preparation(void*) noexcept -> void;
+    inline auto class_event_notification_active() noexcept -> bool;
+}
+
+export namespace vmhook
+{
+    using method_hook_id = std::uint64_t;
+    enum class hook_recursion : std::uint8_t { suppress_same_observer, allow };
+    struct hook_options final
+    {
+        // Lower priorities run first; registration ID breaks ties. The first
+        // callback cancelling execution wins and later callbacks are skipped.
+        std::int32_t priority{};
+        hook_recursion recursion{ hook_recursion::suppress_same_observer };
+    };
 }
 
 export namespace vmhook::hotspot
@@ -6140,8 +6154,15 @@ export namespace vmhook
         };
 
         using hook_callback_t = std::function<void(vmhook::hotspot::frame*, vmhook::hotspot::java_thread*, vmhook::hotspot::return_slot*)>;
+        struct method_observer_control final
+        {
+            vmhook::method_hook_id id{};
+            vmhook::hook_options options{};
+            std::atomic<bool> enabled{ true };
+        };
         struct hooked_method
         {
+            std::shared_ptr<method_observer_control> observer{};
             vmhook::hotspot::method* method{};
             const vmhook::hotspot::const_method* const_method_identity{};
             std::shared_ptr<vmhook::hotspot::hook_callback_t> detour{};
@@ -6170,6 +6191,35 @@ export namespace vmhook
         inline std::vector<vmhook::hotspot::hooked_method> g_hooked_methods{};
         inline std::mutex g_hooked_methods_mutex{};
         inline std::atomic<bool> g_shutdown_requested{ false };
+        inline std::atomic<vmhook::method_hook_id> g_next_method_hook_id{ 1 };
+        inline std::atomic<std::size_t> g_active_hook_callbacks{};
+        inline std::atomic<std::uint64_t> g_hook_callback_failures{};
+        inline std::atomic<std::uint64_t> g_suppressed_hook_recursions{};
+        inline thread_local std::size_t current_method_observer_depth{};
+        inline thread_local std::size_t suppress_method_observers{};
+        struct method_observer_guard final
+        {
+            const method_observer_control* observer{};
+            method_observer_guard* previous{};
+            inline static thread_local method_observer_guard* current{};
+            explicit method_observer_guard(const method_observer_control* next) noexcept
+                : observer{ next }, previous{ current }
+            {
+                current = this; ++current_method_observer_depth;
+                g_active_hook_callbacks.fetch_add(1, std::memory_order_acq_rel);
+            }
+            ~method_observer_guard()
+            {
+                g_active_hook_callbacks.fetch_sub(1, std::memory_order_acq_rel);
+                --current_method_observer_depth; current = this->previous;
+            }
+            [[nodiscard]] static auto active(const method_observer_control* observer) noexcept -> bool
+            {
+                for (auto* entry{ current }; entry; entry = entry->previous)
+                { if (entry->observer == observer) { return true; } }
+                return false;
+            }
+        };
 
         struct hook_dispatch_snapshot
         {
@@ -6217,6 +6267,34 @@ export namespace vmhook
             const auto* const pointer{ next.get() };
             g_hook_dispatch_snapshots.push_back(std::move(next));
             g_hook_dispatch.store(pointer, std::memory_order_seq_cst);
+        }
+
+        inline auto dispatch_method_observers(const hook_dispatch_snapshot& snapshot,
+            const vmhook::hotspot::method* const method,
+            const vmhook::hotspot::const_method* const identity,
+            vmhook::hotspot::frame* const frame, vmhook::hotspot::java_thread* const thread,
+            vmhook::hotspot::return_slot* const slot) noexcept -> void
+        {
+            if (!slot || suppress_method_observers != 0) { return; }
+            for (const auto& entry : snapshot.methods)
+            {
+                if (g_shutdown_requested.load(std::memory_order_acquire) || slot->cancel) { break; }
+                if (entry.method != method || entry.const_method_identity != identity || !entry.detour) { continue; }
+                if (entry.observer && !entry.observer->enabled.load(std::memory_order_acquire)) { continue; }
+                // Even explicitly recursive observers have a finite C++ depth.
+                if (current_method_observer_depth >= 64
+                    || (entry.observer && entry.observer->options.recursion == vmhook::hook_recursion::suppress_same_observer
+                        && method_observer_guard::active(entry.observer.get())))
+                { g_suppressed_hook_recursions.fetch_add(1, std::memory_order_relaxed); continue; }
+                const method_observer_guard entered{ entry.observer.get() };
+                try { (*entry.detour)(frame, thread, slot); }
+                catch (...)
+                {
+                    // An unsuccessful callback cannot leave a forced return.
+                    slot->cancel = false; slot->retval = 0;
+                    g_hook_callback_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
 
         /*
@@ -6317,19 +6395,13 @@ export namespace vmhook
                 const auto* const current_method{ frame_pointer->get_method() };
                 if (!current_method) { return 0; }
                 const hook_dispatch_reader reader{};
-                const vmhook::hotspot::hook_callback_t* callback{};
-                if (!reader.snapshot) { return 0; }
+                if (!reader.snapshot || suppress_method_observers != 0) { return 0; }
                 const auto* const const_method{ current_method->get_const_method() };
-                {
-                    if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire)) { return 0; }
-                    for (const auto& entry : reader.snapshot->methods)
-                    {
-                        if (entry.method == current_method
-                            && entry.const_method_identity == const_method)
-                        { callback = entry.detour.get(); break; }
-                    }
-                }
-                if (!callback) { return 0; }
+                const auto found{ std::find_if(reader.snapshot->methods.begin(), reader.snapshot->methods.end(),
+                    [current_method, const_method](const auto& entry)
+                    { return entry.method == current_method && entry.const_method_identity == const_method
+                        && entry.detour && (!entry.observer || entry.observer->enabled.load(std::memory_order_acquire)); }) };
+                if (found == reader.snapshot->methods.end()) { return 0; }
                 // Keep the immutable snapshot alive through the callback. No
                 // callback ownership operation takes a registry lock or frees
                 // captured user objects while this Java thread is dispatching.
@@ -6351,17 +6423,19 @@ export namespace vmhook
                 const interpreter_locals_guard locals_guard{ frame_pointer, locals };
                 struct callback_arguments
                 {
-                    const vmhook::hotspot::hook_callback_t* callback;
+                    const hook_dispatch_snapshot* snapshot;
+                    const vmhook::hotspot::method* method;
+                    const vmhook::hotspot::const_method* identity;
                     vmhook::hotspot::frame* frame;
                     vmhook::hotspot::java_thread* thread;
                     vmhook::hotspot::return_slot* slot;
-                } arguments{ callback, frame_pointer, thread, slot };
+                } arguments{ reader.snapshot, current_method, const_method, frame_pointer, thread, slot };
                 const bool completed{ vmhook::detail::execute_borrowed_callback(thread, anchor,
                     +[](void* const opaque)
                     {
                         auto& call{ *static_cast<callback_arguments*>(opaque) };
                         vmhook::detail::pump_dispatch();
-                        (*call.callback)(call.frame, call.thread, call.slot);
+                        dispatch_method_observers(*call.snapshot, call.method, call.identity, call.frame, call.thread, call.slot);
                     }, &arguments) };
                 if (!completed) { slot->cancel = false; slot->retval = 0; }
                 // The genuine VM-to-Java transition may deliver an async
@@ -9124,12 +9198,15 @@ export namespace vmhook
     // safepoint before publishing the interpreter callback.
     template<class wrapper_type, class callback_type>
         requires vmhook::detail::hook_callback_supported_v<callback_type>
-    inline auto hook(const std::string_view method_name,
-                     const std::string_view method_signature,
-                     callback_type&& user_detour) -> bool
+    inline auto add_hook(const std::string_view method_name,
+                         const std::string_view method_signature,
+                         callback_type&& user_detour,
+                         const hook_options options = {}) -> method_hook_id
     {
         try
         {
+            if (vmhook::hotspot::in_java_detour() || vmhook::detail::class_event_notification_active())
+            { throw vmhook::exception{ "Install hooks from a native administrator, outside VM callbacks." }; }
             using traits_t = vmhook::detail::function_traits<std::remove_cvref_t<decltype(user_detour)>>;
             using all_args_tuple_t = typename traits_t::args_tuple_t;
             static_assert(std::tuple_size_v<all_args_tuple_t> >= 1,
@@ -9215,6 +9292,11 @@ export namespace vmhook
                 }(std::make_index_sequence<std::tuple_size_v<method_arg_tuple_t>>{});
             };
             vmhook::hotspot::hooked_method method_entry{};
+            method_entry.observer = std::make_shared<vmhook::hotspot::method_observer_control>();
+            method_entry.observer->id = vmhook::hotspot::g_next_method_hook_id.fetch_add(1, std::memory_order_relaxed);
+            if (method_entry.observer->id == 0) { throw vmhook::exception{ "Method observer IDs exhausted." }; }
+            method_entry.observer->options = options;
+            const auto observer_id{ method_entry.observer->id };
             method_entry.method = found_method;
             method_entry.const_method_identity = found_method->get_const_method();
             method_entry.detour = std::make_shared<vmhook::hotspot::hook_callback_t>(std::move(wrapper_detour));
@@ -9226,9 +9308,17 @@ export namespace vmhook
             std::vector<std::unique_ptr<vmhook::hotspot::hook_dispatch_snapshot>> retired_snapshots{};
             std::lock_guard<std::mutex> install_lock{ vmhook::hotspot::g_hooked_methods_mutex };
             if (vmhook::hotspot::g_shutdown_requested.load(std::memory_order_acquire)) { return false; }
-            for (const auto& existing : vmhook::hotspot::g_hooked_methods)
+            const auto existing_method{ std::find_if(vmhook::hotspot::g_hooked_methods.begin(),
+                vmhook::hotspot::g_hooked_methods.end(), [found_method](const auto& existing)
+                { return existing.method == found_method; }) };
+            const bool policy_installed{ existing_method != vmhook::hotspot::g_hooked_methods.end() };
+            if (policy_installed)
             {
-                if (existing.method == found_method) { return false; }
+                if (existing_method->const_method_identity != method_entry.const_method_identity
+                    || !existing_method->jit_policy)
+                { throw vmhook::exception{ "Hooked method identity changed." }; }
+                method_entry.jit_policy = existing_method->jit_policy;
+                method_entry.metadata_pin = existing_method->metadata_pin;
             }
             // Reserve all containers before patching any executable code. Publishing
             // the callback after patch succeeds cannot then fail on allocation.
@@ -9239,6 +9329,23 @@ export namespace vmhook
             auto next_dispatch{ std::make_unique<vmhook::hotspot::hook_dispatch_snapshot>() };
             next_dispatch->methods = vmhook::hotspot::g_hooked_methods;
             next_dispatch->methods.push_back(method_entry);
+            std::erase_if(next_dispatch->methods, [](const auto& entry) { return !entry.detour; });
+            std::stable_sort(next_dispatch->methods.begin(), next_dispatch->methods.end(), [](const auto& left, const auto& right)
+            {
+                const auto lp{ left.observer ? left.observer->options.priority : 0 };
+                const auto rp{ right.observer ? right.observer->options.priority : 0 };
+                if (lp != rp) { return lp < rp; }
+                return (left.observer ? left.observer->id : 0) < (right.observer ? right.observer->id : 0);
+            });
+            if (policy_installed)
+            {
+                std::erase_if(vmhook::hotspot::g_hooked_methods, [found_method](const auto& entry)
+                { return entry.method == found_method && !entry.detour; });
+                vmhook::hotspot::g_hooked_methods.push_back(std::move(method_entry));
+                vmhook::hotspot::publish_hook_dispatch_locked(std::move(next_dispatch));
+                vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
+                return observer_id;
+            }
             const auto existing_stub{ std::find_if(vmhook::hotspot::g_hooked_i2i_entries.begin(),
                 vmhook::hotspot::g_hooked_i2i_entries.end(), [i2i](const auto& entry) { return entry.i2i_entry == i2i; }) };
             std::unique_ptr<vmhook::hotspot::midi2i_hook> prepared_stub{};
@@ -9263,7 +9370,11 @@ export namespace vmhook
                     if (*transaction.stub && !(*transaction.stub)->activate_at_safepoint()) { return false; }
                     // Capacities, callback objects, metadata roots and code bytes
                     // are ready before this safepoint. Publication cannot allocate.
-                    (*transaction.dispatch)->methods.back().jit_policy = transaction.method->jit_policy;
+                    for (auto& entry : (*transaction.dispatch)->methods)
+                    {
+                        if (entry.observer == transaction.method->observer)
+                        { entry.jit_policy = transaction.method->jit_policy; }
+                    }
                     if (*transaction.stub)
                     { vmhook::hotspot::g_hooked_i2i_entries.push_back({ transaction.i2i, transaction.stub->release() }); }
                     vmhook::hotspot::g_hooked_methods.push_back(std::move(*transaction.method));
@@ -9272,7 +9383,7 @@ export namespace vmhook
                 }, &installation, method_entry.jit_policy) };
             if (!installed) { throw vmhook::exception{ "HotSpot compilation/deoptimization hook transaction failed." }; }
             vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
-            return true;
+            return observer_id;
         }
         catch (const std::exception& exception)
         {
@@ -9283,10 +9394,169 @@ export namespace vmhook
 
     template<class wrapper_type, class callback_type>
         requires vmhook::detail::hook_callback_supported_v<callback_type>
+    inline auto add_hook(const std::string_view method_name, callback_type&& user_detour,
+                         const hook_options options = {}) -> method_hook_id
+    {
+        return vmhook::add_hook<wrapper_type>(method_name, std::string_view{},
+            std::forward<callback_type>(user_detour), options);
+    }
+
+    template<class wrapper_type, class callback_type>
+        requires vmhook::detail::hook_callback_supported_v<callback_type>
+    inline auto hook(const std::string_view method_name, const std::string_view method_signature,
+                     callback_type&& user_detour) -> bool
+    {
+        return vmhook::add_hook<wrapper_type>(method_name, method_signature,
+            std::forward<callback_type>(user_detour)) != 0;
+    }
+
+    template<class wrapper_type, class callback_type>
+        requires vmhook::detail::hook_callback_supported_v<callback_type>
     inline auto hook(const std::string_view method_name, callback_type&& user_detour) -> bool
     {
         return vmhook::hook<wrapper_type>(method_name, std::string_view{},
             std::forward<decltype(user_detour)>(user_detour));
+    }
+
+    // Removal disables future entries immediately. An already executing
+    // observer may complete. Its JIT policy and physical stub remain installed
+    // until shutdown_hooks(), so removal from a callback never starts a VM op.
+    inline auto remove_hook(const method_hook_id id) noexcept -> bool
+    {
+        if (!id) { return false; }
+        // A borrowed Java callback must never wait for the installation mutex:
+        // a native installer can hold it while requesting a VM safepoint.
+        if (hotspot::current_method_observer_depth != 0 || hotspot::in_java_detour()
+            || detail::class_event_notification_active())
+        {
+            const hotspot::hook_dispatch_reader reader{};
+            if (!reader.snapshot) { return false; }
+            for (const auto& entry : reader.snapshot->methods)
+            {
+                if (entry.observer && entry.observer->id == id)
+                { return entry.observer->enabled.exchange(false, std::memory_order_acq_rel); }
+            }
+            return false;
+        }
+        try
+        {
+            std::vector<std::unique_ptr<hotspot::hook_dispatch_snapshot>> retired{};
+            std::shared_ptr<hotspot::hook_callback_t> removed_callback{};
+            std::lock_guard lock{ hotspot::g_hooked_methods_mutex };
+            const auto found{ std::find_if(hotspot::g_hooked_methods.begin(), hotspot::g_hooked_methods.end(),
+                [id](const auto& entry) { return entry.observer && entry.observer->id == id; }) };
+            if (found == hotspot::g_hooked_methods.end() || !found->observer->enabled.load(std::memory_order_acquire))
+            { return false; }
+            auto next{ std::make_unique<hotspot::hook_dispatch_snapshot>() };
+            if (const auto* current{ hotspot::g_hook_dispatch.load(std::memory_order_seq_cst) }) { next->methods = current->methods; }
+            std::erase_if(next->methods, [id](const auto& entry) { return entry.observer && entry.observer->id == id; });
+            hotspot::g_hook_dispatch_snapshots.reserve(hotspot::g_hook_dispatch_snapshots.size() + 1);
+            retired.reserve(hotspot::g_hook_dispatch_snapshots.size() + 1);
+            found->observer->enabled.store(false, std::memory_order_release);
+            removed_callback = std::move(found->detour);
+            const auto* const method{ found->method };
+            if (std::any_of(hotspot::g_hooked_methods.begin(), hotspot::g_hooked_methods.end(),
+                [&found, method](const auto& entry) { return &entry != &*found && entry.method == method; }))
+            { hotspot::g_hooked_methods.erase(found); }
+            hotspot::publish_hook_dispatch_locked(std::move(next));
+            hotspot::collect_hook_dispatch_locked(retired);
+            return true;
+        }
+        catch (...) { return false; }
+    }
+
+    // Release disabled observer captures on a native administrator, outside
+    // registry locks and after immutable readers leave. Callback-side removal
+    // only flips an atomic flag; this operation performs deferred reclamation.
+    inline auto reclaim_hook_callbacks() noexcept -> bool
+    {
+        if (hotspot::current_method_observer_depth != 0 || hotspot::in_java_detour()
+            || detail::class_event_notification_active()) { return false; }
+        try
+        {
+            std::vector<std::unique_ptr<hotspot::hook_dispatch_snapshot>> retired{};
+            std::vector<std::shared_ptr<hotspot::hook_callback_t>> captures{};
+            std::lock_guard lock{ hotspot::g_hooked_methods_mutex };
+            auto next{ std::make_unique<hotspot::hook_dispatch_snapshot>() };
+            if (const auto* current{ hotspot::g_hook_dispatch.load(std::memory_order_seq_cst) }) { next->methods = current->methods; }
+            std::erase_if(next->methods, [](const auto& entry)
+            { return !entry.detour || (entry.observer && !entry.observer->enabled.load(std::memory_order_acquire)); });
+            captures.reserve(hotspot::g_hooked_methods.size());
+            hotspot::g_hook_dispatch_snapshots.reserve(hotspot::g_hook_dispatch_snapshots.size() + 1);
+            retired.reserve(hotspot::g_hook_dispatch_snapshots.size() + 1);
+            for (auto& entry : hotspot::g_hooked_methods)
+            {
+                if (entry.observer && !entry.observer->enabled.load(std::memory_order_acquire))
+                { captures.push_back(std::move(entry.detour)); }
+            }
+            hotspot::publish_hook_dispatch_locked(std::move(next));
+            hotspot::collect_hook_dispatch_locked(retired);
+            return true;
+        }
+        catch (...) { return false; }
+    }
+
+    // Invoke on the same OS thread with method observers suppressed. This is
+    // context-local suppression, not hook removal; other threads still notify.
+    template<class callable_type>
+    inline auto call_without_hooks(callable_type&& call) -> decltype(auto)
+    {
+        struct suppression final
+        {
+            suppression() noexcept { ++hotspot::suppress_method_observers; }
+            ~suppression() { --hotspot::suppress_method_observers; }
+        } guard{};
+        return std::invoke(std::forward<callable_type>(call));
+    }
+
+    struct hook_resource_stats final
+    {
+        std::size_t active_observers{}, retained_method_policies{}, physical_stubs{};
+        std::size_t retained_snapshots{}, dispatch_readers{}, active_callbacks{};
+        std::uint64_t callback_failures{}, suppressed_recursions{};
+        bool shutdown_requested{};
+        // Published code can remain on a Java return stack after callbacks drain.
+        bool dll_must_remain_loaded{ true };
+    };
+    [[nodiscard]] inline auto hook_resources() noexcept -> hook_resource_stats
+    {
+        hook_resource_stats result{};
+        try
+        {
+            // Aggregate registry sizes are an administrator diagnostic. In a
+            // callback only the lock-free counters below are reported.
+            if (hotspot::current_method_observer_depth == 0 && !hotspot::in_java_detour()
+                && !detail::class_event_notification_active())
+            {
+            std::lock_guard lock{ hotspot::g_hooked_methods_mutex };
+            for (std::size_t i{}; i < hotspot::g_hooked_methods.size(); ++i)
+            {
+                const auto& entry{ hotspot::g_hooked_methods[i] };
+                if (entry.detour && (!entry.observer || entry.observer->enabled.load(std::memory_order_acquire)))
+                { ++result.active_observers; }
+                if (std::none_of(hotspot::g_hooked_methods.begin(), hotspot::g_hooked_methods.begin() + i,
+                    [&entry](const auto& earlier) { return earlier.method == entry.method; }))
+                { ++result.retained_method_policies; }
+            }
+            result.physical_stubs = hotspot::g_hooked_i2i_entries.size();
+            result.retained_snapshots = hotspot::g_hook_dispatch_snapshots.size();
+            }
+        }
+        catch (...) {}
+        result.dispatch_readers = hotspot::g_hook_dispatch_readers.load(std::memory_order_seq_cst);
+        result.active_callbacks = hotspot::g_active_hook_callbacks.load(std::memory_order_acquire);
+        result.callback_failures = hotspot::g_hook_callback_failures.load(std::memory_order_relaxed);
+        result.suppressed_recursions = hotspot::g_suppressed_hook_recursions.load(std::memory_order_relaxed);
+        result.shutdown_requested = hotspot::g_shutdown_requested.load(std::memory_order_acquire);
+        return result;
+    }
+
+    // Read-only quiescence indication. It never claims that executable return
+    // PCs have drained or that FreeLibrary is safe. Call after observer removal.
+    [[nodiscard]] inline auto hook_callbacks_idle() noexcept -> bool
+    {
+        return hotspot::g_hook_dispatch_readers.load(std::memory_order_seq_cst) == 0
+            && hotspot::g_active_hook_callbacks.load(std::memory_order_acquire) == 0;
     }
 
     // Number of observer entries whose code patch or method identity changed.
@@ -9323,6 +9593,9 @@ export namespace vmhook
     inline auto shutdown_hooks() noexcept -> void
     {
         vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
+        // Callback-side shutdown disables method dispatch without taking locks
+        // or starting a safepoint. A native owner completes removal later.
+        if (vmhook::hotspot::in_java_detour() || vmhook::detail::class_event_notification_active()) { return; }
         // These registries can be active independently of method hooks. Their
         // callback publication must stop even when a method VM operation fails.
         vmhook::detail::disable_class_observers();
@@ -9339,8 +9612,14 @@ export namespace vmhook
                     vmhook::hotspot::g_hook_dispatch.store(nullptr, std::memory_order_seq_cst);
                     for (const auto& entry : vmhook::hotspot::g_hooked_i2i_entries)
                     { if (entry.hook) { (void)entry.hook->remove_at_safepoint(); } }
-                    for (const auto& entry : vmhook::hotspot::g_hooked_methods)
-                    { vmhook::detail::jit_backend::release_method_policy_at_safepoint(entry.jit_policy); }
+                    for (std::size_t i{}; i < vmhook::hotspot::g_hooked_methods.size(); ++i)
+                    {
+                        const auto& entry{ vmhook::hotspot::g_hooked_methods[i] };
+                        if (entry.observer) { entry.observer->enabled.store(false, std::memory_order_release); }
+                        if (std::none_of(vmhook::hotspot::g_hooked_methods.begin(), vmhook::hotspot::g_hooked_methods.begin() + i,
+                            [&entry](const auto& earlier) { return earlier.method == entry.method; }))
+                        { vmhook::detail::jit_backend::release_method_policy_at_safepoint(entry.jit_policy); }
+                    }
                 }, nullptr);
                 if (removed)
                 {
