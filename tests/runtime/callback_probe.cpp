@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <chrono>
 #include <fstream>
 #endif
@@ -131,12 +132,13 @@ namespace
             if (deadline_reached) { check(false, "worker.wait_deadline"); }
             const auto returned{static_cast<std::int32_t>(callback_fixture::static_members::get_field("validReturns")->get())};
             const auto finished{std::chrono::steady_clock::now()};
-            report << "callbacks=" << callback_count.load() << "\nnested=" << nested_count.load()
-                   << "\ngc_observed=" << observed_gc.load() << "\nreturns=" << returned
-                   << "\nwait_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(finished - wait_started).count()
-                   << "\nworker_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(finished - worker_started).count()
-                   << "\npolls=" << polls << "\nwait_completed=" << (returned == 24)
-                   << "\nreturn_roots_scanned=" << vmhook::detail::callback_return_roots::scanned_slots.load() << '\n';
+            report << std::format(
+                "callbacks={}\nnested={}\ngc_observed={}\nreturns={}\nwait_ms={}\nworker_ms={}\n"
+                "polls={}\nwait_completed={:d}\nreturn_roots_scanned={}\n",
+                callback_count.load(), nested_count.load(), observed_gc.load(), returned,
+                std::chrono::duration_cast<std::chrono::milliseconds>(finished - wait_started).count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(finished - worker_started).count(),
+                polls, returned == 24, vmhook::detail::callback_return_roots::scanned_slots.load());
             if (callback_count.load() != 24) { check(false, "worker.callback_count"); }
             else if (nested_count.load() != 24) { check(false, "worker.nested_count"); }
             else if (observed_gc.load() == 0) { check(false, "worker.gc_observed"); }
@@ -148,12 +150,12 @@ namespace
             }
             catch (const vmhook::exception&) {}
             if (const char* const failure{first_failure.load(std::memory_order_acquire)})
-            { report << "first_failure=" << failure << '\n'; }
-            report << "callback_proof=" << (correct.load() ? "pass" : "fail") << '\n';
+            { report << std::format("first_failure={}\n", failure); }
+            report << std::format("callback_proof={}\n", (correct.load() ? "pass" : "fail"));
             return correct.load() ? 0 : 2;
         }
         catch (const std::exception& failure)
-        { report << "exception=" << failure.what() << "\ncallback_proof=fail\n"; return 3; }
+        { report << std::format("exception={}\ncallback_proof=fail\n", failure.what()); return 3; }
     }
 }
 

@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 
 namespace
@@ -55,7 +56,7 @@ namespace
             }
             const auto argument{arguments->get(0)};
             const auto text{argument->get_method("toString", "()Ljava/lang/String;")->call().as_string()};
-            return vmhook::new_string("native:" + text);
+            return vmhook::new_string(std::format("native:{}", text));
         }
         if (name == "add")
         {
@@ -80,7 +81,7 @@ namespace
         std::ofstream report{destination};
         report.setf(std::ios::unitbuf);
         const auto passed = [&](const char* label, bool condition)
-        { report << label << '=' << (condition ? "pass" : "fail") << '\n'; check(condition); return condition; };
+        { report << std::format("{}={}\n", label, (condition ? "pass" : "fail")); check(condition); return condition; };
         try
         {
             {
@@ -107,8 +108,8 @@ namespace
                         other_calls.fetch_add(1, std::memory_order_relaxed);
                         if (method->name() != "echo") { throw std::runtime_error{"Unexpected second interface method"}; }
                         const auto argument{arguments->get(0)};
-                        return vmhook::new_string("other:" + argument->get_method("toString",
-                            "()Ljava/lang/String;")->call().as_string());
+                        return vmhook::new_string(std::format("other:{}", argument->get_method("toString",
+                            "()Ljava/lang/String;")->call().as_string()));
                     }));
                 const auto first{current->acquire()}, second{other->acquire()};
                 fixture::static_members::get_method("set_current", "(Linterface_fixture$api;)V")->call(first);
@@ -143,10 +144,10 @@ namespace
             const std::int32_t errors = fixture::static_members::get_field("error_count")->get();
             const std::unique_ptr<vmhook::any_object> failure = fixture::static_members::get_field("failure")->get();
             if (failure->get_instance())
-            { report << "java_failure=" << failure->get_method("toString", "()Ljava/lang/String;")->call().as_string() << '\n'; }
-            report << "callbacks=" << calls.load() << "\nother_callbacks=" << other_calls.load()
-                << "\nroot_checks=" << root_checks.load() << "\njava_checks=" << valid
-                << "\njava_errors=" << errors << '\n';
+            { report << std::format("java_failure={}\n", failure->get_method("toString", "()Ljava/lang/String;")->call().as_string()); }
+            report << std::format(
+                "callbacks={}\nother_callbacks={}\nroot_checks={}\njava_checks={:d}\njava_errors={}\n",
+                calls.load(), other_calls.load(), root_checks.load(), valid, errors);
             passed("interface_roundtrip", finished && valid == 18 && !failure->get_instance());
             passed("interface_errors", errors == 3);
             passed("interface_gc", root_checks.load() > 0);
@@ -161,7 +162,7 @@ namespace
             return correct.load() ? 0 : 2;
         }
         catch (const std::exception& error)
-        { report << "exception=" << error.what() << "\ninterface_proof=fail\n"; return 3; }
+        { report << std::format("exception={}\ninterface_proof=fail\n", error.what()); return 3; }
     }
 }
 

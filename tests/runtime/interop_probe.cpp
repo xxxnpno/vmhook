@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -31,7 +32,7 @@ namespace
     auto require(const bool condition, const std::string_view label) -> void
     { if (!condition) { throw std::runtime_error{std::string{label}}; } }
     auto check(std::ostream& output, const std::string_view label, const bool condition) -> void
-    { require(condition, label); output << label << "=pass\n"; output.flush(); }
+    { require(condition, label); output << std::format("{}=pass\n", label); output.flush(); }
 
     template<std::size_t... index>
     auto call_many_references(const std::unique_ptr<player>& value, std::index_sequence<index...>) -> std::int32_t
@@ -59,7 +60,7 @@ namespace
             require(vmhook::register_class<interop_fixture>("InteropFixture")
                 && vmhook::register_class<player>("InteropFixture$Player")
                 && vmhook::register_class<wide>("InteropFixture$Wide"), "metadata");
-            vmhook::native_thread_context context{"VMHook-interop-" + std::to_string(::GetCurrentThreadId())};
+            vmhook::native_thread_context context{std::format("VMHook-interop-{}", ::GetCurrentThreadId())};
             check(output, "context", context.valid());
             const auto first = vmhook::make_unique<player>(std::int32_t{11});
             const auto last = vmhook::make_unique<player>(std::int32_t{22});
@@ -206,7 +207,7 @@ namespace
             check(output, "interop_complete", vmhook::verify_hooks() == 0);
             return 0;
         }
-        catch (const std::exception& error) { output << "exception=" << error.what() << '\n'; return 2; }
+        catch (const std::exception& error) { output << std::format("exception={}\n", error.what()); return 2; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance, DWORD reason, LPVOID)

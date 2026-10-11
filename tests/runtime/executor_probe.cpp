@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -87,7 +88,7 @@ namespace
     auto refused(function_type&& function) -> bool
     { try { function(); } catch (const vmhook::exception&) { return true; } return false; }
     auto check(std::ostream& output, std::string_view name, bool correct) -> bool
-    { output << name << '=' << (correct ? "pass" : "fail") << '\n'; output.flush(); return correct; }
+    { output << std::format("{}={}\n", name, (correct ? "pass" : "fail")); output.flush(); return correct; }
     auto await(std::atomic<bool>& flag) -> bool
     {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
@@ -373,7 +374,7 @@ namespace
             return 0;
         }
         catch (const std::exception& error)
-        { output << "exception=" << error.what() << '\n'; output.flush(); return 14; }
+        { output << std::format("exception={}\n", error.what()); output.flush(); return 14; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance, DWORD reason, LPVOID)

@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -23,7 +24,7 @@ namespace
           if (!result.was_invoked() || result.threw()) { throw vmhook::exception{"Drop failed"}; } }
     };
     auto check(std::ostream& output, std::string_view name, bool correct) -> bool
-    { output << name << '=' << (correct ? "pass" : "fail") << '\n'; output.flush(); return correct; }
+    { output << std::format("{}={}\n", name, (correct ? "pass" : "fail")); output.flush(); return correct; }
     template<typename function_type> auto refused(function_type&& function) -> bool
     {
         try { function(); }
@@ -100,7 +101,7 @@ namespace
             return 0;
         }
         catch (const std::exception& error)
-        { output << "exception=" << error.what() << '\n'; output.flush(); return 8; }
+        { output << std::format("exception={}\n", error.what()); output.flush(); return 8; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance, DWORD reason, LPVOID)

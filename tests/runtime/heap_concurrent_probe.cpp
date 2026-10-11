@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 namespace {
@@ -94,12 +95,12 @@ auto owner=vmhook::detail::materialize_object<node>(0,root);
 if (!owner || !owner->get_instance() || owner->value()<0 || owner->value()>=250000) throw std::runtime_error("captured oop changed after marking");
 }
 }
-output << "mark_completed=" << (completed ? "pass" : "fail") << '\n';
-output << "satb_active_captures=" << observed << "\nrooted_captures=" << captured << "\nheap_walks=" << iterations << '\n';
+output << std::format("mark_completed={}\n", (completed ? "pass" : "fail"));
+output << std::format("satb_active_captures={}\nrooted_captures={}\nheap_walks={}\n", observed, captured, iterations);
 const bool exact_capture = observed == 1 && captured == 64 && held.size() == 64;
-output << "heap_concurrent=" << (exact_capture && completed ? "pass" : "fail") << "\nnative_complete=pass\n" << std::flush;
+output << std::format("heap_concurrent={}\nnative_complete=pass\n", (exact_capture && completed ? "pass" : "fail")) << std::flush;
 return exact_capture && completed ? 0 : 2;
-} catch(const std::exception& error) { output << "exception=" << error.what() << '\n' << std::flush; return 3; }
+} catch(const std::exception& error) { output << std::format("exception={}\n", error.what()) << std::flush; return 3; }
 }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance,DWORD reason,LPVOID) {

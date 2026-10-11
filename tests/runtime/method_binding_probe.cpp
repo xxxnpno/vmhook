@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -86,7 +87,7 @@ namespace
         output.setf(std::ios::unitbuf);
         bool valid{true};
         const auto check = [&](const std::string_view name, const bool correct)
-        { output << name << '=' << (correct ? "pass" : "fail") << '\n'; valid = valid && correct; };
+        { output << std::format("{}={}\n", name, (correct ? "pass" : "fail")); valid = valid && correct; };
         try
         {
             vmhook::native_thread_context context{"VMHook-method-binding"};
@@ -243,11 +244,11 @@ namespace
             check("reclamation", reclaimed && resources.active_observers == 0
                 && stopped.retained_method_policies == 0 && stopped.physical_stubs == 0
                 && fixture::run_a() == 93 && fixture::run_b() == 168);
-            output << "method_binding_proof=" << (valid ? "pass" : "fail") << '\n';
+            output << std::format("method_binding_proof={}\n", (valid ? "pass" : "fail"));
             return valid ? 0 : 2;
         }
         catch (const std::exception& error)
-        { output << "exception=" << error.what() << "\nmethod_binding_proof=fail\n"; return 3; }
+        { output << std::format("exception={}\nmethod_binding_proof=fail\n", error.what()); return 3; }
     }
 }
 

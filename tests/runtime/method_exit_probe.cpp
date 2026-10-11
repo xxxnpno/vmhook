@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 namespace
 {
@@ -27,7 +28,7 @@ namespace
         const auto* path=std::getenv("VMHOOK_METHOD_EXIT_REPORT");
         std::ofstream output{path?path:"vmhook-method-exit-report.txt"};output.setf(std::ios::unitbuf);
         bool valid=true;
-        const auto check=[&](std::string_view name,bool value) {output<<name<<'='<<(value?"pass":"fail")<<'\n';valid=valid&&value;};
+        const auto check=[&](std::string_view name,bool value) {output << std::format("{}={}\n", name, (value?"pass":"fail"));valid=valid&&value;};
         try
         {
             vmhook::native_thread_context context{"VMHook-committed-exit"};check("context",context.valid());
@@ -118,9 +119,9 @@ namespace
             vmhook::shutdown_hooks();const auto stopped=vmhook::method_exit_resources();
             check("shutdown",stopped.active_observers==0&&stopped.retained_observers==0&&stopped.resident_stubs==6&&stopped.dll_must_remain_loaded&&weak_queue.expired());
             check("shutdown_original",fixture::target_int(5)==6);
-            output<<"method_exit_proof="<<(valid?"pass":"fail")<<'\n';return valid?0:2;
+            output << std::format("method_exit_proof={}\n", (valid?"pass":"fail"));return valid?0:2;
         }
-        catch(const std::exception& failure) {output<<"exception="<<failure.what()<<"\nmethod_exit_proof=fail\n";return 3;}
+        catch(const std::exception& failure) {output << std::format("exception={}\nmethod_exit_proof=fail\n", failure.what());return 3;}
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE self,DWORD reason,LPVOID)

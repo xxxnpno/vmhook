@@ -20,35 +20,36 @@ auto check_monitor_locks(vmhook::native_thread_context& context, std::ostream& o
         }
         return false;
     };
-    output << "monitor_stage=start" << std::endl;
+    output << "monitor_stage=start\n" << std::flush;
     if (held()) { return false; }
     {
         vmhook::monitor_lock lock{object};
-        output << "monitor_stage=locked held " << held() << " depth " << vmhook::detail::native_backend::active_context_lifetime()->operation_depth << std::endl;
+        output << std::format("monitor_stage=locked held {:d} depth {}\n", held(),
+            vmhook::detail::native_backend::active_context_lifetime()->operation_depth) << std::flush;
         if (!lock.owns_lock() || !held() || context.close()) { return false; }
         {
             vmhook::monitor_lock recursive{object};
             if (!held()) { return false; }
         }
-        output << "monitor_stage=recursive_done" << std::endl;
+        output << "monitor_stage=recursive_done\n" << std::flush;
         if (!held()) { return false; }
         object->get_field("value")->set(std::int32_t{8000});
         write("monitor_request", 1);
         if (!await("monitor_attempting", 1)) { return false; }
         std::this_thread::sleep_for(std::chrono::milliseconds{15});
         if (read("monitor_acquired") != 0) { return false; }
-        output << "monitor_stage=java_blocked" << std::endl;
+        output << "monitor_stage=java_blocked\n" << std::flush;
         native_fixture::collect();
         if (!held() || object->value() != 8000 || read("monitor_acquired") != 0) { return false; }
     }
-    output << "monitor_stage=released" << std::endl;
+    output << "monitor_stage=released\n" << std::flush;
     if (held() || !await("monitor_acquired", 1) || read("monitor_seen") != 8000 || object->value() != 8001)
     { return false; }
     if (!await("monitor_request", 0)) { return false; }
-    output << "monitor_stage=java_acquired" << std::endl;
+    output << "monitor_stage=java_acquired\n" << std::flush;
     write("monitor_request", 2);
     if (!await("monitor_inside", 1)) { return false; }
-    output << "monitor_stage=java_inside" << std::endl;
+    output << "monitor_stage=java_inside\n" << std::flush;
     std::atomic<bool> started{}, acquired{}, result{};
     std::thread competitor{[&]
     {
@@ -80,7 +81,8 @@ auto check_monitor_locks(vmhook::native_thread_context& context, std::ostream& o
     native_fixture::collect();
     write("monitor_release", 1);
     competitor.join();
-    output << "monitor_stage=competitor_joined blocked " << blocked << " acquired " << acquired.load() << " result " << result.load() << std::endl;
+    output << std::format("monitor_stage=competitor_joined blocked {:d} acquired {:d} result {:d}\n",
+        blocked, acquired.load(), result.load()) << std::flush;
     if (!blocked || !acquired.load(std::memory_order_acquire) || !result.load(std::memory_order_acquire)
         || object->value() != 9002 || held()) { return false; }
     try
@@ -90,7 +92,7 @@ auto check_monitor_locks(vmhook::native_thread_context& context, std::ostream& o
     }
     catch (const std::bad_alloc&) {}
     if (held() || vmhook::with_monitor(object, [&] { return held() ? 42 : -1; }) != 42) { return false; }
-    output << "monitor_stage=unwind_done" << std::endl;
+    output << "monitor_stage=unwind_done\n" << std::flush;
     const auto java_null = std::make_unique<native_fixture>(nullptr);
     try { vmhook::monitor_lock lock{java_null}; return false; }
     catch (const vmhook::exception& error)

@@ -3,6 +3,8 @@ import std;
 import vmhook;
 import vmhook.windows;
 #else
+#include <format>
+#include <iostream>
 #include <vmhook/vmhook.hpp>
 #endif
 
@@ -10,7 +12,7 @@ int main()
 {
     int failures{};
     const auto check = [&](bool value, const char* name)
-    { if (!value) { std::cerr << "FAIL: " << name << '\n'; ++failures; } };
+    { if (!value) { std::cerr << std::format("FAIL: {}\n", name); ++failures; } };
     vmhook::bounded_event_queue<std::uint64_t> tiny{2};
     std::uint64_t value{};
     check(!tiny.try_pop(value), "empty queue refuses reads");

@@ -46,6 +46,12 @@ The failed initialization is cached for that loaded VMHook image. It does not
 retry partially constructed metadata during a later operation. The report's
 own copied C++ strings can also raise `std::bad_alloc`.
 
+Runtime messages and composed identifiers use `std::format`. Literal diagnostic
+formats are checked during compilation; dynamic formats use `std::vformat` and
+report malformed formats with `std::format_error`. Formatting operations preserve
+the original allocation exception. Only the `noexcept` logging boundary contains
+formatting failures, so a diagnostic cannot replace an operation's existing error.
+
 An entry callback or forced return is not an event for an original method's
 exit. The committed-normal-return capability requires the independently verified
 final-tail sites and records copied values or reference kinds; it does not

@@ -24,6 +24,15 @@ from runtime_evidence import runtime_evidence, read_results
 
 
 CHECKS = {
+    "coalesced_jit": [
+        "context", "registration", "compiled_baseline", "visible_inline_metadata",
+        "first_hook", "first_global_invalidation", "direct_first_hook", "inlined_first_hook",
+        "indirect_first_hook", "unrelated_recompiled", "caller_recompiled_under_policy", "second_hook",
+        "coalesced_code_retention", "coalesced_caller_code_retention", "coalesced_direct_semantics", "coalesced_inlined_semantics",
+        "coalesced_indirect_semantics", "rejected_addition_keeps_policy", "remove_second", "remove_first",
+        "dormant_policy_reuse", "incomplete_invalidation_guard", "changed_identity_guard", "field_only_policy_guard",
+        "restoration_clears_invalidation_proof", "public_incomplete_policy_recovery", "folded_leaf_fallback", "observer_lifecycle",
+        "shutdown_restores_policy", "shutdown_recompilation", "coalesced_jit_proof"],
     "jit": ["metadata", "compiled_callee", "compiled_caller", "inline_metadata",
             "typed_compiled", "hook", "typed_hooks", "typed_returns", "void_cancellation",
             "callee_deoptimized", "callbacks", "registry_contention",
@@ -77,6 +86,9 @@ CHECKS = {
                    "field_policy_cpp_oom", "failure_cleanup", "method_retry", "method_original",
                    "field_retry", "field_original", "closed", "contextless_cpp_oom",
                    "contextless_retry", "hook_roots_complete"],
+    "reference_graph": ["graph_cycles", "graph_arrays", "graph_inheritance",
+                        "graph_reference_boundaries", "graph_class_identity", "graph_budgets",
+                        "graph_cpp_allocation", "graph_resources", "graph_gc", "graph_refusal", "native_complete"],
     "direct_array": ["direct_array_batch", "direct_array_cpp_allocation",
                      "direct_array_recovery", "direct_array_refusal",
                      "direct_array_string_policy", "native_complete"],
@@ -116,6 +128,7 @@ CHECKS = {
 }
 
 FIXTURES = {
+    "coalesced_jit": "CoalescedJitFixture",
     "jit": "ObservationJitFixture",
     "fields": "ObservationFieldFixture",
     "classes": "ObservationClassFixture",
@@ -131,6 +144,7 @@ FIXTURES = {
     "hook_roots": "RootFixture",
     "method_binding": "MethodBindingFixture",
     "argument_descriptor": "ArgumentDescriptorFixture",
+    "reference_graph": "ReferenceGraphFixture",
     "direct_array": "DirectArrayFixture",
     "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
@@ -142,6 +156,7 @@ FIXTURES = {
 
 
 OPTIONAL_PROBES = {
+    "coalesced_jit": "coalesced_jit_probe",
     "callbacks": "callback_probe",
     "hook_composition": "composition_probe",
     "lifetime": "lifetime_probe",
@@ -154,6 +169,7 @@ OPTIONAL_PROBES = {
     "hook_roots": "hook_roots_probe",
     "method_binding": "method_binding_probe",
     "argument_descriptor": "argument_descriptor_probe",
+    "reference_graph": "reference_graph_probe",
     "direct_array": "direct_array_probe",
     "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
@@ -163,6 +179,7 @@ OPTIONAL_PROBES = {
     "virtual_thread": "virtual_thread_probe",
 }
 TERMINAL_CHECK = {
+    "coalesced_jit": "coalesced_jit_proof",
     "callbacks": "callback_proof",
     "callback_throw": "callback_throw_proof",
     "virtual_thread": "virtual_thread_proof",
@@ -177,6 +194,7 @@ TERMINAL_CHECK = {
     "hook_roots": "hook_roots_complete",
     "method_binding": "method_binding_proof",
     "argument_descriptor": "descriptor_complete",
+    "reference_graph": "native_complete",
     "direct_array": "native_complete",
     "method_exit": "method_exit_proof",
 }
@@ -247,6 +265,7 @@ def execute_mode(args, mode, directory):
                        VMHOOK_CALLBACK_THROW_REPORT=windows_path(result),
                        VMHOOK_METHOD_EXIT_REPORT=windows_path(result),
                        VMHOOK_METHOD_BINDING_REPORT=windows_path(result),
+                       VMHOOK_COALESCED_JIT_REPORT=windows_path(result),
                        VMHOOK_VIRTUAL_THREAD_REPORT=windows_path(result))
     java_flags = (["-XX:-ClassUnloadingWithConcurrentMark"]
                   if mode == "heap_liveness" and args.heap_liveness_class_unloading_disabled else [])
@@ -453,6 +472,9 @@ def main():
             sources = [source / (name + ".java") for name in fixture_names]
             for fixture in sources:
                 evidence.add_input(fixture.stem + "_source", fixture)
+            if "coalesced_jit" in modes:
+                evidence.add_input("coalesced_jit_native_source", source / "coalesced_jit_probe.cpp")
+                evidence.add_input("coalesced_jit_canonical_source", source.parents[1] / "modules" / "vmhook.ixx")
             compilation = subprocess.run(prefix + [str(args.javac), "-d", target, *map(str, sources)],
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          text=True, timeout=90)

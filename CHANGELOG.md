@@ -8,6 +8,12 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Bounded rooted reference-graph snapshots with cycle/shared-object IDs, explicit
+  traversal budgets and copied records; weak-reference internals are excluded
+  before reading.
+- Optional pinned H2 TCP application validation runs real JDBC transactions,
+  isolation/rollback, Unicode/null/array results, SQL exceptions and moving GC
+  from an injected C++ OS worker, with dependency provenance and workload timings.
 - Passive exact-image capability reporting and offline DLL/PDB inspection.
 - Durable retained objects with explicit cross-context acquisition, exact
   per-wrapper defining-loader bindings and generation-pinned proxies/caches.
@@ -74,6 +80,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   fields, newly loaded accessors, class notifications and rooted callbacks.
 
 ### Changed
+
+- Runtime messages, descriptors, identifiers and consumer result records use
+  `std::format`; dynamic formatting uses `std::vformat`. Compile-time builders
+  and byte encoders retain their allocation-free implementations.
+- Additional method observers and dormant-policy reuse now validate completed
+  initial compiler drain/deoptimization, exact method identity and live
+  compilation/inlining exclusions at a safepoint before publication. Failed
+  additions preserve earlier observers' policy. Validated reuse retains
+  unrelated and recompiled caller code; first installations still invalidate
+  globally because folded C2 leaves can be absent from method metadata.
 
 - **Breaking Java object ownership contract:** object-valued field getters,
   method returns, `self()` and `root<wrapper>::get()` produce
@@ -185,6 +201,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Enabled diagnostic logging catches formatting allocation failures inside its
+  `noexcept` boundary. Checked formatting propagates the original `bad_alloc`
+  or `format_error` instead of silently returning an unformatted message.
 - Interpreter trampoline allocation keeps its strict nearby-address contract.
   A failed hint no longer falls back outside the relative jump's range.
   Cancellation tests use a previously unused method, verify its body is skipped,

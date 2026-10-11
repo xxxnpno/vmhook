@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -60,7 +61,7 @@ namespace
         output.setf(std::ios::unitbuf);
         bool passed{true};
         const auto check = [&](std::string_view name, bool correct)
-        { output << name << '=' << (correct ? "pass" : "fail") << '\n'; passed = passed && correct; };
+        { output << std::format("{}={}\n", name, (correct ? "pass" : "fail")); passed = passed && correct; };
         try
         {
             const char* selected{std::getenv("VMHOOK_RUNTIME_INIT_FAULT")};
@@ -70,7 +71,7 @@ namespace
                 || fault == "profile" || fault == "diagnostic"};
             if (!builtin)
             {
-                const std::filesystem::path invalid_pdb{std::string{result_path ? result_path : "runtime-init-result.txt"} + ".invalid.pdb"};
+                const std::filesystem::path invalid_pdb{std::format("{}.invalid.pdb", result_path ? result_path : "runtime-init-result.txt")};
                 std::ofstream invalid{invalid_pdb, std::ios::binary};
                 const std::array<char, 64> bytes{};
                 invalid.write(bytes.data(), bytes.size());
@@ -101,7 +102,7 @@ namespace
             allocation_fault::reject_all = false;
             allocation_fault::reject_next = false;
             allocation_fault::rejected_size = 0;
-            output << "rejected_allocation=" << allocation_fault::rejected_allocation << '\n';
+            output << std::format("rejected_allocation={}\n", allocation_fault::rejected_allocation);
             check("fault_consumed", allocation_error ? allocation_fault::rejected_allocation != 0
                                                      : allocation_fault::rejected_allocation == 0);
             const auto report{vmhook::runtime_capabilities()};
@@ -150,7 +151,7 @@ namespace
             return passed ? 0 : 2;
         }
         catch (const std::exception& error)
-        { output << "exception=" << error.what() << '\n'; return 3; }
+        { output << std::format("exception={}\n", error.what()); return 3; }
     }
 }
 

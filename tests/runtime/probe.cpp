@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -165,18 +166,16 @@ namespace
         {
             ::Sleep(10);
         }
-        output << "cancellation="
-               << (installed && cancelled_calls.load(std::memory_order_relaxed) >= 16
-                   && body_before == 0 && fixture::cancellation_body() == 0 ? "pass" : "fail") << '\n';
+        output << std::format("cancellation={}\n", (installed && cancelled_calls.load(std::memory_order_relaxed) >= 16
+                   && body_before == 0 && fixture::cancellation_body() == 0 ? "pass" : "fail"));
         vmhook::shutdown_hooks();
         ::Sleep(100);
         const auto after = cancelled_calls.load(std::memory_order_relaxed);
         const auto body_after = context.valid() ? fixture::cancellation_body() : -1;
         ::Sleep(200);
-        output << "shutdown="
-               << (cancelled_calls.load(std::memory_order_relaxed) == after
+        output << std::format("shutdown={}\n", (cancelled_calls.load(std::memory_order_relaxed) == after
                    && vmhook::verify_hooks() == 0 && context.valid()
-                   && fixture::cancellation_body() > body_after ? "pass" : "fail") << '\n';
+                   && fixture::cancellation_body() > body_after ? "pass" : "fail"));
     }
 
     auto worker(void*) -> DWORD
@@ -203,8 +202,7 @@ namespace
             // Checked call() throws outside a Java context; try_call() reports
             // this deliberate refusal without hiding checked-call regressions.
             const auto refused = fixture::static_members::get_method("count", "()I")->try_call();
-            output << "native_refusal="
-                   << (!vmhook::can_call_java() && !refused.was_invoked() ? "pass" : "fail") << '\n';
+            output << std::format("native_refusal={}\n", (!vmhook::can_call_java() && !refused.was_invoked() ? "pass" : "fail"));
             char mode[32]{};
             if (::GetEnvironmentVariableA("VMHOOK_TEST_MODE", mode, sizeof mode)
                 && std::string_view{mode} == "metadata")
@@ -219,7 +217,7 @@ namespace
             }
             output << "hook=pass\n";
             const bool arguments_correct = verify_argument_mutation();
-            output << "argument_mutation=" << (arguments_correct ? "pass" : "fail") << '\n';
+            output << std::format("argument_mutation={}\n", (arguments_correct ? "pass" : "fail"));
             if (!arguments_correct
                 || !install_dispatch_hook()) { return 7; }
             const auto worker_thread = ::GetCurrentThreadId();
@@ -234,7 +232,7 @@ namespace
                 });
                 const bool dispatched = future.wait_for(std::chrono::seconds{15}) == std::future_status::ready
                     && future.get();
-                output << "dispatch=" << (dispatched ? "pass" : "fail") << '\n';
+                output << std::format("dispatch={}\n", (dispatched ? "pass" : "fail"));
                 verify_hook_lifecycle(output);
                 return dispatched ? 0 : 4;
             }
@@ -276,13 +274,12 @@ namespace
                 return 4;
             }
             const auto results = future.get();
-            output << "dispatch=" << (results.callback_thread ? "pass" : "fail") << "\ninvocation="
-                   << (results.invoked ? (results.count_correct ? "pass" : "fail") : "unsupported")
-                   << "\nconstruction="
-                   << (results.constructed ? (results.construction_correct ? "pass" : "fail") : "unsupported")
-                   << "\njava_exception=" << (results.exception_correct ? "pass" : "fail")
-                   << "\nstring_read=" << (results.string_correct ? "pass" : "fail")
-                   << '\n';
+            output << std::format(
+                "dispatch={}\ninvocation={}\nconstruction={}\njava_exception={}\nstring_read={}\n",
+                results.callback_thread ? "pass" : "fail",
+                results.invoked ? (results.count_correct ? "pass" : "fail") : "unsupported",
+                results.constructed ? (results.construction_correct ? "pass" : "fail") : "unsupported",
+                results.exception_correct ? "pass" : "fail", results.string_correct ? "pass" : "fail");
             if (!results.callback_thread || !results.invoked || !results.count_correct
                 || !results.constructed || !results.construction_correct
                 || !results.exception_correct || !results.string_correct)
@@ -315,12 +312,12 @@ namespace
                 stress_correct = stress.wait_for(std::chrono::seconds{5}) == std::future_status::ready
                     && stress.get();
             }
-            output << "gc_stress=" << (stress_correct ? "pass" : "fail") << '\n';
+            output << std::format("gc_stress={}\n", (stress_correct ? "pass" : "fail"));
             verify_hook_lifecycle(output);
         }
         catch (const std::exception& error)
         {
-            output << "exception=" << error.what() << '\n';
+            output << std::format("exception={}\n", error.what());
             return 5;
         }
         return 0;

@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -37,7 +38,7 @@ namespace
         char destination[4096]{};
         if (!::GetEnvironmentVariableA("VMHOOK_TEST_RESULT", destination, sizeof destination)) { return 1; }
         std::ofstream output{destination};
-        const auto check = [&](std::string_view label) { output << label << "=pass\n"; output.flush(); };
+        const auto check = [&](std::string_view label) { output << std::format("{}=pass\n", label); output.flush(); };
         try
         {
             vmhook::native_thread_context context{"VMHook-descriptors"};
@@ -48,7 +49,7 @@ namespace
                 "ArrayObject", "Nested", "CollectionExact", "CollectionBroad", "Invalid", "Ambiguous"};
             const auto register_results = [&]<std::size_t... index>(std::index_sequence<index...>)
             { return (vmhook::register_class<result<static_cast<int>(index)>>(
-                "ArgumentDescriptorFixture$" + std::string{names[index]}) && ...); };
+                std::format("ArgumentDescriptorFixture${}", names[index])) && ...); };
             require(register_results(std::make_index_sequence<11>{}), "constructor class bindings");
             const auto text{vmhook::new_string<vmhook::java_string>("descriptor")};
             const auto text_null{std::make_unique<vmhook::java_string>(nullptr)};
@@ -126,7 +127,7 @@ namespace
             check("inferred_hook_arguments");
             check("descriptor_complete"); return 0;
         }
-        catch (const std::exception& error) { output << "exception=" << error.what() << '\n'; output.flush(); return 2; }
+        catch (const std::exception& error) { output << std::format("exception={}\n", error.what()); output.flush(); return 2; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance, DWORD reason, LPVOID)

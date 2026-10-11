@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #include <cstdlib>
 #include <new>
@@ -84,16 +85,16 @@ auto worker(void*) -> DWORD {
             saved=*ints;
         }
         const bool expired=refused([&]{ vmhook::set_prim_array(*saved,integers); });
-        output << "direct_array_batch=" << (batch && observed ? "pass" : "fail") << '\n';
-        output << "direct_array_cpp_allocation=" << (allocation ? "pass" : "fail") << '\n';
-        output << "direct_array_recovery=" << (recovered ? "pass" : "fail") << '\n';
-        output << "direct_array_refusal=" << (layout && expired ? "pass" : "fail") << '\n';
-        output << "direct_array_string_policy=" << (string_policy ? "pass" : "fail") << '\n';
+        output << std::format("direct_array_batch={}\n", (batch && observed ? "pass" : "fail"));
+        output << std::format("direct_array_cpp_allocation={}\n", (allocation ? "pass" : "fail"));
+        output << std::format("direct_array_recovery={}\n", (recovered ? "pass" : "fail"));
+        output << std::format("direct_array_refusal={}\n", (layout && expired ? "pass" : "fail"));
+        output << std::format("direct_array_string_policy={}\n", (string_policy ? "pass" : "fail"));
         output << "native_complete=pass\n" << std::flush;
         return batch && observed && allocation && recovered && layout && expired && string_policy ? 0 : 2;
     } catch(const std::exception& error) {
         pn::root_reuse_callback()=original_provider;fail_allocation=false;
-        output << "exception=" << error.what() << '\n' << std::flush;return 3;
+        output << std::format("exception={}\n", error.what()) << std::flush;return 3;
     }
 }
 }

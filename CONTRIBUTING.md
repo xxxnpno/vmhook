@@ -85,6 +85,18 @@ formatting, use descriptive names, and prefer trailing return types. Use `conste
 `consteval`, and `noexcept` where their actual contracts permit them. Runtime
 metadata and VM state still require runtime validation.
 
+Use `std::format` for composed runtime messages, member descriptors, identifiers
+and output records. Prefer compile-time checked `std::format_string` parameters
+when a formatting helper accepts literal formats; reserve `std::vformat` for
+explicitly dynamic formats. Streams handle I/O after formatting the complete
+record. Preserve numeric boolean values and record terminators in machine-readable
+output. Keep descriptor builders that run in `constexpr` or `consteval` code:
+standard formatting is not a constant-expression operation in C++23 or C++26.
+Parsing, UTF encoding and machine-code emission also keep their own algorithms.
+Checked operations propagate formatting errors and the original `std::bad_alloc`.
+Logging catches failures inside its `noexcept` boundary without allocating a
+replacement message in a catch handler.
+
 Keep changes focused. Do not commit binaries, build directories, module caches,
 precompiled headers, downloaded toolchains, or crash dumps. Do not add build
 branches for other operating systems or compilers.

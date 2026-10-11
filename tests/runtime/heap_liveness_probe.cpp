@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 namespace {
@@ -29,10 +30,10 @@ auto worker(void*) -> DWORD {
             filtered_refusal=std::string_view{error.what()}.find("dead-object filter")!=std::string_view::npos;
         }
         const bool support=vmhook::detail::verified_heap_iteration_available();
-        output << "heap_liveness=" << ((refusal ? filtered_refusal && !support : accepted && support) ? "pass" : "fail") << '\n';
+        output << std::format("heap_liveness={}\n", ((refusal ? filtered_refusal && !support : accepted && support) ? "pass" : "fail"));
         output << "native_complete=pass\n" << std::flush;
         return refusal ? (filtered_refusal && !support ? 0 : 2) : (accepted && support ? 0 : 3);
-    } catch(const std::exception& error) { output << "exception=" << error.what() << '\n' << std::flush; return 4; }
+    } catch(const std::exception& error) { output << std::format("exception={}\n", error.what()) << std::flush; return 4; }
 }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance,DWORD reason,LPVOID) {
