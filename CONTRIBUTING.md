@@ -35,10 +35,25 @@ features, including static reflection.
   explicit receiver argument. Class-bound lookup uses the same names under
   `static_members`; a static wrapper function uses that qualifier explicitly.
 - Hooks persist until explicitly removed. Do not add scoped hook handles.
+- Use `std::unique_ptr<wrapper>` for Java object getters, method returns,
+  `self()`, `root<wrapper>::get()` and hook receivers/arguments. Object setters and
+  method/constructor arguments accept these owners or const references to them,
+  not plain wrappers, wrapper references or raw object addresses. Hook object
+  return and argument replacements likewise take the pointer itself.
+  A Java null must still allocate a wrapper whose `get_instance()` is null,
+  including null collection elements and map keys/values. Reject empty C++
+  pointers as object inputs. C++ allocation failure raises `std::bad_alloc`;
+  failed operations and expired/foreign-thread roots must not masquerade as a
+  Java null. Keep copied primitive/string values distinct from Java references.
+  Allocation helpers also return owning wrappers and report backend/root
+  failures explicitly; preserve their actual allocator/context restrictions.
+  Reference field stores require Epsilon until a write-barrier backend exists.
 - Convert collections through their Java interface operations. Do not infer a
   map implementation from a field named `table` or a list from `get(int)`.
   Keep snapshot arrays and entries rooted across calls, resolve moved objects
-  again, preserve nulls and encounter order, and check registered element types.
+  again, preserve Java nulls through allocated wrappers and preserve encounter
+  order, and check registered element types. Null source containers still
+  convert to empty vectors.
   Verify target-inferred vector returns in both public interfaces and live
   collection variants on Java 8–27.
 - Keep preprocessor directives out of every `.ixx` file. Import the standard
@@ -95,6 +110,10 @@ Check failure paths as well as successful calls: a missing member, a null
 receiver, an unsupported layout, a Java exception, and a dispatch task that
 cannot run must have an observable result. Never turn unavailable invocation
 into a successful zero result or a constructor-less object.
+For object changes, test allocated Java-null wrappers separately from empty
+C++ owners, including getters, constructors, calls, collections, hook arguments
+and forced hook returns. Check that foreign-thread and expired-root access
+throws rather than resolving to a null instance.
 
 Tests must launch their JVM normally. Do not make them pass by adding `-Xint`,
 turning off the JIT or collector, or linking JNI into VMHook.

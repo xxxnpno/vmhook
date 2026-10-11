@@ -212,6 +212,8 @@ namespace vmhook::detail::native_backend
         explicit operator bool() const noexcept { return this->valid_; }
     };
     inline auto retain_oop(void*) noexcept -> root;
+    inline auto active_context_lifetime() noexcept -> std::shared_ptr<context_lifetime>;
+    inline auto refresh(void**, const root&) noexcept -> void*;
 }
 
 namespace vmhook::detail
@@ -224,6 +226,8 @@ namespace vmhook::detail
     inline auto resolve_callback_oop_snapshot(void*) noexcept -> void*;
     inline auto set_callback_reference(hotspot::return_slot*, const native_backend::root&) noexcept -> bool;
     inline auto set_callback_reference_snapshot(hotspot::return_slot*, void*) noexcept -> bool;
+    template<typename value_type>
+    consteval auto hook_write_argument_supported() noexcept -> bool;
 }
 
 namespace vmhook::detail::jit_backend
@@ -753,7 +757,7 @@ namespace vmhook
         }
 
         template<typename value_type>
-            requires (!std::is_base_of_v<vmhook::object_base, value_type>)
+            requires std::is_arithmetic_v<value_type>
         auto set(const value_type value) noexcept
             -> void
         {
@@ -761,17 +765,8 @@ namespace vmhook
                           "return type too large for hook slot");
             static_assert(std::is_trivially_copyable_v<value_type>,
                           "return_value::set: value_type must be trivially copyable - the slot is "
-                          "a raw 64-bit cell, not a managed object.  Pass a primitive, an oop "
-                          "pointer (void*), or a small POD by value.");
-            if constexpr (std::is_pointer_v<value_type>)
-            {
-                if (value)
-                {
-                    (void)vmhook::detail::set_callback_reference_snapshot(this->return_slot,
-                        const_cast<void*>(static_cast<const void*>(value)));
-                    return;
-                }
-            }
+                          "a raw 64-bit cell. Pass Java object results through a "
+                          "std::unique_ptr to their wrapper.");
             this->return_slot->cancel = true;
 
             // Sign-extend signed integers smaller than int64 BEFORE writing the
@@ -794,37 +789,15 @@ namespace vmhook
         }
 
         /*
-            @brief Typed null-return overload for hooks on methods that return a
-                   Java reference type.
-            @details
-            Equivalent to set<vmhook::oop_t>(nullptr) but documents the slot's
-            Java type at the call site:
-
-                // Before - works but says nothing about what null means
-                ret.set<vmhook::oop_t>(nullptr);
-
-                // After - reads as "return null MovingObjectPosition"
-                ret.set<sdk::moving_object_position>(nullptr);
-
-            The wrapper_type template argument is documentation only - we never
-            touch an instance, just write a null OOP into the 64-bit retval slot.
-            Selected only when wrapper_type derives from vmhook::object_base, so
-            primitive set<int32_t>(...) calls remain on the integer path above.
+            @brief Returns the Java reference held by an allocated wrapper.
+            @details A Java null is represented by a non-null unique_ptr whose
+            wrapper has a null instance. Empty C++ owners are refused. Live
+            references use the existing VM-scanned callback return-root path.
         */
         template<typename wrapper_type>
-            requires std::is_base_of_v<vmhook::object_base, wrapper_type>
-        auto set(std::nullptr_t) noexcept
-            -> void
-        {
-            this->return_slot->cancel = true;
-            this->return_slot->retval = 0;
-        }
-
-        auto set(const vmhook::object_base& value) noexcept -> void;
-        template<typename wrapper_type>
-        auto set(const vmhook::borrowed<wrapper_type>& value) noexcept -> void;
-        auto set(const vmhook::detail::native_backend::root& value) noexcept -> void
-        { (void)vmhook::detail::set_callback_reference(this->return_slot, value); }
+            requires (std::is_base_of_v<vmhook::object_base, wrapper_type>
+                      && !std::is_const_v<wrapper_type> && !std::is_volatile_v<wrapper_type>)
+        auto set(const std::unique_ptr<wrapper_type>& value) -> void;
 
         auto cancel() noexcept
             -> void
@@ -845,12 +818,13 @@ namespace vmhook
             Thread safety: not thread-safe; must only be called from the hook callback.
 
             @param index  Zero-based index of the declared Java parameter to overwrite.
-            @param value  New value to store; must be trivially copyable and fit in a
-                          Java local-variable slot (up to 8 bytes).
+            @param value  New Java primitive, string, or allocated wrapper owner.
+                          Java-null object values use a wrapper with a null instance.
             @return true if the write succeeded, false if frame is nullptr or index is
                     out of range.
         */
         template<typename value_type>
+            requires (vmhook::detail::hook_write_argument_supported<value_type>())
         auto set_arg(std::int32_t index, value_type&& value) noexcept
             -> bool;
 
@@ -1383,7 +1357,8 @@ namespace vmhook
 
             The contract it exists to enforce: the POINTER is always valid, and
             the OBJECT may be absent.  `p->get_instance() == nullptr` means the
-            Java reference was null (or could not be decoded); `p` itself is
+            Java reference was null; invalid references and failed operations
+            throw instead of masquerading as Java null. `p` itself is
             never null, so there is exactly one thing to check and `p->` is
             always safe to write.
 
@@ -1391,18 +1366,30 @@ namespace vmhook
             replaced — made the two indistinguishable at the call site and made
             every access site carry a null test before it could ask anything.
 
-            The one residual null is a failed C++ allocation: `new` is nothrow
-            here because every one of these paths is noexcept, and there is
-            nothing honest to return when the process is out of memory.
+            C++ allocation failure throws std::bad_alloc. An empty owning
+            pointer is never a successful materialized Java object result.
 
-            Complexity: O(1) plus one small allocation.  noexcept.
+            Complexity: O(1) plus one small allocation.
         */
         template<typename wrapper_type>
-        [[nodiscard]] inline auto wrap_object(void* const address) noexcept
+        [[nodiscard]] inline auto wrap_object(void* const address)
             -> std::unique_ptr<wrapper_type>
         {
-            return std::unique_ptr<wrapper_type>{ new (std::nothrow) wrapper_type{ address } };
+            return std::make_unique<wrapper_type>(address);
         }
+
+        // Definitions follow object_base and the exact Klass assignability
+        // walker. All value conversions share this checked materialization.
+        template<typename wrapper_type>
+        [[nodiscard]] auto materialize_object(const std::uint32_t compressed,
+            const native_backend::root& existing) -> std::unique_ptr<wrapper_type>;
+
+        // Checks the Java descriptor in the declaring class's loader namespace.
+        // The caller retains its owner and refreshes its OOP after this check.
+        inline auto require_reference_argument(void* address, std::string_view descriptor,
+            vmhook::hotspot::klass* declaring_class) -> void;
+        template<typename wrapper_type>
+        inline auto require_object_wrapper_type(void* address) -> void;
 
         /*
             @brief Reflects a C++ type name for diagnostics.
@@ -1702,7 +1689,7 @@ namespace vmhook
         };
 
         /*
-            @brief Restricts value conversions to supported scalar, string, wrapper, and reference targets.
+            @brief Restricts value conversions to scalar, string, array, and owning wrapper targets.
             @details This avoids offering unrelated conversion candidates to class constructors.
         */
         template<typename type>
@@ -1710,46 +1697,32 @@ namespace vmhook
             []() constexpr noexcept -> bool
             {
                 using clean = std::remove_cvref_t<type>;
-                if constexpr (std::is_same_v<clean, std::nullptr_t>)
+                if constexpr (is_unique_ptr_v<clean>)
                 {
-                    return false;
+                    using wrapper_type = typename clean::element_type;
+                    return std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+                        && std::is_base_of_v<vmhook::object_base, wrapper_type>
+                        && !std::is_same_v<wrapper_type, vmhook::object_base>
+                        && std::is_constructible_v<wrapper_type, void*>
+                        && std::is_same_v<typename clean::deleter_type, std::default_delete<wrapper_type>>;
                 }
-                else if constexpr (std::is_pointer_v<clean>)
+                else if constexpr (is_vector_v<clean>)
                 {
-                    // Only void* (any cv) is a legitimate pointer target; every
-                    // other pointer (char*, const char*, W*, ...) is excised.
-                    return std::is_void_v<std::remove_pointer_t<clean>>;
+                    using element_type = typename is_vector<clean>::value_type_t;
+                    return std::is_arithmetic_v<element_type>
+                        || std::is_same_v<element_type, std::string>;
                 }
                 else
                 {
-                    return true;
+                    return std::is_arithmetic_v<clean> || std::is_same_v<clean, std::string>;
                 }
             }()
         };
 
         /*
-            @brief Recognises the reference-shaped targets a value_t can produce.
-            @details
-            A Java reference read (field or call result) arrives as a compressed
-            OOP.  What the caller wants out of it is decided by the type they
-            assigned it to, not by a template argument they had to supply:
-
-                vmhook::borrowed<entity> e = f->get();   // is_borrowed_v
-                vmhook::ref<entity>      r = f->get();   // is_ref_v
-                entity                   w = f->get();   // is_java_wrapper_v
-
-            Before these traits existed every one of those lines compiled and
-            produced a DEFAULT-CONSTRUCTED result — an empty handle, a null
-            wrapper — because the conversion fell through to `target_type{}`.
-            That is the worst possible outcome: the code reads correctly and is
-            silently null.  Recognising the shape here is what turns those three
-            lines into real decodes.
-
-            The borrow case reuses the existing is_borrowed_v (the detour
-            machinery already needed it); ref and wrapper are new here.  Each is
-            a pure name match, so none needs a complete type — the branch that
-            uses it is only instantiated at the call site, by which point
-            borrowed / ref / the wrapper all are complete.
+            @brief Recognises low-level anchored-reference handles.
+            @details These types support metadata/path inspection internally.
+            Public Java object values and arguments use std::unique_ptr wrappers.
         */
         template<typename type>
         struct is_ref : std::false_type {};
@@ -1794,6 +1767,67 @@ namespace vmhook
 
         template<typename type>
         using handle_wrapper_t = typename handle_wrapper_impl<std::remove_cvref_t<type>>::type_t;
+
+        // Public Java references use owning C++ wrappers. A null Java reference
+        // is represented by an allocated wrapper, never by an empty unique_ptr.
+        template<typename type>
+        inline constexpr bool is_java_object_pointer_v{
+            []() constexpr noexcept -> bool
+            {
+                using clean_type = std::remove_cvref_t<type>;
+                if constexpr (!is_unique_ptr_v<clean_type>) { return false; }
+                else
+                {
+                    using wrapper_type = typename is_unique_ptr<clean_type>::value_type_t;
+                    return is_java_wrapper_v<wrapper_type>
+                        && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+                        && std::is_same_v<typename clean_type::deleter_type,
+                                          std::default_delete<wrapper_type>>;
+                }
+            }()
+        };
+
+        template<typename type>
+        inline constexpr bool supported_java_argument_v{
+            []() constexpr noexcept -> bool
+            {
+                using clean_type = std::remove_cvref_t<type>;
+                if constexpr (is_java_wrapper_v<clean_type>
+                    || is_borrowed_v<clean_type> || is_ref_v<clean_type>
+                    || std::is_same_v<clean_type, std::nullptr_t>)
+                { return false; }
+                else
+                {
+                    return std::is_arithmetic_v<clean_type>
+                        || std::is_enum_v<clean_type>
+                        || std::is_convertible_v<type, std::string_view>
+                        || is_java_object_pointer_v<type>;
+                }
+            }()
+        };
+
+        template<typename type>
+        inline constexpr bool supported_field_value_v{
+            supported_java_argument_v<type>
+            || (is_vector_v<std::remove_cvref_t<type>>
+                && value_t_convertible_target_v<std::remove_cvref_t<type>>)
+        };
+
+        template<typename type>
+        inline auto require_object_argument(const type& value) -> void
+        {
+            if constexpr (is_java_object_pointer_v<type>)
+            {
+                if (!value)
+                {
+                    throw vmhook::exception{
+                        "An empty C++ unique_ptr is not a Java null reference; "
+                        "pass an allocated wrapper whose get_instance() is nullptr." };
+                }
+                if (const auto root{ value->get_native_root() }; root && !root->valid())
+                { throw vmhook::exception{ "The Java argument's context root is invalid." }; }
+            }
+        }
 
         struct interpreter_argument_slot
         {
@@ -1871,17 +1905,35 @@ namespace vmhook
                     typename is_unique_ptr<clean_type>::value_type_t>;
             }
             else if constexpr (is_borrowed_v<clean_type> || is_java_wrapper_v<clean_type>)
-            {
-                // A wrapper is a reference shape. Writes additionally validate
-                // the actual oop's class before publishing it as a stack root.
-                return reference;
-            }
+            { return false; }
             else
             {
                 constexpr auto expected{ descriptor_of_v<clean_type> };
                 return !descriptor.empty() && !expected.empty() && descriptor == expected;
             }
         }
+
+        template<typename value_type>
+        inline constexpr bool frame_argument_supported_v{ []() consteval
+        {
+            using clean_type = std::remove_cvref_t<value_type>;
+            if constexpr (is_unique_ptr_v<clean_type>)
+            {
+                using wrapper_type = typename is_unique_ptr<clean_type>::value_type_t;
+                return is_java_wrapper_v<wrapper_type>
+                    && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+                    && std::is_same_v<clean_type, std::unique_ptr<wrapper_type>>;
+            }
+            else
+            {
+                // The hotspot::frame API also serves trusted VM ABI diagnostics.
+                // Public hook callbacks exclude this raw snapshot spelling.
+                return std::is_arithmetic_v<clean_type>
+                    || std::is_same_v<clean_type, std::string>
+                    || (std::is_pointer_v<clean_type>
+                        && std::is_void_v<std::remove_pointer_t<clean_type>>);
+            }
+        }() };
 
     }
 
@@ -5642,58 +5694,52 @@ namespace vmhook
         /*
             @brief Type-erased container for method arguments obtained via auto-detection.
             @details
-            Returned by frame::get_arguments() (no template parameters). Stores raw decoded
-            OOP pointers and class names. Call as<T>() to construct a wrapper on demand.
+            Returned by frame::get_arguments() (no template parameters). Stores
+            retained reference roots and descriptors. Call as<T>() to construct
+            an owning wrapper within the original callback context.
         */
         struct method_args
         {
             /*
                 @brief One observed argument from an intercepted Java method call.
-                @details decoded_oop holds the full-width reference already present
-                in interpreter locals, or zero for a primitive. class_name uses
-                JVM-internal slash separators for optional wrapper conversion.
-                The address is non-owning and does not outlive its VM context.
+                @details A reference root remains scanned through subsequent
+                Java calls. Reference entries without a root are verified Java
+                nulls; primitive entries cannot convert to object wrappers.
             */
             struct argument_entry
             {
-                void* decoded_oop;
+                vmhook::detail::native_backend::root reference_root{};
                 std::string class_name;
+                bool is_reference{};
             };
 
             /*
-                @brief Returns the raw decoded OOP at the given index.
+                @brief Returns an owning generic wrapper at the given index.
                 @param index Zero-based argument index (0 = this / first parameter).
             */
-            auto operator[](const std::size_t index) const noexcept
-                -> void*
-            {
-                if (index >= this->arguments.size())
-                {
-                    return nullptr;
-                }
-                return this->arguments[index].decoded_oop;
-            }
+            auto operator[](std::size_t index) const -> std::unique_ptr<vmhook::any_object>;
 
             /*
                 @brief Returns the argument at the given index as a C++ wrapper.
-                @tparam wrapper_type The C++ wrapper class (must be constructible from void* OOP).
+                @tparam wrapper_type The Java wrapper class.
                 @param index Zero-based argument index.
-                @return A new wrapper_type* constructed from the decoded OOP, or nullptr.
+                @return An allocated wrapper, including for a null Java reference.
             */
             template<typename wrapper_type>
-            auto as(const std::size_t index) const noexcept
-                -> wrapper_type*
+                requires vmhook::detail::container_wrapper<wrapper_type>
+            auto as(const std::size_t index) const
+                -> std::unique_ptr<wrapper_type>
             {
                 if (index >= this->arguments.size())
-                {
-                    return nullptr;
-                }
-                void* const raw{ this->arguments[index].decoded_oop };
-                if (!raw)
-                {
-                    return nullptr;
-                }
-                return new wrapper_type{ raw };
+                { throw vmhook::exception{ "The intercepted Java argument index is out of range." }; }
+                vmhook::detail::native_backend::operation access{};
+                if (!access || !this->context_
+                    || vmhook::detail::native_backend::active_context_lifetime() != this->context_)
+                { throw vmhook::exception{ "Java frame arguments require their original callback context." }; }
+                const auto& argument{ this->arguments[index] };
+                if (!argument.is_reference)
+                { throw vmhook::exception{ "A primitive Java argument cannot convert to an object wrapper." }; }
+                return vmhook::detail::materialize_object<wrapper_type>(0, argument.reference_root);
             }
 
             /*
@@ -5710,7 +5756,10 @@ namespace vmhook
                 return this->arguments.size();
             }
 
+        private:
+            friend struct frame;
             std::vector<argument_entry> arguments{};
+            std::shared_ptr<vmhook::detail::native_backend::context_lifetime> context_{};
         };
 
 
@@ -5770,24 +5819,25 @@ namespace vmhook
             /*
                 @brief Retrieves a typed prefix of the intercepted arguments.
                 @tparam types The C++ types of the method arguments in declaration order.
-                @return A tuple of values, or a default tuple on a descriptor/type mismatch.
+                @return A tuple of primitive/string values and allocated wrapper owners.
                 @details
                 For primitive types, the raw slot value is reinterpreted directly.
-                For pointer types, the full uncompressed oop is read directly.
+                Object arguments use owning wrappers, including Java-null values.
+                Raw void* slots are reserved for trusted HotSpot ABI diagnostics.
                 For index 0 on instance methods, this holds the implicit `this` reference.
             */
             template<typename... types>
-            auto get_arguments() const noexcept
+                requires (vmhook::detail::frame_argument_supported_v<types> && ...)
+            auto get_arguments() const
                 -> std::tuple<std::remove_cvref_t<types>...>
             {
                 using result_type = std::tuple<std::remove_cvref_t<types>...>;
-                try
                 {
                     auto* const method{ this->get_method() };
                     std::uint16_t access_flags{};
                     if (!this->get_locals() || !method
                         || !vmhook::os::safe_read(&access_flags, method->get_access_flags(), sizeof(access_flags)))
-                    { return result_type{}; }
+                    { throw vmhook::exception{ "The intercepted Java frame arguments are unavailable." }; }
                     const auto signature{ method->get_signature() };
                     std::array<std::int32_t, sizeof...(types)> slots{};
                     const bool valid{ [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
@@ -5803,14 +5853,14 @@ namespace vmhook
                             return true;
                         }()) && ...);
                     }(std::index_sequence_for<types...>{}) };
-                    if (!valid) { return result_type{}; }
+                    if (!valid)
+                    { throw vmhook::exception{ "The requested Java frame arguments do not match its descriptor." }; }
                     return [this, &slots]<std::size_t... indexes>(std::index_sequence<indexes...>)
                     {
                         return result_type{ vmhook::detail::extract_frame_arg<types>(
                             const_cast<frame*>(this), slots[indexes])... };
                     }(std::index_sequence_for<types...>{});
                 }
-                catch (...) { return result_type{}; }
             }
 
             /*
@@ -5819,43 +5869,51 @@ namespace vmhook
                 @details
                 Parses the method descriptor (e.g. "(ILjava/lang/String;)V") to determine
                 how many arguments there are and which slots correspond to reference types.
-                For reference-type arguments the factory registered via vmhook::register_class<T>()
-                is used to construct a std::unique_ptr<T>. Primitive arguments are skipped
-                (only reference-type args produce entries).
+                The receiver and all parameters keep their declaration-order
+                indices. Reference entries retain VM-scanned roots; as<T>()
+                verifies their wrapper class. Primitive entries are counted but
+                cannot be accessed as object wrappers.
 
                 Usage:
                     auto args = frame->get_arguments();
-                    auto* player = args.as<test_target>(0);  // first ref arg
+                    auto player = args.as<test_target>(0);  // instance receiver
             */
-            auto get_arguments() const noexcept
+            auto get_arguments() const
                 -> vmhook::hotspot::method_args
             {
-                try
                 {
                     vmhook::hotspot::method_args result{};
+                    vmhook::detail::native_backend::operation access{};
+                    result.context_ = vmhook::detail::native_backend::active_context_lifetime();
+                    if (!access || !result.context_)
+                    { throw vmhook::exception{ "Java frame arguments require the active callback context." }; }
                     auto* const method{ this->get_method() };
                     void** const locals{ this->get_locals() };
                     std::uint16_t access_flags{};
                     if (!locals || !method
                         || !vmhook::os::safe_read(&access_flags, method->get_access_flags(), sizeof(access_flags)))
-                    { return result; }
+                    { throw vmhook::exception{ "The intercepted Java frame arguments are unavailable." }; }
                     const auto signature{ method->get_signature() };
                     for (std::int32_t index{}; index < 255; ++index)
                     {
                         const auto argument{ vmhook::detail::interpreter_argument_layout(
-                            signature, (access_flags & 0x0008u) != 0, index) };
+                            signature, (access_flags & 0x0008u) != 0, index, true) };
                         if (!argument) { break; }
                         const auto descriptor{ argument->descriptor };
-                        if (descriptor.front() != 'L' && descriptor.front() != '[') { continue; }
+                        const bool reference{ descriptor.empty() || descriptor.front() == 'L' || descriptor.front() == '[' };
                         void* oop{};
-                        if (!vmhook::os::safe_read(&oop, locals - argument->slot, sizeof(oop))) { oop = nullptr; }
-                        const auto name{ descriptor.front() == '[' ? descriptor
-                            : descriptor.substr(1, descriptor.size() - 2) };
-                        result.arguments.push_back({ oop, std::string{ name } });
+                        if (reference && !vmhook::os::safe_read(&oop, locals - argument->slot, sizeof(oop)))
+                        { throw vmhook::exception{ "The intercepted Java reference argument is unreadable." }; }
+                        const auto root{ reference ? vmhook::detail::native_backend::retain_oop(oop)
+                            : vmhook::detail::native_backend::root{} };
+                        if (oop && !root)
+                        { throw vmhook::exception{ "The intercepted Java reference argument cannot be retained." }; }
+                        const auto name{ descriptor.size() > 1 && descriptor.front() == 'L'
+                            ? descriptor.substr(1, descriptor.size() - 2) : descriptor };
+                        result.arguments.push_back({ root, std::string{ name }, reference });
                     }
                     return result;
                 }
-                catch (...) { return {}; }
             }
 
 
@@ -8498,10 +8556,95 @@ namespace vmhook
             using type_t = std::tuple<>;
         };
 
+        [[nodiscard]] inline auto callback_declaring_class(vmhook::hotspot::method* const method)
+            -> vmhook::hotspot::klass*
+        {
+            const auto* const const_method{ method ? method->get_const_method() : nullptr };
+            const auto* const constants{ const_method ? const_method->get_constants() : nullptr };
+            const auto* const holder_entry{
+                vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
+            auto* const holder{ constants && holder_entry
+                ? const_cast<vmhook::hotspot::klass*>(static_cast<const vmhook::hotspot::klass*>(
+                    vmhook::hotspot::safe_read_pointer(reinterpret_cast<const std::byte*>(constants)
+                        + holder_entry->offset))) : nullptr };
+            if (!holder || !vmhook::hotspot::is_valid_pointer(holder))
+            { throw vmhook::exception{ "The hooked Java method declaring class is unavailable." }; }
+            return holder;
+        }
+
+        // Java objects enter a callback through an owning C++ wrapper. The
+        // const-reference form borrows that owner for this invocation; a value
+        // parameter receives it by move. Neither form transfers Java ownership.
+        template<typename argument_type>
+        inline constexpr bool hook_argument_supported_v{ []() consteval
+        {
+            using clean_type = std::remove_cvref_t<argument_type>;
+            if constexpr (is_unique_ptr_v<clean_type>)
+            {
+                using wrapper_type = typename is_unique_ptr<clean_type>::value_type_t;
+                return is_java_wrapper_v<wrapper_type>
+                    && !std::is_const_v<wrapper_type> && !std::is_volatile_v<wrapper_type>
+                    && std::is_same_v<clean_type, std::unique_ptr<wrapper_type>>
+                    && (std::is_same_v<argument_type, clean_type>
+                        || std::is_same_v<argument_type, const clean_type&>);
+            }
+            else
+            {
+                return (std::is_arithmetic_v<clean_type>
+                    || std::is_same_v<clean_type, std::string>)
+                    && !std::is_volatile_v<std::remove_reference_t<argument_type>>
+                    && (!std::is_reference_v<argument_type>
+                        || std::is_same_v<argument_type, const clean_type&>);
+            }
+        }() };
+
+        template<typename callback_type>
+        inline constexpr bool hook_callback_supported_v{ []() consteval
+        {
+            using clean_type = std::remove_cvref_t<callback_type>;
+            if constexpr (requires { typename function_traits<clean_type>::args_tuple_t; })
+            {
+                using arguments = typename function_traits<clean_type>::args_tuple_t;
+                if constexpr (std::tuple_size_v<arguments> == 0) { return false; }
+                else if constexpr (!std::is_same_v<std::tuple_element_t<0, arguments>, vmhook::return_value&>)
+                { return false; }
+                else
+                {
+                    return []<std::size_t... indexes>(std::index_sequence<indexes...>)
+                    {
+                        return (hook_argument_supported_v<std::tuple_element_t<indexes + 1, arguments>> && ...);
+                    }(std::make_index_sequence<std::tuple_size_v<arguments> - 1>{});
+                }
+            }
+            else { return false; }
+        }() };
+
+        template<typename value_type>
+        consteval auto hook_write_argument_supported() noexcept -> bool
+        {
+            using clean_type = std::decay_t<value_type>;
+            if constexpr (is_unique_ptr_v<clean_type>)
+            {
+                using wrapper_type = typename is_unique_ptr<clean_type>::value_type_t;
+                return is_java_wrapper_v<wrapper_type>
+                    && !std::is_const_v<wrapper_type> && !std::is_volatile_v<wrapper_type>
+                    && std::is_same_v<clean_type, std::unique_ptr<wrapper_type>>
+                    && !std::is_volatile_v<std::remove_reference_t<value_type>>;
+            }
+            else
+            {
+                return std::is_arithmetic_v<clean_type>
+                    || std::is_same_v<clean_type, std::string>
+                    || std::is_same_v<clean_type, std::string_view>
+                    || std::is_same_v<clean_type, char*>
+                    || std::is_same_v<clean_type, const char*>;
+            }
+        }
+
         /*
             @brief Reads a parameter beginning at a descriptor-validated JVM slot.
             @details Interpreter references are full oops. Strings are copied to
-            C++ storage; wrapper/borrowed arguments refer to the same Java object.
+            C++ storage; owning wrapper arguments refer to the same Java object.
             Slot zero is the receiver for instance methods. A long/double's second
             local slot cannot be requested as an independent argument.
             Metadata and allocation errors may throw to the callback boundary.
@@ -8512,6 +8655,13 @@ namespace vmhook
         {
             using base_t = std::remove_cvref_t<value_type>;
             vmhook::detail::native_backend::operation access{};
+            const auto invalid_argument = []() -> base_t
+            {
+                if constexpr (is_unique_ptr_v<base_t>)
+                { throw vmhook::exception{ "Cannot read or retain the Java callback object argument." }; }
+                else { return base_t{}; }
+            };
+            if (!access) { return invalid_argument(); }
 
             // Bound interpreter-local indices before negative-offset addressing.
             // Descriptor checks below also verify that the chosen slot begins a
@@ -8520,7 +8670,7 @@ namespace vmhook
             constexpr std::int32_t max_jvm_locals{ 0xFFFF };
             if (index < 0 || index > max_jvm_locals)
             {
-                return base_t{};
+                return invalid_argument();
             }
 
             // Null-frame guard.  frame::get_locals() already survives being
@@ -8530,23 +8680,23 @@ namespace vmhook
             // the body is.  GCC diagnoses exactly that (-Wnonnull) as soon as a
             // caller can be seen passing null.  Guard it here, at the choke
             // point every detour argument passes through, so the contract is
-            // "a null frame yields a default-constructed argument" by
-            // construction rather than by the callee's good behaviour.
+            // "a null frame refuses an object argument" by construction.
+            // It cannot manufacture a null C++ owner for a failed Java read.
             if (!frame)
             {
-                return base_t{};
+                return invalid_argument();
             }
 
             void** const locals{ frame->get_locals() };
             if (!locals)
             {
-                return base_t{};
+                return invalid_argument();
             }
 
             auto* const method{ frame->get_method() };
             std::uint16_t access_flags{};
             if (!method || !vmhook::os::safe_read(&access_flags, method->get_access_flags(), sizeof(access_flags)))
-            { return base_t{}; }
+            { return invalid_argument(); }
             const auto signature{ method->get_signature() };
             bool compatible{};
             for (std::int32_t ordinal{}; ordinal <= 255; ++ordinal)
@@ -8560,18 +8710,18 @@ namespace vmhook
                     break;
                 }
             }
-            if (!compatible) { return base_t{}; }
+            if (!compatible) { return invalid_argument(); }
 
             // Read JVM memory through the Windows memory API and stop on unreadable data.
             // A successful read does not establish object lifetime or a coherent VM snapshot.
-            const auto read_slot = [locals](const std::int32_t slot_index) noexcept -> void*
+            const auto read_slot = [locals](const std::int32_t slot_index) -> void*
             {
                 void* slot_value{ nullptr };
                 if (!vmhook::os::safe_read(&slot_value,
                                            &locals[-slot_index],
                                            sizeof(slot_value)))
                 {
-                    return nullptr;
+                    throw vmhook::exception{ "The Java callback argument slot is unreadable." };
                 }
                 return slot_value;
             };
@@ -8586,22 +8736,6 @@ namespace vmhook
             {
                 return vmhook::read_java_string(decode_oop(raw_value));
             }
-            else if constexpr (is_borrowed_v<base_t>)
-            {
-                // The zero-ceremony detour argument.  A borrowed<W> stamps the
-                // decoded oop with the collection epoch it was read in, so the
-                // handle resolves to nullptr the moment the collector moves -
-                // EXPIRED rather than dangling - and carrying it out of the
-                // detour fails loudly instead of silently reading a relocated
-                // address.  Unlike the unique_ptr<W> arm below it needs no
-                // registered factory, no allocation and no map lookup: it is two
-                // words, trivially copyable, and constructed unconditionally.
-                //
-                // A null slot yields a default-constructed (empty, never
-                // expired) borrow, which is the honest reading of a Java null -
-                // `if (arg)` is false for both, and expired() distinguishes them.
-                return base_t{ decode_oop(raw_value), vmhook::detail::native_backend::retain_oop(raw_value) };
-            }
             else if constexpr (is_unique_ptr_v<base_t>)
             {
                 // A detour argument declared as std::unique_ptr<W> is the same
@@ -8611,18 +8745,14 @@ namespace vmhook
                 // Construct the statically known wrapper around the decoded
                 // reference. Registration controls its later member lookups.
                 using element_t = typename base_t::element_type;
-                auto wrapped{ vmhook::detail::wrap_object<element_t>(decode_oop(raw_value)) };
-                if (wrapped) { wrapped->set_native_root(vmhook::detail::native_backend::retain_oop(raw_value)); }
-                return wrapped;
-            }
-            else if constexpr (is_java_wrapper_v<base_t>)
-            {
-                base_t wrapped{ decode_oop(raw_value) };
-                wrapped.set_native_root(vmhook::detail::native_backend::retain_oop(raw_value));
-                return wrapped;
+                const auto root{ vmhook::detail::native_backend::retain_oop(raw_value) };
+                if (raw_value && !root) { return invalid_argument(); }
+                return vmhook::detail::materialize_object<element_t>(std::uint32_t{}, root);
             }
             else if constexpr (std::is_pointer_v<base_t>)
             {
+                // Trusted frame diagnostics can request a raw ABI snapshot.
+                // The public hook callback constraint excludes this branch.
                 vmhook::detail::track_callback_oop_snapshot(raw_value,
                     vmhook::detail::native_backend::retain_oop(raw_value));
                 return reinterpret_cast<base_t>(decode_oop(raw_value));
@@ -8649,12 +8779,8 @@ namespace vmhook
             {
                 static_assert(vmhook::detail::dependent_false_v<base_t>,
                               "vmhook::detail::extract_frame_arg: unsupported argument type.  "
-                              "The previous behaviour silently returned a default-constructed "
-                              "value (all zeros) for any type larger than a pointer that wasn't "
-                              "std::string / unique_ptr<T> / a raw pointer - user hook callbacks "
-                              "saw a hidden zero arg with no compile-time or runtime warning.  "
-                              "Convert the arg to one of: primitive / pointer / std::string / "
-                              "unique_ptr<vmhook::object>.");
+                              "Public Java callback arguments use primitives, std::string, "
+                              "or std::unique_ptr to a Java wrapper.");
             }
         }
 
@@ -8924,6 +9050,7 @@ namespace vmhook
     }
 
     template<typename value_type>
+        requires (vmhook::detail::hook_write_argument_supported<value_type>())
     auto return_value::set_arg(const std::int32_t index, value_type&& value) noexcept
         -> bool
     {
@@ -8983,28 +9110,15 @@ namespace vmhook
                 // wrote a narrow/compressed pointer into a wide slot, corrupting the
                 // local.  Always store the wide pointer; storing nullptr wide is the
                 // correct representation of a null local too.
-                if (oop)
-                {
-                    const auto descriptor{ argument->descriptor };
-                    if (descriptor.empty() || (descriptor.front() != 'L' && descriptor.front() != '['))
-                    { return false; }
-                    const auto expected{ descriptor.front() == '[' ? descriptor
-                        : descriptor.substr(1, descriptor.size() - 2) };
-                    bool compatible{};
-                    auto* klass{ vmhook::klass_from_oop(oop) };
-                    // Conservatively accept exact classes and their class ancestors.
-                    // Interface assignability requires the secondary-super layout.
-                    for (std::size_t depth{}; klass && depth < 256; ++depth)
-                    {
-                        if (!vmhook::hotspot::is_valid_pointer(klass)) { break; }
-                        auto* const name{ klass->get_name() };
-                        if (!name || !vmhook::hotspot::is_valid_pointer(name)) { break; }
-                        if (name->to_string() == expected) { compatible = true; break; }
-                        klass = klass->get_super();
-                    }
-                    if (!compatible) { return false; }
-                }
-                return write_slot(argument_slot, oop);
+                const auto root{ vmhook::detail::native_backend::retain_oop(oop) };
+                if (oop && !root) { return false; }
+                vmhook::detail::require_reference_argument(oop, argument->descriptor,
+                    vmhook::detail::callback_declaring_class(method));
+                // Descriptor resolution can invoke Java while respecting the
+                // declaring loader. The reference must be refreshed afterward.
+                void* const current{ vmhook::detail::native_backend::refresh(nullptr, root) };
+                if (oop && !current) { return false; }
+                return write_slot(argument_slot, current);
             };
 
             if constexpr (vmhook::detail::is_unique_object_ptr<clean_value_type>::value)
@@ -9013,11 +9127,13 @@ namespace vmhook
                 // even when the derived wrapper shadows the name (e.g. with a same-named
                 // static helper).  Avoids the static_cast<object_base*> which produces an
                 // "incomplete type" warning under GCC at template-definition time.
-                return store_oop(value ? value->vmhook::object_base::get_instance() : nullptr);
-            }
-            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_value_type>)
-            {
-                return store_oop(value.get_instance());
+                if (!value) { return false; }
+                const auto root{ value->get_native_root() };
+                if (root && !root->valid()) { return false; }
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_value_type>::value_type_t;
+                if (void* const address{ value->vmhook::object_base::get_instance() })
+                { vmhook::detail::require_object_wrapper_type<wrapper_type>(address); }
+                return store_oop(value->vmhook::object_base::get_instance());
             }
             else if constexpr (std::is_same_v<clean_value_type, std::string> || std::is_same_v<clean_value_type, std::string_view>)
             {
@@ -9071,21 +9187,6 @@ namespace vmhook
 
                 return store_oop(string_oop);
             }
-            else if constexpr (std::is_same_v<clean_value_type, std::nullptr_t>)
-            {
-                return store_oop(nullptr);
-            }
-            else if constexpr (vmhook::detail::is_borrowed_v<clean_value_type>)
-            {
-                return store_oop(value.resolve());
-            }
-            else if constexpr (std::is_pointer_v<clean_value_type>
-                               && std::is_void_v<std::remove_pointer_t<clean_value_type>>)
-            {
-                void* const snapshot{ const_cast<void*>(static_cast<const void*>(value)) };
-                void* const current{ vmhook::detail::resolve_callback_oop_snapshot(snapshot) };
-                return (!snapshot || current) && store_oop(current);
-            }
             else if constexpr (std::is_trivially_copyable_v<clean_value_type> && sizeof(clean_value_type) <= sizeof(void*))
             {
                 void* raw{};
@@ -9125,10 +9226,11 @@ namespace vmhook
     // Installation excludes this method from compilation and inlining, drains
     // existing compiler tasks and invalidates compiled callers at a real VM
     // safepoint before publishing the interpreter callback.
-    template<class wrapper_type>
+    template<class wrapper_type, class callback_type>
+        requires vmhook::detail::hook_callback_supported_v<callback_type>
     inline auto hook(const std::string_view method_name,
                      const std::string_view method_signature,
-                     auto&& user_detour) -> bool
+                     callback_type&& user_detour) -> bool
     {
         try
         {
@@ -9283,8 +9385,9 @@ namespace vmhook
         }
     }
 
-    template<class wrapper_type>
-    inline auto hook(const std::string_view method_name, auto&& user_detour) -> bool
+    template<class wrapper_type, class callback_type>
+        requires vmhook::detail::hook_callback_supported_v<callback_type>
+    inline auto hook(const std::string_view method_name, callback_type&& user_detour) -> bool
     {
         return vmhook::hook<wrapper_type>(method_name, std::string_view{},
             std::forward<decltype(user_detour)>(user_detour));
@@ -9383,9 +9486,10 @@ namespace vmhook
         @return true on a successful single-match install; false if no method
                 (or more than one) matches, or the install itself fails.
     */
-    template<class wrapper_type>
+    template<class wrapper_type, class callback_type>
+        requires vmhook::detail::hook_callback_supported_v<callback_type>
     inline auto hook_by_signature(const std::string_view jvm_descriptor,
-                                  auto&&                  user_detour) -> bool
+                                  callback_type&&         user_detour) -> bool
     {
         const auto names{ vmhook::find_methods_by_signature<wrapper_type>(jvm_descriptor) };
         if (names.empty())
@@ -13338,16 +13442,19 @@ namespace vmhook
         The constructor overload is chosen from the C++ argument types. Some
         refusals, including an unmatched overload or a late call-frame refusal,
         are discovered after allocation. Refusal or a thrown Java constructor
-        abandons that allocation and returns no Java instance to the caller.
-        Check both the C++ wrapper pointer and get_instance() before use.
+        abandons that allocation and throws vmhook::exception. C++ allocation
+        failure throws std::bad_alloc.
 
         An optional wrapper construct(args...) runs after the Java constructor.
         A native-context result retains a GC root until that context ends.
         A detour result remains a non-owning wrapper.
-        Defined after the invocation machinery; exception safety: noexcept.
+        Defined after the invocation machinery.
     */
     template<typename wrapper_type, typename... args_t>
-    [[nodiscard]] inline auto make_unique(args_t&&... args) noexcept
+        requires (vmhook::detail::is_java_wrapper_v<wrapper_type>
+            && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+            && (vmhook::detail::supported_java_argument_v<args_t> && ...))
+    [[nodiscard]] inline auto make_unique(args_t&&... args)
         -> std::unique_ptr<wrapper_type>;
 
 
@@ -14392,197 +14499,6 @@ namespace vmhook
             }
 
             /*
-                @brief Decides whether a decoded object reference may be wrapped as wrapper_type.
-                @tparam wrapper_type  The C++ wrapper the caller wants to construct.
-                @param decoded_oop    The decoded (full 64-bit) heap pointer just read.
-                @return  true to accept the wrap (including all uncertain cases),
-            */
-            template<typename wrapper_type>
-            static auto klass_match_ok(void* const decoded_oop) noexcept
-                -> bool
-            {
-                // (1) Wrapper type registered?  If not, we have no expected name to
-                // compare against — fail open (accept), matching the pre-fix path and
-                // the same "unregistered => no constraint" rule used by
-                // argument_matches_descriptor().
-                const std::string expected_name{ vmhook::detail::registered_class_name<wrapper_type>() };
-                if (expected_name.empty())
-                {
-                    return true;
-                }
-
-                // (2) Resolve the wrapper's registered klass.  If the class is not
-                // resolvable in this JVM we cannot judge a mismatch — fail open.
-                vmhook::hotspot::klass* const expected_klass{ vmhook::find_class(expected_name) };
-                if (!expected_klass || !vmhook::hotspot::is_valid_pointer(expected_klass))
-                {
-                    return true;
-                }
-
-                // (2a) If the wrapper's registered class is a Java INTERFACE, the
-                // superclass walk below can NEVER find it on a concrete oop's chain
-                // (an implemented interface is not a superclass), so it would wrongly
-                // reject every interface-typed read.  Fail OPEN for interface (and,
-                // in the degraded no-_access_flags fallback, any non-instantiable)
-                // wrappers.  See klass_is_interface_like for the primary
-                // (JVM_ACC_INTERFACE) and fallback (_layout_helper) signals — both
-                // fail open on uncertainty.
-                if (klass_is_interface_like(expected_klass))
-                {
-                    return true;
-                }
-
-                // Read JVM memory through the Windows memory API and stop on unreadable data.
-                // A successful read does not establish object lifetime or a coherent VM snapshot.
-                if (!decoded_oop || !vmhook::hotspot::is_valid_pointer(decoded_oop))
-                {
-                    return true;
-                }
-                vmhook::hotspot::klass* const runtime_klass{ vmhook::klass_from_oop(decoded_oop) };
-                if (!runtime_klass || !vmhook::hotspot::is_valid_pointer(runtime_klass))
-                {
-                    return true;
-                }
-
-                // (4) Walk the runtime klass's SUPERCLASS chain; accept if the wrapper
-                // klass appears anywhere on it (IS-A), by pointer identity OR by name
-                // (the latter rescues a same-named class from a different loader).
-                // The walk is depth-bounded so a corrupt _super link can never spin.
-                vmhook::hotspot::klass* current{ runtime_klass };
-                for (int depth{ 0 }; depth < 64 && current != nullptr && vmhook::hotspot::is_valid_pointer(current); ++depth)
-                {
-                    if (current == expected_klass)
-                    {
-                        return true;
-                    }
-                    if (const vmhook::hotspot::symbol* const name_sym{ current->get_name() };
-                        name_sym && vmhook::hotspot::is_valid_pointer(name_sym)
-                        && name_sym->to_string() == expected_name)
-                    {
-                        return true;
-                    }
-                    current = current->get_super();
-                }
-
-                // (5) Registered name/klass is known, is not an interface, and is
-                // absent from the whole superclass chain: a confident cross-klass
-                // mismatch — reject.
-                return false;
-            }
-
-            /*
-                @brief True if the wrapper klass is interface-like and the super-walk must be skipped.
-                @details
-                Fail-open gate for klass_match_ok.  A wrapper registered for a Java
-                INTERFACE must never be put through the superclass walk: an oop that
-                implements the interface does NOT have the interface on its _super
-                chain, so the walk would WRONGLY reject every interface-typed read.
-                This returns true exactly when klass_match_ok should fail open for k.
-
-                PRIMARY signal — Klass::_access_flags & JVM_ACC_INTERFACE (0x0200):
-                _access_flags is a HotSpot AccessFlags whose low 16 bits mirror the
-                class-file access flags; the interface bit is 9 (0x0200).  It is read
-                with std::memcpy (no strict-aliasing UB).  AccessFlags is u4 on JDK 8..
-                ~24 and narrowed to u2 on the very latest builds, but the interface bit
-                lives in the low halfword either way, so a little-endian 4-byte memcpy
-                captures it on every width; the surplus bytes are masked off.
-
-                FALLBACK signal — Klass::_layout_helper (read via get_instance_size()):
-                used ONLY when the _access_flags VMStruct entry is unavailable (a JDK
-                that renamed/removed it).  An interface (like any non-instantiable
-                klass) has a non-positive _layout_helper, so get_instance_size()==0;
-                a concrete instantiable class has a positive size.  Treating
-                size==0 as "interface-like" preserves interface reads on such a JDK.
-                This is a deliberate, monotone widening of fail-open (it also accepts
-                an abstract-base wrapper without the IS-A walk) that fires ONLY in the
-                degraded no-_access_flags mode — every concrete wrapper (e.g. the
-                Decoy reject case) keeps a positive size and still takes the walk.
-
-                Returns false (NOT interface-like => run the superclass walk) on any
-                uncertainty: null/!is_valid_pointer klass, or both signals negative.
-
-                @param k  A live, is_valid_pointer-checked klass*.
-                @return true to fail open (skip the super-walk) for an interface-like k.
-            */
-            static auto klass_is_interface_like(vmhook::hotspot::klass* const k) noexcept
-                -> bool
-            {
-                if (!k || !vmhook::hotspot::is_valid_pointer(k))
-                {
-                    return false;
-                }
-
-                // PRIMARY: read the class-file access flags and test JVM_ACC_INTERFACE.
-                static const vmhook::hotspot::vm_struct_entry_t* const entry{
-                    vmhook::hotspot::iterate_struct_entries("Klass", "_access_flags") };
-                if (entry)
-                {
-                    std::uint32_t access_flags{ 0u };
-                    std::memcpy(&access_flags,
-                                reinterpret_cast<const std::uint8_t*>(k) + entry->offset,
-                                sizeof(access_flags));
-                    constexpr std::uint32_t jvm_acc_interface{ 0x0200u };
-                    return (access_flags & jvm_acc_interface) != 0u;
-                }
-
-                // FALLBACK (only when _access_flags is unavailable): a non-positive
-                // layout helper => non-instantiable (interface / abstract / array),
-                // so fail open.  get_instance_size() returns 0 for that case.
-                return k->get_instance_size() == 0u;
-            }
-
-            /*
-                @brief The address a reference value points at, or nullptr.
-                @details
-                The single decode-and-vet step behind every reference-shaped
-                conversion (borrowed<W>, ref<W>, a wrapper W, and the untyped
-                operator->).  It exists so those four cannot drift apart: each
-                one has the same three ways to come back empty, and each of them
-                is a case where handing back an address would be worse than
-                handing back nothing.
-
-                  - the compressed OOP is null (a Java null), or decodes to an
-                    address that fails the heap-range heuristic, or
-                  - the descriptor is not a single object reference.  An ARRAY
-                    field ('[') decodes to the ARRAY oop, not an element, so
-                    wrapping it would resolve every later field at an offset
-                    that means nothing.  Read arrays into a std::vector instead.
-                  - the object's runtime klass provably is not the wrapper's.
-
-                Complexity: O(D) in superclass-chain depth.  noexcept.
-
-                @tparam wrapper_type  The wrapper the caller is aiming at; drives
-                                      the klass gate.  `void` (an untyped read)
-                                      skips it, since there is nothing to check.
-                @param compressed     The stored compressed OOP.
-                @return  A decoded, vetted heap address, or nullptr.
-            */
-            template<typename wrapper_type>
-            auto reference_target(const std::uint32_t compressed) const noexcept
-                -> void*
-            {
-                if (this->signature.empty() || this->signature.front() != 'L')
-                {
-                    return nullptr;
-                }
-                void* const decoded{ this->reference_address(compressed) };
-                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
-                {
-                    return nullptr;
-                }
-                if constexpr (!std::is_void_v<wrapper_type>)
-                {
-                    // Fail-open cross-klass guard, identical to the unique_ptr
-                    // arm's: only a PROVEN mismatch rejects.
-                    if (!klass_match_ok<wrapper_type>(decoded))
-                    {
-                        return nullptr;
-                    }
-                }
-                return decoded;
-            }
-
-            /*
                 @brief Converts a variant alternative source_type to target_type with semantic dispatch.
                 @details
                 Called by operator target_type() via std::visit.  Applies the correct
@@ -14594,15 +14510,17 @@ namespace vmhook
                   - numeric / bool types <- static_cast from the variant alternative
 
                 Complexity: O(1) for scalars; O(N) for strings/arrays.
-                Exception safety: noexcept — returns a default-constructed target_type on failure.
+                Owning object conversion throws for failed reads, invalid
+                contexts, unknown wrapper classes, and incompatible objects.
+                Only a genuine Java null creates a wrapper on nullptr.
 
                 @tparam target_type  Desired output type.
                 @tparam source_type  The variant alternative actually stored.
                 @param value         The stored alternative value.
-                @return              Converted value, or default-constructed target_type on failure.
+                @return              Converted value; object refusals throw.
             */
             template<typename target_type, typename source_type>
-            auto cast_for_variant(source_type value) const noexcept
+            auto cast_for_variant(source_type value) const
                 -> target_type
             {
                 vmhook::detail::native_backend::operation access{};
@@ -14641,110 +14559,13 @@ namespace vmhook
                 }
                 else if constexpr (vmhook::detail::is_unique_ptr_v<clean_target_type>)
                 {
-                    // The unique_ptr is NEVER null; the INSTANCE inside it may be.
-                    // Every refusal below therefore yields a wrapper on a null oop
-                    // rather than a null pointer, so a caller has exactly one thing
-                    // to check (`p->get_instance()`) and `p->` is always safe.
-                    //
-                    // What is refused, and why, is unchanged:
-                    //   - a non-'L' descriptor: an ARRAY field decodes to the ARRAY
-                    //     oop, not an element, so a wrapper on it would resolve
-                    //     every later field at a meaningless offset (read a '[L'
-                    //     field into a std::vector instead);
-                    //   - an address that fails the heap-range check;
-                    //   - a PROVEN cross-klass mismatch.  klass_match_ok is
-                    //     fail-open: unregistered wrappers, unresolvable klasses,
-                    //     interface-registered wrappers and IS-A reads all pass.
                     using wrapper_type = typename clean_target_type::element_type;
+                    if (this->signature.empty() || this->signature.front() != 'L')
+                    { throw vmhook::exception{ "Object conversion requires a Java object field" }; }
                     if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
-                    {
-                        if (this->signature.empty() || this->signature.front() != 'L')
-                        {
-                            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
-                        }
-                        void* const decoded{ this->reference_address(value) };
-                        if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)
-                            || !klass_match_ok<wrapper_type>(decoded))
-                        {
-                            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
-                        }
-                        auto wrapped{ vmhook::detail::wrap_object<wrapper_type>(decoded) };
-                        if (wrapped) { wrapped->set_native_root(this->native_root); }
-                        return wrapped;
-                    }
+                    { return vmhook::detail::materialize_object<wrapper_type>(value, this->native_root); }
                     else
-                    {
-                        // A primitive is not an object: an empty wrapper, never one
-                        // aimed at an address invented from the primitive's bits.
-                        return vmhook::detail::wrap_object<wrapper_type>(nullptr);
-                    }
-                }
-                else if constexpr (std::is_same_v<target_type, void*>)
-                {
-                    // For void*, only convert from uint32_t (compressed OOP)
-                    if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
-                    {
-                        return this->reference_address(value);
-                    }
-                    else
-                    {
-                        return static_cast<target_type>(nullptr);
-                    }
-                }
-                // --- Reference targets: borrowed<W> / ref<W> / a wrapper W ------
-                //
-                // These three are what let the CALLER'S DECLARED TYPE decide how a
-                // reference field comes back, with no template argument and no
-                // to_borrowed<> at the call site:
-                //
-                //     vmhook::borrowed<entity> e = self->get_field("rider")->get();
-                //     entity                   w = self->get_field("rider")->get();
-                //
-                // Every one of them goes through the same decode + validity + klass
-                // gate the unique_ptr arm uses, so a mistyped read yields an EMPTY
-                // handle / null wrapper instead of one aimed at a foreign object.
-                else if constexpr (vmhook::detail::is_borrowed_v<clean_target_type>
-                                || vmhook::detail::is_ref_v<clean_target_type>)
-                {
-                    if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
-                    {
-                        using handle_wrapper_type =
-                            vmhook::detail::handle_wrapper_t<clean_target_type>;
-                        void* const decoded{ reference_target<handle_wrapper_type>(value) };
-                        if (!decoded)
-                        {
-                            return clean_target_type{};
-                        }
-                        if constexpr (vmhook::detail::is_borrowed_v<clean_target_type>)
-                        {
-                            return clean_target_type{ decoded, this->native_root };
-                        }
-                        else
-                        {
-                            return this->native_root
-                                ? clean_target_type::from_native_root(this->native_root)
-                                : clean_target_type::ephemeral(decoded);
-                        }
-                    }
-                    else
-                    {
-                        // A primitive read is not an object.  Empty, never a handle
-                        // fabricated out of the primitive's bits.
-                        return clean_target_type{};
-                    }
-                }
-                else if constexpr (vmhook::detail::is_java_wrapper_v<clean_target_type>)
-                {
-                    if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
-                    {
-                        clean_target_type wrapped{ reference_target<clean_target_type>(value) };
-                        wrapped.set_native_root(this->native_root);
-                        return wrapped;
-                    }
-                    else
-                    {
-                        return clean_target_type{ nullptr };
-                    }
+                    { throw vmhook::exception{ "Java object field could not be read or retained" }; }
                 }
                 else if constexpr (requires { static_cast<target_type>(value); })
                 {
@@ -14762,9 +14583,9 @@ namespace vmhook
             */
             template<typename target_type>
                 requires vmhook::detail::value_t_convertible_target_v<target_type>
-            operator target_type() const noexcept
+            operator target_type() const
             {
-                return std::visit([this](auto value) noexcept
+                return std::visit([this](auto value)
                     -> target_type
                     {
                         return this->cast_for_variant<target_type>(value);
@@ -14815,24 +14636,8 @@ namespace vmhook
             auto to_entries() const
                 -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>;
 
-            /*
-                @brief Converts a reference field value to an epoch-checked non-owning borrow.
-                @details Epoch checks reject some observed stale addresses. They do not root an
-                object, stop collection, or close a race between checking and dereferencing it.
-            */
-            template<typename wrapper_type = void>
-            [[nodiscard]] auto to_borrowed() const noexcept
-                -> vmhook::borrowed<wrapper_type>;
-
-            /*
-                @brief Navigates straight into the object this value refers to.
-            */
-            auto operator->() const noexcept
-                -> vmhook::detail::access<vmhook::any_object>;
-
-            /* @brief Same as operator->, spelled for `(*value).member`. */
-            auto operator*() const noexcept
-                -> vmhook::detail::access<vmhook::any_object>;
+            /* Checked untyped navigation materializes an owning wrapper. */
+            auto operator->() const -> std::unique_ptr<vmhook::any_object>;
         };
 
         /*
@@ -14866,6 +14671,7 @@ namespace vmhook
             , mirror_klass{ mirror_klass }
             , field_offset{ field_offset }
         {
+            this->reference_declaring_class = mirror_klass;
             vmhook::detail::native_backend::operation access{};
             if (access)
             {
@@ -14875,9 +14681,10 @@ namespace vmhook
         }
 
         field_proxy(void* field_pointer, std::string sig, const bool is_static_flag,
-                    vmhook::detail::native_backend::root holder, const std::size_t offset) noexcept
+                    vmhook::detail::native_backend::root holder, const std::size_t offset,
+                    vmhook::hotspot::klass* const declaring_class = nullptr) noexcept
             : field_pointer{ field_pointer }, signature_text{ std::move(sig) }, static_field{ is_static_flag },
-              field_offset{ offset }, holder_root{ std::move(holder) }
+              field_offset{ offset }, holder_root{ std::move(holder) }, reference_declaring_class{ declaring_class }
         {
             this->native_bound = this->holder_root != nullptr || vmhook::detail::native_backend::active();
         }
@@ -15013,14 +14820,21 @@ namespace vmhook
             never reallocates a Java array — array length is fixed at creation.
         */
         template<typename value_type>
-        auto set(const value_type& value) const noexcept
+            requires vmhook::detail::supported_field_value_v<value_type>
+        auto set(const value_type& value) const
             -> void
         {
+            vmhook::detail::require_object_argument(value);
             vmhook::detail::native_backend::operation access{};
 
-            if constexpr (names_a_java_object_v<std::remove_cvref_t<value_type>>)
+            if constexpr (vmhook::detail::is_java_object_pointer_v<value_type>)
             {
-                this->store_object_oop(object_address_of(value));
+                if (!this->store_object(value))
+                {
+                    throw vmhook::exception{
+                        "Java reference field store refused: check the field type, "
+                        "owning context and supported collector write barrier." };
+                }
             }
             else
             {
@@ -15029,51 +14843,11 @@ namespace vmhook
         }
 
         /*
-            @brief True for every C++ type that names a live Java object.
-            @details
-            The value_t arm is detected STRUCTURALLY (does it have to_borrowed?)
-            rather than by name: method_proxy is not declared yet at this point
-            in the header, and to_borrowed<>() is the member both value types
-            have and nothing else does.
-        */
-        template<typename clean_value_type>
-        static constexpr bool names_a_java_object_v{
-            vmhook::detail::is_borrowed_v<clean_value_type>
-            || vmhook::detail::is_ref_v<clean_value_type>
-            || vmhook::detail::is_java_wrapper_v<clean_value_type>
-            || requires(const clean_value_type& probe) { probe.template to_borrowed<>(); } };
-
-        /*
-            @brief The live address behind any of those, or nullptr.
-            @details Each shape is asked in ITS OWN terms - a borrow and a ref
-            revalidate, a wrapper reports its instance, a value decodes and vets
-            - so "this source is no longer good" is decided by the thing that
-            knows, not by a common denominator that would have to guess.
-        */
-        template<typename value_type>
-        static auto object_address_of(const value_type& value) noexcept
-            -> void*
-        {
-            using clean_value_type = std::remove_cvref_t<value_type>;
-            if constexpr (vmhook::detail::is_borrowed_v<clean_value_type>
-                       || vmhook::detail::is_ref_v<clean_value_type>)
-            {
-                return value.resolve();
-            }
-            else if constexpr (vmhook::detail::is_java_wrapper_v<clean_value_type>)
-            {
-                return value.get_instance();
-            }
-            else
-            {
-                return value.template to_borrowed<>().resolve();
-            }
-        }
-
-        /*
             @brief The primitive / string / array write.  @see set().
         */
         template<typename value_type>
+            requires (vmhook::detail::supported_field_value_v<value_type>
+                      && !vmhook::detail::is_java_object_pointer_v<value_type>)
         auto set_non_object(const value_type& value) const noexcept
             -> void
         {
@@ -15149,23 +14923,6 @@ namespace vmhook
                 else
                 {
                     vmhook::set_prim_array(*this, value);
-                }
-            }
-            else if constexpr (vmhook::detail::is_unique_ptr_v<clean_value_type>)
-            {
-                if (this->field_pointer)
-                {
-                    // Explicit base-class qualification reaches object_base::get_instance()
-                    // even when the derived wrapper shadows the name with a same-named
-                    // static helper (e.g. example_class::get_instance() returning a
-                    // unique_ptr).  Resolved at instantiation; never requires object_base
-                    // to be complete at template-definition time.
-                    void* oop_pointer{ nullptr };
-                    if (value)
-                    {
-                        oop_pointer = value->vmhook::object_base::get_instance();
-                    }
-                    (void)this->store_object_oop(oop_pointer);
                 }
             }
             else if constexpr (std::is_trivially_copyable_v<clean_value_type>)
@@ -15452,51 +15209,29 @@ namespace vmhook
         }
 
         /*
-            @brief Stores the object behind a lifetime-checked handle into this
-                   reference field.
-            @details
-            Phase-3 intercept: the write counterpart of value_t::to_borrowed(),
-            and the one place where taking a handle is genuinely SAFER than
-            taking an address rather than merely tidier.
-
-            A raw store_object_oop(addr) call cannot tell whether `addr` was
-            still valid at the instant of the write.  If a collection moved the
-            object between the caller reading the address and this store, the
-            field ends up holding a pointer into free or relocated space and the
-            corruption surfaces arbitrarily later, in unrelated code.  That is
-            the single worst failure mode this library can produce.
-
-            Resolving the handle HERE, immediately before the write, closes the
-            window as far as it can be closed without a real GC root: an expired
-            handle is refused outright (returns false, writes nothing) instead of
-            storing a known-stale address.  What it cannot close is a collection
-            that lands between this resolve and the safe_write a few instructions
-            later; nothing in a pure-VM build can, and Layer 2 is where that gets
-            fixed properly.
-
-            An EMPTY handle is not an error - it stores a null reference, which
-            is what "no object" means in Java.  An EXPIRED handle IS an error,
-            because the caller believes they have an object and they do not.
-            That asymmetry is the whole reason the two states are distinct.
-
-            @param handle  Borrow of the object to store.  Empty -> stores null.
-                           Expired -> refused.
-            @return  true if a reference was written (including a null one);
-                     false on an expired handle or any store_object_oop failure.
+            @brief Stores a Java reference from an allocated C++ wrapper.
+            @details Rejects empty C++ pointers, expired roots, and incompatible
+            Java classes. The wrapper and field owner are resolved again after
+            type checking, which can run Java code and trigger collection.
+            A wrapper whose get_instance() is nullptr writes Java null.
+            Reference publication still requires the supported collector store
+            policy; set() reports a refused publication with vmhook::exception.
+            @return true when the reference was written, false when the store
+            backend refuses publication. Invalid inputs throw.
         */
         template<typename wrapper_type>
-        auto store_object(const vmhook::borrowed<wrapper_type>& handle) const noexcept
+            requires vmhook::detail::is_java_wrapper_v<wrapper_type>
+        auto store_object(const std::unique_ptr<wrapper_type>& value) const
             -> bool
         {
-            if (handle.expired())
-            {
-                ::vmhook::detail::log_line("{} field_proxy::store_object(): refusing to store an EXPIRED "
-                           "handle - the object it named has been moved or reclaimed, and "
-                           "writing its old address would corrupt the field.",
-                           vmhook::warning_tag);
-                return false;
-            }
-            return this->store_object_oop(handle.resolve());
+            vmhook::detail::require_object_argument(value);
+            vmhook::detail::native_backend::operation access{};
+            void* const address{ value->vmhook::object_base::get_instance() };
+            if (address) { vmhook::detail::require_object_wrapper_type<wrapper_type>(address); }
+            vmhook::detail::require_reference_argument(address, this->signature_text, this->reference_declaring_class);
+            // Type resolution can call Java and move the object. Resolve the
+            // owner's root again immediately before publishing the field slot.
+            return this->store_object_oop(value->vmhook::object_base::get_instance());
         }
 
         /*
@@ -15567,6 +15302,9 @@ namespace vmhook
         std::size_t             field_offset{ 0 };
         vmhook::detail::native_backend::root holder_root{};
         bool native_bound{ false };
+        // The field descriptor resolves in this declaring class's loader.
+        // It supplies type identity only; it never selects the storage holder.
+        vmhook::hotspot::klass* reference_declaring_class{ nullptr };
     };
 
     // --- detail helpers that depend on hotspot types -------------------------
@@ -16545,180 +16283,45 @@ namespace vmhook
             }
 
             /*
-                @brief The address a reference RESULT points at, or nullptr.
-                @details
-                The call-result twin of field_proxy::value_t::reference_target,
-                and it exists for the same reason: borrowed<W>, ref<W>, a
-                wrapper W and the untyped operator-> must all decide "is there
-                an object here?" identically, or they will disagree in exactly
-                the cases that matter.
-
-                Unlike the field twin there is no descriptor to consult — a
-                returned value carries no signature — so the vetting is decode,
-                heap-range check, and the same fail-open klass gate.  A call
-                that returned void, a primitive, or an eagerly-decoded String
-                never reaches here: those are other variant alternatives.
-
-                Complexity: O(D) in superclass-chain depth.  noexcept.
-            */
-            template<typename wrapper_type>
-            auto reference_target(const std::uint32_t compressed) const noexcept
-                -> void*
-            {
-                void* const decoded{ this->reference_address(compressed) };
-                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
-                {
-                    return nullptr;
-                }
-                if constexpr (!std::is_void_v<wrapper_type>)
-                {
-                    if (!vmhook::field_proxy::value_t::klass_match_ok<wrapper_type>(decoded))
-                    {
-                        return nullptr;
-                    }
-                }
-                return decoded;
-            }
-
-            /*
                 @brief Converts the stored value to T via static_cast. Falls back to a default-constructed T for variant alternatives that cannot be cast to the target type (std::monostate, std::string).
             */
             template<typename target_type>
                 requires vmhook::detail::value_t_convertible_target_v<target_type>
-            operator target_type() const noexcept
+            operator target_type() const
             {
                 vmhook::detail::native_backend::operation access{};
-                return std::visit([this](auto v) noexcept
-                    -> target_type
+                if constexpr (vmhook::detail::is_unique_ptr_v<target_type>)
+                {
+                    using wrapper_type = typename target_type::element_type;
+                    if (!this->was_invoked() || this->threw() || this->result_failed || !this->reference_result)
+                    { throw vmhook::exception{ "Object conversion requires a successful Java reference result" }; }
+                    if (this->reference_array_result)
+                    { throw vmhook::exception{ "Object wrapper conversion does not accept an array result; use to_vector" }; }
+                    if (this->native_root)
+                    { return vmhook::detail::materialize_object<wrapper_type>(0, this->native_root); }
+                    if (std::holds_alternative<std::uint32_t>(this->data))
+                    { return vmhook::detail::materialize_object<wrapper_type>(std::get<std::uint32_t>(this->data), {}); }
+                    if (std::holds_alternative<std::monostate>(this->data))
+                    { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+                    throw vmhook::exception{ "Java reference result could not be retained" };
+                }
+                else
+                {
+                    return std::visit([this](auto value) -> target_type
                     {
-                        using stored_type = std::remove_cvref_t<decltype(v)>;
-                        if constexpr (std::is_same_v<stored_type, std::uint32_t>)
+                        using stored_type = std::remove_cvref_t<decltype(value)>;
+                        if constexpr (std::is_same_v<target_type, std::string>)
                         {
-                            if (this->native_root)
-                            {
-                                v = vmhook::hotspot::encode_oop_pointer(this->native_root->resolve_under_vm());
-                            }
-                        }
-
-                        // unique_ptr<wrapper> <- compressed-OOP reference return.
-                        // Mirrors field_proxy::value_t::cast_for_variant so an
-                        // Object-returning Java method can be assigned straight
-                        // into a std::unique_ptr<my_wrapper> instead of silently
-                        // yielding null.  The uint32_t alternative is the
-                        // compressed OOP (the call-stub reference path stores
-                        // encode_oop_pointer(result)); decode + validate + wrap.
-                        if constexpr (vmhook::detail::is_unique_ptr_v<target_type>)
-                        {
-                            using wrapper_type = typename vmhook::detail::is_unique_ptr<target_type>::value_type_t;
-                            static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
-                                          "method_proxy::value_t -> std::unique_ptr<T>: T must derive "
-                                          "from vmhook::object_base.  Return-by-wrapper only works for "
-                                          "registered vmhook wrapper types.");
-                            // NEVER a null unique_ptr; a wrapper on a null oop.
-                            // See detail::wrap_object for why the pointer and the
-                            // object are kept as separate questions.
-                            if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                            {
-                                void* const decoded{ this->reference_address(v) };
-                                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded)
-                                    || !vmhook::field_proxy::value_t::klass_match_ok<wrapper_type>(decoded))
-                                {
-                                    return vmhook::detail::wrap_object<wrapper_type>(nullptr);
-                                }
-                                auto wrapped{ vmhook::detail::wrap_object<wrapper_type>(decoded) };
-                                if (wrapped) { wrapped->set_native_root(this->native_root); }
-                                return wrapped;
-                            }
-                            else
-                            {
-                                // void, a primitive, or a String the call already
-                                // decoded eagerly - no object to hand back.
-                                return vmhook::detail::wrap_object<wrapper_type>(nullptr);
-                            }
-                        }
-                        // std::string <- either the eagerly-decoded std::string
-                        // alternative (the call-stub String path) or a compressed
-                        // OOP pointing at a java.lang.String.
-                        else if constexpr (std::is_same_v<target_type, std::string>)
-                        {
-                            if constexpr (std::is_same_v<stored_type, std::string>)
-                            {
-                                return v;
-                            }
+                            if constexpr (std::is_same_v<stored_type, std::string>) { return value; }
                             else if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                            {
-                                return vmhook::read_java_string(this->reference_address(v));
-                            }
-                            else
-                            {
-                                return target_type{};
-                            }
+                            { return vmhook::read_java_string(this->reference_address(value)); }
+                            else { return {}; }
                         }
-                        // Compressed-OOP -> raw heap pointer conversion.
-                        else if constexpr (std::is_same_v<target_type, void*>
-                                        && std::is_same_v<stored_type, std::uint32_t>)
-                        {
-                            return this->reference_address(v);
-                        }
-                        // --- Reference targets: borrowed<W> / ref<W> / a wrapper W --
-                        // The call-result twin of the field_proxy arm.  What the
-                        // caller declared decides the shape; nothing has to be
-                        // spelled at the call site:
-                        //     vmhook::borrowed<item> i = p->call("getHeld");
-                        //     item                   w = p->call("getHeld");
-                        else if constexpr (vmhook::detail::is_borrowed_v<target_type>
-                                        || vmhook::detail::is_ref_v<target_type>)
-                        {
-                            if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                            {
-                                using handle_wrapper_type =
-                                    vmhook::detail::handle_wrapper_t<target_type>;
-                                void* const decoded{ reference_target<handle_wrapper_type>(v) };
-                                if (!decoded)
-                                {
-                                    return target_type{};
-                                }
-                                if constexpr (vmhook::detail::is_borrowed_v<target_type>)
-                                {
-                                    return target_type{ decoded, this->native_root };
-                                }
-                                else
-                                {
-                                    return this->native_root
-                                        ? target_type::from_native_root(this->native_root)
-                                        : target_type::ephemeral(decoded);
-                                }
-                            }
-                            else
-                            {
-                                // void, a primitive, or a String the call already
-                                // decoded eagerly - no address left to hand out.
-                                return target_type{};
-                            }
-                        }
-                        else if constexpr (vmhook::detail::is_java_wrapper_v<target_type>)
-                        {
-                            if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                            {
-                                target_type wrapped{ reference_target<target_type>(v) };
-                                wrapped.set_native_root(this->native_root);
-                                return wrapped;
-                            }
-                            else
-                            {
-                                return target_type{ nullptr };
-                            }
-                        }
-                        else if constexpr (requires { static_cast<target_type>(v); })
-                        {
-                            return static_cast<target_type>(v);
-                        }
-                        else
-                        {
-                            return target_type{};
-                        }
-                    }
-                , data);
+                        else if constexpr (requires { static_cast<target_type>(value); })
+                        { return static_cast<target_type>(value); }
+                        else { return {}; }
+                    }, this->data);
+                }
             }
 
             /*
@@ -16780,38 +16383,8 @@ namespace vmhook
             auto to_entries() const
                 -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>;
 
-            /*
-                @brief Converts an object call result to an epoch-checked non-owning borrow.
-                @details Primitive, String, or null results produce an empty borrow. A detour alone
-                does not root arbitrary returned objects; no cross-call or concurrent-GC lifetime is promised.
-            */
-            template<typename wrapper_type = void>
-            [[nodiscard]] auto to_borrowed() const noexcept
-                -> vmhook::borrowed<wrapper_type>;
-
-            /*
-                @brief Navigates straight into the object this call returned.
-                @details
-                Lets a chain of Java calls be written as a chain, with no
-                wrapper type named anywhere along it:
-
-                    auto stack = self->get_method("getHeldItem")->call();
-                    std::string label = stack->get_method("getDisplayName")->call();
-
-                The class comes from the returned object's own header, so this
-                works for a type no register_class<T>() ever mentioned.  A void,
-                primitive, String, or failed call navigates to a null-safe
-                any_object whose reads return empty and log.  Binds for ONE
-                expression (see detail::access); defined out-of-line.
-
-                Complexity: O(1).  Exception safety: noexcept.
-            */
-            auto operator->() const noexcept
-                -> vmhook::detail::access<vmhook::any_object>;
-
-            /* @brief Same as operator->, spelled for `(*result).member`. */
-            auto operator*() const noexcept
-                -> vmhook::detail::access<vmhook::any_object>;
+            /* Checked untyped navigation materializes an owning wrapper. */
+            auto operator->() const -> std::unique_ptr<vmhook::any_object>;
         };
 
         /*
@@ -17016,7 +16589,7 @@ namespace vmhook
             }
             const bool selected_private{ selected_method->safe_access_flags_test(0x0002u, kind_readable) };
             if (!kind_readable) { return value_t{ std::monostate{} }; }
-            auto* const selected_holder{ native_call ? declaring_class(selected_method) : nullptr };
+            auto* const selected_holder{ declaring_class(selected_method) };
 
             std::string selected_signature{ selected_method->get_signature() };
             const std::string selected_name{ native_call ? selected_method->get_name() : std::string{} };
@@ -17676,24 +17249,17 @@ namespace vmhook
                 // any other reference to a real compressed oop so value_t
                 // round-trips through decode_oop_pointer instead of truncating.
                 void* const result_oop{ reinterpret_cast<void*>(result_holder) };
-                if (!result_oop)
-                {
-                    auto result{ value_t::completed(std::monostate{}, receiver_after) };
-                    result.reference_result = true;
-                    result.reference_array_result = ret_char == '[';
-                    result.primitive_array_result = ret_char == '[' && rparen + 2 < sig.size()
-                        && sig[rparen + 2] != 'L' && sig[rparen + 2] != '[';
-                    return result;
-                }
-                if (rparen != std::string_view::npos
-                    && sig.substr(rparen + 1) == "Ljava/lang/String;")
-                {
-                    return value_t::completed(vmhook::read_java_string(result_oop), receiver_after);
-                }
-                auto result{ value_t::completed(vmhook::hotspot::encode_oop_pointer(result_oop), receiver_after) };
+                auto result{ value_t::completed(std::uint32_t{}, receiver_after) };
                 result.reference_array_result = ret_char == '[';
                 result.primitive_array_result = ret_char == '[' && rparen + 2 < sig.size()
                     && sig[rparen + 2] != 'L' && sig[rparen + 2] != '[';
+                if (!result_oop) { return result; }
+                result.native_root = vmhook::detail::native_backend::retain_oop(result_oop);
+                if (!result.native_root) { result.result_failed = true; return result; }
+                result.data = vmhook::hotspot::encode_oop_pointer(result_oop);
+                if (rparen != std::string_view::npos
+                    && sig.substr(rparen + 1) == "Ljava/lang/String;")
+                { result.data = vmhook::read_java_string(result_oop); }
                 return result;
             }
             }
@@ -17712,9 +17278,11 @@ namespace vmhook
         */
     public:
         template<typename... args_t>
-        auto call(args_t&&... args) const noexcept
+            requires (vmhook::detail::supported_java_argument_v<args_t> && ...)
+        auto call(args_t&&... args) const
             -> value_t
         {
+            (vmhook::detail::require_object_argument(args), ...);
             vmhook::detail::native_backend::operation native_operation{};
             const bool native_call{ vmhook::detail::native_backend::active() };
             if ((this->native_class_root && !this->native_class_root->valid())
@@ -17789,7 +17357,7 @@ namespace vmhook
             {
                 std::size_t root_index{};
                 bool roots_failed{};
-                [[maybe_unused]] auto retain_argument = [&](auto&& argument) noexcept
+                [[maybe_unused]] auto retain_argument = [&](auto&& argument)
                 {
                     const std::size_t index{ root_index++ };
                     auto& root{ native_argument_roots[index] };
@@ -17814,6 +17382,8 @@ namespace vmhook
                                                             param_descriptors,
                                                             max_param_slots) };
             std::size_t argument_index{ 0 };
+            std::size_t argument_descriptor_position{ selected_signature.find('(') + 1 };
+            const auto argument_descriptor_end{ selected_signature.find(')') };
 
             // The SELECTED overload controls the receiver slot. Its readable
             // ACC_STATIC bit was checked above; using the proxy's initial method
@@ -17827,7 +17397,7 @@ namespace vmhook
             // `(pack(args), ...)` expands to nothing, so `pack` is legitimately
             // never invoked — silence -Wunused-but-set-variable on that path.
             [[maybe_unused]] bool packing_failed{ false };
-            [[maybe_unused]] auto pack = [&](auto&& a) noexcept
+            [[maybe_unused]] auto pack = [&](auto&& a)
                 {
                     if (packing_failed) { return; }
                     using clean_t = std::remove_cvref_t<decltype(a)>;
@@ -17839,6 +17409,8 @@ namespace vmhook
                             ? param_descriptors[argument_index]
                             : '\0' };
                     const std::size_t native_root_index{ argument_index++ };
+                    const auto full_descriptor{ next_argument_descriptor(selected_signature,
+                        argument_descriptor_position, argument_descriptor_end) };
 
                     // Two slots for J / D, value in the HIGH slot.  With no
                     // descriptor, fall back to the C++ type: an 8-byte arithmetic
@@ -17898,38 +17470,15 @@ namespace vmhook
                         if (!string_oop) { packing_failed = true; return; }
                         params[param_idx++] = reinterpret_cast<std::intptr_t>(string_oop);
                     }
-                    else if constexpr (std::is_same_v<clean_t, std::nullptr_t>)
+                    else if constexpr (vmhook::detail::is_java_object_pointer_v<clean_t>)
                     {
-                        params[param_idx++] = 0;
-                    }
-                    else if constexpr (vmhook::detail::is_ref_v<clean_t>)
-                    {
-                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a.resolve());
-                    }
-                    else if constexpr (vmhook::detail::is_borrowed_v<clean_t>)
-                    {
-                        // A borrow is a legal OUTGOING argument for the same
-                        // reason it is a legal incoming one: it names an object.
-                        // resolve() rather than raw_unsafe() is the whole point
-                        // -- an expired handle passes null instead of an address
-                        // the collector has already moved, so a stale reference
-                        // becomes a NullPointerException in Java rather than
-                        // heap corruption in the VM.
-                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a.resolve());
-                    }
-                    else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
-                    {
+                        vmhook::detail::require_object_argument(a);
                         using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
-                        if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
-                        {
-                            if (a) { argument_owners[param_idx] = &a->instance; }
-                            params[param_idx++] = reinterpret_cast<std::intptr_t>(a ? a->get_instance() : nullptr);
-                        }
-                    }
-                    else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
-                    {
-                        argument_owners[param_idx] = &a.instance;
-                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a.get_instance());
+                        void* const address{ a->get_instance() };
+                        if (address) { vmhook::detail::require_object_wrapper_type<wrapper_type>(address); }
+                        vmhook::detail::require_reference_argument(address, full_descriptor, selected_holder);
+                        argument_owners[param_idx] = &a->instance;
+                        params[param_idx++] = reinterpret_cast<std::intptr_t>(a->get_instance());
                     }
                     else
                     {
@@ -18246,31 +17795,18 @@ namespace vmhook
         }
 
         template<typename argument_type>
-        static auto retain_native_argument(argument_type&& argument, bool& required) noexcept
+        static auto retain_native_argument(argument_type&& argument, bool& required)
             -> vmhook::detail::native_backend::root
         {
             using clean_type = std::remove_cvref_t<argument_type>;
             void* oop{};
             vmhook::detail::native_backend::root existing{};
-            if constexpr (vmhook::detail::is_unique_ptr_v<clean_type>)
+            if constexpr (vmhook::detail::is_java_object_pointer_v<clean_type>)
             {
-                using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_type>::value_type_t;
-                if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
-                {
-                    if (argument)
-                    { existing = argument->get_native_root(); oop = argument->get_instance(); }
-                }
+                vmhook::detail::require_object_argument(argument);
+                existing = argument->get_native_root();
+                oop = argument->get_instance();
             }
-            else if constexpr (std::is_base_of_v<vmhook::object_base, clean_type>)
-            { existing = argument.get_native_root(); oop = argument.get_instance(); }
-            else if constexpr (vmhook::detail::is_ref_v<clean_type> || vmhook::detail::is_borrowed_v<clean_type>)
-            {
-                if constexpr (requires { argument.get_native_root(); })
-                { existing = argument.get_native_root(); }
-                oop = argument.resolve();
-            }
-            else if constexpr (std::is_same_v<clean_type, void*>)
-            { oop = argument; }
             if (existing)
             {
                 required = true;
@@ -18769,7 +18305,10 @@ namespace vmhook
         std::span<const vmhook::detail::native_backend::root> native_constructor_arguments{};
 
         template<typename wrapper_type, typename... args_t>
-        friend auto make_unique(args_t&&... args) noexcept -> std::unique_ptr<wrapper_type>;
+            requires (vmhook::detail::is_java_wrapper_v<wrapper_type>
+                && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+                && (vmhook::detail::supported_java_argument_v<args_t> && ...))
+        friend auto make_unique(args_t&&... args) -> std::unique_ptr<wrapper_type>;
     };
 
     // --- Object base class ----------------------------------------------------
@@ -18783,22 +18322,20 @@ namespace vmhook
     using oop_type_t = void*;
 
     /*
-        @brief Short alias for oop_type_t; both names refer to a decoded Java heap pointer.
-        @details
-        Provided for brevity in user code:
-            vmhook::hook<my_class>("tick",
-                [](vmhook::return_value& ret, const std::unique_ptr<my_class>& self, vmhook::oop_t other) { ... });
+        @brief Short alias for oop_type_t, a decoded Java heap pointer.
+        @details Used by trusted VM ABI operations and diagnostics. Public Java
+        object arguments and hook receivers use std::unique_ptr wrappers.
     */
     using oop_t = oop_type_t;
 
     /*
-        @brief Base of the non-owning Java object wrappers.
-        @details Typed wrappers derive from object<derived>. The camelCase member
-        lookups use an explicit receiver for instance access; static access uses
-        the registered Java class. Native-context results carry VM-scanned root
-        tickets and refresh their address under a VM operation. Raw-pointer
-        wrappers remain non-owning. Context tickets are confined to their context
-        and OS thread and become invalid when that context closes.
+        @brief Base of the Java object wrappers.
+        @details Typed wrappers derive from object<derived>. get_field() and
+        get_method() bind the instance through this specialization. Static
+        wrappers use static_members and the registered Java class. Owning C++
+        pointers own wrappers, while VM-scanned root tickets retain Java objects
+        and refresh their addresses under a VM operation. Context tickets are
+        confined to their context and OS thread; using an invalid ticket throws.
     */
     class object_base
     {
@@ -18859,14 +18396,17 @@ namespace vmhook
             address is a snapshot and can move after this method returns to native
             state; use wrapper calls and fields to keep operations guarded.
         */
-        auto get_instance() const noexcept
+        auto get_instance() const
             -> oop_type_t
         {
             vmhook::detail::native_backend::operation access{};
             if (this->native_root_)
             {
-                if (!this->native_root_->valid()) { return nullptr; }
+                if (!access || !this->native_root_->valid())
+                { throw vmhook::exception{ "Java object belongs to a closed or different thread context" }; }
                 this->instance = this->native_root_->resolve_under_vm();
+                if (!this->instance)
+                { throw vmhook::exception{ "Retained Java object cannot be resolved in the current VM context" }; }
                 vmhook::detail::track_callback_oop_snapshot(this->instance, this->native_root_);
             }
             return this->instance;
@@ -18874,12 +18414,9 @@ namespace vmhook
 
         auto set_native_root(vmhook::detail::native_backend::root root) noexcept -> void
         {
+            // Preserve the observed address. Checked get_instance resolves a
+            // non-null ticket; invalid lifetimes never turn into Java null.
             this->native_root_ = std::move(root);
-            if (this->native_root_)
-            {
-                vmhook::detail::native_backend::operation access{};
-                this->instance = this->native_root_->resolve_under_vm();
-            }
         }
 
         [[nodiscard]] auto get_native_root() const noexcept -> vmhook::detail::native_backend::root
@@ -18955,7 +18492,8 @@ namespace vmhook
 
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
             return vmhook::field_proxy{ field_pointer, entry->signature, false,
-                                        this->native_root_, entry->offset };
+                                        this->native_root_, entry->offset,
+                                        entry->declaring_klass ? entry->declaring_klass : resolved_klass };
         }
 
         /*
@@ -19322,9 +18860,7 @@ namespace vmhook
         {
             if (this->native_root_)
             {
-                if (!this->native_root_->valid()) { return nullptr; }
-                this->instance = this->native_root_->resolve_under_vm();
-                if (!this->instance) { return nullptr; }
+                (void)this->get_instance();
             }
             // THE OBJECT IS ASKED WHAT IT IS, not the wrapper.  A wrapper is
             // registered as the type its call site DECLARES -- a parameter typed
@@ -19828,10 +19364,40 @@ namespace vmhook
         std::optional<proxy_type> member;
     };
 
-    inline auto return_value::set(const vmhook::object_base& value) noexcept -> void
+    template<typename wrapper_type>
+        requires (std::is_base_of_v<vmhook::object_base, wrapper_type>
+                  && !std::is_const_v<wrapper_type> && !std::is_volatile_v<wrapper_type>)
+    inline auto return_value::set(const std::unique_ptr<wrapper_type>& value) -> void
     {
-        if (const auto root{ value.get_native_root() })
-        { (void)vmhook::detail::set_callback_reference(this->return_slot, root); }
+        if (!value)
+        { throw vmhook::exception{ "A Java hook result requires an allocated C++ wrapper owner." }; }
+        vmhook::detail::native_backend::operation access{};
+        if (!access)
+        { throw vmhook::exception{ "A Java hook object result requires the active callback context." }; }
+        const auto root{ value->get_native_root() };
+        if (root && !root->valid())
+        { throw vmhook::exception{ "The Java hook result belongs to a closed or different thread context." }; }
+        void* oop{ value->vmhook::object_base::get_instance() };
+        if (oop && !root)
+        { throw vmhook::exception{ "A non-null Java hook result requires a retained VM root." }; }
+        if (oop) { vmhook::detail::require_object_wrapper_type<wrapper_type>(oop); }
+        oop = value->vmhook::object_base::get_instance();
+        auto* const method{ this->stack_frame ? this->stack_frame->get_method() : nullptr };
+        const auto signature{ method ? method->get_signature() : std::string{} };
+        const auto return_position{ signature.find(')') };
+        if (return_position == std::string::npos)
+        { throw vmhook::exception{ "The Java hook result does not match its declared reference return type." }; }
+        vmhook::detail::require_reference_argument(oop,
+            std::string_view{ signature }.substr(return_position + 1),
+            vmhook::detail::callback_declaring_class(method));
+        (void)value->vmhook::object_base::get_instance();
+        // Null references follow the checked reference result path too. This
+        // validates the Java return descriptor and installs the synthetic root
+        // scan metadata before the callback leaves VM state.
+        if (!vmhook::detail::set_callback_reference(this->return_slot, root))
+        {
+            throw vmhook::exception{ "The active Java hook cannot return this object reference." };
+        }
     }
 
     /*
@@ -19857,9 +19423,9 @@ namespace vmhook
     public:
         using object_base::object_base;
 
-        /* @brief Returns a lifetime-checked borrow of this wrapper's instance. */
-        [[nodiscard]] auto self() const noexcept
-            -> vmhook::borrowed<derived>;
+        /* @brief Allocates another C++ wrapper sharing this Java reference root. */
+        [[nodiscard]] auto self() const
+            -> std::unique_ptr<std::conditional_t<std::is_void_v<derived>, vmhook::any_object, derived>>;
 
         /* @brief Binds an instance or static field to this wrapper. */
         [[nodiscard]] auto get_field(const std::string_view name) const
@@ -20046,7 +19612,7 @@ namespace vmhook
             @brief Returns the klass by reading the narrow klass slot in the OOP header.
             Falls back to nullptr if the OOP is invalid.
         */
-        auto oop_klass() const noexcept -> vmhook::hotspot::klass*
+        auto oop_klass() const -> vmhook::hotspot::klass*
         {
             return vmhook::klass_from_oop(this->get_instance());
         }
@@ -20091,7 +19657,8 @@ namespace vmhook
             }
             void* const field_pointer{ reinterpret_cast<std::uint8_t*>(this->instance) + entry->offset };
             return vmhook::field_proxy{ field_pointer, entry->signature, false,
-                                        this->get_native_root(), entry->offset };
+                                        this->get_native_root(), entry->offset,
+                                        entry->declaring_klass ? entry->declaring_klass : k };
         }
 
         /*
@@ -20188,7 +19755,7 @@ namespace vmhook
             this?`.  Read from the live header, so it names the CONCRETE class,
             not whatever base a caller happened to expect.
         */
-        auto class_name() const noexcept
+        auto class_name() const
             -> std::string
         {
             vmhook::detail::native_backend::operation access{};
@@ -20206,7 +19773,7 @@ namespace vmhook
         }
 
         /* @brief True when the object is an instance of the named Java class. */
-        auto instance_of(const std::string_view name) const noexcept
+        auto instance_of(const std::string_view name) const
             -> bool
         {
             vmhook::detail::native_backend::operation access{};
@@ -20215,7 +19782,7 @@ namespace vmhook
         }
 
         /* @brief True when there is an object here at all. */
-        explicit operator bool() const noexcept
+        explicit operator bool() const
         {
             return this->get_instance() != nullptr;
         }
@@ -20329,6 +19896,147 @@ namespace vmhook
             return false;
         }
 
+        inline auto require_reference_argument(void* const address, const std::string_view descriptor,
+            vmhook::hotspot::klass* const declaring_class) -> void
+        {
+            std::size_t dimensions{};
+            while (dimensions < descriptor.size() && descriptor[dimensions] == '[') { ++dimensions; }
+            const auto component{ descriptor.substr(dimensions) };
+            const bool object_component{ component.size() >= 3 && component.front() == 'L'
+                && component.back() == ';'
+                && component.find(';') == component.size() - 1
+                && component.find_first_of("[.\0", 0, 3) == std::string_view::npos };
+            const bool primitive_component{ dimensions != 0 && component.size() == 1
+                && std::string_view{"ZBCSIJFD"}.find(component.front()) != std::string_view::npos };
+            if (dimensions > 255 || (!object_component && !primitive_component))
+            { throw vmhook::exception{ "A Java object argument requires a valid reference descriptor" }; }
+            // Java null is assignable to every reference descriptor without
+            // loading or initializing the descriptor's class.
+            if (!address) { return; }
+            native_backend::operation access{};
+            if (!access || !declaring_class || !vmhook::hotspot::is_valid_pointer(declaring_class))
+            { throw vmhook::exception{ "A Java object argument requires its declaring class and VM context" }; }
+            const auto argument_root{ native_backend::retain_oop(address) };
+            const auto declaring_root{ native_backend::retain_class(declaring_class) };
+            if (!argument_root || !declaring_root)
+            { throw vmhook::exception{ "Java argument and declaring class could not be retained" }; }
+
+            const auto loader_of = [](vmhook::hotspot::klass* const klass) -> void*
+            {
+                const auto* const data_entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_class_loader_data") };
+                const auto* const loader_entry{ vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_class_loader") };
+                void* data{};
+                void* loader{};
+                if (!klass || !data_entry || !loader_entry || !loader_entry->type_string
+                    || !vmhook::os::safe_read(&data, reinterpret_cast<const std::byte*>(klass)
+                        + data_entry->offset, sizeof(data)) || !vmhook::hotspot::is_valid_pointer(data)
+                    || !vmhook::os::safe_read(&loader, static_cast<const std::byte*>(data)
+                        + loader_entry->offset, sizeof(loader)))
+                { throw vmhook::exception{ "Java declaring-loader metadata could not be read" }; }
+                const std::string_view storage{ loader_entry->type_string };
+                if (storage == "OopHandle")
+                {
+                    if (loader && (!vmhook::hotspot::is_valid_pointer(loader)
+                        || !vmhook::os::safe_read(&loader, loader, sizeof(loader))))
+                    { throw vmhook::exception{ "Java declaring-loader handle could not be read" }; }
+                }
+                else if (storage != "oop")
+                { throw vmhook::exception{ "Java declaring-loader storage is unsupported" }; }
+                if (loader && !vmhook::hotspot::is_valid_pointer(loader))
+                { throw vmhook::exception{ "Java declaring-loader reference is invalid" }; }
+                return loader;
+            };
+            const auto array_of = [dimensions](vmhook::hotspot::klass* value) -> vmhook::hotspot::klass*
+            {
+                for (std::size_t dimension{}; value && dimension < dimensions; ++dimension)
+                {
+                    const auto* const entry{ vmhook::hotspot::iterate_struct_entries(
+                        dimension == 0 ? "InstanceKlass" : "ArrayKlass",
+                        dimension == 0 ? "_array_klasses" : "_higher_dimension") };
+                    vmhook::hotspot::klass* next{};
+                    if (!entry || !vmhook::os::safe_read(&next, reinterpret_cast<const std::byte*>(value)
+                        + entry->offset, sizeof(next)) || !vmhook::hotspot::is_valid_pointer(next))
+                    { return nullptr; }
+                    value = next;
+                }
+                return value;
+            };
+
+            const auto internal_name{ object_component ? component.substr(1, component.size() - 2)
+                                                       : std::string_view{} };
+            vmhook::hotspot::klass* expected{};
+            void* const declaring_loader{ loader_of(declaring_class) };
+            if (object_component)
+            {
+                auto* const candidate{ vmhook::find_class(internal_name) };
+                // A class already defined by this loader, or an ancestor whose
+                // identity Java linking has already constrained, is unambiguous.
+                if (candidate && (loader_of(candidate) == declaring_loader
+                    || container_class_assignable(declaring_class, candidate)))
+                { expected = dimensions == 0 ? candidate : array_of(candidate); }
+            }
+            else { expected = vmhook::resolve_array_klass(descriptor); }
+
+            if (!expected)
+            {
+                // Name-only graph lookup cannot prove parent delegation or
+                // distinguish duplicate definitions. Ask Java's actual loader,
+                // directly through the private call backend to avoid recursively
+                // entering public argument validation. Initialization stays off.
+                const auto loader_root{ declaring_loader ? native_backend::retain_oop(declaring_loader)
+                                                          : native_backend::root{} };
+                if (declaring_loader && !loader_root)
+                { throw vmhook::exception{ "Java declaring loader could not be retained" }; }
+                auto* const class_class{ vmhook::find_class("java/lang/Class") };
+                if (!class_class || loader_of(class_class) != nullptr)
+                { throw vmhook::exception{ "Bootstrap java.lang.Class metadata is unavailable" }; }
+                const auto class_root{ native_backend::retain_class(class_class) };
+                std::string binary_name{ dimensions == 0 ? internal_name : descriptor };
+                std::replace(binary_name.begin(), binary_name.end(), '/', '.');
+                const auto name_root{ native_backend::make_string(binary_name) };
+                if (!class_root || !name_root)
+                { throw vmhook::exception{ "Java argument class-resolution inputs could not be retained" }; }
+                constexpr std::string_view lookup_signature{
+                    "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;" };
+                vmhook::hotspot::method* lookup{};
+                std::int32_t count{};
+                vmhook::hotspot::method** methods{};
+                if (vmhook::hotspot::safe_klass_methods(class_class, methods, count))
+                {
+                    for (std::int32_t index{}; index < count; ++index)
+                    {
+                        auto* const method{ methods[index] };
+                        if (method && method->get_name() == "forName" && method->get_signature() == lookup_signature)
+                        { lookup = method; break; }
+                    }
+                }
+                if (!lookup) { throw vmhook::exception{ "Java declaring-loader class resolution is unavailable" }; }
+                std::array<std::intptr_t, 3> parameters{
+                    reinterpret_cast<std::intptr_t>(name_root->resolve_under_vm()), 0,
+                    reinterpret_cast<std::intptr_t>(loader_root ? loader_root->resolve_under_vm() : nullptr) };
+                const auto resolved{ native_backend::invoke_packed(lookup, lookup_signature,
+                    parameters.data(), parameters.size(), nullptr, nullptr) };
+                if (!resolved.invoked || resolved.threw || !resolved.error.empty()
+                    || !resolved.object || !resolved.object->valid())
+                { throw vmhook::exception{ "Java argument descriptor could not be resolved by its declaring loader" }; }
+                void* const mirror{ resolved.object->resolve_under_vm() };
+                if (!mirror) { throw vmhook::exception{ "Resolved Java argument class mirror is invalid" }; }
+                const vmhook::hotspot::class_loader_data_graph graph{};
+                graph.for_each_klass([&](const std::string_view name, vmhook::hotspot::klass* const klass)
+                {
+                    if (expected) { return; }
+                    auto* const candidate{ name == (dimensions == 0 ? internal_name : descriptor) ? klass
+                        : object_component && dimensions != 0 && name == internal_name ? array_of(klass) : nullptr };
+                    if (candidate && candidate->get_java_mirror() == mirror) { expected = candidate; }
+                });
+                if (!expected)
+                { throw vmhook::exception{ "Resolved Java argument class identity could not be verified" }; }
+            }
+            void* const current{ argument_root->resolve_under_vm() };
+            if (!current || !container_class_assignable(vmhook::klass_from_oop(current), expected))
+            { throw vmhook::exception{ "Java object is incompatible with the declared reference type" }; }
+        }
+
         [[nodiscard]] inline auto container_address(const native_backend::root& root) -> void*
         {
             if (!root || !root->valid())
@@ -20432,15 +20140,20 @@ namespace vmhook
             if (!vmhook::os::safe_read(&compressed, static_cast<const std::byte*>(array) + layout->body_offset
                     + static_cast<std::size_t>(index) * layout->element_width, sizeof(compressed)))
             { throw vmhook::exception{ "Java collection snapshot element is unreadable" }; }
-            return retain_container_address(vmhook::hotspot::decode_oop_pointer(compressed));
+            if (compressed == 0) { return {}; }
+            void* const decoded{ vmhook::hotspot::decode_oop_pointer(compressed) };
+            if (!decoded)
+            { throw vmhook::exception{ "Java collection element reference could not be decoded" }; }
+            return retain_container_address(decoded);
         }
 
-        template<container_wrapper wrapper_type>
-        [[nodiscard]] auto wrap_container_element(const native_backend::root& root)
-            -> std::unique_ptr<wrapper_type>
+        template<typename wrapper_type>
+        inline auto require_object_wrapper_type(void* const address) -> void
         {
-            if (!root) { return nullptr; }
-            void* const address{ container_address(root) };
+            static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>);
+            auto* const runtime_class{ vmhook::klass_from_oop(address) };
+            if (!runtime_class || !vmhook::hotspot::is_valid_pointer(runtime_class))
+            { throw vmhook::exception{ "Java object runtime class cannot be resolved" }; }
             if constexpr (!std::is_same_v<wrapper_type, vmhook::any_object>)
             {
                 std::string expected_name{ vmhook::detail::registered_class_name<wrapper_type>() };
@@ -20450,15 +20163,42 @@ namespace vmhook
                     { expected_name = wrapper_type::java_contract; }
                 }
                 if (expected_name.empty())
-                { throw vmhook::exception{ "Collection element wrapper is not registered with a Java class" }; }
+                { throw vmhook::exception{ "Object wrapper is not registered with a Java class" }; }
                 auto* const expected_class{ vmhook::find_class(expected_name) };
-                if (!expected_class || !container_class_assignable(vmhook::klass_from_oop(address), expected_class))
-                { throw vmhook::exception{ std::format("Collection element does not match wrapper class '{}'", expected_name) }; }
+                if (!expected_class || !container_class_assignable(runtime_class, expected_class))
+                { throw vmhook::exception{ std::format("Java object does not match wrapper class '{}'", expected_name) }; }
             }
-            auto result{ std::make_unique<wrapper_type>(address) };
+        }
+
+        template<typename wrapper_type>
+        [[nodiscard]] auto materialize_object(const std::uint32_t compressed,
+            const native_backend::root& existing) -> std::unique_ptr<wrapper_type>
+        {
+            // A verified zero reference needs no JVM operation. The C++ object
+            // still exists, including for null collection elements and map parts.
+            if (!existing && compressed == 0) { return wrap_object<wrapper_type>(nullptr); }
+            native_backend::operation access{};
+            if (!access)
+            { throw vmhook::exception{ "Java object conversion requires its native-thread or callback context" }; }
+            auto root{ existing };
+            if (!root)
+            {
+                void* const decoded{ vmhook::hotspot::decode_oop_pointer(compressed) };
+                if (!decoded || !vmhook::hotspot::is_valid_pointer(decoded))
+                { throw vmhook::exception{ "Java object reference could not be decoded" }; }
+                root = retain_container_address(decoded);
+            }
+            void* const address{ container_address(root) };
+            require_object_wrapper_type<wrapper_type>(address);
+            auto result{ wrap_object<wrapper_type>(address) };
             result->set_native_root(root);
             return result;
         }
+
+        template<container_wrapper wrapper_type>
+        [[nodiscard]] auto wrap_container_element(const native_backend::root& root)
+            -> std::unique_ptr<wrapper_type>
+        { return materialize_object<wrapper_type>(0, root); }
 
         template<container_wrapper element_type>
         [[nodiscard]] auto container_array_vector(const native_backend::root& snapshot)
@@ -20481,6 +20221,10 @@ namespace vmhook
             return snapshot;
         }
     }
+
+    inline auto hotspot::method_args::operator[](const std::size_t index) const
+        -> std::unique_ptr<vmhook::any_object>
+    { return this->as<vmhook::any_object>(index); }
 
     /* Java Collection wrappers use the public toArray contract. Snapshot order
        and concurrent-mutation semantics are those of the Java implementation.
@@ -23756,14 +23500,71 @@ namespace hotspot
         auto operator=(root&&) -> root& = delete /* "a root cannot be reseated; construct the one you want." */;
         ~root()                              = default;
 
-        /*
-            @brief A ref anchored at this root's static field.
-            @details Binds on first use and on every subsequent call until it
-            succeeds, so a class loaded late is picked up automatically.  The
-            returned ref is a COPY - dereference it, store it, hand it to another
-            thread.  It carries no address of its own - only the immutable anchor.
-        */
-        auto get() const noexcept
+        using element_type = std::conditional_t<std::is_void_v<wrapper_type>, vmhook::any_object, wrapper_type>;
+
+        /* Read the current static reference as an owning C++ wrapper. Java null
+           creates an allocated wrapper; lookup and lifetime failures throw. */
+        auto get() const -> std::unique_ptr<element_type>
+        {
+            vmhook::detail::native_backend::operation access{};
+            if (!access)
+            { throw vmhook::exception{ "Static object access requires a native-thread or callback context" }; }
+            std::string owner{ this->class_name_ };
+            if (owner.empty()) { owner = vmhook::detail::registered_class_name<element_type>(); }
+            if (owner.empty() || this->field_name_.empty())
+            { throw vmhook::exception{ "Static object field owner and name are required" }; }
+            auto* const owner_class{ vmhook::find_class(owner) };
+            if (!owner_class) { throw vmhook::exception{ "Static object field owner class is not loaded" }; }
+            const auto entry{ vmhook::find_field(owner_class, this->field_name_) };
+            if (!entry || !entry->is_static || entry->signature.empty() || entry->signature.front() != 'L')
+            { throw vmhook::exception{ "Static object accessor requires an existing static Java object field" }; }
+            auto* const declaring{ entry->declaring_klass ? entry->declaring_klass : owner_class };
+            vmhook::field_proxy field{ nullptr, entry->signature, true, declaring, entry->offset };
+            return static_cast<std::unique_ptr<element_type>>(field.get());
+        }
+
+        /* @brief The static field's current value address, or nullptr. */
+        auto resolve() const noexcept
+            -> vmhook::oop_t
+        {
+            return this->anchor_ref().resolve();
+        }
+
+        /* @brief True when the root binds AND currently holds a live object. */
+        explicit operator bool() const noexcept
+        {
+            return this->resolve() != nullptr;
+        }
+
+        /* @brief True once the (class, field) pair has resolved to a real
+           static reference field.  False before the class is loaded. */
+        auto bound() const noexcept
+            -> bool
+        {
+            return !this->anchor_ref().empty();
+        }
+
+        /* Checked navigation uses the same owning object result as get(). */
+        auto operator->() const -> std::unique_ptr<element_type>
+        { return this->get(); }
+
+        /* @brief The declaring class name this root was given, if any (empty when
+           the root defers to the wrapper type's registered name). */
+        auto declaring_class() const noexcept
+            -> std::string_view
+        {
+            return this->class_name_;
+        }
+
+        /* @brief The static field name this root was given. */
+        auto field_name() const noexcept
+            -> std::string_view
+        {
+            return this->field_name_;
+        }
+
+    private:
+        auto anchor_ref() const noexcept
             -> vmhook::ref<wrapper_type>
         {
             try
@@ -23799,69 +23600,7 @@ namespace hotspot
             }
         }
 
-        /* @brief The static field's current value address, or nullptr. */
-        auto resolve() const noexcept
-            -> vmhook::oop_t
-        {
-            return this->get().resolve();
-        }
 
-        /* @brief True when the root binds AND currently holds a live object. */
-        explicit operator bool() const noexcept
-        {
-            return this->resolve() != nullptr;
-        }
-
-        /* @brief True once the (class, field) pair has resolved to a real
-           static reference field.  False before the class is loaded. */
-        auto bound() const noexcept
-            -> bool
-        {
-            return !this->get().empty();
-        }
-
-        /*
-            @brief Revalidates and binds a wrapper for this expression only -
-                   `minecraft->the_player()`.  See vmhook::detail::access.
-        */
-        auto operator->() const noexcept
-            -> vmhook::detail::access<wrapper_type>
-            requires (!std::is_void_v<wrapper_type>
-                      && std::is_constructible_v<wrapper_type, vmhook::oop_t>)
-        {
-            vmhook::detail::native_backend::operation access{};
-            return vmhook::detail::access<wrapper_type>{ this->resolve() };
-        }
-
-        /*
-            @brief The UNTYPED root navigates too, through any_object.
-            @details Same revalidation; the members come from the live object's
-            own class instead of a wrapper the caller had to declare first.
-        */
-        auto operator->() const noexcept
-            -> vmhook::detail::access<vmhook::any_object>
-            requires (std::is_void_v<wrapper_type>)
-        {
-            vmhook::detail::native_backend::operation access{};
-            return vmhook::detail::access<vmhook::any_object>{ this->resolve() };
-        }
-
-        /* @brief The declaring class name this root was given, if any (empty when
-           the root defers to the wrapper type's registered name). */
-        auto declaring_class() const noexcept
-            -> std::string_view
-        {
-            return this->class_name_;
-        }
-
-        /* @brief The static field name this root was given. */
-        auto field_name() const noexcept
-            -> std::string_view
-        {
-            return this->field_name_;
-        }
-
-    private:
         std::string class_name_{};
         std::string field_name_{};
         mutable std::mutex                 bind_mutex_{};
@@ -24047,30 +23786,26 @@ namespace hotspot
         vmhook::detail::native_backend::root native_root_{};
     };
 
-    template<typename wrapper_type>
-    inline auto return_value::set(const vmhook::borrowed<wrapper_type>& value) noexcept -> void
-    {
-        if (const auto root{ value.get_native_root() })
-        { (void)vmhook::detail::set_callback_reference(this->return_slot, root); }
-    }
-
     /*
         @brief Out-of-line definition of object<derived>::self().
-        @details
-        Deferred for the same reason as to_borrowed below: vmhook::borrowed is
-        only complete at this point in the header.
+        @details Clones the C++ view, retaining the same context-scanned Java
+        reference. Java null still produces an allocated C++ wrapper.
     */
     template<typename derived>
-    auto object<derived>::self() const noexcept
-        -> vmhook::borrowed<derived>
+    auto object<derived>::self() const
+        -> std::unique_ptr<std::conditional_t<std::is_void_v<derived>, vmhook::any_object, derived>>
     {
-
+        using wrapper_type = std::conditional_t<std::is_void_v<derived>, vmhook::any_object, derived>;
+        vmhook::detail::native_backend::operation access{};
+        auto root{ this->get_native_root() };
+        if (root) { return vmhook::detail::materialize_object<wrapper_type>(0, root); }
         vmhook::oop_t const held{ this->get_instance() };
-        if (!held)
-        {
-            return vmhook::borrowed<derived>{};
-        }
-        return vmhook::borrowed<derived>{ held, this->get_native_root() };
+        if (!held) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+        if (!access)
+        { throw vmhook::exception{ "Copying a Java reference requires its native-thread or callback context" }; }
+        root = vmhook::detail::native_backend::retain_oop(held);
+        if (!root) { throw vmhook::exception{ "Java reference could not be retained for the wrapper copy" }; }
+        return vmhook::detail::materialize_object<wrapper_type>(0, root);
     }
 
     /*
@@ -24079,14 +23814,11 @@ namespace hotspot
         Deferred to here because the allocation and invocation machinery it
         needs is only complete at this point.
 
-        Every failure between the allocation and a successfully-returned
-        constructor abandons the instance and yields an EMPTY wrapper (a
-        non-null unique_ptr whose get_instance() is null).  That is
-        deliberate — an object that was allocated but whose `<init>` did not run
-        (or threw) has Java-visible invariants that were never established, and
-        handing it back would push a half-built object into code that has no way
-        to tell.  Abandoning it costs one dead object the collector reclaims;
-        returning it costs whatever that class's constructor was for.
+        Failed allocation, refused invocation, a thrown Java constructor, or
+        lost result bookkeeping throws vmhook::exception and abandons the Java
+        allocation. A half-built instance is never represented as Java null.
+        Successful construction returns an allocated wrapper and a rooted Java
+        object. C++ allocation failure propagates std::bad_alloc.
     */
     namespace detail
     {
@@ -24129,9 +23861,12 @@ namespace hotspot
                             || method->get_signature() != signature) { continue; }
                         const vmhook::method_proxy allocation{ singleton, method, std::string{signature},
                                                                /*signature_pinned=*/true };
-                        const auto result{ allocation.call(mirror) };
-                        return result.was_invoked() && !result.threw()
-                            ? static_cast<void*>(result) : nullptr;
+                        auto mirror_wrapper{ vmhook::detail::wrap_object<vmhook::any_object>(mirror) };
+                        const auto result{ allocation.call(mirror_wrapper) };
+                        if (!result.was_invoked() || result.threw() || result.result_failed)
+                        { return nullptr; }
+                        const std::unique_ptr<vmhook::any_object> allocated = result;
+                        return allocated->get_instance();
                     }
                 }
             }
@@ -24144,20 +23879,23 @@ namespace hotspot
     }
 
     template<typename wrapper_type, typename... args_t>
-    inline auto make_unique(args_t&&... args) noexcept
+        requires (vmhook::detail::is_java_wrapper_v<wrapper_type>
+            && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+            && (vmhook::detail::supported_java_argument_v<args_t> && ...))
+    inline auto make_unique(args_t&&... args)
         -> std::unique_ptr<wrapper_type>
     {
         vmhook::detail::native_backend::operation native_operation{};
         const bool native_call{ vmhook::detail::native_backend::active() };
         if (native_call && !native_operation)
-        { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+        { throw vmhook::exception{ "Java object construction requires an active VM context" }; }
         const std::string class_name{ vmhook::detail::registered_class_name<wrapper_type>() };
         if (class_name.empty())
         {
             ::vmhook::detail::log_line("{} make_unique(): type '{}' is not registered - call "
                        "register_class<T>(\"java/lang/Name\") before constructing it.",
                        vmhook::error_tag, vmhook::detail::type_name<wrapper_type>());
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java object wrapper is not registered" };
         }
 
         vmhook::hotspot::klass* const target_klass{ vmhook::find_class(class_name) };
@@ -24165,7 +23903,7 @@ namespace hotspot
         {
             ::vmhook::detail::log_line("{} make_unique(): class '{}' is not loaded in this VM.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java object wrapper class is not loaded" };
         }
 
         // A zero instance size means non-instantiable (interface / abstract /
@@ -24177,7 +23915,7 @@ namespace hotspot
             ::vmhook::detail::log_line("{} make_unique(): '{}' is not instantiable (interface, "
                        "abstract, or its instance size could not be read).",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java object wrapper class is not instantiable or initialized" };
         }
 
         // Locate ANY <init> on the class first.  The exact overload is chosen
@@ -24211,7 +23949,7 @@ namespace hotspot
             ::vmhook::detail::log_line("{} make_unique(): '{}' declares no <init> this library can "
                        "reach - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java constructor metadata cannot be resolved" };
         }
 
         // Check known backend prerequisites before reserving Java heap space.
@@ -24222,7 +23960,7 @@ namespace hotspot
             ::vmhook::detail::log_line("{} make_unique(): no call stub could be derived on this VM, "
                        "so '{}' cannot be constructed - nothing was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java construction call backend is unavailable" };
         }
         if (!native_call && !vmhook::hotspot::ensure_current_java_thread())
         {
@@ -24230,7 +23968,7 @@ namespace hotspot
                        "so the constructor of '{}' cannot run - nothing "
                        "was allocated.",
                        vmhook::error_tag, class_name);
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java constructor requires a validated thread context" };
         }
 
         // The interpreter locals[] array method_proxy::call packs into is sized
@@ -24246,7 +23984,7 @@ namespace hotspot
                        "8 the interpreter locals[] array holds - nothing was allocated.",
                        vmhook::error_tag, vmhook::detail::type_name<wrapper_type>(),
                        sizeof...(args_t));
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java constructor exceeds the supported argument count" };
         }
         else
         {
@@ -24256,7 +23994,7 @@ namespace hotspot
         {
             std::size_t index{};
             bool failed{};
-            [[maybe_unused]] auto retain_argument = [&](auto&& argument) noexcept
+            [[maybe_unused]] auto retain_argument = [&](auto&& argument)
             {
                 bool required{};
                 auto& root{ native_argument_roots[index++] };
@@ -24264,7 +24002,7 @@ namespace hotspot
                 if ((required && !root) || (root && !root->valid())) { failed = true; }
             };
             (retain_argument(args), ...);
-            if (failed) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+            if (failed) { throw vmhook::exception{ "Java constructor arguments cannot be retained in this context" }; }
         }
         vmhook::detail::native_backend::root allocated_root{};
         if (native_call) { allocated_root = vmhook::detail::native_backend::allocate(target_klass); }
@@ -24277,7 +24015,7 @@ namespace hotspot
         {
             ::vmhook::detail::log_line("{} make_unique(): allocation of {} bytes for '{}' failed.",
                        vmhook::warning_tag, instance_size, class_name);
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java object allocation failed" };
         }
 
         if (native_call)
@@ -24295,7 +24033,7 @@ namespace hotspot
                     if (method && method->get_name() == "<init>") { initializer = method; break; }
                 }
             }
-            if (!initializer) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+            if (!initializer) { throw vmhook::exception{ "Java constructor metadata became unavailable after allocation" }; }
         }
         vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature(),
             false, native_call ? &allocated : nullptr, allocated_root };
@@ -24304,7 +24042,7 @@ namespace hotspot
         if (!call_result.was_invoked())
         {
             ::vmhook::detail::log_line("{} make_unique(): constructor invocation was refused.", vmhook::error_tag);
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java constructor invocation was refused" };
         }
         if (call_result.threw())
         {
@@ -24313,13 +24051,17 @@ namespace hotspot
                        vmhook::error_tag, class_name,
                        call_result.exception_class.empty()
                            ? "an exception" : call_result.exception_class.c_str());
-            return vmhook::detail::wrap_object<wrapper_type>(nullptr);
+            throw vmhook::exception{ "Java constructor threw an exception" };
         }
 
-        // wrap_object never yields a null pointer: a caller checks
-        // get_instance(), exactly as for a field read or a call result.
-        auto result{ vmhook::detail::wrap_object<wrapper_type>(call_result.receiver_address) };
-        if (native_call && result) { result->set_native_root(call_result.native_receiver_root); }
+        if (call_result.result_failed || !call_result.receiver_address)
+        { throw vmhook::exception{ "Java constructor result could not be retained" }; }
+        auto receiver_root{ call_result.native_receiver_root };
+        if (!receiver_root)
+        { receiver_root = vmhook::detail::native_backend::retain_oop(call_result.receiver_address); }
+        if (!receiver_root)
+        { throw vmhook::exception{ "Constructed Java object requires a retained reference" }; }
+        auto result{ vmhook::detail::materialize_object<wrapper_type>(0, receiver_root) };
 
         // OPTIONAL C++-side hook.  It runs AFTER the Java constructor, so a
         // wrapper that wants to stamp extra state can, and one that does not
@@ -24327,208 +24069,73 @@ namespace hotspot
         if constexpr (requires(wrapper_type& wrapper, args_t&&... hook_args)
                       { wrapper.construct(std::forward<args_t>(hook_args)...); })
         {
-            if (result)
-            {
-                result->construct(std::forward<args_t>(args)...);
-            }
+            result->construct(std::forward<args_t>(args)...);
         }
         return result;
         }
     }
 
-    // Allocation helpers returning non-owning diagnostic borrows.
-    // new_* wraps the same raw allocation with a collection sample. A changed
-    // sample can reject the address; an unchanged sample does not prove liveness
-    // or synchronize with GC. No persistent root or no-safepoint window is created.
-    // A failed allocation returns an empty borrow.
+    /* Allocation-only helpers return rooted owning C++ wrappers. They never
+       convert a refused allocation into a Java-null success. make_unique runs
+       Java constructors; new_object deliberately performs allocation only. */
 
-    /*
-        @brief Allocates a raw Java object and returns a diagnostic borrow.
-        @details Uses make_java_object, including its own-TLAB and layout gates.
-        No Java constructor is invoked. Failure returns an empty borrow.
-        The collection sample is diagnostic and does not register a GC root.
-    */
-    template<typename wrapper_type = void>
+    template<typename wrapper_type = vmhook::any_object>
+        requires vmhook::detail::is_java_object_pointer_v<std::unique_ptr<wrapper_type>>
     [[nodiscard]] inline auto new_object(vmhook::hotspot::klass* const klass,
-                           const std::size_t requested_size) noexcept
-        -> vmhook::borrowed<wrapper_type>
+                                        const std::size_t requested_size)
+        -> std::unique_ptr<wrapper_type>
     {
-        void* const allocated{ vmhook::make_java_object(klass, requested_size) };
-        return allocated ? vmhook::borrowed<wrapper_type>{ allocated }
-                         : vmhook::borrowed<wrapper_type>{};
+        vmhook::detail::native_backend::operation access{};
+        if (!access)
+        { throw vmhook::exception{ "Java object allocation requires a native-thread or callback context" }; }
+        if (!klass || !vmhook::hotspot::is_valid_pointer(klass) || requested_size == 0
+            || klass->get_instance_size() != requested_size)
+        { throw vmhook::exception{ "Java object allocation requires a concrete class with its exact instance size" }; }
+        const auto root{ vmhook::detail::native_backend::allocate(klass) };
+        if (!root) { throw vmhook::exception{ "Java object allocation failed" }; }
+        return vmhook::detail::materialize_object<wrapper_type>(0, root);
     }
 
-    /*
-        @brief Allocates a raw Java array and returns a diagnostic borrow.
-        @details Uses make_java_array and returns empty on allocation failure.
-        The borrow does not prevent relocation, collection, or slot mutation.
-    */
-    template<typename wrapper_type = void>
+    /* Keeps the existing verified detour/TLAB array allocator. Unsupported
+       contexts, geometry, exhaustion, and root failures are explicit errors. */
+    template<typename wrapper_type = vmhook::any_object>
+        requires vmhook::detail::is_java_object_pointer_v<std::unique_ptr<wrapper_type>>
     [[nodiscard]] inline auto new_array(const std::string_view class_name,
-                          const std::int32_t length,
-                          const std::size_t element_size) noexcept
-        -> vmhook::borrowed<wrapper_type>
+                                       const std::int32_t length,
+                                       const std::size_t element_size)
+        -> std::unique_ptr<wrapper_type>
     {
+        vmhook::detail::native_backend::operation access{};
+        if (!access)
+        { throw vmhook::exception{ "Java array allocation requires a rooted callback context" }; }
         void* const allocated{ vmhook::make_java_array(class_name, length, element_size) };
-        return allocated ? vmhook::borrowed<wrapper_type>{ allocated }
-                         : vmhook::borrowed<wrapper_type>{};
+        if (!allocated) { throw vmhook::exception{ "Java array allocation is unavailable or failed" }; }
+        const auto root{ vmhook::detail::native_backend::retain_oop(allocated) };
+        if (!root) { throw vmhook::exception{ "Allocated Java array could not be retained" }; }
+        return vmhook::detail::materialize_object<wrapper_type>(0, root);
     }
 
-    /*
-        @brief Builds a Java String and returns a diagnostic borrow.
-        @details Uses make_java_string and returns empty on failure. No root is
-        registered: an unchanged collection sample does not prove the String is
-        still alive, and field publication requires the supported store policy.
-    */
-    [[nodiscard]] inline auto new_string(const std::string_view value) noexcept
-        -> vmhook::borrowed<>
-    {
-        void* const allocated{ vmhook::make_java_string(value) };
-        return allocated ? vmhook::borrowed<>{ allocated } : vmhook::borrowed<>{};
-    }
-
-    /*
-        @brief Out-of-line definition of method_proxy::value_t::to_borrowed<W>().
-        @details
-        Deferred for the same reason as the field_proxy twin below: this is the
-        first point in the header where vmhook::borrowed is complete.
-
-        Only the compressed-OOP alternative yields a handle.  The std::string
-        alternative deliberately does NOT: by the time the variant holds a
-        string, call() has already decoded the String oop eagerly and the
-        address is gone, so producing a borrow would mean producing one from
-        nothing.  Callers who want the String want as_string(); callers who want
-        the OBJECT should declare the return as a reference type.
-    */
-    template<typename wrapper_type>
-    auto method_proxy::value_t::to_borrowed() const noexcept
-        -> vmhook::borrowed<wrapper_type>
+    template<typename wrapper_type = vmhook::any_object>
+        requires vmhook::detail::is_java_object_pointer_v<std::unique_ptr<wrapper_type>>
+    [[nodiscard]] inline auto new_string(const std::string_view value)
+        -> std::unique_ptr<wrapper_type>
     {
         vmhook::detail::native_backend::operation access{};
-        return std::visit([this](const auto& stored) noexcept
-            -> vmhook::borrowed<wrapper_type>
-            {
-                using stored_type = std::remove_cvref_t<decltype(stored)>;
-                if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                {
-                    if (stored == 0u && !this->native_root)
-                    {
-                        return vmhook::borrowed<wrapper_type>{};
-                    }
-                    return vmhook::borrowed<wrapper_type>{
-                        this->reference_address(stored), this->native_root };
-                }
-                else
-                {
-                    return vmhook::borrowed<wrapper_type>{};
-                }
-            }, this->data);
+        if (!access)
+        { throw vmhook::exception{ "Java String allocation requires a native-thread or callback context" }; }
+        const auto root{ vmhook::detail::native_backend::make_string(value) };
+        if (!root) { throw vmhook::exception{ "Java String allocation failed" }; }
+        return vmhook::detail::materialize_object<wrapper_type>(0, root);
     }
 
-    /*
-        @brief Out-of-line definition of field_proxy::value_t::to_borrowed<W>().
-        @details
-        Deferred to here because vmhook::borrowed is only complete at this point
-        (it needs gc_epoch(), which needs the whole hotspot layer) — the same
-        treatment to_vector / to_entries already get.
-
-        The stored alternative is the ONLY thing consulted: a compressed-OOP
-        alternative is decoded and stamped, and every primitive alternative
-        yields an empty borrow rather than a borrow of reinterpreted bits.
-    */
-    template<typename wrapper_type>
-    auto field_proxy::value_t::to_borrowed() const noexcept
-        -> vmhook::borrowed<wrapper_type>
+    inline auto field_proxy::value_t::operator->() const -> std::unique_ptr<vmhook::any_object>
     {
-        vmhook::detail::native_backend::operation access{};
-        return std::visit([this](const auto& stored) noexcept
-            -> vmhook::borrowed<wrapper_type>
-            {
-                using stored_type = std::remove_cvref_t<decltype(stored)>;
-                if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                {
-                    // A zero narrow oop is Java null: decode would hand back
-                    // nullptr anyway, but going through the empty-borrow
-                    // constructor keeps "never borrowed" distinct from
-                    // "borrowed and since expired".
-                    if (stored == 0u && !this->native_root)
-                    {
-                        return vmhook::borrowed<wrapper_type>{};
-                    }
-                    return vmhook::borrowed<wrapper_type>{
-                        this->reference_address(stored), this->native_root };
-                }
-                else
-                {
-                    return vmhook::borrowed<wrapper_type>{};
-                }
-            }, this->data);
+        return static_cast<std::unique_ptr<vmhook::any_object>>(*this);
     }
 
-    /*
-        @brief Out-of-line definitions of the untyped `->` on both value types.
-        @details
-        Deferred to here because detail::access and any_object are only complete
-        at this point.  Both do the same thing: decode the reference the value
-        holds, vet it once, and bind an any_object to it for the length of the
-        surrounding expression.
-
-        A value that holds no object — a primitive, a void call, a Java null, an
-        array, an address that fails the heap check — binds a NULL any_object
-        rather than failing.  That is deliberate: `a->get_method("b")->call()->get_method("c")->call()` then
-        ends quietly at the first missing link and logs there, instead of
-        requiring a check between every hop.
-    */
-    inline auto field_proxy::value_t::operator->() const noexcept
-        -> vmhook::detail::access<vmhook::any_object>
+    inline auto method_proxy::value_t::operator->() const -> std::unique_ptr<vmhook::any_object>
     {
-        vmhook::detail::native_backend::operation access{};
-        return std::visit([this](const auto& stored) noexcept
-            -> vmhook::detail::access<vmhook::any_object>
-            {
-                using stored_type = std::remove_cvref_t<decltype(stored)>;
-                if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                {
-                    return vmhook::detail::access<vmhook::any_object>{
-                        this->reference_target<void>(stored), this->native_root };
-                }
-                else
-                {
-                    return vmhook::detail::access<vmhook::any_object>{ nullptr };
-                }
-            }, this->data);
-    }
-
-    inline auto field_proxy::value_t::operator*() const noexcept
-        -> vmhook::detail::access<vmhook::any_object>
-    {
-        return this->operator->();
-    }
-
-    inline auto method_proxy::value_t::operator->() const noexcept
-        -> vmhook::detail::access<vmhook::any_object>
-    {
-        vmhook::detail::native_backend::operation access{};
-        return std::visit([this](const auto& stored) noexcept
-            -> vmhook::detail::access<vmhook::any_object>
-            {
-                using stored_type = std::remove_cvref_t<decltype(stored)>;
-                if constexpr (std::is_same_v<stored_type, std::uint32_t>)
-                {
-                    return vmhook::detail::access<vmhook::any_object>{
-                        this->reference_target<void>(stored), this->native_root };
-                }
-                else
-                {
-                    return vmhook::detail::access<vmhook::any_object>{ nullptr };
-                }
-            }, this->data);
-    }
-
-    inline auto method_proxy::value_t::operator*() const noexcept
-        -> vmhook::detail::access<vmhook::any_object>
-    {
-        return this->operator->();
+        return static_cast<std::unique_ptr<vmhook::any_object>>(*this);
     }
 
     /*
@@ -24833,19 +24440,17 @@ namespace hotspot
     /*
         @brief Wraps the Java object behind a wrapper unique_ptr in a holder.
         @details `pin(wrapper)` instead of `vmhook::oop_pin{ wrapper->get_instance() }`.
-        Returns an empty holder for a null wrapper.  No GC protection, and no
-        root — only the relocation detector described in the oop_pin class
-        doc.
+        An empty C++ pointer or invalid context throws. A Java null wrapper
+        creates an empty diagnostic holder. This holder supplies no GC root:
+        retain the owning wrapper for its actual context-scanned lifetime.
     */
     template<typename wrapper_type>
-    inline auto pin(const std::unique_ptr<wrapper_type>& wrapper) noexcept
+        requires vmhook::detail::is_java_object_pointer_v<std::unique_ptr<wrapper_type>>
+    inline auto pin(const std::unique_ptr<wrapper_type>& wrapper)
         -> vmhook::oop_pin
     {
-        static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
-                      "vmhook::pin(unique_ptr<T>): T must derive from vmhook::object_base.");
-        return wrapper
-            ? vmhook::oop_pin{ wrapper->vmhook::object_base::get_instance() }
-            : vmhook::oop_pin{};
+        vmhook::detail::require_object_argument(wrapper);
+        return vmhook::oop_pin{ wrapper->vmhook::object_base::get_instance() };
     }
 
     /*

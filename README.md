@@ -89,10 +89,11 @@ CRTP supplies the class identity; an instance function additionally supplies
 its receiver. C++ cannot safely infer that receiver from a static function, so
 the helper qualifier distinguishes the two inside the wrapper.
 
-## Collections and maps
+## Object fields and arguments
 
-Suppose `example/World.playerEntities` is a Java collection of
-`example/Player` objects. A wrapper can return the C++ vector directly:
+Use `std::unique_ptr<player>` for a Java Player reference. Object getters and
+method returns allocate a C++ wrapper; setters and object arguments take the
+owning pointer, usually by const reference:
 
 ```cpp
 class player : public vmhook::object<player>
@@ -111,18 +112,64 @@ class world : public vmhook::object<world>
 public:
     using vmhook::object<world>::object;
 
-    auto get_player_entities() const
-        -> std::vector<std::unique_ptr<player>>
+    auto get_player() const -> std::unique_ptr<player>
     {
-        return get_field("playerEntities")->get().to_vector();
+        return get_field("player")->get();
+    }
+
+    auto set_player(const std::unique_ptr<player>& next) -> void
+    {
+        get_field("player")->set(next);
+    }
+
+    auto select_player(const std::unique_ptr<player>& next)
+        -> std::unique_ptr<player>
+    {
+        return get_method("selectPlayer", "(Lexample/Player;)Lexample/Player;")
+            ->call(next);
     }
 };
 ```
 
 Register `player` and `world` with their Java class names during setup, just
-as in the native-thread example below. The declared return type supplies
-`player`; there is no receiver argument or repeated template argument.
-Object-array fields and Java collection method results support the same form.
+as in the native-thread example below. Reference field stores currently require
+Epsilon; this pointer syntax does not bypass the write-barrier restriction.
+Java method calls use their normal collector-aware execution.
+
+A Java null still has an allocated C++ wrapper. Check its instance:
+
+```cpp
+auto selected = world_instance->get_player();
+if (selected->get_instance() == nullptr)
+{
+    // The Java player field is null.
+}
+
+// Pass a Java null with an allocated wrapper, too.
+auto no_player = std::make_unique<player>(nullptr);
+auto previous = world_instance->select_player(no_player);
+```
+
+An empty `std::unique_ptr<player>` is refused as an object argument. Allocation
+failure throws `std::bad_alloc`; a successful object result never returns an
+empty pointer. Failed calls, invalid types and expired roots report
+`vmhook::exception` when converted to an owning wrapper.
+
+## Collections and maps
+
+Suppose `example/World.playerEntities` is a Java collection of
+`example/Player` objects. Add this method to `world`:
+
+```cpp
+auto get_player_entities() const -> std::vector<std::unique_ptr<player>>
+{
+    return get_field("playerEntities")->get().to_vector();
+}
+```
+
+The declared return type supplies `player`; there is no receiver argument or
+repeated template argument. Object-array fields and Java collection method
+results support the same form.
 
 The mini wrappers include `collection`, `list`, `array_list`, `linked_list`,
 `set`, `hash_set`, `linked_hash_set`, `tree_set`, `queue`, `deque`, `array_deque`,
@@ -136,9 +183,9 @@ node layouts. Encounter order follows the Java operation.
 Use a mini wrapper when you also need container operations:
 
 ```cpp
-vmhook::list players = get_field("playerEntities")->get();
-const auto count = players.size();
-std::vector<std::unique_ptr<player>> copied = players.to_vector();
+std::unique_ptr<vmhook::list> players = get_field("playerEntities")->get();
+const auto count = players->size();
+std::vector<std::unique_ptr<player>> copied = players->to_vector();
 ```
 
 For a map, declare a vector of key/value wrapper pairs. For example, a
@@ -164,9 +211,10 @@ auto relationships = get_field("relationships")->get().to_vector<player, player>
 Without those template arguments, `auto` stores a deferred conversion value,
 not a `std::vector`. It owns its source value, including its context-bound
 root, and reads the Java collection when converted to the declared vector.
-Use it on the owning thread before that context closes. Actual Java null
-elements, keys and values remain `nullptr`; a null source becomes an empty
-vector. Unsupported shapes, incompatible registered wrapper types, expired
+Use it on the owning thread before that context closes. Every element, key
+and value has an allocated wrapper, including Java nulls: test
+`entry->get_instance() == nullptr`. A null source becomes an empty vector.
+Unsupported shapes, incompatible registered wrapper types, expired
 roots and failed Java calls throw `vmhook::exception`. The returned unique
 pointers own C++ wrappers, while Java manages the objects. Conversion follows
 the Java implementation's concurrent-mutation semantics; it does not promise
@@ -191,11 +239,6 @@ auto worker() -> void
     }
 
     auto instance = vmhook::make_unique<counter>(std::int32_t{10});
-    if (!instance || !instance->get_instance())
-    {
-        throw vmhook::exception{"Counter construction failed"};
-    }
-
     const auto value = instance->add(5);
     const auto total = counter::get_total();
     std::cout << value << ", total: " << total << '\n';
@@ -209,6 +252,8 @@ allow the JVM to reach safepoints and collect garbage. `vmhook::make_unique`
 uses HotSpot's collector-aware allocator and invokes the real Java constructor;
 `std::make_unique` only constructs a C++ wrapper. The Java class must already be
 loaded and concrete; VMHook performs the required class initialization.
+`vmhook::make_unique` throws `vmhook::exception` if Java construction fails,
+and C++ wrapper allocation failure throws `std::bad_alloc`.
 
 Construct and close the context on the same thread. Its destructor closes it;
 `close()` is also available when explicit cleanup is useful. Contexts cannot be
@@ -253,22 +298,40 @@ const auto count = static_cast<std::int32_t>(result);
 Direct conversion to a primitive returns its default value when invocation is
 refused. A reported Java exception is consumed by the native call backend so
 the next call can proceed. `result_failed` reports native result bookkeeping
-failure even when the Java method ran; collection conversion refuses it.
+failure even when the Java method ran; owning object and collection conversions
+refuse it instead of returning a Java-null wrapper.
 Both instance lookups and `static_members` lookups
 support boolean checks before using `->`.
 
 `std::string` carries UTF-8 text for a Java String, and
-`std::unique_ptr<wrapper>` represents a wrapped Java object. The unique pointer
-owns the **C++ wrapper**. Inside a
+`std::unique_ptr<wrapper>` represents a wrapped Java object. Object-valued
+fields, method results, `self()`, `root<wrapper>::get()` and hook
+receivers/arguments use this form. Pass object inputs as unique pointers or
+const references to them;
+do not dereference them into a by-value wrapper or wrapper-reference argument.
+The unique pointer owns the **C++ wrapper**. Inside a
 native context, constructed objects, object-valued results and reference field
 reads carry VM-scanned roots. Those roots follow moving GC during calls and
-while the worker is idle. Copies and supported `borrowed`/`ref` conversions
-retain that context-bound protection; they do not become cross-thread handles.
+while the worker is idle. The wrapper's shared root ticket retains that
+context-bound protection; it does not become a cross-thread handle.
+
+`new_object`, `new_array` and `new_string` also return owning pointers, with
+`any_object` as the default wrapper type. `new_object` does not run a Java
+constructor; use `vmhook::make_unique` for normal construction. Array allocation
+retains its narrower supported callback/TLAB requirements.
+
+A Java null produces a non-empty unique pointer with
+`pointer->get_instance() == nullptr`. Empty C++ pointers are not Java nulls and
+are refused as object inputs. Allocation failure throws `std::bad_alloc`.
+An expired or foreign-thread rooted wrapper throws `vmhook::exception` from
+`get_instance()`; it does not silently turn into a Java null.
 
 Use each rooted wrapper on its context's owning thread. Closing the context
 invalidates its rooted wrappers, object-valued results and derived references;
-foreign-thread and expired uses are refused. Ordinary C++ values already copied
-out remain usable. A receiver-bound method proxy must not outlive its C++
+foreign-thread and expired uses are refused. Primitive values, UTF-8
+`std::string`s and ordinary C++ values copied out remain usable. A vector's
+wrapper elements still retain their context-bound lifetime. A receiver-bound
+method proxy must not outlive its C++
 wrapper. `get_instance()` exposes an address snapshot, not a permanently stable
 pointer: do not save or dereference raw heap addresses across GC.
 
@@ -296,6 +359,12 @@ const bool installed = vmhook::hook<counter>("add", "(I)I", &add_hook);
 `result.set_arg(0, value)` replaces the first Java argument, excluding the
 receiver. `cancel()` skips a void method and `set(value)` forces a return.
 An untouched result lets the original method run. There are no scoped hooks.
+
+Object receivers and arguments use `std::unique_ptr<wrapper>` by value or
+`const std::unique_ptr<wrapper>&`. A Java-null argument is an allocated wrapper
+with a null instance. Use `result.set(pointer)` for an object return and
+`result.set_arg(index, pointer)` for an object argument replacement. Empty
+pointers, raw object addresses and plain wrapper values are refused.
 
 The declaring Java class must already be loaded and linked. Hook registration
 does not load, link or initialize it; a class that is only loaded is refused.
@@ -478,7 +547,9 @@ cover same-thread calls, real constructors, JIT execution, moving GC,
 receiver binding and collection conversions. Collection regressions include
 ordered and unmodifiable containers, identity/concurrent maps, nulls,
 interface and subclass elements, deferred results, invalid types and expired
-contexts.
+contexts. Object-reference checks distinguish allocated Java-null wrappers
+from empty C++ owners in getters, calls, constructor arguments, collections
+and hooks.
 
 The observation fixtures verify actual compilation and inlining before hooks,
 VM deoptimization, all eight primitive field types, class notifications and
@@ -486,9 +557,10 @@ nested callback calls with rooted returns during independent GC. Platform
 thread frames are covered; virtual thread frames remain outside the verified
 scope. Tests launch JVMs normally with their default collectors.
 
-Results for the implementation are recorded in
-[PR #44](https://github.com/xxxnpno/vmhook/pull/44), with the tested commit and
-execution environment identified. Native Windows runs and separate Wine runs
+Each validation result identifies the tested commit and execution environment.
+[PR #44](https://github.com/xxxnpno/vmhook/pull/44) records the preceding
+collection implementation, before the allocated-wrapper Java-null contract.
+Native Windows runs and separate Wine runs
 are distinct evidence. These finite checks concern the exact images and
 tested collectors, not every vendor/collector combination. See
 [hook fixtures](docs/hooks.md) and the native-thread guide for reproduction.

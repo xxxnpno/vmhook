@@ -193,7 +193,8 @@ namespace
             [](vmhook::return_value& result)
             {
                 typed_calls[3].fetch_add(1);
-                result.set(nullptr);
+                const auto java_null = std::make_unique<vmhook::any_object>(nullptr);
+                result.set(java_null);
             }) && typed_installed;
         typed_installed = vmhook::hook<jit_fixture>("targetVoid", "()V",
             [](vmhook::return_value& result)
