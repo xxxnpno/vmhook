@@ -209,6 +209,31 @@ def audited_profile(entry: dict, recipe: dict, dll: Path) -> dict:
             for selector, value in proof["enums"].items():
                 if recipe["types"][owner]["enums"].get(selector) != value:
                     raise pp.profile_error("Exact-image derived layout differs from proof: " + owner + "::" + selector)
+    heap = recipe["provenance"].get("heap_iteration_proof")
+    if heap:
+        for subject, alias in (("prepare", "heap_ensure_g1"), ("walk", "heap_iterate_g1")):
+            slot = heap[subject + "_slot"]
+            if not 0 <= slot < 128:
+                raise pp.profile_error("Exact-image heap virtual slot is out of bounds")
+            pointer = int.from_bytes(image.read(heap["heap_vtable_rva"] + slot * 8, 8), "little")
+            if pointer - image.base != recipe["aliases"][alias]:
+                raise pp.profile_error("Exact-image heap function differs from its vtable slot: " + alias)
+            instruction = image.read(heap[subject + "_call_rva"], 6)
+            if instruction[:2] != b"\xff\x90" or int.from_bytes(instruction[2:], "little") != slot * 8:
+                raise pp.profile_error("Exact-image heap VM-operation dispatch mismatch: " + alias)
+        if image.read(heap["prepare_call_rva"] - 2, 2) != b"\x33\xd2":
+            raise pp.profile_error("Exact-image heap parsability call must pass retire_tlabs=false")
+        lea_rva = heap["region_closure_lea_rva"]
+        instruction = image.read(lea_rva, 7)
+        if instruction[:3] != b"\x48\x8d\x05" or \
+                lea_rva + 7 + int.from_bytes(instruction[3:], "little", signed=True) != heap["region_closure_vtable_rva"]:
+            raise pp.profile_error("Exact-image heap iterator closure construction mismatch")
+        if int.from_bytes(image.read(heap["region_closure_vtable_rva"], 8), "little") - image.base != heap["region_callback_rva"]:
+            raise pp.profile_error("Exact-image heap region callback differs from its vtable")
+        region_slot = heap["heap_region_iterate_slot"]
+        if not 0 <= region_slot < 128 or \
+                int.from_bytes(image.read(heap["heap_region_vtable_rva"] + region_slot * 8, 8), "little") - image.base != heap["heap_region_iterate_rva"]:
+            raise pp.profile_error("Exact-image HeapRegion iterator differs from its vtable")
     types = {}
     for name, facts in recipe["types"].items():
         observed = metadata.get(name)

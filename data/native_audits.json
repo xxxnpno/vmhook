@@ -82,7 +82,9 @@
         "interpreter_entry_table": 9337312,
         "field_enable_guards10": 6397504,
         "field_special_exit10": 6401232,
-        "frame_oops_interpreted": 2697552
+        "frame_oops_interpreted": 2697552,
+        "heap_ensure_g1": 1892720,
+        "heap_iterate_g1": 2756688
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -815,6 +817,14 @@
             "vtable_do_oop_wide": 1,
             "vtable_count": 2
           }
+        },
+        "ObjectClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_object": 0,
+            "vtable_count": 1
+          }
         }
       },
       "code_prefixes": {
@@ -884,7 +894,9 @@
         "interpreter_entry_table": "00000000000000000000000000000000",
         "field_enable_guards10": "48895c2408574883ec20488b81280100",
         "field_special_exit10": "48895c240848896c2410488974241857",
-        "frame_oops_interpreted": "48895c24185556574154415541564157488d6c24e04881ec20010000488b05cd"
+        "frame_oops_interpreted": "48895c24185556574154415541564157488d6c24e04881ec20010000488b05cd",
+        "heap_ensure_g1": "48895c240848896c2410488974241848897c242041564883ec20488b1d070875",
+        "heap_iterate_g1": "4883ec48488d05ed434a004889542430488d5424204881c128010000c6442428"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -914,7 +926,8 @@
           "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
           "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
           "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body.",
-          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace."
+          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace.",
+          "Heap iteration: exact RTTI vtables and VM_HeapIterateOperation machine calls prove the G1 parsability/iteration entries and ObjectClosure slot0 ABI. PRODUCT ObjectClosure is 8 bytes with no state. Captured oops are written into preallocated caller HandleArea roots before safepoint completion. Iterator sees allocated objects, including unreclaimed unreachable objects."
         ],
         "source_hashes": {
           "9-javaCalls.cpp": "974c9324fd5af15c2e743010e2e40a28f308464ae22d7941f3fb42a8048a8706",
@@ -958,7 +971,12 @@
           "intrinsic/9/exact9-vmSymbols.hpp": "e6251dc9f5f077f323a9b386235e3b38c23dbe7365575e48b400d7902b4e0c32",
           "deallocate/9/utilities/growableArray.hpp": "782d7e8c28d1724e41fdef3c567e255d5c5c4ec3012d104a2d79825adfd68af9",
           "deallocate/9/classfile/classLoaderData.hpp": "d3a857ef01cbc6b3b539951f342bdd5a9eb6fc8e9c812c43ecff1c8abfe4ff25",
-          "deallocate/9/classfile/classLoaderData.cpp": "2446688f51ad65f1118d76effe74a4f062d5004a9eb5fb6825dad483cd291ea1"
+          "deallocate/9/classfile/classLoaderData.cpp": "2446688f51ad65f1118d76effe74a4f062d5004a9eb5fb6825dad483cd291ea1",
+          "heap/9/memory/iterator.hpp": "61a9df5436017759629b97d038a55588365b357fd21fc824f4716e102fa1d4c5",
+          "heap/9/gc/shared/collectedHeap.cpp": "68f72f9bec204c8227fa3333632170ddf5668de285bb27f10edda0ee59c808e7",
+          "heap/9/gc/g1/g1CollectedHeap.cpp": "8fe2b0a4b25cdfd2b18cb068e47bab15928d9c6e8a6aa6b302fadbd80ebded3c",
+          "heap/9/gc/g1/heapRegion.cpp": "31302a30b62b37314a8fcbc43e2d9e734b7c030684960be6443f35b4e4987a09",
+          "heap/9/prims/jvmtiTagMap.cpp": "f991ed3a829bc0f15eca442230e4b161a7558e6bd10cc898df16c2a6ea94bd7b"
         },
         "observation_entrypoints": {
           "vm_execute": {
@@ -1397,6 +1415,17 @@
               },
               "proof": "Frame mirror is a full-width oop slot at FP-32. The scanner passes that slot in RDX and OopClosure in RCX, then calls [closure_vptr+8], proving the wide overload is slot1. Tagged PRODUCT OopClosure/Closure have no virtual destructor or diagnostic base; OopClosure declares exactly the wide and narrow do_oop virtuals."
             }
+          ],
+          "ObjectClosure": [
+            {
+              "rva": 3156323,
+              "bytes": "488b06488bd3488bceff10",
+              "enums": {
+                "vtable_do_object": 0,
+                "vtable_count": 1
+              },
+              "proof": "Exact HeapRegion RTTI vtable leads to its object_iterate slot14. The function passes the oop in RDX and ObjectClosure in RCX, calls [closure_vptr+0]. Tagged PRODUCT Closure is empty; ObjectClosure has only do_object(oop), no virtual destructor or inherited abort state."
+            }
           ]
         },
         "function_reference_proofs": {
@@ -1426,6 +1455,22 @@
               "proof": "frame::oops_do tests is_interpreted_frame and passes RCX=this,RDX=OopClosure,R8=RegisterMap,R9b=query_oop_map_cache to the exact scanner; no CLDClosure argument. The body matches the tagged source: Method/BCI, monitors, native temporary oop, mirror, invoke arguments, mask_for/compute_one_oop_map, then iterate_oop."
             }
           ]
+        },
+        "heap_iteration_proof": {
+          "heap_type": "G1CollectedHeap",
+          "heap_vtable_rva": 7620360,
+          "prepare_slot": 22,
+          "walk_slot": 38,
+          "vm_operation_doit_rva": 4394576,
+          "prepare_call_rva": 4394604,
+          "walk_call_rva": 4394647,
+          "region_closure_vtable_rva": 7623752,
+          "region_closure_lea_rva": 2756692,
+          "region_callback_rva": 2738224,
+          "heap_region_vtable_rva": 7700872,
+          "heap_region_iterate_slot": 14,
+          "heap_region_iterate_rva": 3156256,
+          "source_notes": "The exact VM_HeapIterateOperation::doit loads Universe::_collectedHeap, sets EDX=0, invokes heap ensure_parsability(false), then invokes object_iterate(ObjectClosure*). G1 object_iterate constructs the RTTI-identified IterateObjectClosureRegionClosure; its callback invokes HeapRegion object_iterate at offset0x70, whose callback above proves ObjectClosure slot0."
         }
       }
     },
@@ -1510,7 +1555,9 @@
         "bytecode_lengths": 9586800,
         "class_loader_data_head": 9606128,
         "interpreter_entry_table": 9577632,
-        "frame_oops_interpreted": 2796992
+        "frame_oops_interpreted": 2796992,
+        "heap_ensure_g1": 1972816,
+        "heap_iterate_g1": 2852368
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -2239,6 +2286,14 @@
             "vtable_do_oop_wide": 1,
             "vtable_count": 2
           }
+        },
+        "ObjectClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_object": 0,
+            "vtable_count": 1
+          }
         }
       },
       "code_prefixes": {
@@ -2308,7 +2363,9 @@
         "bytecode_lengths": "00000000000000000000000000000000",
         "class_loader_data_head": "0000000000000000",
         "interpreter_entry_table": "00000000000000000000000000000000",
-        "frame_oops_interpreted": "4c8bdc554156498d6ba84881ec48010000488b05882265004833c44889451844"
+        "frame_oops_interpreted": "4c8bdc554156498d6ba84881ec48010000488b05882265004833c44889451844",
+        "heap_ensure_g1": "48896c2410488974241848897c242041564883ec500fb669108b05ad0b78000f",
+        "heap_iterate_g1": "4883ec48488d054d444b004889542430488d5424204881c1e8020000c6442428"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -2338,7 +2395,8 @@
           "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
           "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
           "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body.",
-          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace."
+          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace.",
+          "Heap iteration: exact RTTI vtables and VM_HeapIterateOperation machine calls prove the G1 parsability/iteration entries and ObjectClosure slot0 ABI. PRODUCT ObjectClosure is 8 bytes with no state. Captured oops are written into preallocated caller HandleArea roots before safepoint completion. Iterator sees allocated objects, including unreclaimed unreachable objects."
         ],
         "source_hashes": {
           "10-handles.cpp": "42c41ba4b1387e23cf36dbda4162e6accbd23581690a7e8ac67202b476e9bc5f",
@@ -2383,7 +2441,12 @@
           "intrinsic/10/exact10-abstractInterpreter.hpp": "a47d0352ea165e602d71bbc0e9cf1c88782458a9e9463875f6d76bfbdb673ab9",
           "deallocate/10/utilities/growableArray.hpp": "ef87744831f9c6ee53c5a29d8ceaf1651823a263d13bb1b6ada3c5a738f9c150",
           "deallocate/10/classfile/classLoaderData.hpp": "0f9bf6c64f6ab0f2247dd4729d5b22364086d60b8a0517456850a417a9c15e7b",
-          "deallocate/10/classfile/classLoaderData.cpp": "1a29d8ace762a2c8dd8556adf7d44f26dfc794316602b134ef21a05b8e9ec286"
+          "deallocate/10/classfile/classLoaderData.cpp": "1a29d8ace762a2c8dd8556adf7d44f26dfc794316602b134ef21a05b8e9ec286",
+          "heap/10/memory/iterator.hpp": "d28705d8009afe8ae888d773ba3fb8a6c17fb7fa2940de975aa502153202880a",
+          "heap/10/gc/shared/collectedHeap.cpp": "9f152a79c034a111307cb73d6ce7701ee357eab2527938260d0f71a789215e9d",
+          "heap/10/gc/g1/g1CollectedHeap.cpp": "335377787897ec229ff1a134a0fc9ff6113be951fe271b95484e67b7c88c6719",
+          "heap/10/gc/g1/heapRegion.cpp": "210bfe728085c41ad61fc5f4521b8cb4819f9bf77645efe3e9376848092d064e",
+          "heap/10/prims/jvmtiTagMap.cpp": "7af5d7bd4094e5966734ea2b00b13dd0bb16918d3765851cbe25373503a19dd3"
         },
         "observation_entrypoints": {
           "vm_execute": {
@@ -2832,6 +2895,17 @@
               },
               "proof": "Frame mirror is a full-width oop slot at FP-32. The scanner passes that slot in RDX and OopClosure in RCX, then calls [closure_vptr+8], proving the wide overload is slot1. Tagged PRODUCT OopClosure/Closure have no virtual destructor or diagnostic base; OopClosure declares exactly the wide and narrow do_oop virtuals."
             }
+          ],
+          "ObjectClosure": [
+            {
+              "rva": 3338243,
+              "bytes": "488b06488bd3488bceff10",
+              "enums": {
+                "vtable_do_object": 0,
+                "vtable_count": 1
+              },
+              "proof": "Exact HeapRegion RTTI vtable leads to its object_iterate slot14. The function passes the oop in RDX and ObjectClosure in RCX, calls [closure_vptr+0]. Tagged PRODUCT Closure is empty; ObjectClosure has only do_object(oop), no virtual destructor or inherited abort state."
+            }
           ]
         },
         "function_reference_proofs": {
@@ -2843,6 +2917,22 @@
               "proof": "frame::oops_do tests is_interpreted_frame and passes RCX=this,RDX=OopClosure,R8=RegisterMap,R9b=query_oop_map_cache to the exact scanner; no CLDClosure argument. The body matches the tagged source: Method/BCI, monitors, native temporary oop, mirror, invoke arguments, mask_for/compute_one_oop_map, then iterate_oop."
             }
           ]
+        },
+        "heap_iteration_proof": {
+          "heap_type": "G1CollectedHeap",
+          "heap_vtable_rva": 7782144,
+          "prepare_slot": 23,
+          "walk_slot": 40,
+          "vm_operation_doit_rva": 4435792,
+          "prepare_call_rva": 4435820,
+          "walk_call_rva": 4435863,
+          "region_closure_vtable_rva": 7785064,
+          "region_closure_lea_rva": 2852372,
+          "region_callback_rva": 2836080,
+          "heap_region_vtable_rva": 7857160,
+          "heap_region_iterate_slot": 14,
+          "heap_region_iterate_rva": 3338176,
+          "source_notes": "The exact VM_HeapIterateOperation::doit loads Universe::_collectedHeap, sets EDX=0, invokes heap ensure_parsability(false), then invokes object_iterate(ObjectClosure*). G1 object_iterate constructs the RTTI-identified IterateObjectClosureRegionClosure; its callback invokes HeapRegion object_iterate at offset0x70, whose callback above proves ObjectClosure slot0."
         }
       }
     }

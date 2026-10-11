@@ -425,6 +425,43 @@ class pdb_file:
             raise profile_error("Conflicting OopClosure virtual layouts")
         return layouts[0]
 
+    def object_closure(self) -> dict:
+        """Prove the exact ObjectClosure::do_object(oopDesc*) MSVC ABI."""
+        layouts = []
+        for definition in self.classes.get("ObjectClosure", []):
+            slots, object_slots = [], []
+            if definition["size"] not in (8, 16):
+                raise profile_error("ObjectClosure has an unsupported bounded layout")
+            layout = self.describe("ObjectClosure")
+            if set(layout["members"]) - {"_abort"}:
+                raise profile_error("ObjectClosure has an unexpected state member")
+            abort = layout["members"].get("_abort")
+            if abort and (abort["offset"] != 8 or abort.get("storage_size") != 1):
+                raise profile_error("Legacy ObjectClosure abort flag has an unsupported layout")
+            for method in self.fields(definition["field_index"]):
+                if method["kind"] != "method" or method["virtual_offset"] is None:
+                    continue
+                offset = method["virtual_offset"]
+                if offset % 8 or not 0 <= offset <= 1024:
+                    raise profile_error("Invalid bounded ObjectClosure virtual slot")
+                slots.append(offset // 8)
+                if method["name"] != "do_object":
+                    continue
+                leaf, record = self.records[method["type_index"]]
+                if leaf != 0x1009 or integer(record, 0) != 3 or integer(record, 14, "H") != 1:
+                    raise profile_error("ObjectClosure do_object must be a void member with one argument")
+                arguments_leaf, arguments = self.records[integer(record, 16)]
+                if arguments_leaf != 0x1201 or integer(arguments, 0) != 1 \
+                        or not self.points_to(integer(arguments, 4), "oopDesc", 1):
+                    raise profile_error("ObjectClosure do_object does not take an oopDesc pointer")
+                object_slots.append(offset // 8)
+            if len(object_slots) != 1 or not slots:
+                raise profile_error("ObjectClosure virtual callback is ambiguous")
+            layouts.append({"vtable_do_object": object_slots[0], "vtable_count": max(slots) + 1})
+        if not layouts or any(layout != layouts[0] for layout in layouts):
+            raise profile_error("Missing or conflicting ObjectClosure layout")
+        return layouts[0]
+
     def describe(self, name: str, seen: frozenset[str] = frozenset()) -> dict:
         if name in seen:
             raise profile_error("Cyclic PDB class inheritance")
@@ -526,6 +563,8 @@ def extract(pdb_path: Path, dll_path: Path, java_feature: int,
         frame["enums"]["interpreter_frame_bcp_offset"] = bcp_offsets[0]
     if "OopClosure" in names:
         types["OopClosure"]["enums"].update(pdb.wide_oop_closure())
+    if "ObjectClosure" in names and "ObjectClosure" in types:
+        types["ObjectClosure"]["enums"].update(pdb.object_closure())
     if "ObservationABI" in names:
         # This explicitly synthetic profile record contains signature/layout
         # selectors, not a native object layout. See derived_profile_facts in

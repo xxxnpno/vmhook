@@ -83,7 +83,7 @@ def main() -> int:
             required = ['metadata', 'native_refusal']
             if args.native_threads:
                 required += ['native_attach', 'same_thread', 'class_initialization', 'construction',
-                             'constructor_refusal', 'dispatch_semantics', 'invocation', 'collections', 'object_contract', 'field_memory', 'strings',
+                             'constructor_refusal', 'dispatch_semantics', 'invocation', 'collections', 'object_contract', 'field_memory', 'heap_iteration', 'strings',
                              'root_growth', 'java_exception', 'idle_gc', 'wrong_thread',
                              'compiled_invocation', 'context_closed', 'repeated_attach',
                              'concurrent_attach', 'no_hooks', 'native_complete']

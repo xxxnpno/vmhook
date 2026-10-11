@@ -317,6 +317,35 @@ namespace
 
     #include "field_memory_cases.hpp"
 
+    auto check_heap_iteration() -> bool
+    {
+        const auto snapshot = vmhook::get_instances<native_fixture>();
+        if (snapshot.size() < 3 || !vmhook::get_instances<native_fixture>(0).empty()) { return false; }
+        std::vector<std::int32_t> values;
+        for (const auto& object : snapshot)
+        {
+            if (!object || !object->get_instance()) { return false; }
+            // Java code collects after the VM iterator has returned. Every
+            // remaining snapshot object must follow relocation through its root.
+            values.push_back(object->add(std::int32_t{}));
+        }
+        for (const auto wanted : {10, 20, 41})
+        { if (std::ranges::find(values, wanted) == values.end()) { return false; } }
+        std::size_t callbacks{};
+        if (vmhook::for_each_instance<native_fixture>([&](std::unique_ptr<native_fixture> object)
+            { if (object && object->get_instance()) { ++callbacks; } }, 1) != 1 || callbacks != 1)
+        { return false; }
+        callbacks = 0;
+        auto* const target = vmhook::find_class("NativeFixture");
+        const auto count = vmhook::for_each_instance_of(target, [&](std::unique_ptr<vmhook::any_object> object)
+        {
+            if (!object || !object->get_instance()) { return; }
+            (void)static_cast<std::int32_t>(object->get_field("value")->get());
+            ++callbacks;
+        });
+        return count >= 3 && count == callbacks;
+    }
+
     auto check_object_contract(const std::unique_ptr<native_fixture>& first,
                                const std::unique_ptr<native_fixture>& second) -> bool
     {
@@ -517,6 +546,7 @@ namespace
             output << "object_stores=collector_barrier_accessor" << '\n';
             if (!passed(output, "object_contract", check_object_contract(first, second))) { return false; }
             if (!passed(output, "field_memory", check_field_memory(first, second))) { return false; }
+            if (!passed(output, "heap_iteration", check_heap_iteration())) { return false; }
 
             const auto virtual_call = base_method(*first, "virtualValue");
             const auto private_call = base_method(*first, "privateValue");

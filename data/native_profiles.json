@@ -739,6 +739,18 @@
     ],
     "frame_oops_interpreted_small1": [
       "??$oops_interpreted_do@V?$SmallRegisterMapType@$00@@@frame@@QEBAXPEAVOopClosure@@PEBV?$SmallRegisterMapType@$00@@_N@Z"
+    ],
+    "heap_ensure_g1": [
+      "?ensure_parsability@CollectedHeap@@UEAAX_N@Z"
+    ],
+    "heap_ensure_parallel": [
+      "?ensure_parsability@ParallelScavengeHeap@@UEAAX_N@Z"
+    ],
+    "heap_iterate_g1": [
+      "?object_iterate@G1CollectedHeap@@UEAAXPEAVObjectClosure@@@Z"
+    ],
+    "heap_iterate_parallel": [
+      "?object_iterate@ParallelScavengeHeap@@UEAAXPEAVObjectClosure@@@Z"
     ]
   },
   "profile_types": [
@@ -834,7 +846,8 @@
     "AbstractInterpreter::MethodKind",
     "InstanceKlass::<unnamed-enum-_misc_rewritten>",
     "frame",
-    "OopClosure"
+    "OopClosure",
+    "ObjectClosure"
   ],
   "required_fields": {
     "JavaThread": [
@@ -1491,6 +1504,10 @@
     "OopClosure": [
       "vtable_do_oop_wide",
       "vtable_count"
+    ],
+    "ObjectClosure": [
+      "vtable_count",
+      "vtable_do_object"
     ]
   },
   "alias_kinds": {
