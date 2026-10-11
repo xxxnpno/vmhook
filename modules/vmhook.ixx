@@ -15518,6 +15518,9 @@ export namespace vmhook
             catch (const vmhook::exception& error) { return std::unexpected{ error }; }
         }
 
+        auto set_metadata_lifetime(std::shared_ptr<void> lifetime) noexcept -> void
+        { this->metadata_lifetime_ = std::move(lifetime); }
+
         /*
             @brief Returns the JVM type descriptor of this field (e.g. "I", "Z", "J").
         */
@@ -15924,6 +15927,7 @@ export namespace vmhook
         // It supplies type identity only; it never selects the storage holder.
         vmhook::hotspot::klass* reference_declaring_class{ nullptr };
         std::uint16_t field_flags{};
+        std::shared_ptr<void> metadata_lifetime_{};
     };
 
     // --- detail helpers that depend on hotspot types -------------------------
@@ -18282,6 +18286,9 @@ export namespace vmhook
         }
 
     public:
+        auto set_metadata_lifetime(std::shared_ptr<void> lifetime) noexcept -> void
+        { this->metadata_lifetime_ = std::move(lifetime); }
+
         /*
             @brief Returns the method name.
         */
@@ -19033,6 +19040,7 @@ export namespace vmhook
                 && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
                 && (vmhook::detail::supported_java_argument_v<args_t> && ...))
         friend auto make_unique(args_t&&... args) -> std::unique_ptr<wrapper_type>;
+        std::shared_ptr<void> metadata_lifetime_{};
     };
 
     // --- Object base class ----------------------------------------------------

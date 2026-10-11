@@ -125,6 +125,10 @@ int main()
     try { (void)vmhook::detail::utf8_to_utf16("allocate"); }
     catch (const std::bad_alloc&) { utf_allocation = true; }
     check(utf_allocation, "Unicode allocation failure propagates std::bad_alloc");
+    // Initialize Windows emulated TLS/destructor registration before faulting
+    // the operation's own C++ allocation, rather than a runtime TLS allocation.
+    (void)vmhook::detail::call_handle_pool();
+    (void)vmhook::detail::call_handle_depth;
     bool handle_allocation{};
     fail_next_allocation.store(true);
     try { vmhook::detail::call_handles_guard handles; }
