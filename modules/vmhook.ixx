@@ -26433,3 +26433,208 @@ export namespace vmhook
     }
 }
 // VMHOOK_RUNTIME_DIAGNOSTICS_END
+
+// VMHOOK_MANAGEMENT_OBSERVATIONS_BEGIN
+export namespace vmhook
+{
+    // These are copied C++ observations, not Java object wrappers. They remain
+    // usable after the originating native_thread_context has closed.
+    struct memory_usage_snapshot final
+    {
+        std::int64_t initial_bytes{}, used_bytes{}, committed_bytes{};
+        std::optional<std::int64_t> maximum_bytes{};
+    };
+
+    struct garbage_collector_snapshot final
+    {
+        std::string name{};
+        bool valid{};
+        std::optional<std::int64_t> collection_count{}, collection_time_ms{};
+    };
+
+    struct runtime_snapshot final
+    {
+        std::chrono::steady_clock::time_point capture_started{}, capture_finished{};
+        std::int64_t started_unix_ms{}, uptime_ms{}, total_loaded_classes{}, unloaded_classes{};
+        std::int32_t loaded_classes{}, live_threads{}, daemon_threads{}, peak_threads{};
+        std::int64_t total_started_threads{};
+        std::optional<std::int64_t> compilation_time_ms{};
+        memory_usage_snapshot heap{}, non_heap{};
+        std::vector<garbage_collector_snapshot> garbage_collectors{};
+    };
+
+    struct java_stack_frame_snapshot final
+    {
+        std::string class_name{}, method_name{};
+        std::int32_t line_number{};
+        bool native_method{};
+    };
+
+    struct java_thread_snapshot final
+    {
+        std::int64_t id{};
+        bool alive{};
+        std::string name{}, state{};
+        bool suspended{}, in_native{};
+        std::int64_t blocked_count{}, waited_count{};
+        std::optional<std::int64_t> blocked_time_ms{}, waited_time_ms{}, cpu_time_ns{};
+        std::vector<java_stack_frame_snapshot> stack{};
+    };
+
+    namespace detail
+    {
+        template<typename... argument_types>
+        inline auto management_call(const std::unique_ptr<any_object>& receiver,
+            const std::string_view contract, const std::string_view name,
+            const std::string_view signature, argument_types&&... arguments)
+            -> method_proxy::value_t
+        {
+            if (!receiver) { throw exception{ "Management operation requires an allocated C++ owner" }; }
+            return invoke_container(*receiver, contract, name, signature,
+                                    std::forward<argument_types>(arguments)...);
+        }
+
+        inline auto management_bean(const std::string_view name, const std::string_view signature)
+            -> std::unique_ptr<any_object>
+        { return call_bootstrap_method("java/lang/management/ManagementFactory", name, signature); }
+
+        inline auto observed_nonnegative(const std::int64_t value) noexcept -> std::optional<std::int64_t>
+        { return value < 0 ? std::nullopt : std::optional<std::int64_t>{ value }; }
+
+        inline auto observe_memory_usage(const std::unique_ptr<any_object>& usage) -> memory_usage_snapshot
+        {
+            constexpr std::string_view contract{ "java/lang/management/MemoryUsage" };
+            memory_usage_snapshot result{};
+            result.initial_bytes = management_call(usage, contract, "getInit", "()J");
+            result.used_bytes = management_call(usage, contract, "getUsed", "()J");
+            result.committed_bytes = management_call(usage, contract, "getCommitted", "()J");
+            const std::int64_t maximum{ management_call(usage, contract, "getMax", "()J") };
+            result.maximum_bytes = observed_nonnegative(maximum);
+            return result;
+        }
+    }
+
+    // Ordinary Java management calls on the current native context. Counters
+    // are read sequentially, not atomically; the interval is included. No
+    // monitoring setting, JVM launch argument or JNI/JVMTI API is required.
+    [[nodiscard]] inline auto observe_runtime() -> runtime_snapshot
+    {
+        runtime_snapshot result{};
+        result.capture_started = std::chrono::steady_clock::now();
+        const auto runtime{ detail::management_bean("getRuntimeMXBean", "()Ljava/lang/management/RuntimeMXBean;") };
+        constexpr std::string_view runtime_contract{ "java/lang/management/RuntimeMXBean" };
+        result.started_unix_ms = detail::management_call(runtime, runtime_contract, "getStartTime", "()J");
+        result.uptime_ms = detail::management_call(runtime, runtime_contract, "getUptime", "()J");
+        const auto memory{ detail::management_bean("getMemoryMXBean", "()Ljava/lang/management/MemoryMXBean;") };
+        const std::unique_ptr<any_object> heap{
+            detail::management_call(memory, "java/lang/management/MemoryMXBean", "getHeapMemoryUsage", "()Ljava/lang/management/MemoryUsage;") };
+        const std::unique_ptr<any_object> non_heap{
+            detail::management_call(memory, "java/lang/management/MemoryMXBean", "getNonHeapMemoryUsage", "()Ljava/lang/management/MemoryUsage;") };
+        result.heap = detail::observe_memory_usage(heap);
+        result.non_heap = detail::observe_memory_usage(non_heap);
+        const auto classes{ detail::management_bean("getClassLoadingMXBean", "()Ljava/lang/management/ClassLoadingMXBean;") };
+        constexpr std::string_view class_contract{ "java/lang/management/ClassLoadingMXBean" };
+        result.loaded_classes = detail::management_call(classes, class_contract, "getLoadedClassCount", "()I");
+        result.total_loaded_classes = detail::management_call(classes, class_contract, "getTotalLoadedClassCount", "()J");
+        result.unloaded_classes = detail::management_call(classes, class_contract, "getUnloadedClassCount", "()J");
+        const auto threads{ detail::management_bean("getThreadMXBean", "()Ljava/lang/management/ThreadMXBean;") };
+        constexpr std::string_view thread_contract{ "java/lang/management/ThreadMXBean" };
+        result.live_threads = detail::management_call(threads, thread_contract, "getThreadCount", "()I");
+        result.daemon_threads = detail::management_call(threads, thread_contract, "getDaemonThreadCount", "()I");
+        result.peak_threads = detail::management_call(threads, thread_contract, "getPeakThreadCount", "()I");
+        result.total_started_threads = detail::management_call(threads, thread_contract, "getTotalStartedThreadCount", "()J");
+        const auto compiler{ detail::management_bean("getCompilationMXBean", "()Ljava/lang/management/CompilationMXBean;") };
+        if (compiler->get_instance())
+        {
+            const bool supported{ detail::management_call(compiler, "java/lang/management/CompilationMXBean",
+                                                          "isCompilationTimeMonitoringSupported", "()Z") };
+            if (supported)
+            {
+                const std::int64_t elapsed{ detail::management_call(compiler, "java/lang/management/CompilationMXBean",
+                                                                   "getTotalCompilationTime", "()J") };
+                result.compilation_time_ms = detail::observed_nonnegative(elapsed);
+            }
+        }
+        const std::vector<std::unique_ptr<any_object>> collectors{
+            detail::call_bootstrap_method("java/lang/management/ManagementFactory", "getGarbageCollectorMXBeans", "()Ljava/util/List;").to_vector() };
+        result.garbage_collectors.reserve(collectors.size());
+        for (const auto& collector : collectors)
+        {
+            constexpr std::string_view contract{ "java/lang/management/GarbageCollectorMXBean" };
+            garbage_collector_snapshot snapshot{};
+            snapshot.name = detail::management_call(collector, contract, "getName", "()Ljava/lang/String;");
+            snapshot.valid = detail::management_call(collector, contract, "isValid", "()Z");
+            const std::int64_t count{ detail::management_call(collector, contract, "getCollectionCount", "()J") };
+            const std::int64_t elapsed{ detail::management_call(collector, contract, "getCollectionTime", "()J") };
+            snapshot.collection_count = detail::observed_nonnegative(count);
+            snapshot.collection_time_ms = detail::observed_nonnegative(elapsed);
+            result.garbage_collectors.push_back(std::move(snapshot));
+        }
+        result.capture_finished = std::chrono::steady_clock::now();
+        return result;
+    }
+
+    // Java ThreadMXBean snapshots include interpreted and compiled Java
+    // frames, subject to the JVM's ordinary stack-trace precision. They are
+    // synchronous observations, not asynchronous mixed-stack CPU samples.
+    [[nodiscard]] inline auto observe_java_threads(const std::int32_t max_depth = 64,
+        const std::size_t max_threads = 4096) -> std::vector<java_thread_snapshot>
+    {
+        if (max_depth < 0 || max_depth > 1024 || max_threads == 0 || max_threads > 65536)
+        { throw exception{ "Java thread snapshot limits are out of range" }; }
+        const auto bean{ detail::management_bean("getThreadMXBean", "()Ljava/lang/management/ThreadMXBean;") };
+        constexpr std::string_view contract{ "java/lang/management/ThreadMXBean" };
+        const std::unique_ptr<array<std::int64_t>> ids{ detail::management_call(bean, contract, "getAllThreadIds", "()[J") };
+        if (static_cast<std::size_t>(ids->size()) > max_threads)
+        { throw exception{ "Java thread snapshot exceeds the requested thread limit" }; }
+        const auto copied_ids{ ids->to_vector() };
+        const std::vector<std::unique_ptr<any_object>> infos{
+            detail::management_call(bean, contract, "getThreadInfo", "([JI)[Ljava/lang/management/ThreadInfo;", ids, max_depth).to_vector() };
+        if (infos.size() != copied_ids.size())
+        { throw exception{ "Java thread snapshot returned an inconsistent result length" }; }
+        const bool cpu_supported{ detail::management_call(bean, contract, "isThreadCpuTimeSupported", "()Z") };
+        std::vector<java_thread_snapshot> result{};
+        result.reserve(infos.size());
+        for (std::size_t index{}; index < infos.size(); ++index)
+        {
+            java_thread_snapshot snapshot{};
+            snapshot.id = copied_ids[index];
+            const auto& info{ infos[index] };
+            if (!info->get_instance()) { result.push_back(std::move(snapshot)); continue; }
+            snapshot.alive = true;
+            constexpr std::string_view info_contract{ "java/lang/management/ThreadInfo" };
+            snapshot.name = detail::management_call(info, info_contract, "getThreadName", "()Ljava/lang/String;");
+            const std::unique_ptr<any_object> state{ detail::management_call(info, info_contract, "getThreadState", "()Ljava/lang/Thread$State;") };
+            snapshot.state = detail::management_call(state, "java/lang/Enum", "name", "()Ljava/lang/String;");
+            snapshot.suspended = detail::management_call(info, info_contract, "isSuspended", "()Z");
+            snapshot.in_native = detail::management_call(info, info_contract, "isInNative", "()Z");
+            snapshot.blocked_count = detail::management_call(info, info_contract, "getBlockedCount", "()J");
+            snapshot.waited_count = detail::management_call(info, info_contract, "getWaitedCount", "()J");
+            const std::int64_t blocked{ detail::management_call(info, info_contract, "getBlockedTime", "()J") };
+            const std::int64_t waited{ detail::management_call(info, info_contract, "getWaitedTime", "()J") };
+            snapshot.blocked_time_ms = detail::observed_nonnegative(blocked);
+            snapshot.waited_time_ms = detail::observed_nonnegative(waited);
+            if (cpu_supported)
+            {
+                const std::int64_t cpu{ detail::management_call(bean, contract, "getThreadCpuTime", "(J)J", snapshot.id) };
+                snapshot.cpu_time_ns = detail::observed_nonnegative(cpu);
+            }
+            const std::vector<std::unique_ptr<any_object>> frames{
+                detail::management_call(info, info_contract, "getStackTrace", "()[Ljava/lang/StackTraceElement;").to_vector() };
+            snapshot.stack.reserve(frames.size());
+            for (const auto& frame : frames)
+            {
+                constexpr std::string_view frame_contract{ "java/lang/StackTraceElement" };
+                java_stack_frame_snapshot copied{};
+                copied.class_name = detail::management_call(frame, frame_contract, "getClassName", "()Ljava/lang/String;");
+                copied.method_name = detail::management_call(frame, frame_contract, "getMethodName", "()Ljava/lang/String;");
+                copied.line_number = detail::management_call(frame, frame_contract, "getLineNumber", "()I");
+                copied.native_method = detail::management_call(frame, frame_contract, "isNativeMethod", "()Z");
+                snapshot.stack.push_back(std::move(copied));
+            }
+            result.push_back(std::move(snapshot));
+        }
+        return result;
+    }
+}
+// VMHOOK_MANAGEMENT_OBSERVATIONS_END
