@@ -13,12 +13,19 @@ namespace allocation_fault
     inline thread_local std::int32_t context_budget{-1};
     inline thread_local std::size_t context_allocations{};
     inline thread_local bool count_context_allocations{};
+    inline std::atomic<std::uint32_t> executor_fault_origin{};
+    inline std::atomic<bool> reject_executor_session{};
 }
 [[gnu::noinline]] auto operator new(std::size_t size) -> void*
 {
     if (allocation_fault::count_context_allocations) { ++allocation_fault::context_allocations; }
     if (allocation_fault::context_budget >= 0 && allocation_fault::context_budget-- == 0)
     { allocation_fault::context_budget = -1; throw std::bad_alloc{}; }
+    if (allocation_fault::reject_executor_session.load(std::memory_order_acquire)
+        && size == sizeof(vmhook::detail::private_native::java_session)
+        && vmhook::windows::GetCurrentThreadId() != allocation_fault::executor_fault_origin.load()
+        && allocation_fault::reject_executor_session.exchange(false))
+    { throw std::bad_alloc{}; }
     auto expected = size;
     if (size && allocation_fault::rejected_size.compare_exchange_strong(expected, 0))
     { throw std::bad_alloc{}; }
@@ -186,6 +193,31 @@ namespace
             && vmhook::ref<node>{}.element<node>(-1).empty());
         return boundaries_ok && anchors_ok && retry_ok;
     }
+    auto class_observer_allocation_failure(std::ostream& output) -> bool
+    {
+        const auto warm = vmhook::on_class_loaded([](const vmhook::class_load_event&) {});
+        if (!warm || !vmhook::remove_class_observer(warm))
+        { throw vmhook::exception{"Class observer setup is unavailable"}; }
+        bool rejected{};
+        allocation_fault::context_budget = 0;
+        try { (void)vmhook::on_class_loaded([](const vmhook::class_load_event&) {}); }
+        catch (const std::bad_alloc&) { rejected = true; }
+        allocation_fault::context_budget = -1;
+        if (!check(output, "class_observer_cpp_oom", rejected)) { return false; }
+        static std::atomic<std::size_t> notifications{};
+        const auto observer = vmhook::on_class_loaded([](const vmhook::class_load_event& event)
+        {
+            if (event.internal_name == "ExecutorFixture$ObserverMarker") { ++notifications; }
+        });
+        if (!observer) { throw vmhook::exception{"Class observer retry failed"}; }
+        {
+            vmhook::native_thread_context context{"VMHook-class-observer-retry"};
+            if (!context.valid()) { throw vmhook::exception{context.error()}; }
+            (void)fixture::static_members::get_method("load_observer_marker")->call();
+        }
+        return check(output, "class_observer_failure_retry", notifications.load() == 1
+            && vmhook::remove_class_observer(observer));
+    }
     auto worker(void*) -> DWORD
     {
         char destination[4096]{};
@@ -210,13 +242,21 @@ namespace
             if (!check(output, "metadata", vmhook::register_class<fixture>("ExecutorFixture")
                 && vmhook::register_class<node>("ExecutorFixture$Node"))) { return 2; }
             if (!legacy_reference_allocation_failures(output)
-                || !context_allocation_failures(output)) { return 2; }
+                || !context_allocation_failures(output)
+                || !class_observer_allocation_failure(output)) { return 2; }
             vmhook::retained_object<node> saved{};
             {
                 vmhook::native_thread_context source{"VMHook-executor-source"};
                 if (!source.valid()) { throw vmhook::exception{source.error()}; }
                 saved = vmhook::retain(fixture::create(41));
             }
+            allocation_fault::executor_fault_origin.store(vmhook::windows::GetCurrentThreadId());
+            allocation_fault::reject_executor_session.store(true, std::memory_order_release);
+            bool executor_initialization_oom{};
+            try { vmhook::native_executor rejected{{1, 2}}; }
+            catch (const std::bad_alloc&) { executor_initialization_oom = true; }
+            const auto session_rejected = !allocation_fault::reject_executor_session.exchange(false);
+            if (!check(output, "executor_context_cpp_oom", executor_initialization_oom && session_rejected)) { return 2; }
             vmhook::native_executor executor{{1, 2}};
             active_executor = &executor;
             auto blocker = executor.submit([](const vmhook::native_task_control& control) -> std::string
