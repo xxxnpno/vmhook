@@ -52,3 +52,11 @@ their receiver before lookup and resolve it again afterward. The advanced raw
 rooted VM operation; an address copied earlier in native state is insufficient.
 The raw String decoder validates the live object's exact bootstrap class without
 a safepoint, so its caller's root and current VM operation remain required.
+
+For modern G1, the VMThread has its own SATB queue. The matching source creates
+that queue for every `Thread`, activates it through all-thread iteration, and
+flushes its partial buffer at remark through non-Java-thread iteration. A
+snapshot containing one mirror does not have to fill a buffer to preserve it.
+The exact Java 17, 21 and 27 publisher source/hash chains are recorded in
+`data/native_audits.json`; the matching private enqueue entry still comes from
+each exact image profile.

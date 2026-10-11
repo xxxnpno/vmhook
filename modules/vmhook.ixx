@@ -25728,7 +25728,7 @@ namespace hotspot
             This backend may safepoint. It belongs to make_unique only: raw
             array/String assembly retains its allocation-only no-safepoint path.
         */
-        inline auto allocate_instance_through_java(vmhook::hotspot::klass* const target) noexcept -> void*
+        inline auto allocate_instance_through_java(vmhook::hotspot::klass* const target) -> void*
         {
             if (!target || !vmhook::hotspot::in_java_detour()
                 || !vmhook::detail::java_execution_supported()
@@ -25736,8 +25736,10 @@ namespace hotspot
             { return nullptr; }
             try
             {
-                void* const mirror{ target->get_java_mirror() };
-                if (!mirror) { return nullptr; }
+                native_backend::operation access{};
+                if (!access) { return nullptr; }
+                const auto mirror_root{native_backend::retain_class(target)};
+                if (!mirror_root) { return nullptr; }
                 constexpr std::string_view signature{ "(Ljava/lang/Class;)Ljava/lang/Object;" };
                 for (const std::string_view class_name : { "jdk/internal/misc/Unsafe", "sun/misc/Unsafe" })
                 {
@@ -25756,9 +25758,11 @@ namespace hotspot
                         auto* const method{ methods[index] };
                         if (!method || method->get_name() != "allocateInstance"
                             || method->get_signature() != signature) { continue; }
-                        const vmhook::method_proxy allocation{ singleton, method, std::string{signature},
-                                                               /*signature_pinned=*/true };
-                        auto mirror_wrapper{ vmhook::detail::wrap_object<vmhook::any_object>(mirror) };
+                        const auto singleton_root{native_backend::retain_oop(singleton)};
+                        if (!singleton_root) { return nullptr; }
+                        const vmhook::method_proxy allocation{singleton, method, std::string{signature},
+                            /*signature_pinned=*/true, nullptr, singleton_root};
+                        auto mirror_wrapper{materialize_object<vmhook::any_object>(0, mirror_root)};
                         const auto result{ allocation.call(mirror_wrapper) };
                         if (!result.was_invoked() || result.threw() || result.result_failed)
                         { return nullptr; }
@@ -25767,6 +25771,7 @@ namespace hotspot
                     }
                 }
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (const std::exception& error)
             {
                 ::vmhook::detail::log_line("{} Java allocation backend: {}", vmhook::error_tag, error.what());

@@ -3197,6 +3197,113 @@
         "frame_x86.cpp sender_for_entry_frame() uses saved_rbp_address() to update the saved-link register map when the address is non-null.",
         "macroAssembler_x86.cpp reset_last_Java_frame() clears saved_rbp_address together with the last Java SP, FP and PC."
       ]
+    },
+    {
+      "identity": {
+        "guid": "e442ae1e-2a33-fb96-991b-ae4f84049fe5",
+        "age": 1,
+        "machine": 34404,
+        "image_size": 13025280,
+        "pe_timestamp": 807086503,
+        "sha256": "6b9a2354b41134986d61d1f8ff0f9614e3a6b7e235469b7e9260fe7a1d9bb84a",
+        "java_feature": 17
+      },
+      "source_repository": "https://github.com/adoptium/jdk17u",
+      "source_commit": "79597447bd94",
+      "source_sha256": {
+        "src/hotspot/share/gc/shared/satbMarkQueue.cpp": "0c5a2ac222a171ac14a944d7ebc068ab0f2ae677743e1664a3bcd74be608028f",
+        "src/hotspot/share/gc/g1/g1ConcurrentMark.cpp": "fd40cfcd0965c40646b465d2da4a1ce413ed206977ff4ee62eaea970ea877eec",
+        "src/hotspot/share/gc/g1/g1BarrierSet.cpp": "bc871137f682ced241c787b1876998115785b3da91cbd716bcb16f9966613c66",
+        "src/hotspot/share/runtime/thread.cpp": "6507c363b6a2701af8d3a8e22575d447204e3243a1f18f38dd89f859250f2229",
+        "src/hotspot/share/runtime/thread.hpp": "53e22e00d0f3f10be47fa152d31e2542bed3245c9a17355e1514c9a227477b38",
+        "src/hotspot/share/runtime/vmThread.hpp": "dc48c9d0ca18316570e7789f4ea424f7b3e20b1f2bd4fd56067a717ddaebd887",
+        "src/hotspot/share/runtime/nonJavaThread.cpp": "379f3021614afbd6165ba3084ef629a22ae8f9e2c9c775a6e4056eb13acab33f",
+        "src/hotspot/share/runtime/nonJavaThread.hpp": "005ebb00ec8df7d7466aa7bfcccc301e53c214fbf2b1af05027eeb7331f01864"
+      },
+      "subject": "G1 VMThread SATB queue creation, activation and partial-buffer remark drain",
+      "source_facts": [
+        "Thread::Thread invokes BarrierSet::on_thread_create after barrier-set initialization; G1BarrierSet::on_thread_create allocates G1ThreadLocalData for all Thread objects.",
+        "VMThread derives from NamedThread, which derives from NonJavaThread. Thread::call_run invokes NonJavaThread::pre_run before VMThread::run, registering the VMThread in NonJavaThread::Iterator.",
+        "SATBMarkQueueSet::set_active_all_threads updates each queue through Threads::threads_do, whose non-Java iteration includes the registered VMThread.",
+        "G1RemarkThreadsClosure::do_thread flushes the SATB queue before any JavaThread-only work. Java 17 remark calls Threads::threads_do; Java 21/27 remark calls Threads::possibly_parallel_threads_do, which includes NonJavaThread::Iterator.",
+        "Therefore even a partial VMThread SATB buffer, including a single mirror newly published by a VM operation, is transferred for completed-buffer marking at remark. Full-buffer overflow is not required."
+      ],
+      "limitations": [
+        "This exact tagged-source chain proves VMThread support; ordinary System.gc tests alone do not demonstrate an active concurrent marking phase.",
+        "The general heap iterator must independently prove object liveness around post-remark cleanup; CLDG lookup uses the matching internal live-holder traversal."
+      ]
+    },
+    {
+      "identity": {
+        "guid": "bf39a5d1-44b0-9d94-33ed-ab5d25845be7",
+        "age": 1,
+        "machine": 34404,
+        "image_size": 14295040,
+        "pe_timestamp": 3619660896,
+        "sha256": "3df13bd73c7dbeef26693cef664b4ede84649720f7a12f0203215a65656d25f4",
+        "java_feature": 21
+      },
+      "source_repository": "https://github.com/adoptium/jdk21u",
+      "source_commit": "1c417fbfc2f7",
+      "source_sha256": {
+        "src/hotspot/share/gc/shared/satbMarkQueue.cpp": "1de0d2047d65d010819f744c8f671d1371c6786ee33c66c18ff76295b882e64a",
+        "src/hotspot/share/gc/g1/g1ConcurrentMark.cpp": "29512bdd179e72401f0382971d721e3d87f1d42129c9c7b7516ee035122e83bb",
+        "src/hotspot/share/gc/g1/g1BarrierSet.cpp": "442594b2aadffd3604330eb70dcea8cc186afd2c536f739496a92ab99e22f8b0",
+        "src/hotspot/share/runtime/thread.cpp": "29dda956e5683d6464961b7c68dd6960f8dd78f98f33b9c8215764484a3ade1f",
+        "src/hotspot/share/runtime/thread.hpp": "6b1039f533c4d332e07d3c117a8142a7a66bbb879d1bf90164277bc97dd32850",
+        "src/hotspot/share/runtime/vmThread.hpp": "b7a088c4fcd7089f3f39bd0b19eb68aa608b1a61ad5b9c152f80515c4fdd98ed",
+        "src/hotspot/share/runtime/nonJavaThread.cpp": "33bf181028eac84b493bc37860bd990f95c15432a2a4385812d85fd5a6b4e26a",
+        "src/hotspot/share/runtime/nonJavaThread.hpp": "f0a1fccf0ecd1e9a30d50472165dd8eafee69e0183aa771b0de8ca8a39b64aa0",
+        "src/hotspot/share/runtime/threads.cpp": "c65536ca884012a75d2f6f31141f2461c355675602ad36012d1072df90f5221a"
+      },
+      "subject": "G1 VMThread SATB queue creation, activation and partial-buffer remark drain",
+      "source_facts": [
+        "Thread::Thread invokes BarrierSet::on_thread_create after barrier-set initialization; G1BarrierSet::on_thread_create allocates G1ThreadLocalData for all Thread objects.",
+        "VMThread derives from NamedThread, which derives from NonJavaThread. Thread::call_run invokes NonJavaThread::pre_run before VMThread::run, registering the VMThread in NonJavaThread::Iterator.",
+        "SATBMarkQueueSet::set_active_all_threads updates each queue through Threads::threads_do, whose non-Java iteration includes the registered VMThread.",
+        "G1RemarkThreadsClosure::do_thread flushes the SATB queue before any JavaThread-only work. Java 17 remark calls Threads::threads_do; Java 21/27 remark calls Threads::possibly_parallel_threads_do, which includes NonJavaThread::Iterator.",
+        "Therefore even a partial VMThread SATB buffer, including a single mirror newly published by a VM operation, is transferred for completed-buffer marking at remark. Full-buffer overflow is not required."
+      ],
+      "limitations": [
+        "This exact tagged-source chain proves VMThread support; ordinary System.gc tests alone do not demonstrate an active concurrent marking phase.",
+        "The general heap iterator must independently prove object liveness around post-remark cleanup; CLDG lookup uses the matching internal live-holder traversal."
+      ]
+    },
+    {
+      "identity": {
+        "guid": "ce07d576-734b-eb55-0a57-b420424be891",
+        "age": 1,
+        "machine": 34404,
+        "image_size": 15519744,
+        "pe_timestamp": 4183519753,
+        "sha256": "eae6c00b80f738a9ea0ebf6dc2a0110ea93438b23290ec1d4d140ed981f1960b",
+        "java_feature": 27
+      },
+      "source_repository": "https://github.com/adoptium/jdk",
+      "source_commit": "efe86855fd73",
+      "source_sha256": {
+        "src/hotspot/share/gc/shared/satbMarkQueue.cpp": "8710a2780db1d47ed7f2eb26a5b1b137078f55210f70aa1d53a90e470324e704",
+        "src/hotspot/share/gc/g1/g1ConcurrentMark.cpp": "2d45516f2a2a42639310191dbe5d234d73c333ba4d3aed10c02a68f999760e5c",
+        "src/hotspot/share/gc/g1/g1BarrierSet.cpp": "c7adec279661523ec9f9b72d5b8f8c222e4b659ae6b4c0764a2ee5a371f1b764",
+        "src/hotspot/share/runtime/thread.cpp": "273d45e8c1440dd08a4a0fb1de54a17b51ab54fcab277f58dc6c60a2e78cfd9c",
+        "src/hotspot/share/runtime/thread.hpp": "a0434660049c706b1303d0e640084cb56882cbe0c169a3d47a4b52d0b51c79ad",
+        "src/hotspot/share/runtime/vmThread.hpp": "0a02b92c1523e225f963c441bdc4bca78f4e17d8909e6f1e6e6a3844117f4b56",
+        "src/hotspot/share/runtime/nonJavaThread.cpp": "757f5a2fd785da676afa9bc5bb8a4b3307b1b6c6eff70b4d1993b527853a40aa",
+        "src/hotspot/share/runtime/nonJavaThread.hpp": "7645bc2db6b1bad43b3cb0b0538162455a80e6d2e7a92c49aeb7082f5ac10e4d",
+        "src/hotspot/share/runtime/threads.cpp": "92fe2072df5ca12a013218d52f4b83ddf09fdfc4fc321cfd982ddf669f7cfc73"
+      },
+      "subject": "G1 VMThread SATB queue creation, activation and partial-buffer remark drain",
+      "source_facts": [
+        "Thread::Thread invokes BarrierSet::on_thread_create after barrier-set initialization; G1BarrierSet::on_thread_create allocates G1ThreadLocalData for all Thread objects.",
+        "VMThread derives from NamedThread, which derives from NonJavaThread. Thread::call_run invokes NonJavaThread::pre_run before VMThread::run, registering the VMThread in NonJavaThread::Iterator.",
+        "SATBMarkQueueSet::set_active_all_threads updates each queue through Threads::threads_do, whose non-Java iteration includes the registered VMThread.",
+        "G1RemarkThreadsClosure::do_thread flushes the SATB queue before any JavaThread-only work. Java 17 remark calls Threads::threads_do; Java 21/27 remark calls Threads::possibly_parallel_threads_do, which includes NonJavaThread::Iterator.",
+        "Therefore even a partial VMThread SATB buffer, including a single mirror newly published by a VM operation, is transferred for completed-buffer marking at remark. Full-buffer overflow is not required."
+      ],
+      "limitations": [
+        "This exact tagged-source chain proves VMThread support; ordinary System.gc tests alone do not demonstrate an active concurrent marking phase.",
+        "The general heap iterator must independently prove object liveness around post-remark cleanup; CLDG lookup uses the matching internal live-holder traversal."
+      ]
     }
   ]
 }
