@@ -46,6 +46,11 @@ namespace
             {
                 fixture::static_members::get_method("collect", "()V")->call();
                 check(method->name() == name && arguments->size() == 1);
+                const auto parameters{method->parameter_types()};
+                const auto parameter{parameters->get(0)}, returned{method->return_type()};
+                check(parameters->size() == 1
+                    && parameter->get_method("getName", "()Ljava/lang/String;")->call().as_string() == "java.lang.String"
+                    && returned->get_method("getName", "()Ljava/lang/String;")->call().as_string() == "java.lang.String");
                 root_checks.fetch_add(1, std::memory_order_relaxed);
             }
             const auto argument{arguments->get(0)};

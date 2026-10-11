@@ -57,8 +57,9 @@ boxed objects for primitive interface results. The JDK performs its normal
 result cast, unboxing and checked-exception rules.
 
 `reflection_method::name()` and `declaring_class_name()` inspect the original
-Java reflection object. To distinguish overloads, inspect its normal
-`getParameterTypes()` method. Calls to `Object.equals`, `hashCode` and `toString`
+Java reflection object. To distinguish overloads, use `parameter_types()` and
+`return_type()`; each returned class wrapper exposes its normal Java `getName`
+method. Calls to `Object.equals`, `hashCode` and `toString`
 use the helper's ordinary Java identity behavior, without invoking the C++
 callback. Interface default methods reach the callback like other interface
 methods; automatic default-body dispatch is not supplied.

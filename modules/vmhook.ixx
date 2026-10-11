@@ -25748,6 +25748,18 @@ namespace hotspot
             if (!declaring->get_instance()) { throw exception{"Java Method has no declaring class"}; }
             return declaring->get_method("getName", "()Ljava/lang/String;")->call().as_string();
         }
+        auto parameter_types() const -> std::unique_ptr<array<any_object>>
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            return detail::call_container_method(get_native_root(), "getParameterTypes", "()[Ljava/lang/Class;");
+        }
+        auto return_type() const -> std::unique_ptr<any_object>
+        {
+            detail::native_backend::operation access{};
+            if (!access) { throw exception{"Java Method inspection requires its owning VM context"}; }
+            return detail::call_container_method(get_native_root(), "getReturnType", "()Ljava/lang/Class;");
+        }
     };
 
     namespace detail
