@@ -166,3 +166,5 @@ provide the separate reference-field and Java-interface callback fixtures. Their
 evidence records include artifact hashes and partial results on failure. For
 local Windows-binary checks on Linux, use the supported Wine/emulator option
 where provided; those runs remain distinct from native Windows CI evidence.
+The original exit and throw/catch backend sites, prototype limits and remaining
+proof are described in [advanced-events.md](advanced-events.md).

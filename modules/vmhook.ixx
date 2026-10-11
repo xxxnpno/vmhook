@@ -45,6 +45,10 @@ export namespace vmhook::detail
     inline auto fail_class_hook_preparation(void*) noexcept -> void;
     inline auto class_event_notification_active() noexcept -> bool;
     inline auto disable_deferred_hooks() noexcept -> void;
+    inline auto disable_exit_telemetry() noexcept -> void;
+    inline auto reclaim_exit_telemetry() noexcept -> void;
+    inline auto clear_forced_exit(void*,const void*,const void*) noexcept -> void;
+    inline auto mark_forced_exit(void*,const void*,const void*) noexcept -> void;
     inline auto reclaim_class_observers() noexcept -> bool;
     inline auto reclaim_deferred_hook_captures() noexcept -> bool;
 }
@@ -6571,9 +6575,10 @@ export namespace vmhook
                 { return 0; }
                 const auto* const current_method{ frame_pointer->get_method() };
                 if (!current_method) { return 0; }
+                const auto* const const_method{ current_method->get_const_method() };
+                vmhook::detail::clear_forced_exit(frame_pointer,current_method,const_method);
                 const hook_dispatch_reader reader{};
                 if (!reader.snapshot || suppress_method_observers != 0) { return 0; }
-                const auto* const const_method{ current_method->get_const_method() };
                 const auto found{ std::find_if(reader.snapshot->methods.begin(), reader.snapshot->methods.end(),
                     [current_method, const_method](const auto& entry)
                     { return entry.method == current_method && entry.const_method_identity == const_method
@@ -6641,6 +6646,7 @@ export namespace vmhook
                     void* const handler{ vmhook::detail::jit_backend::return_handler(
                         const_cast<vmhook::hotspot::method*>(current_method)) };
                     if (!handler) { std::terminate(); }
+                    vmhook::detail::mark_forced_exit(frame_pointer,current_method,const_method);
                     *saved_rax = handler;
                 }
                 return slot->cancel ? slot->retval : 0;
@@ -9564,6 +9570,7 @@ export namespace vmhook
     {
         vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
         vmhook::detail::disable_deferred_hooks();
+        vmhook::detail::disable_exit_telemetry();
         // Callback-side shutdown disables method dispatch without taking locks
         // or starting a safepoint. A native owner completes removal later.
         if (vmhook::hotspot::in_java_detour() || vmhook::detail::class_event_notification_active()) { return; }
@@ -9609,6 +9616,7 @@ export namespace vmhook
                 vmhook::detail::reset_watcher_latches();
                 (void)vmhook::detail::reclaim_class_observers();
                 (void)vmhook::detail::reclaim_deferred_hook_captures();
+                vmhook::detail::reclaim_exit_telemetry();
             }
         }
         catch (...) {}
@@ -28649,6 +28657,495 @@ export namespace vmhook::detail
 }
 // VMHOOK_PERSISTENT_ROOTS_END
 
+// VMHOOK_COMMITTED_EXIT_TELEMETRY_BEGIN
+export namespace vmhook
+{
+    using method_exit_observer_id = std::uint64_t;
+    enum class method_exit_origin : std::uint8_t { original_body, entry_forced_return };
+    enum class method_exit_result : std::uint8_t
+    { boolean_value, byte_value, char_value, short_value, int_value, long_value, float_value, double_value, reference, void_value };
+    struct method_exit_record final
+    {
+        method_exit_observer_id observer_id{};
+        std::uint64_t event_id{}, bits{};
+        std::uint32_t os_thread_id{};
+        method_exit_result result{};
+        method_exit_origin origin{};
+    };
+    static_assert(std::is_trivially_copyable_v<method_exit_record>);
+    using method_exit_queue = bounded_event_queue<method_exit_record>;
+    struct method_exit_resource_stats final
+    {
+        std::size_t active_observers{}, retained_observers{}, resident_stubs{}, resident_stub_bytes{}, retained_snapshots{}, dispatch_readers{};
+        std::size_t observer_limit{}, resident_origin_bytes{}, used_origin_slots{}, poisoned_origin_slots{};
+        std::uint64_t records{}, dropped_records{}, origin_overflows{};
+        bool registry_sizes_available{}, dll_must_remain_loaded{true};
+    };
+}
+export namespace vmhook::detail::exit_telemetry
+{
+    namespace pn = vmhook::detail::private_native;
+    static_assert(std::atomic<std::uint64_t>::is_always_lock_free
+        &&std::atomic<std::size_t>::is_always_lock_free&&std::atomic<std::uint32_t>::is_always_lock_free
+        &&std::atomic<void*>::is_always_lock_free&&std::atomic_bool::is_always_lock_free);
+    struct forced_frame { void* fp{}; const void* method{}; const void* identity{}; };
+    inline std::atomic_bool enabled{};
+    inline std::atomic<std::uint64_t> shutdown_epoch{};
+    // MinGW emulated TLS may allocate on first access. The return leaf uses
+    // static bounded storage instead: only this OS thread writes its frame list.
+    struct origin_slot final
+    {
+        std::atomic<std::uint32_t> owner{};
+        std::array<forced_frame,64> frames{};
+        std::atomic_bool poisoned{};
+    };
+    inline std::array<origin_slot,1024> origin_slots{};
+    inline std::atomic<std::uint64_t> origin_overflows{};
+    inline auto origin_for(std::uint32_t id,bool create) noexcept -> origin_slot*
+    {
+        const auto start=static_cast<std::size_t>(id)%origin_slots.size();
+        for(std::size_t n{};n<origin_slots.size();++n)
+        {
+            auto& candidate=origin_slots[(start+n)%origin_slots.size()];
+            auto owner=candidate.owner.load(std::memory_order_acquire);
+            if(owner==id) {return &candidate;}
+            if(!owner)
+            {
+                if(!create) {return nullptr;}
+                if(candidate.owner.compare_exchange_strong(owner,id,std::memory_order_acq_rel)) {return &candidate;}
+                if(owner==id) {return &candidate;}
+            }
+        }
+        return nullptr;
+    }
+    inline auto clear_forced(void* fp, const void*, const void*) noexcept -> void
+    {
+        if(!enabled.load(std::memory_order_relaxed)) { return; }
+        if(auto* slot=origin_for(vmhook::windows::GetCurrentThreadId(),true))
+        {for(auto& entry:slot->frames) {if(entry.fp==fp) {entry={};}}}
+    }
+    inline auto mark_forced(void* fp,const void* method,const void* identity) noexcept -> void
+    {
+        if(!enabled.load(std::memory_order_relaxed)) { return; }
+        auto* slot=origin_for(vmhook::windows::GetCurrentThreadId(),true);
+        if(slot)
+        {
+            for(auto& entry:slot->frames)
+            {if(!entry.fp || entry.fp==fp) {entry={fp,method,identity}; return;}}
+            slot->poisoned.store(true,std::memory_order_relaxed);
+        }
+        origin_overflows.fetch_add(1,std::memory_order_relaxed);
+    }
+    inline auto consume_origin(std::uint32_t id,void* fp,const void* method,const void* identity) noexcept
+        -> std::optional<method_exit_origin>
+    {
+        auto* slot=origin_for(id,false);
+        if(!slot) {return {};}
+        for(auto& entry:slot->frames)
+        {
+            if(entry.fp!=fp) { continue; }
+            const bool forced=entry.method==method&&entry.identity==identity;
+            entry={};
+            if(forced) { return method_exit_origin::entry_forced_return; }
+        }
+        if(slot->poisoned.load(std::memory_order_relaxed)) { return {}; }
+        return method_exit_origin::original_body;
+    }
+    struct binding final
+    {
+        method_exit_observer_id id{};
+        std::atomic_bool active{true};
+        hotspot::method* method{};
+        const void* identity{};
+        method_exit_result result{};
+        std::shared_ptr<method_exit_queue> queue{};
+        std::shared_ptr<void> metadata_pin{}, policy{};
+    };
+    struct snapshot final {std::vector<std::shared_ptr<binding>> bindings{};};
+    inline std::atomic<const snapshot*> published{};
+    inline std::atomic<std::size_t> readers{};
+    inline std::mutex writer_mutex{};
+    inline constexpr std::size_t maximum_retained_observers{4096};
+    inline std::vector<std::shared_ptr<binding>> bindings{};
+    inline std::vector<std::unique_ptr<snapshot>> snapshots{};
+    inline std::atomic<std::uint64_t> next_id{1},next_event{1},records{},drops{};
+    struct reader final
+    {
+        const snapshot* view{};
+        reader() noexcept {readers.fetch_add(1,std::memory_order_seq_cst);view=published.load(std::memory_order_seq_cst);}
+        ~reader(){readers.fetch_sub(1,std::memory_order_seq_cst);}
+    };
+    struct scratch_frame final
+    {
+        std::array<std::byte,96> vectors{};
+        std::uint64_t rbp{},r11{},r10{},r9{},r8{},rdx{},rcx{},rax{},flags{};
+    };
+    static_assert(sizeof(scratch_frame)==168);
+    struct site final
+    {
+        std::uint8_t* patch{};
+        std::uint8_t* generated{};
+        std::size_t length{},generated_size{};
+        unsigned basic_type{};
+        std::array<std::uint8_t,16> original{},replacement{};
+    };
+    inline std::array<site,6> sites{};
+    inline bool installed{};
+    inline std::size_t method_offset{},const_method_offset{},resident_bytes{},platform_offset{},mounted_offset{};
+    inline bool virtual_threads{};
+    inline auto platform_leaf(void* thread) noexcept->bool
+    {
+        if(!virtual_threads) {return true;}
+        // Real return codelet: R15 is a live JavaThread and the exact profile
+        // verified these OopHandle slots. No VM safepoint or mount operation
+        // can occur in this running-Java leaf; avoid an OS memory-read service.
+        auto** carrier=pn::load<void**>(thread,platform_offset);
+        auto** mounted=pn::load<void**>(thread,mounted_offset);
+        return carrier&&mounted&&*carrier&&*carrier==*mounted;
+    }
+    inline auto bridge(void* fp,void* thread,const scratch_frame* scratch,const site* current) noexcept -> void
+    {
+        if(!enabled.load(std::memory_order_acquire)) { return; }
+        // The leaf never publishes an anchor, enters VM/native state, invokes a
+        // user callback, allocates, locks, polls or passes a raw oop to a queue.
+        reader held{};
+        if(!held.view) { return; }
+        const auto method=pn::load<void*>(static_cast<std::byte*>(fp)-method_offset,0);
+        if(!method) { return; }
+        bool selected_method{};
+        for(const auto& selected:held.view->bindings)
+        {if(selected->method==method&&selected->active.load(std::memory_order_seq_cst)) {selected_method=true;break;}}
+        if(!selected_method||!platform_leaf(thread)) {return;}
+        const auto identity=pn::load<void*>(method,const_method_offset);
+        const auto os_thread=vmhook::windows::GetCurrentThreadId();
+        const auto origin=consume_origin(os_thread,fp,method,identity);
+        if(!origin) { drops.fetch_add(1,std::memory_order_relaxed);return; }
+        const auto event=next_event.fetch_add(1,std::memory_order_relaxed);
+        for(const auto& selected:held.view->bindings)
+        {
+            if(selected->method!=method || selected->identity!=identity
+                || !selected->active.load(std::memory_order_seq_cst)) { continue; }
+            std::uint64_t bits{};
+            if(current->basic_type==6) {std::memcpy(&bits,scratch->vectors.data(),4);}
+            else if(current->basic_type==7) {std::memcpy(&bits,scratch->vectors.data(),8);}
+            else if(current->basic_type!=12 && current->basic_type!=14) {bits=scratch->rax;}
+            switch(selected->result)
+            {
+                case method_exit_result::boolean_value: bits &= 1;break;
+                case method_exit_result::byte_value: bits &= 0xff;break;
+                case method_exit_result::char_value: case method_exit_result::short_value: bits &= 0xffff;break;
+                case method_exit_result::int_value: case method_exit_result::float_value: bits &= 0xffffffff;break;
+                case method_exit_result::reference: case method_exit_result::void_value: bits=0;break;
+                default:break;
+            }
+            const method_exit_record record{selected->id,event,bits,os_thread,selected->result,*origin};
+            if(selected->queue->try_push(record)) {records.fetch_add(1,std::memory_order_relaxed);}
+            else {drops.fetch_add(1,std::memory_order_relaxed);}
+        }
+    }
+    struct assembler final
+    {
+        std::vector<std::uint8_t> data{};
+        auto emit(std::initializer_list<std::uint8_t> bytes)->void {data.insert(data.end(),bytes);}
+        template<class type> auto value(type value)->void
+        {const auto*bytes=reinterpret_cast<const std::uint8_t*>(&value);data.insert(data.end(),bytes,bytes+sizeof(value));}
+        auto jump(const void* target)->void {emit({0xff,0x25,0,0,0,0});value(target);}
+    };
+    inline auto exit_instruction_size(const std::uint8_t* code,std::size_t available) noexcept->std::size_t
+    {
+        if(const auto common=hotspot::interpreter_instruction_size(code,available)) {return common;}
+        if(!available) {return 0;}
+        // Unreachable HotSpot stop stubs include HLT. TEST AL/AX/EAX/RAX uses
+        // the accumulator-immediate encoding, distinct from the ModRM group.
+        if(code[0]==0xf4) {return 1;}
+        std::size_t cursor{};bool operand16{};
+        while(cursor<available&&(code[cursor]==0x66||(code[cursor]>=0x40&&code[cursor]<=0x4f)))
+        {operand16|=code[cursor]==0x66;++cursor;}
+        if(cursor<available&&(code[cursor]==0xa8||code[cursor]==0xa9))
+        {const auto length=cursor+1+(code[cursor]==0xa8?1:operand16?2:4);return length<=available?length:0;}
+        // Template TOS pushes/pops: scalar MOVSS/MOVSD or VEX VMOVSS/VMOVSD.
+        // Other SSE/VEX/EVEX instructions still refuse, rather than guessing.
+        cursor=0;
+        if(available>=4&&((code[0]==0xc5&&(code[1]==0xfa||code[1]==0xfb))
+            ||((code[0]==0xf2||code[0]==0xf3)&&code[1]==0x0f))
+            &&(code[2]==0x10||code[2]==0x11)) {cursor=3;}
+        if(!cursor) {return 0;}
+        const auto modrm=code[cursor++];const auto mod=modrm>>6;const auto rm=modrm&7;
+        if(mod!=3&&rm==4)
+        {if(cursor>=available) {return 0;}const auto sib=code[cursor++];if(mod==0&&(sib&7)==5) {cursor+=4;}}
+        if(mod==0&&rm==5) {cursor+=4;}else if(mod==1) {++cursor;}else if(mod==2) {cursor+=4;}
+        return cursor<=available&&cursor<=15?cursor:0;
+    }
+    inline auto verify_final_tail(const std::uint8_t* at,std::size_t available,bool jfr) noexcept->bool
+    {
+        // The preserved post-commit tail has no VM call/poll or throwing branch.
+        // pop_cont_fastpath is only a compare and a conditional zero store.
+        const auto prefix=static_cast<std::size_t>(jfr?14:6);
+        if(available<prefix+3) {return false;}
+        auto* next=at+prefix;
+        constexpr std::array<std::uint8_t,3> jump{0x41,0xff,0xe5};
+        if(!std::memcmp(next,jump.data(),jump.size())) {return true;}
+        if(available<prefix+23||next[0]!=0x49||next[1]!=0x3b||next[2]!=0xa7
+            ||next[7]!=0x72||next[8]!=0x0b||next[9]!=0x49||next[10]!=0xc7||next[11]!=0x87
+            ||std::memcmp(next+3,next+12,4)||pn::load<std::uint32_t>(next,16)!=0
+            ||std::memcmp(next+20,jump.data(),jump.size())) {return false;}
+        return true;
+    }
+    inline auto find_site(unsigned basic_type)->site
+    {
+        auto& runtime=pn::rt();
+        auto* entry=static_cast<std::uint8_t*>(jit_backend::config().return_entries[basic_type]);
+        if(!entry) {throw exception{"Typed return entry unavailable"};}
+        auto* queue=pn::load<void*>(runtime.function("interpreter_code"),0);
+        auto* buffer=pn::load<std::uint8_t*>(queue,runtime.off("StubQueue","_stub_buffer"));
+        const auto limit=pn::load<int>(queue,runtime.off("StubQueue","_buffer_limit"));
+        const auto count=pn::load<int>(queue,runtime.off("StubQueue","_number_of_stubs"));
+        const auto end=pn::load<int>(queue,runtime.off("StubQueue","_queue_end"));
+        auto index=pn::load<int>(queue,runtime.off("StubQueue","_queue_begin"));
+        if(!buffer||limit<=0||limit>16*1024*1024||count<=0||count>4096) {throw exception{"Return codelet bounds invalid"};}
+        site found{};found.basic_type=basic_type;
+        const auto expected_bytecode=basic_type==10?172:basic_type==11?173:basic_type==6?174:basic_type==7?175:basic_type==12?176:177;
+        for(int visited{};visited<count;++visited)
+        {
+            if(index<0||index>=limit) {throw exception{"Return codelet index invalid"};}
+            auto* stub=buffer+index;
+            const auto size=pn::load<int>(stub,runtime.off("InterpreterCodelet","_size"));
+            if(size<16||size>limit-index) {throw exception{"Return codelet size invalid"};}
+            if(entry>=stub+runtime.size("InterpreterCodelet")&&entry<stub+size)
+            {
+                if(pn::load<int>(stub,runtime.off("InterpreterCodelet","_bytecode"))!=expected_bytecode)
+                {throw exception{"Return entry does not identify its typed bytecode"};}
+                constexpr std::array<std::uint8_t,6> classic{0xc9,0x41,0x5d,0x48,0x8b,0xe3};
+                for(auto* at=entry;at+classic.size()<=stub+size;++at)
+                {
+                    std::size_t length{};
+                    if(!std::memcmp(at,classic.data(),classic.size())&&runtime.profile->java_feature<25) {length=6;}
+                    else if(runtime.profile->java_feature>=25&&at+14<=stub+size&&at[0]==0xc9&&at[1]==0x41
+                        &&at[2]==0xc6&&at[3]==0x87&&at[8]==0&&!std::memcmp(at+9,classic.data()+1,5)
+                        &&runtime.enum_value("ObservationABI","normal_exit_jfr_clear_width")==1
+                        &&pn::load<std::uint32_t>(at,4)==static_cast<std::uint32_t>(runtime.enum_value("ObservationABI","normal_exit_jfr_clear_offset"))) {length=9;}
+                    if(!length||!verify_final_tail(at,static_cast<std::size_t>(stub+size-at),runtime.profile->java_feature>=25)) {continue;}
+                    if(found.patch) {throw exception{"Ambiguous committed-return tail"};}
+                    // Require a real decoded boundary from the typed entry to
+                    // LEAVE. The relocated prefix contains no relative branch.
+                    auto* boundary=entry;
+                    while(boundary<at)
+                    {
+                        const auto step=exit_instruction_size(boundary,static_cast<std::size_t>(at-boundary));
+                        if(!step) {throw exception{"Undecoded return instruction before final tail"};}
+                        boundary+=step;
+                    }
+                    found.patch=at;found.length=length;
+                }
+                if(!found.patch) {throw exception{"Verified committed-return tail unavailable"};}
+                std::memcpy(found.original.data(),found.patch,found.length);return found;
+            }
+            index+=size;if(index==end) {break;}if(index>=limit) {index=0;}
+        }
+        throw exception{"Typed return codelet unavailable"};
+    }
+    inline auto prepare_stub(site& current)->void
+    {
+        using namespace vmhook::windows;
+        assembler code{};
+        code.emit({0x9c,0x50,0x51,0x52,0x41,0x50,0x41,0x51,0x41,0x52,0x41,0x53,0x55,0x48,0x83,0xec,0x60});
+        for(std::uint8_t i{};i<6;++i) {code.emit({0xf3,0x0f,0x7f,static_cast<std::uint8_t>(0x44+i*8),0x24,static_cast<std::uint8_t>(i*16)});}
+        code.emit({0x48,0x89,0xe9,0x4c,0x89,0xfa,0x4c,0x8d,0x04,0x24,0x49,0xb9});code.value(&current);
+        code.emit({0x48,0x89,0xe5,0x48,0x83,0xe4,0xf0,0x48,0x83,0xec,0x20,0x48,0xb8});code.value(&bridge);
+        code.emit({0xff,0xd0,0x48,0x89,0xec});
+        for(std::uint8_t i{};i<6;++i) {code.emit({0xf3,0x0f,0x6f,static_cast<std::uint8_t>(0x44+i*8),0x24,static_cast<std::uint8_t>(i*16)});}
+        code.emit({0x48,0x83,0xc4,0x60,0x5d,0x41,0x5b,0x41,0x5a,0x41,0x59,0x41,0x58,0x5a,0x59,0x58,0x9d});
+        code.data.insert(code.data.end(),current.original.begin(),current.original.begin()+current.length);
+        code.jump(current.patch+current.length);
+        current.generated_size=code.data.size();
+        current.generated=hotspot::allocate_nearby_memory(current.patch,code.data.size());
+        if(!current.generated) {throw exception{"Exit telemetry ASM allocation failed"};}
+        std::memcpy(current.generated,code.data.data(),code.data.size());DWORD prior{};
+        if(!VirtualProtect(current.generated,code.data.size(),page_execute_read,&prior)
+            ||!FlushInstructionCache(GetCurrentProcess(),current.generated,code.data.size()))
+        {throw exception{"Exit telemetry ASM publication failed"};}
+        const auto delta=reinterpret_cast<std::intptr_t>(current.generated)-reinterpret_cast<std::intptr_t>(current.patch+5);
+        if(delta<std::numeric_limits<std::int32_t>::min()||delta>std::numeric_limits<std::int32_t>::max())
+        {throw exception{"Exit telemetry branch out of range"};}
+        current.replacement.fill(0x90);current.replacement[0]=0xe9;
+        const auto offset=static_cast<std::int32_t>(delta);std::memcpy(current.replacement.data()+1,&offset,4);
+    }
+    inline auto activate(void* opaque) noexcept->void
+    {
+        using namespace vmhook::windows;auto& okay=*static_cast<bool*>(opaque);
+        std::array<DWORD,6> protections{};std::size_t writable{};
+        for(const auto& target:sites) {if(std::memcmp(target.patch,target.original.data(),target.length)) {return;}}
+        for(;writable<sites.size();++writable)
+        {auto& target=sites[writable];if(!VirtualProtect(target.patch,target.length,page_execute_readwrite,&protections[writable])) {break;}}
+        if(writable==sites.size())
+        {
+            okay=true;
+            for(auto& target:sites) {std::memcpy(target.patch,target.replacement.data(),target.length);}
+            for(auto& target:sites) {if(!FlushInstructionCache(GetCurrentProcess(),target.patch,target.length)) {okay=false;}}
+            if(!okay) {for(auto& target:sites) {std::memcpy(target.patch,target.original.data(),target.length);FlushInstructionCache(GetCurrentProcess(),target.patch,target.length);}}
+        }
+        while(writable) {const auto i=--writable;DWORD ignored{};VirtualProtect(sites[i].patch,sites[i].length,protections[i],&ignored);}
+    }
+    inline auto supported() noexcept->bool
+    {
+        try {auto& runtime=pn::rt();return runtime.ready&&!runtime.uses_external_symbols()
+            &&callback_backend::platform_callback_layout::get().ready&&borrowed_callback_supported()
+            &&jit_backend::config().ready;}
+        catch(...) {return false;}
+    }
+    inline auto prepare()->void
+    {
+        if(installed)
+        {for(const auto& target:sites) {if(std::memcmp(target.patch,target.replacement.data(),target.length)) {throw exception{"Exit telemetry code patch changed"};}}return;}
+        if(!supported()) {throw exception{"Committed exit telemetry profile unavailable"};}
+        auto& runtime=pn::rt();
+        if(runtime.enum_value("frame","interpreter_frame_method_offset")!=-3) {throw exception{"Exit telemetry frame layout unavailable"};}
+        method_offset=24;const_method_offset=runtime.off("Method","_constMethod");
+        const auto& layout=callback_backend::platform_callback_layout::get();
+        platform_offset=layout.platform_offset;mounted_offset=layout.mounted_offset;virtual_threads=layout.virtual_threads;
+        const std::array<unsigned,6> types{10,11,6,7,12,14};
+        try
+        {
+        for(std::size_t i{};i<sites.size();++i) {sites[i]=find_site(types[i]);prepare_stub(sites[i]);}
+        HMODULE resident{};
+        if(!GetModuleHandleExW(windows::module_handle_from_address|windows::module_handle_pin,
+            reinterpret_cast<const wchar_t*>(&bridge),&resident)) {throw exception{"Cannot pin exit telemetry DLL"};}
+        bool okay{};if(!jit_backend::at_safepoint(&activate,&okay)||!okay) {throw exception{"Exit telemetry patch transaction refused"};}
+        installed=true;for(const auto& target:sites) {resident_bytes+=target.generated_size;}
+        }
+        catch(...)
+        {
+            if(!installed) {for(auto& target:sites) {if(target.generated) {windows::VirtualFree(target.generated,0,windows::mem_release);}target={};}}
+            throw;
+        }
+        enabled.store(true,std::memory_order_release);
+    }
+    inline auto result_kind(std::string_view descriptor)->method_exit_result
+    {
+        const auto end=descriptor.find(')');if(end==descriptor.npos||end+1==descriptor.size()) {throw exception{"Invalid exit method descriptor"};}
+        switch(descriptor[end+1])
+        {
+            case 'Z':return method_exit_result::boolean_value;case 'B':return method_exit_result::byte_value;
+            case 'C':return method_exit_result::char_value;case 'S':return method_exit_result::short_value;
+            case 'I':return method_exit_result::int_value;case 'J':return method_exit_result::long_value;
+            case 'F':return method_exit_result::float_value;case 'D':return method_exit_result::double_value;
+            case 'L':case '[':return method_exit_result::reference;case 'V':return method_exit_result::void_value;
+        }
+        throw exception{"Unsupported exit result descriptor"};
+    }
+    inline auto reclaim()->bool
+    {
+        if(hotspot::in_java_detour()||class_event_notification_active()) {return false;}
+        std::vector<std::unique_ptr<snapshot>> retired{};std::vector<std::shared_ptr<binding>> owners{};
+        {
+            std::lock_guard lock{writer_mutex};
+            auto next=std::make_unique<snapshot>();for(const auto& entry:bindings) {if(entry->active.load(std::memory_order_seq_cst)) {next->bindings.push_back(entry);}}
+            snapshots.reserve(snapshots.size()+1);retired.reserve(snapshots.size());owners.reserve(bindings.size());
+            const auto* value=next.get();snapshots.push_back(std::move(next));published.store(value,std::memory_order_seq_cst);
+            if(readers.load(std::memory_order_seq_cst)==0)
+            {
+                for(auto& old:snapshots) {if(old.get()!=value) {retired.push_back(std::move(old));}}
+                std::erase_if(snapshots,[](const auto& old){return !old;});
+                for(auto& entry:bindings) {if(!entry->active.load(std::memory_order_seq_cst)) {owners.push_back(std::move(entry));}}
+                std::erase_if(bindings,[](const auto& entry){return !entry;});
+            }
+        }
+        retired.clear();owners.clear();flush_hook_roots();return true;
+    }
+}
+export namespace vmhook::detail
+{
+    inline auto clear_forced_exit(void* fp,const void* method,const void* identity) noexcept->void
+    {exit_telemetry::clear_forced(fp,method,identity);}
+    inline auto mark_forced_exit(void* fp,const void* method,const void* identity) noexcept->void
+    {exit_telemetry::mark_forced(fp,method,identity);}
+    inline auto disable_exit_telemetry() noexcept->void
+    {
+        exit_telemetry::shutdown_epoch.fetch_add(1,std::memory_order_acq_rel);
+        exit_telemetry::enabled.store(false,std::memory_order_release);
+        exit_telemetry::reader held{};
+        if(held.view) {for(const auto& entry:held.view->bindings) {entry->active.store(false,std::memory_order_seq_cst);}}
+    }
+    inline auto reclaim_exit_telemetry() noexcept->void
+    {try {(void)exit_telemetry::reclaim();}catch(...) {}}
+}
+export namespace vmhook
+{
+    template<class wrapper_type>
+    inline auto observe_method_exits(std::string_view method_name,std::string_view descriptor,
+        std::shared_ptr<method_exit_queue> queue)->method_exit_observer_id
+    {
+        if(!queue) {throw exception{"An exit telemetry queue is required"};}
+        if(hotspot::in_java_detour()||detail::class_event_notification_active()) {throw exception{"Register exit observers on a native administrator"};}
+        const auto epoch=detail::exit_telemetry::shutdown_epoch.load(std::memory_order_acquire);
+        if(hotspot::g_shutdown_requested.load(std::memory_order_acquire)) {return 0;}
+        {
+            std::lock_guard lock{detail::exit_telemetry::writer_mutex};
+            if(detail::exit_telemetry::bindings.size()>=detail::exit_telemetry::maximum_retained_observers)
+            {throw exception{"Exit observer budget exhausted; reclaim inactive observers"};}
+        }
+        auto selected=std::make_shared<detail::exit_telemetry::binding>();
+        selected->result=detail::exit_telemetry::result_kind(descriptor);
+        const auto policy_id=add_hook<wrapper_type>(method_name,descriptor,[](return_value&){});
+        if(!policy_id) {return 0;}
+        try
+        {
+            std::lock_guard lock{hotspot::g_hooked_methods_mutex};
+            for(const auto& entry:hotspot::g_hooked_methods)
+            {if(entry.observer&&entry.observer->id==policy_id) {selected->method=entry.method;selected->identity=entry.const_method_identity;selected->metadata_pin=entry.metadata_pin;selected->policy=entry.jit_policy;break;}}
+        }
+        catch(...) {(void)remove_hook(policy_id);throw;}
+        // The shared method policy and class pin remain resident, without an
+        // active entry callback. Explicit shutdown releases that shared policy.
+        (void)remove_hook(policy_id);
+        if(!selected->method||!selected->metadata_pin||!selected->policy) {return 0;}
+        selected->queue=std::move(queue);selected->id=detail::exit_telemetry::next_id.fetch_add(1,std::memory_order_relaxed);
+        if(!selected->id) {throw exception{"Exit observer IDs exhausted"};}
+        std::lock_guard lock{detail::exit_telemetry::writer_mutex};
+        if(epoch!=detail::exit_telemetry::shutdown_epoch.load(std::memory_order_acquire)
+            ||hotspot::g_shutdown_requested.load(std::memory_order_acquire)) {return 0;}
+        if(detail::exit_telemetry::bindings.size()>=detail::exit_telemetry::maximum_retained_observers)
+        {throw exception{"Exit observer budget exhausted; reclaim inactive observers"};}
+        auto next=std::make_unique<detail::exit_telemetry::snapshot>();next->bindings=detail::exit_telemetry::bindings;next->bindings.push_back(selected);
+        detail::exit_telemetry::bindings.reserve(detail::exit_telemetry::bindings.size()+1);
+        detail::exit_telemetry::snapshots.reserve(detail::exit_telemetry::snapshots.size()+1);
+        detail::exit_telemetry::prepare();
+        detail::exit_telemetry::bindings.push_back(selected);const auto* value=next.get();detail::exit_telemetry::snapshots.push_back(std::move(next));
+        detail::exit_telemetry::published.store(value,std::memory_order_seq_cst);
+        detail::exit_telemetry::enabled.store(true,std::memory_order_release);
+        if(epoch!=detail::exit_telemetry::shutdown_epoch.load(std::memory_order_acquire)
+            ||hotspot::g_shutdown_requested.load(std::memory_order_acquire))
+        {selected->active.store(false,std::memory_order_seq_cst);detail::exit_telemetry::enabled.store(false,std::memory_order_release);return 0;}
+        return selected->id;
+    }
+    inline auto remove_method_exit_observer(method_exit_observer_id id) noexcept->bool
+    {
+        detail::exit_telemetry::reader held{};if(!held.view||!id) {return false;}
+        for(const auto& entry:held.view->bindings) {if(entry->id==id) {return entry->active.exchange(false,std::memory_order_seq_cst);}}
+        return false;
+    }
+    inline auto reclaim_method_exit_observers() noexcept->bool
+    {try{return detail::exit_telemetry::reclaim();}catch(...){return false;}}
+    inline auto method_exit_resources() noexcept->method_exit_resource_stats
+    {
+        namespace backend=detail::exit_telemetry;method_exit_resource_stats result{};
+        if(!hotspot::in_java_detour()&&!detail::class_event_notification_active())
+        {
+            try {std::lock_guard lock{backend::writer_mutex};result.registry_sizes_available=true;result.retained_observers=backend::bindings.size();
+                for(const auto& entry:backend::bindings) {if(entry->active.load(std::memory_order_seq_cst)) {++result.active_observers;}}
+                result.resident_stubs=backend::installed?backend::sites.size():0;result.resident_stub_bytes=backend::resident_bytes;result.retained_snapshots=backend::snapshots.size();}
+            catch(...){}
+        }
+        result.observer_limit=backend::maximum_retained_observers;
+        result.resident_origin_bytes=sizeof(backend::origin_slots);
+        for(const auto& slot:backend::origin_slots)
+        {if(slot.owner.load(std::memory_order_acquire)) {++result.used_origin_slots;}if(slot.poisoned.load(std::memory_order_relaxed)) {++result.poisoned_origin_slots;}}
+        result.dispatch_readers=backend::readers.load(std::memory_order_seq_cst);result.records=backend::records.load(std::memory_order_relaxed);
+        result.dropped_records=backend::drops.load(std::memory_order_relaxed);result.origin_overflows=backend::origin_overflows.load(std::memory_order_relaxed);return result;
+    }
+}
+// VMHOOK_COMMITTED_EXIT_TELEMETRY_END
+
 // VMHOOK_RUNTIME_DIAGNOSTICS_BEGIN
 export namespace vmhook::detail
 {
@@ -28762,8 +29259,10 @@ export namespace vmhook
                     "Exact private definition routes; observer preparation must pass");
             }
         }
-        set(runtime_feature::original_method_exit_events, feature_state::unavailable,
-            "Entry callbacks and forced returns do not observe an original method exit");
+        set(runtime_feature::original_method_exit_events,
+            !report.external_symbols && persistent_collector && detail::exit_telemetry::supported()
+                ? feature_state::conditional : feature_state::unavailable,
+            "Copied committed normal returns only; primitive bits or reference kind, verified target/tails and platform threads required");
         set(runtime_feature::exact_heap_iteration,
             detail::verified_heap_iteration_available() ? feature_state::conditional : feature_state::unavailable,
             "Verified G1/Parallel VM heap walk; requires a standalone native context and bounded rooted snapshot");
