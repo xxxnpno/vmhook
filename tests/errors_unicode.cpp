@@ -152,5 +152,10 @@ int main()
     try { (void)vmhook::detail::type_name<deliberately_long_type_name_for_allocation_failure>(); }
     catch (const std::bad_alloc&) { diagnostic_allocation = true; }
     check(diagnostic_allocation, "type-name diagnostics do not terminate on C++ allocation failure");
+    bool field_diagnostic_allocation{};
+    fail_next_allocation.store(true);
+    try { (void)vmhook::get_field<std::int32_t>(nullptr, nullptr, "allocation_missing_field"); }
+    catch (const std::bad_alloc&) { field_diagnostic_allocation = true; }
+    check(field_diagnostic_allocation, "raw field helpers do not hide diagnostic allocation failure as zero");
     return failures ? 1 : 0;
 }

@@ -2226,7 +2226,8 @@ export namespace vmhook
             /*
                 @brief Converts this HotSpot Symbol to a std::string.
                 @return A std::string containing a copy of the symbol's character data,
-                        or an empty string on failure.
+                        or an empty string on unreadable metadata. C++ allocation failure
+                        propagates std::bad_alloc.
             */
             auto to_string() const
                 -> std::string
@@ -14013,6 +14014,7 @@ export namespace vmhook
             }
             return result;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (const std::exception& exception)
         {
             ::vmhook::detail::log_line("{} vmhook::get_field<{}>('{}') {}", vmhook::error_tag, vmhook::detail::type_name<value_type>(), name, exception.what());
@@ -14087,6 +14089,7 @@ export namespace vmhook
 
             (void)vmhook::os::safe_write(reinterpret_cast<std::uint8_t*>(object) + entry->offset, &value, sizeof(value_type));
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (const std::exception& exception)
         {
             ::vmhook::detail::log_line("{} vmhook::set_field<{}>('{}') {}", vmhook::error_tag, vmhook::detail::type_name<value_type>(), name, exception.what());
@@ -14788,7 +14791,7 @@ export namespace vmhook
                 @brief Appends one boolean element from a Java boolean[] to result.
                 @details
                 Reads the element as uint8_t and converts non-zero to true.
-                Complexity: O(1). Exception safety: noexcept.
+                Complexity: O(1). Exception safety: allocation and checked conversion failures propagate.
             */
             static auto append_array_value(std::vector<bool>& result, void* const array_oop, const std::int32_t index, std::string_view)
                 -> void
@@ -14800,7 +14803,7 @@ export namespace vmhook
                 @brief Appends one Java String element from a String[] to result.
                 @details
                 Reads the compressed OOP at index, decodes it, then calls read_java_string().
-                Complexity: O(S) where S = string length. Exception safety: noexcept.
+                Complexity: O(S) where S = string length. Exception safety: allocation and checked conversion failures propagate.
             */
             static auto append_array_value(std::vector<std::string>& result, void* const array_oop, const std::int32_t index, std::string_view)
                 -> void
@@ -14814,7 +14817,7 @@ export namespace vmhook
                 @details
                 For "[C" arrays reads a uint16 and narrows to char; for all other arrays
                 reads directly as char.
-                Complexity: O(1). Exception safety: noexcept.
+                Complexity: O(1). Exception safety: allocation and checked conversion failures propagate.
             */
             static auto append_array_value(std::vector<char>& result, void* const array_oop, const std::int32_t index, const std::string_view signature)
                 -> void
@@ -14834,7 +14837,7 @@ export namespace vmhook
                 @details
                 Used for numeric types (int, float, double, etc.) and any other trivially
                 copyable element_type.
-                Complexity: O(1). Exception safety: noexcept.
+                Complexity: O(1). Exception safety: allocation and checked conversion failures propagate.
             */
             template<typename element_type>
             static auto append_array_value(std::vector<element_type>& result, void* const array_oop, const std::int32_t index, std::string_view)
@@ -21929,7 +21932,7 @@ export namespace vmhook
         Writes only min(array_length, values.size()) elements.
 
         Complexity: O(N * S) where N = element count, S = average string length.
-        Exception safety: noexcept — returns silently if the OOP is null.
+        Exception safety: invalid slots return silently; C++ allocation errors propagate.
 
         @param field   A field_proxy whose field holds a String[] reference.
         @param values  New string contents for each slot.
