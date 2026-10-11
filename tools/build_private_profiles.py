@@ -168,6 +168,20 @@ def audited_profile(entry: dict, recipe: dict, dll: Path) -> dict:
     if recipe["identity"] != entry["identity"]:
         raise pp.profile_error("Audit recipe differs from pinned image identity")
     metadata = image.metadata()
+    heap_lock_proof = recipe["provenance"].get("heap_lock_initialization_proof")
+    if heap_lock_proof:
+        reference = bytes.fromhex(heap_lock_proof["reference_bytes"])
+        publication = bytes.fromhex(heap_lock_proof["publication_bytes"])
+        name_rva = heap_lock_proof["name_rva"]
+        if image.read(name_rva, 10) != b"Heap_lock\0" or len(reference) != 7 or \
+                reference[:3] != b"\x4c\x8d\x05" or \
+                image.read(heap_lock_proof["reference_rva"], 7) != reference or \
+                heap_lock_proof["reference_rva"] + 7 + int.from_bytes(reference[3:], "little", signed=True) != name_rva:
+            raise pp.profile_error("Exact-image Heap_lock constructor name proof differs")
+        if len(publication) != 7 or publication[:3] != b"\x48\x89\x3d" or \
+                image.read(heap_lock_proof["publication_rva"], 7) != publication or \
+                heap_lock_proof["publication_rva"] + 7 + int.from_bytes(publication[3:], "little", signed=True) != recipe["aliases"]["heap_lock"]:
+            raise pp.profile_error("Exact-image Heap_lock pointer publication proof differs")
     for alias, prefix in recipe["code_prefixes"].items():
         expected = bytes.fromhex(prefix)
         if image.read(recipe["aliases"][alias], len(expected)) != expected:
@@ -194,7 +208,8 @@ def audited_profile(entry: dict, recipe: dict, dll: Path) -> dict:
     for alias, checks in recipe["provenance"].get("data_layout_proofs", {}).items():
         for proof in checks:
             expected = bytes.fromhex(proof["bytes"])
-            if len(expected) != 7 or expected[:3] not in (b"\x48\x8b\x05", b"\x48\x89\x05") or \
+            if len(expected) != 7 or expected[0] not in (0x48, 0x4c) or \
+                    expected[1] not in (0x8b, 0x89) or expected[2] & 0xc7 != 0x05 or \
                     image.read(proof["rva"], len(expected)) != expected:
                 raise pp.profile_error("Exact-image data-reference mismatch: " + alias)
             displacement = int.from_bytes(expected[3:], "little", signed=True)

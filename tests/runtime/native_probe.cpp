@@ -332,6 +332,21 @@ namespace
         }
         for (const auto wanted : {10, 20, 41})
         { if (std::ranges::find(values, wanted) == values.end()) { return false; } }
+        // Race repeated count/capture VM operations against the fixture's
+        // ordinary allocation slow paths. A safepoint without caller Heap_lock
+        // can observe an allocated Eden interval before its header is written.
+        for (std::size_t attempt{}; attempt < 32; ++attempt)
+        {
+            const auto held = vmhook::get_instances<native_fixture>(16);
+            if (held.size() < 3) { return false; }
+            if (attempt % 8 == 0) { native_fixture::collect(); }
+            for (const auto& object : held)
+            {
+                if (!object || !object->get_instance()) { return false; }
+                (void)object->add(std::int32_t{});
+            }
+            std::this_thread::yield();
+        }
         std::size_t callbacks{};
         if (vmhook::for_each_instance<native_fixture>([&](std::unique_ptr<native_fixture> object)
             { if (object && object->get_instance()) { ++callbacks; } }, 1) != 1 || callbacks != 1)

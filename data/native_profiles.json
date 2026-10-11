@@ -764,6 +764,18 @@
     ],
     "interpreter_remove_activation": [
       "?_remove_activation_entry@TemplateInterpreter@@1PEAEEA"
+    ],
+    "heap_lock": [
+      "?Heap_lock@@3PEAVMonitor@@EA"
+    ],
+    "heap_lock_enter": [
+      "?lock@Mutex@@QEAAXPEAVThread@@@Z",
+      "?lock@Monitor@@QEAAXPEAVThread@@@Z"
+    ],
+    "root_keepalive_g1": [
+      "?enqueue_preloaded@G1BarrierSet@@SAXPEAVoopDesc@@@Z",
+      "?enqueue@G1BarrierSet@@SAXPEAVoopDesc@@@Z",
+      "?enqueue@G1SATBCardTableModRefBS@@SAXPEAVoopDesc@@@Z"
     ]
   },
   "profile_types": [
@@ -1583,7 +1595,8 @@
     "bytecode_lengths": "data",
     "class_loader_data_head": "data",
     "interpreter_entry_table": "data",
-    "interpreter_remove_activation": "data"
+    "interpreter_remove_activation": "data",
+    "heap_lock": "data"
   },
   "derived_profile_facts": {
     "ObservationABI": {
@@ -1674,6 +1687,10 @@
     "interpreter_remove_activation": {
       "storage_size": 8,
       "value": "address interpreter activation removal codelet"
+    },
+    "heap_lock": {
+      "storage_size": 8,
+      "value": "Monitor*; allocation serialization held on caller before heap-walk VM operation"
     }
   }
 }
