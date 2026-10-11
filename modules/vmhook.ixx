@@ -16,6 +16,7 @@ export namespace vmhook::detail::jit_backend
     inline auto with_vm_state(void (*callback)(void*) noexcept, void* opaque) noexcept -> bool;
     inline auto return_handler(vmhook::hotspot::method*) noexcept -> void*;
     inline auto throw_handler() noexcept -> void*;
+    inline auto pending_exception_slot(void*) noexcept -> void**;
     inline auto metadata_contains(void*, vmhook::hotspot::method*) noexcept -> bool;
     inline auto method_is_excluded(vmhook::hotspot::method*) noexcept -> bool;
     inline auto holder_linked(vmhook::hotspot::klass*) noexcept -> bool;
@@ -6168,7 +6169,14 @@ export namespace vmhook
                        0x48, 0x89, 0xe5, 0x48, 0x83, 0xe4, 0xf0, 0x48, 0x83, 0xec, 0x20 });
                 const std::size_t call_offset{ assembly.size() };
                 emit({ 0xff, 0x15, 0, 0, 0, 0 });
-                emit({ 0x48, 0x89, 0xec, 0x80, 0x3c, 0x24, 0 });
+                emit({ 0x48, 0x89, 0xec });
+                // A callback may call Java recursively. That nested normal
+                // entry clears this per-thread flag, even though our outer
+                // synchronized method has not allocated/acquired its monitor.
+                // Restore the audited outer entry invariant for both resume
+                // and forced return/throw before the interpreter can block.
+                assembly.insert(assembly.end(), this->original.begin(), this->original.end());
+                emit({ 0x80, 0x3c, 0x24, 0 });
                 const std::size_t branch_offset{ assembly.size() };
                 emit({ 0x0f, 0x84, 0, 0, 0, 0 });
 
@@ -6577,11 +6585,11 @@ export namespace vmhook
                 // a native return-PC forwarding stub cannot consume this frame.
                 auto** const saved_rax{ reinterpret_cast<void**>(slot)
                     + vmhook::hotspot::trampoline_pushed_words - 2 };
-                const auto* const pending_entry{
-                    vmhook::hotspot::iterate_struct_entries("JavaThread", "_pending_exception") };
                 void* pending{};
-                auto* const pending_slot{ pending_entry
-                    ? reinterpret_cast<std::byte*>(thread) + pending_entry->offset : nullptr };
+                // _pending_exception belongs to inherited ThreadShadow in
+                // HotSpot's exported metadata, not an exact JavaThread entry.
+                // The calibrated private profile resolves the inherited slot.
+                auto** const pending_slot{ vmhook::detail::jit_backend::pending_exception_slot(thread) };
                 if (pending_slot && vmhook::os::safe_read(&pending, pending_slot, sizeof(pending)) && pending)
                 {
                     void* const handler{ vmhook::detail::jit_backend::throw_handler() };
@@ -11290,6 +11298,7 @@ export namespace vmhook::detail::jit_backend
         void* synchronized_method_entry{};
         std::size_t i2i_offset{}, from_interpreted_offset{}, method_code_offset{};
         void* exception_entry{};
+        std::size_t pending_exception_offset{};
         const std::uint8_t* bytecode_lengths{};
         void** class_loader_head{};
         std::size_t cld_klasses{}, cld_next{}, klass_next{}, klass_layout{}, klass_state{}, klass_methods{}, const_method_size{}, code_size_offset{};
@@ -11398,6 +11407,7 @@ export namespace vmhook::detail::jit_backend
                 this->return_entries.at(vm.enum_value("BasicType", "T_ARRAY")) = entry("atos", 176);
                 this->return_entries.at(vm.enum_value("BasicType", "T_VOID")) = entry("vtos", 177);
                 this->exception_entry = pn::load<void*>(vm.function("interpreter_throw_exception"), 0);
+                this->pending_exception_offset = vm.off("JavaThread", "_pending_exception");
                 this->bytecode_lengths = static_cast<const std::uint8_t*>(vm.function("bytecode_lengths"));
                 this->fast_linear_switch = vm.enum_value("Bytecodes::Code", "_fast_linearswitch");
                 this->fast_binary_switch = vm.enum_value("Bytecodes::Code", "_fast_binaryswitch");
@@ -11475,6 +11485,11 @@ export namespace vmhook::detail::jit_backend
         return type < c.return_entries.size() ? c.return_entries[type] : nullptr;
     }
     inline auto throw_handler() noexcept -> void* { return config().exception_entry; }
+    inline auto pending_exception_slot(void* const thread) noexcept -> void**
+    {
+        const auto& c{ config() };
+        return c.ready && thread ? reinterpret_cast<void**>(static_cast<std::byte*>(thread) + c.pending_exception_offset) : nullptr;
+    }
     struct operation_payload final
     {
         safepoint_callback callback{};
