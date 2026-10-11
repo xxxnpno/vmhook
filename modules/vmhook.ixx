@@ -269,6 +269,7 @@ export namespace vmhook
     inline constexpr std::string_view info_tag{ "[VMHook INFO]" };
 
     class any_object;
+    class java_string;
 
     /* Operation failures are separate from successful zero/false/void/null.
        C++ allocation failures remain std::bad_alloc, including try_* APIs. */
@@ -1395,6 +1396,14 @@ export namespace vmhook
         [[nodiscard]] inline auto object_matches_wrapper_type(const native_backend::root& source) -> bool;
         template<typename wrapper_type>
         [[nodiscard]] inline auto loaded_array_wrapper_class() -> vmhook::hotspot::klass*;
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto java_wrapper_descriptor() -> std::string;
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto wrapper_descriptor_assignable(std::string_view descriptor,
+            vmhook::hotspot::klass* declaring_class, bool for_read = false) -> bool;
+        [[nodiscard]] inline auto method_parameters_more_specific(std::string_view left,
+            vmhook::hotspot::klass* left_holder, std::string_view right,
+            vmhook::hotspot::klass* right_holder) -> bool;
 
         /*
             @brief Reflects a C++ type name for diagnostics.
@@ -9912,6 +9921,37 @@ export namespace vmhook
             @tparam arg_type  The C++ argument type.
             @return  JVM type descriptor string.
         */
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto java_wrapper_descriptor() -> std::string
+        {
+            static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>);
+            if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+            {
+                using element_type = typename wrapper_type::java_element_type;
+                if constexpr (std::is_base_of_v<vmhook::object_base, element_type>)
+                { return "[" + java_wrapper_descriptor<element_type>(); }
+                else { return wrapper_type::descriptor(); }
+            }
+            else if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
+            { return std::string{vmhook::detail::class_descriptor_v<wrapper_type>}; }
+            else
+            {
+                const auto binding{registered_class_binding(std::type_index{typeid(wrapper_type)})};
+                if (binding)
+                {
+                    if (binding->name.empty()) { throw vmhook::exception{"Registered Java wrapper has no class name"}; }
+                    return binding->name.front() == '[' ? binding->name : "L" + binding->name + ";";
+                }
+                if constexpr (requires { std::string_view{wrapper_type::java_contract}; })
+                {
+                    constexpr std::string_view contract{wrapper_type::java_contract};
+                    if constexpr (contract.starts_with("java/"))
+                    { return "L" + std::string{contract} + ";"; }
+                }
+                throw vmhook::exception{"Register the Java wrapper before inferring its JVM descriptor"};
+            }
+        }
+
         template<typename arg_type>
         inline auto jvm_descriptor_for_arg()
             -> std::string
@@ -9986,89 +10026,17 @@ export namespace vmhook
             }
             else if constexpr (vmhook::detail::is_borrowed_v<clean_t>)
             {
-                // borrowed<W> describes the SAME Java type as unique_ptr<W> — a
-                // reference to W's registered class — so it resolves through the
-                // same map.  The untyped borrowed<void> carries no wrapper to
-                // resolve and is therefore java/lang/Object by construction, not
-                // by fallback; it is the right descriptor for a detour that only
-                // wants identity and lifetime, not typed field access.
                 using wrapper_type = typename vmhook::detail::is_borrowed<clean_t>::value_type_t;
-                if constexpr (std::is_void_v<wrapper_type>)
-                {
-                    return "Ljava/lang/Object;";
-                }
-                else if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
-                {
-                    // Annotated: the descriptor is a compile-time constant, so it
-                    // cannot disagree with the registry and cannot degrade to
-                    // Ljava/lang/Object; because someone forgot to register.
-                    return std::format(
-                        "L{};", vmhook::detail::annotated_class_name<wrapper_type>());
-                }
-                else
-                {
-                    const std::string registered_name{ vmhook::detail::registered_class_name<wrapper_type>() };
-                    if (registered_name.empty())
-                    {
-                        ::vmhook::detail::log_line("{} vmhook::detail::jvm_descriptor_for_arg<{}>: borrowed<T> wrapper "
-                                   "not registered via vmhook::register_class<T>(name); falling back to "
-                                   "Ljava/lang/Object;.",
-                                   vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>());
-                        return "Ljava/lang/Object;";
-                    }
-                    return std::format("L{};", registered_name);
-                }
+                if constexpr (std::is_void_v<wrapper_type>) { return "Ljava/lang/Object;"; }
+                else { return java_wrapper_descriptor<wrapper_type>(); }
             }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
                 using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
-                static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>,
-                              "vmhook::detail::jvm_descriptor_for_arg: unique_ptr<T> arg's T must "
-                              "derive from vmhook::object_base.  Pass a wrapper, not a raw object.");
-                if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
-                {
-                    return std::format(
-                        "L{};", vmhook::detail::annotated_class_name<wrapper_type>());
-                }
-                else
-                {
-                    // Resolve the JVM class name from the registered wrapper map so the
-                    // descriptor reads `Lcom/example/foo;` instead of the old silently-wrong
-                    // `I` fallback, which broke object construction whenever someone
-                    // passed an object to a constructor that took another object.
-                    const std::string registered_name{ vmhook::detail::registered_class_name<wrapper_type>() };
-                    if (registered_name.empty())
-                    {
-                        ::vmhook::detail::log_line("{} vmhook::detail::jvm_descriptor_for_arg<{}>: unique_ptr<T> wrapper "
-                                   "not registered via vmhook::register_class<T>(name); falling back to "
-                                   "Ljava/lang/Object;.",
-                                   vmhook::warning_tag, vmhook::detail::type_name<wrapper_type>());
-                        return "Ljava/lang/Object;";
-                    }
-                    return std::format("L{};", registered_name);
-                }
+                return java_wrapper_descriptor<wrapper_type>();
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_t>)
-            {
-                if constexpr (vmhook::detail::has_annotated_class_name_v<clean_t>)
-                {
-                    return std::format(
-                        "L{};", vmhook::detail::annotated_class_name<clean_t>());
-                }
-                else
-                {
-                    const std::string registered_name{ vmhook::detail::registered_class_name<clean_t>() };
-                    if (registered_name.empty())
-                    {
-                        ::vmhook::detail::log_line("{} vmhook::detail::jvm_descriptor_for_arg<{}>: object wrapper not "
-                                   "registered via vmhook::register_class<T>(name); falling back to "
-                                   "Ljava/lang/Object;.",
-                                   vmhook::warning_tag, vmhook::detail::type_name<clean_t>());
-                        return "Ljava/lang/Object;";
-                    }
-                    return std::format("L{};", registered_name);
-                }
-            }
+            { return java_wrapper_descriptor<clean_t>(); }
             else
             {
                 static_assert(vmhook::detail::dependent_false_v<clean_t>,
@@ -10081,6 +10049,26 @@ export namespace vmhook
                               "unique_ptr<vmhook::object>, object_base-derived, "
                               "bool, integral (8/16/32/64-bit), float, double.");
             }
+            }
+        }
+
+        template<typename wrapper_type>
+        inline auto wrapper_argument_descriptor_matches(const std::string_view descriptor,
+            const bool allow_upcasts, vmhook::hotspot::klass* const declaring_class) -> bool
+        {
+            const bool reference{!descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[')};
+            if constexpr (std::is_void_v<wrapper_type>) { return reference; }
+            else
+            {
+                if (allow_upcasts)
+                {
+                    return reference && (!declaring_class
+                        || wrapper_descriptor_assignable<wrapper_type>(descriptor, declaring_class));
+                }
+                const auto expected{java_wrapper_descriptor<wrapper_type>()};
+                if constexpr (std::is_same_v<wrapper_type, vmhook::any_object>)
+                { if (expected == "Ljava/lang/Object;") { return reference; } }
+                return descriptor == expected;
             }
         }
     } // namespace detail
@@ -18256,6 +18244,11 @@ export namespace vmhook
             }
 
             vmhook::hotspot::method* const selected_method{ this->resolve_compatible_method<std::remove_cvref_t<args_t>...>() };
+            // Assignability checks may execute Class methods and collect. Refresh
+            // the receiver before inspecting its presence or rooting the call.
+            if (this->receiver_slot) { this->object = *this->receiver_slot; }
+            if (native_call && this->native_receiver_root)
+            { this->object = this->native_receiver_root->resolve_under_vm(); }
             if (!selected_method || !vmhook::hotspot::is_valid_pointer(selected_method))
             {
                 ::vmhook::detail::log_line("{} method_proxy::call('{}{}'): no resolvable Method* for the call.",
@@ -18274,7 +18267,7 @@ export namespace vmhook
             auto* const selected_holder{ native_call ? declaring_class(selected_method) : nullptr };
             std::string selected_signature{ selected_method->get_signature() };
             if (!signature_matches_arguments<std::remove_cvref_t<args_t>...>(
-                    selected_signature, this->signature_pinned))
+                    selected_signature, true))
             {
                 return value_t{ std::monostate{} };
             }
@@ -18903,7 +18896,8 @@ export namespace vmhook
         */
         template<typename argument_type>
         static auto argument_matches_descriptor(const std::string_view descriptor,
-                                                const bool allow_reference_upcasts = false)
+                                                const bool allow_reference_upcasts = false,
+                                                vmhook::hotspot::klass* const declaring_class = nullptr)
             -> bool
         {
             using clean_type = std::remove_cvref_t<argument_type>;
@@ -18913,9 +18907,10 @@ export namespace vmhook
                           || (std::is_array_v<clean_type>
                               && std::is_same_v<std::remove_cv_t<std::remove_extent_t<clean_type>>, char>))
             {
-                return descriptor == "Ljava/lang/String;"
-                    || (allow_reference_upcasts && descriptor.size() >= 3
-                        && descriptor.front() == 'L' && descriptor.back() == ';');
+                if (descriptor == "Ljava/lang/String;") { return true; }
+                return allow_reference_upcasts && !descriptor.empty() && descriptor.front() == 'L'
+                    && (!declaring_class || vmhook::detail::wrapper_descriptor_assignable<vmhook::java_string>(
+                        descriptor, declaring_class));
             }
             else if constexpr (vmhook::detail::is_borrowed_v<clean_type>
                                || vmhook::detail::is_ref_v<clean_type>)
@@ -18931,14 +18926,8 @@ export namespace vmhook
                         return std::type_identity<typename vmhook::detail::is_ref<clean_type>::value_type_t>{};
                     }
                 }())::type;
-                if (allow_reference_upcasts)
-                {
-                    return !descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[');
-                }
-                const std::string registered{ vmhook::detail::registered_class_name<wrapper_type>() };
-                return descriptor.size() >= 3 && descriptor.front() == 'L' && descriptor.back() == ';'
-                    && (registered.empty()
-                        || descriptor.substr(1, descriptor.size() - 2) == registered);
+                return vmhook::detail::wrapper_argument_descriptor_matches<wrapper_type>(
+                    descriptor, allow_reference_upcasts, declaring_class);
             }
             else if constexpr (std::is_same_v<clean_type, std::nullptr_t>
                                || std::is_same_v<clean_type, void*>)
@@ -18950,15 +18939,8 @@ export namespace vmhook
                 using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_type>::value_type_t;
                 if constexpr (std::is_base_of_v<vmhook::object_base, wrapper_type>)
                 {
-                    if (allow_reference_upcasts)
-                    {
-                        return !descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[');
-                    }
-                    const std::string registered{ vmhook::detail::registered_class_name<wrapper_type>() };
-                    return descriptor.size() >= 3
-                        && descriptor.front() == 'L'
-                        && descriptor.back() == ';'
-                        && (registered.empty() || descriptor.substr(1, descriptor.size() - 2) == registered);
+                    return vmhook::detail::wrapper_argument_descriptor_matches<wrapper_type>(
+                        descriptor, allow_reference_upcasts, declaring_class);
                 }
                 else
                 {
@@ -18967,15 +18949,8 @@ export namespace vmhook
             }
             else if constexpr (std::is_base_of_v<vmhook::object_base, clean_type>)
             {
-                if (allow_reference_upcasts)
-                {
-                    return !descriptor.empty() && (descriptor.front() == 'L' || descriptor.front() == '[');
-                }
-                const std::string registered{ vmhook::detail::registered_class_name<clean_type>() };
-                return descriptor.size() >= 3
-                    && descriptor.front() == 'L'
-                    && descriptor.back() == ';'
-                    && (registered.empty() || descriptor.substr(1, descriptor.size() - 2) == registered);
+                return vmhook::detail::wrapper_argument_descriptor_matches<clean_type>(
+                    descriptor, allow_reference_upcasts, declaring_class);
             }
             else if constexpr (std::is_same_v<clean_type, bool>)
             {
@@ -19091,7 +19066,8 @@ export namespace vmhook
         */
         template<typename... args_t>
         static auto signature_matches_arguments(const std::string_view signature,
-                                                [[maybe_unused]] const bool allow_reference_upcasts = false)
+                                                [[maybe_unused]] const bool allow_reference_upcasts = false,
+                                                [[maybe_unused]] vmhook::hotspot::klass* const declaring_class = nullptr)
             -> bool
         {
             const std::size_t open_paren{ signature.find('(') };
@@ -19111,7 +19087,7 @@ export namespace vmhook
                     }
                     const std::string_view descriptor{ next_argument_descriptor(signature, position, close_paren) };
                     matches = !descriptor.empty()
-                        && argument_matches_descriptor<args_t>(descriptor, allow_reference_upcasts);
+                        && argument_matches_descriptor<args_t>(descriptor, allow_reference_upcasts, declaring_class);
                 }(), ...);
 
             return matches && position == close_paren;
@@ -19194,47 +19170,69 @@ export namespace vmhook
             }
 
             const std::string method_name{ this->name() };
-            for (vmhook::hotspot::klass* k{ resolved_klass }; k != nullptr; k = k->get_super())
+            struct candidate_info final
             {
-                // Constructors belong only to their declaring class. A missing
-                // overload must not silently call a superclass constructor on
-                // the newly allocated instance.
+                vmhook::hotspot::klass* holder{};
+                vmhook::hotspot::method* method{};
+                std::string signature{};
+                vmhook::detail::native_backend::root holder_root{};
+            };
+            std::vector<candidate_info> candidates{};
+            auto add_candidate = [&](vmhook::hotspot::method* candidate)
+            {
+                if (!this->callable_candidate(candidate) || candidate->get_name() != method_name) { return; }
+                const auto signature{candidate->get_signature()};
+                // The nearest override wins; equal parameter lists do not create
+                // ambiguity merely because a superclass repeats the declaration.
+                const auto parameters{signature.substr(0, signature.find(')') + 1)};
+                if (std::any_of(candidates.begin(), candidates.end(), [&](const auto& value)
+                    { return value.signature.substr(0, value.signature.find(')') + 1) == parameters; })) { return; }
+                auto* const holder{declaring_class(candidate)};
+                auto root{vmhook::detail::native_backend::retain_class(holder)};
+                if (!root) { throw vmhook::exception{"Overload declaring Class could not be retained"}; }
+                candidates.push_back({holder, candidate, signature, std::move(root)});
+            };
+            for (auto* k{resolved_klass}; k; k = k->get_super())
+            {
                 if (method_name == "<init>" && k != resolved_klass) { break; }
-                const std::int32_t method_count{ k->get_methods_count() };
-                vmhook::hotspot::method** const methods_array{ k->get_methods_ptr() };
-                if (!methods_array || method_count <= 0)
+                const auto count{k->get_methods_count()};
+                auto** const methods{k->get_methods_ptr()};
+                for (std::int32_t index{}; methods && index < count; ++index) { add_candidate(methods[index]); }
+            }
+            if (method_name != "<init>")
+            {
+                for (auto* k{resolved_klass}; k; k = k->get_super())
                 {
-                    continue;
-                }
-
-                for (std::int32_t method_index{ 0 }; method_index < method_count; ++method_index)
-                {
-                    vmhook::hotspot::method* const current_method{ methods_array[method_index] };
-                    if (!this->callable_candidate(current_method) || current_method->get_name() != method_name)
+                    std::int32_t count{};
+                    auto** const defaults{k->get_default_methods_ptr(count)};
+                    for (std::int32_t index{}; defaults && index < count; ++index)
                     {
-                        continue;
-                    }
-
-                    const std::string current_signature{ current_method->get_signature() };
-                    if (signature_matches_arguments<args_t...>(current_signature))
-                    {
-                        return current_method;
+                        add_candidate(static_cast<vmhook::hotspot::method*>(const_cast<void*>(
+                            vmhook::hotspot::safe_read_pointer(&defaults[index]))));
                     }
                 }
             }
-
-            for (auto* k{ resolved_klass }; k; k = k->get_super())
+            for (const auto& candidate : candidates)
             {
-                std::int32_t count{};
-                auto** const defaults{ k->get_default_methods_ptr(count) };
-                for (std::int32_t index{}; defaults && index < count; ++index)
+                if (signature_matches_arguments<args_t...>(candidate.signature)) { return candidate.method; }
+            }
+            std::vector<std::size_t> compatible{};
+            for (std::size_t index{}; index < candidates.size(); ++index)
+            {
+                const auto& candidate{candidates[index]};
+                if (signature_matches_arguments<args_t...>(candidate.signature, true, candidate.holder))
+                { compatible.push_back(index); }
+            }
+            for (const auto index : compatible)
+            {
+                const auto& candidate{candidates[index]};
+                const bool most_specific{std::all_of(compatible.begin(), compatible.end(), [&](const auto other)
                 {
-                    auto* const candidate{ static_cast<vmhook::hotspot::method*>(const_cast<void*>(
-                        vmhook::hotspot::safe_read_pointer(&defaults[index]))) };
-                    if (this->callable_candidate(candidate) && candidate->get_name() == method_name
-                        && signature_matches_arguments<args_t...>(candidate->get_signature()))
-                    { return candidate; }
-                }
+                    if (index == other) { return true; }
+                    return vmhook::detail::method_parameters_more_specific(candidate.signature, candidate.holder,
+                        candidates[other].signature, candidates[other].holder);
+                })};
+                if (most_specific) { return candidate.method; }
             }
 
             // A mismatched fallback can put a primitive in a reference slot or
@@ -26719,6 +26717,122 @@ namespace hotspot
             return destination->to_vector();
         }
     };
+
+    namespace detail
+    {
+        template<typename wrapper_type>
+        inline auto capture_descriptor_bindings(std::vector<callback_class_binding>& values) -> void
+        {
+            const std::type_index type{typeid(wrapper_type)};
+            if (std::none_of(values.begin(), values.end(), [&](const auto& value) { return value.type == type; }))
+            { values.push_back({type, registered_class_binding(type)}); }
+            if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+            {
+                using element_type = typename wrapper_type::java_element_type;
+                if constexpr (std::is_base_of_v<vmhook::object_base, element_type>)
+                { capture_descriptor_bindings<element_type>(values); }
+            }
+        }
+
+        inline auto descriptor_class_mirror(const std::string_view descriptor,
+            const native_backend::root& loader) -> native_backend::root
+        {
+            std::string name{descriptor.front() == '[' ? descriptor : descriptor.substr(1, descriptor.size() - 2)};
+            std::replace(name.begin(), name.end(), '/', '.');
+            auto loader_wrapper{materialize_object<vmhook::any_object>(0, loader)};
+            return container_result_root(call_bootstrap_method("java/lang/Class", "forName",
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", name, false, loader_wrapper));
+        }
+
+        [[nodiscard]] inline auto method_parameters_more_specific(const std::string_view left,
+            vmhook::hotspot::klass* const left_holder, const std::string_view right,
+            vmhook::hotspot::klass* const right_holder) -> bool
+        {
+            const auto left_owner{native_backend::retain_class(left_holder)};
+            const auto right_owner{native_backend::retain_class(right_holder)};
+            if (!left_owner || !right_owner) { throw vmhook::exception{"Overload Class mirror could not be retained"}; }
+            const auto left_loader{container_result_root(call_container_method(left_owner,
+                "getClassLoader", "()Ljava/lang/ClassLoader;"))};
+            const auto right_loader{container_result_root(call_container_method(right_owner,
+                "getClassLoader", "()Ljava/lang/ClassLoader;"))};
+            bool strictly_more_specific{};
+            for (std::int32_t index{};; ++index)
+            {
+                const auto a{interpreter_argument_layout(left, true, index, true)};
+                const auto b{interpreter_argument_layout(right, true, index, true)};
+                if (!a || !b) { return !a && !b && strictly_more_specific; }
+                const bool a_reference{a->descriptor.front() == 'L' || a->descriptor.front() == '['};
+                const bool b_reference{b->descriptor.front() == 'L' || b->descriptor.front() == '['};
+                if (!a_reference || !b_reference)
+                { if (a->descriptor != b->descriptor) { return false; } continue; }
+                const auto a_class{descriptor_class_mirror(a->descriptor, left_loader)};
+                const auto b_class{descriptor_class_mirror(b->descriptor, right_loader)};
+                if (container_address(a_class) == container_address(b_class)) { continue; }
+                auto argument{materialize_object<vmhook::any_object>(0, a_class)};
+                if (!static_cast<bool>(call_container_method(b_class, "isAssignableFrom",
+                    "(Ljava/lang/Class;)Z", argument))) { return false; }
+                strictly_more_specific = true;
+            }
+        }
+
+        template<typename wrapper_type>
+        inline auto wrapper_class_mirror() -> native_backend::root
+        {
+            if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+            {
+                if (auto* const loaded{loaded_array_wrapper_class<wrapper_type>()})
+                { return native_backend::retain_class(loaded); }
+                using element_type = typename wrapper_type::java_element_type;
+                native_backend::root loader{};
+                if constexpr (std::is_base_of_v<vmhook::object_base, element_type>)
+                {
+                    const auto component{wrapper_class_mirror<element_type>()};
+                    loader = container_result_root(call_container_method(component, "getClassLoader",
+                        "()Ljava/lang/ClassLoader;"));
+                }
+                const auto mirror{descriptor_class_mirror(java_wrapper_descriptor<wrapper_type>(), loader)};
+                if (!array_component_matches_wrapper<wrapper_type>(mirror))
+                { throw vmhook::exception{"Inferred Java array class does not match its retained component binding"}; }
+                return mirror;
+            }
+            else
+            {
+                auto* const klass{checked_wrapper_class<wrapper_type>()};
+                const auto mirror{native_backend::retain_class(klass)};
+                if (!mirror) { throw vmhook::exception{"Inferred Java wrapper Class could not be retained"}; }
+                return mirror;
+            }
+        }
+
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto wrapper_descriptor_assignable(const std::string_view descriptor,
+            vmhook::hotspot::klass* const declaring_class, const bool for_read) -> bool
+        {
+            if (descriptor.empty() || (descriptor.front() != 'L' && descriptor.front() != '[')) { return false; }
+            if constexpr (std::is_same_v<wrapper_type, vmhook::any_object>) { return true; }
+            std::unique_ptr<vmhook::native_thread_context> context{};
+            if (!native_backend::active())
+            {
+                context = std::make_unique<vmhook::native_thread_context>("VMHook-descriptor-validation");
+                if (!context->valid()) { throw vmhook::exception{context->error()}; }
+            }
+            native_backend::operation access{};
+            if (!access) { throw vmhook::exception{"Java descriptor comparison requires a rooted VM context"}; }
+            std::vector<callback_class_binding> bindings{};
+            capture_descriptor_bindings<wrapper_type>(bindings);
+            const callback_class_binding_scope scope{bindings};
+            (void)java_wrapper_descriptor<wrapper_type>();
+            const auto owner{native_backend::retain_class(declaring_class)};
+            if (!owner) { throw vmhook::exception{"Java descriptor's declaring Class could not be retained"}; }
+            const auto loader{container_result_root(call_container_method(owner, "getClassLoader",
+                "()Ljava/lang/ClassLoader;"))};
+            const auto declared{descriptor_class_mirror(descriptor, loader)};
+            const auto expected{wrapper_class_mirror<wrapper_type>()};
+            auto argument{materialize_object<vmhook::any_object>(0, for_read ? declared : expected)};
+            return static_cast<bool>(call_container_method(for_read ? expected : declared,
+                "isAssignableFrom", "(Ljava/lang/Class;)Z", argument));
+        }
+    }
 
     inline auto field_proxy::value_t::operator->() const -> std::unique_ptr<vmhook::any_object>
     {
