@@ -45,3 +45,10 @@ waits, explicit release, context-close refusal and exception unwinding. Java
 monitor `wait`/`notify`, timeouts, cancellation and virtual-thread monitor
 ownership are outside this API's current contract. Use normal Java methods for
 Java-level condition waiting.
+
+The acquisition error path clears the JVM pending-exception slot even if C++
+allocation fails while retaining or describing its Throwable. The lock is
+balanced before propagating the C++ error. `monitor_fault_probe.cpp` exercises
+that narrow failure by injecting a pending result after the clean preflight
+and failing the real shared-root allocation; it then checks the pending slot,
+monitor ownership, and successful acquisition on the same context.
