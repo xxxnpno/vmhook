@@ -7755,15 +7755,12 @@ export namespace vmhook
         Walks HotSpot's intrusive `Threads::_thread_list` (the same
         list used internally by `find_java_thread_by_os_thread_id`),
         capping at 4 096 entries as a runaway-list guard.  The visitor
-        receives a `thread_info` snapshot — the underlying JavaThread*
-        is safe to dereference during the visit, but should not be
-        held past the call's return because the JVM may reclaim it
-        when the Java thread exits.
-
-        Concurrent thread creation / exit during iteration may show
-        up as missed entries; HotSpot doesn't pin the list for us.
-        For a stable view, walk during a quiescent period or after
-        installing a JVMTI agent (out of scope for vmhook).
+        receives a best-effort `thread_info` observation. This raw traversal
+        does not pin JavaThread lifetime or acquire HotSpot's thread-list
+        protection. Concurrent creation/exit can change membership or reclaim
+        a thread even during the visit; an observed address is not authority
+        to dereference or retain that JavaThread. Use `observe_java_threads`
+        for copied Java management observations without raw thread ownership.
 
         Complexity: O(N) where N = number of live Java threads.
         Exception safety: callback exceptions propagate; iteration
@@ -14588,12 +14585,14 @@ export namespace vmhook
 
     /*
         @brief Reads the element at the given index from a Java primitive array.
-        @tparam T    The C++ element type (int32_t, double, int8_t, bool, etc.).
+        @tparam element_type The C++ element type (int32_t, double, int8_t, bool, etc.).
         @param array_oop Decoded pointer to the Java array object.
         @param index Zero-based element index.
         @return The element value, or T{} if the pointer/index is invalid.
         @details
-        Data starts at offset +16 from the array oop.  Element stride is sizeof(T).
+        The verified array layout supplies the body offset and element width;
+        the requested C++ width must match it. The caller retains the live array
+        and VM operation; a readable address alone does not establish lifetime.
         Bounds checking is performed against the array length.
     */
     template<typename element_type>
