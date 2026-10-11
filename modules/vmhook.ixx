@@ -4402,16 +4402,14 @@ export namespace vmhook
                 effort: unreadable nodes are skipped silently.
 
                 Complexity: O(N) where N = total loaded classes.
-                Exception safety: noexcept boundary — callback exceptions
-                    are propagated as-is; iteration stops at the throw.
+                Callback exceptions propagate; iteration stops at the throw.
             */
             template<typename callback_type>
             auto for_each_klass(callback_type&& callback) const -> void
             {
-                static const bool use_klasses{
-                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_klasses") != nullptr };
-                static const bool use_cld_dictionary{
-                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_dictionary") != nullptr };
+                const auto& layout{ traversal_layout() };
+                const bool use_klasses{ layout.use_klasses };
+                const bool use_cld_dictionary{ layout.use_cld_dictionary };
 
                 auto* class_loader_data{ this->get_head() };
                 std::int32_t visited{ 0 };
@@ -4460,12 +4458,7 @@ export namespace vmhook
                 // _shared_dictionary covers CDS-archived classes.
                 if (!use_klasses)
                 {
-                    static const vmhook::hotspot::vm_struct_entry_t* const sd_main{
-                        vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_dictionary") };
-                    static const vmhook::hotspot::vm_struct_entry_t* const sd_shared{
-                        vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_shared_dictionary") };
-
-                    for (const auto* const sd_entry : { sd_main, sd_shared })
+                    for (const auto* const sd_entry : { layout.sd_main, layout.sd_shared })
                     {
                         if (!sd_entry || !sd_entry->address) { continue; }
                         auto* const dict{ *reinterpret_cast<vmhook::hotspot::dictionary**>(sd_entry->address) };
@@ -4474,6 +4467,28 @@ export namespace vmhook
                     }
                 }
             }
+
+        private:
+            struct traversal_metadata final
+            {
+                bool use_klasses{}, use_cld_dictionary{};
+                const vmhook::hotspot::vm_struct_entry_t* sd_main{};
+                const vmhook::hotspot::vm_struct_entry_t* sd_shared{};
+            };
+
+            // One metadata owner for every callback instantiation. Keeping the
+            // dynamic cache out of exported templates also avoids duplicate
+            // local-static symbols in GNU Windows module consumers.
+            static auto traversal_layout() -> const traversal_metadata&
+            {
+                static const traversal_metadata value{
+                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_klasses") != nullptr,
+                    vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_dictionary") != nullptr,
+                    vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_dictionary"),
+                    vmhook::hotspot::iterate_struct_entries("SystemDictionary", "_shared_dictionary") };
+                return value;
+            }
+
         };
 
         /*
@@ -27509,6 +27524,10 @@ export namespace vmhook::detail
 // VMHOOK_PERSISTENT_ROOTS_END
 
 // VMHOOK_RUNTIME_DIAGNOSTICS_BEGIN
+export namespace vmhook::detail
+{
+    inline auto verified_heap_iteration_available() noexcept -> bool;
+}
 export namespace vmhook
 {
     enum class feature_state : std::uint8_t { unavailable, conditional, supported };
@@ -27614,8 +27633,9 @@ export namespace vmhook
         }
         set(runtime_feature::original_method_exit_events, feature_state::unavailable,
             "Entry callbacks and forced returns do not observe an original method exit");
-        set(runtime_feature::exact_heap_iteration, feature_state::unavailable,
-            "Conservative instance scans are not an exact safepoint heap walk");
+        set(runtime_feature::exact_heap_iteration,
+            detail::verified_heap_iteration_available() ? feature_state::conditional : feature_state::unavailable,
+            "Verified G1/Parallel VM heap walk; requires a standalone native context and bounded rooted snapshot");
         set(runtime_feature::mixed_stack_sampling, feature_state::unavailable,
             "No verified Windows mixed-stack sampling backend");
         set(runtime_feature::virtual_thread_hooks, feature_state::unavailable,
@@ -28006,5 +28026,10 @@ export namespace vmhook
         { std::invoke(visit, vmhook::detail::materialize_object<vmhook::any_object>(0, root)); }
         return count;
     }
+}
+export namespace vmhook::detail
+{
+    inline auto verified_heap_iteration_available() noexcept -> bool
+    { return heap_iteration::config().ready; }
 }
 // VMHOOK_HEAP_ITERATION_END

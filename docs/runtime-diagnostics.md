@@ -39,6 +39,8 @@ instance reference still needs its live owning context, and a hook still needs
 its signature, root and JIT preparation.
 
 An entry callback or forced return is not an event for an original method's
-exit. Conservative instance scans do not constitute exact heap iteration.
-The report keeps these distinctions explicit, along with unverified mixed-stack
-sampling and virtual-thread transitions.
+exit. The instance snapshot backend uses the verified G1/Parallel object iterator at
+a VM safepoint and roots selected objects before Java resumes. Its capability
+still requires a standalone native context and successful snapshot preparation.
+The report keeps unverified mixed-stack sampling and virtual-thread transitions
+explicit.
