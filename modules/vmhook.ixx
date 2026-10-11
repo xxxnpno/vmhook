@@ -19813,7 +19813,10 @@ export namespace vmhook
 
             const auto loader_of = [](vmhook::hotspot::klass* const klass) -> void*
             {
-                const auto* const data_entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_class_loader_data") };
+                const auto* data_entry{ vmhook::hotspot::iterate_struct_entries("Klass", "_class_loader_data") };
+                // Java 8/9 export this inherited Klass field under InstanceKlass.
+                if (!data_entry)
+                { data_entry = vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_class_loader_data"); }
                 const auto* const loader_entry{ vmhook::hotspot::iterate_struct_entries("ClassLoaderData", "_class_loader") };
                 void* data{};
                 void* loader{};
