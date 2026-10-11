@@ -16,9 +16,14 @@ import platform
 from pathlib import Path
 import queue
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+# Use the same committed-record reader as the owned-JVM runtime fixtures.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests" / "runtime"))
+from runtime_evidence import read_results
 
 
 EXAMPLES = ("native_worker", "wrappers_collections", "method_hook", "field_class_observer")
@@ -115,8 +120,8 @@ def main() -> int:
                 deadline = time.monotonic() + args.timeout
                 while time.monotonic() < deadline:
                     if result.is_file():
-                        values = dict(line.split("=", 1) for line in result.read_text().splitlines() if "=" in line)
-                        if "complete" in values or "exception" in values or "fail" in values.values():
+                        values = read_results(result)
+                        if values.get("complete") == "pass" or "exception" in values or "fail" in values.values():
                             break
                     if process.poll() is not None:
                         raise RuntimeError(f"Java exited during {name}: {process.returncode}")

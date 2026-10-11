@@ -115,7 +115,7 @@ def main() -> int:
                 while not output.empty():
                     capture(output.get_nowait())
                 values = read_results(result)
-                if ('shutdown' in values or 'baseline' in values or 'native_complete' in values
+                if (any(values.get(key) == 'pass' for key in ('shutdown', 'baseline', 'native_complete'))
                     or any(value in ('fail', 'timeout', 'unsupported') for value in values.values())
                     or 'exception' in values):
                     break

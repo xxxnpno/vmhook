@@ -20,7 +20,7 @@ import time
 
 # Keep provenance consistent with the independent owned-JVM fixture runners.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests" / "runtime"))
-from runtime_evidence import runtime_evidence
+from runtime_evidence import runtime_evidence, read_results
 
 
 CHECKS = {
@@ -190,8 +190,7 @@ def report_failure(args, mode, directory, result, pid, error, process_alive=Fals
     """Keep the last native checks and the JVM's fatal report on a failed run."""
     values = {}
     if result.is_file():
-        values = dict(line.split("=", 1) for line in result.read_text(errors="replace").splitlines()
-                      if "=" in line)
+        values = read_results(result)
         for key, value in values.items():
             print(f"{mode}.{key}={value}", flush=True)
     args.evidence_report.update({"failed_mode": mode,
@@ -301,8 +300,7 @@ def execute_mode(args, mode, directory):
         while time.monotonic() < deadline:
             next_line(0.1)
             if result.exists():
-                values = dict(line.split("=", 1) for line in result.read_text().splitlines()
-                              if "=" in line)
+                values = read_results(result)
                 completed = TERMINAL_CHECK.get(mode, mode + "_complete")
                 if values.get(completed) == "pass":
                     break

@@ -28,8 +28,11 @@ def file_record(path: Path) -> dict[str, str]:
 def read_results(path: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
-    return dict(line.split('=', 1) for line in path.read_text(encoding='utf-8', errors='replace').splitlines()
-                if '=' in line)
+    # The native writer may flush a key and value separately. Only LF commits
+    # a record; read bytes so an isolated CR cannot look like a complete CRLF.
+    contents = path.read_bytes()
+    committed = contents[:contents.rfind(b'\n') + 1].decode('utf-8', errors='replace')
+    return dict(line.split('=', 1) for line in committed.splitlines() if '=' in line)
 
 
 class runtime_evidence:

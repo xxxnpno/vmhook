@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 
+from runtime_evidence import read_results
+
 REQUIRED = (
     'context', 'arity', 'constructor_arity', 'primitive_arrays', 'bulk_copy',
     'object_arrays', 'array_return', 'exact_empty_array_guard', 'exact_nested_array_guard',
@@ -85,9 +87,8 @@ def main() -> int:
                 while not lines.empty():
                     print(lines.get_nowait(), flush=True)
                 if destination.is_file():
-                    values = dict(line.split('=', 1) for line in destination.read_text().splitlines()
-                                  if '=' in line)
-                    if 'interop_complete' in values or 'exception' in values:
+                    values = read_results(destination)
+                    if values.get('interop_complete') == 'pass' or 'exception' in values or 'fail' in values.values():
                         break
                 if process.poll() is not None:
                     raise RuntimeError('Java exited during the interop probe')
