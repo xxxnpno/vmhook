@@ -65,6 +65,9 @@ CHECKS = {
                       "monitor_fault_balance", "monitor_fault_retry", "native_complete"],
     "heap_liveness": ["heap_liveness", "native_complete"],
     "heap_concurrent": ["heap_concurrent_ready", "mark_completed", "heap_concurrent", "native_complete"],
+    "special_reference": ["reference_read_refusal", "reference_write_refusal", "reference_atomic_refusal",
+                          "reference_raw_refusal", "reference_hook_refusal", "ordinary_referent",
+                          "reference_java_api", "native_complete"],
     "method_exit": ["context", "registration", "observers", "original_results_and_monitors",
                     "all_primitive_bits", "reference_kind_only", "empty_void_original",
                     "exception_has_no_normal_exit", "resident_stubs", "composition",
@@ -102,6 +105,7 @@ FIXTURES = {
     "monitor_fault": "NativeFixture",
     "heap_liveness": "NativeFixture",
     "heap_concurrent": "HeapConcurrentFixture",
+    "special_reference": "SpecialReferenceFixture",
     "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
@@ -120,6 +124,7 @@ OPTIONAL_PROBES = {
     "monitor_fault": "monitor_fault_probe",
     "heap_liveness": "heap_liveness_probe",
     "heap_concurrent": "heap_concurrent_probe",
+    "special_reference": "special_reference_probe",
     "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
@@ -138,6 +143,7 @@ TERMINAL_CHECK = {
     "monitor_fault": "native_complete",
     "heap_liveness": "native_complete",
     "heap_concurrent": "native_complete",
+    "special_reference": "native_complete",
     "method_exit": "method_exit_proof",
 }
 
