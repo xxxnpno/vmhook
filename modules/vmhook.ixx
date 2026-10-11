@@ -39,6 +39,7 @@ export namespace vmhook::detail
     inline auto prepare_hook_roots() noexcept -> bool;
     inline auto prepare_hook_roots_checked() -> bool;
     inline auto prepare_callback_return_roots() noexcept -> bool;
+    inline auto with_hook_metadata_state(void (*)(void*) noexcept, void*) -> bool;
     inline auto mark_callback_return_root(void*, vmhook::hotspot::method*) noexcept -> bool;
     inline auto callback_return_marker_resources() noexcept -> std::pair<std::size_t, std::size_t>;
     inline auto flush_hook_roots() noexcept -> void;
@@ -996,6 +997,8 @@ export namespace vmhook
             std::shared_ptr<class_binding> binding{};
         };
         struct callback_class_binding_scope;
+        template<class wrapper_type>
+        inline auto capture_field_wrapper_bindings(std::vector<callback_class_binding>&) -> void;
         thread_local const callback_class_binding_scope* active_callback_class_bindings{};
         struct callback_class_binding_scope final
         {
@@ -9203,12 +9206,31 @@ export namespace vmhook
                 std::uint16_t access_flags{};
                 bool duplicate{};
                 std::exception_ptr allocation_failure{};
+                std::vector<vmhook::detail::callback_class_binding> callback_bindings{};
+                std::array<std::int32_t, std::tuple_size_v<method_arg_tuple_t>> argument_slots{};
+                std::string owner_name{};
+                bool arguments_valid{};
             } lookup{ &registered_name, method_name, method_signature };
-            const bool looked_up{ vmhook::detail::jit_backend::with_vm_state_checked([](void* const opaque) noexcept
+            const bool looked_up{ vmhook::detail::with_hook_metadata_state([](void* const opaque) noexcept
             {
                 auto& request{ *static_cast<metadata_lookup*>(opaque) };
                 try
                 {
+                    vmhook::detail::capture_field_wrapper_bindings<wrapper_type>(request.callback_bindings);
+                    [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
+                    {
+                        (([&]
+                        {
+                            using argument_type = std::remove_cvref_t<std::tuple_element_t<indexes, method_arg_tuple_t>>;
+                            if constexpr (vmhook::detail::is_unique_ptr_v<argument_type>)
+                            {
+                                using value_wrapper = typename vmhook::detail::is_unique_ptr<argument_type>::value_type_t;
+                                vmhook::detail::capture_field_wrapper_bindings<value_wrapper>(request.callback_bindings);
+                            }
+                        }()), ...);
+                    }(std::make_index_sequence<std::tuple_size_v<method_arg_tuple_t>>{});
+                    const vmhook::detail::callback_class_binding_scope bindings{request.callback_bindings};
+                    request.owner_name = vmhook::detail::registered_class_name<wrapper_type>();
                     auto* const klass{ vmhook::detail::registered_class_klass<wrapper_type>() };
                     vmhook::hotspot::method** methods{}; std::int32_t count{};
                     if (!klass || !vmhook::detail::jit_backend::holder_linked(klass)
@@ -9228,6 +9250,30 @@ export namespace vmhook
                         || (request.access_flags & (0x0100u | 0x0400u)) != 0) { request.method = nullptr; return; }
                     request.pin = vmhook::detail::retain_hook_klass_checked(klass);
                     if (!request.pin) { request.method = nullptr; }
+                    if (!request.method) { return; }
+                    const auto signature{request.method->get_signature()};
+                    const std::string receiver_descriptor{"L" + request.owner_name + ";"};
+                    auto* const declaring{vmhook::detail::callback_declaring_class(request.method)};
+                    request.arguments_valid = [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
+                    {
+                        return (([&]
+                        {
+                            using argument_type = std::remove_cvref_t<std::tuple_element_t<indexes, method_arg_tuple_t>>;
+                            const auto argument{vmhook::detail::interpreter_argument_layout(signature,
+                                (request.access_flags & 0x0008u) != 0, static_cast<std::int32_t>(indexes), true)};
+                            if (!argument || !vmhook::detail::interpreter_argument_type_matches<argument_type>(argument->descriptor))
+                            { return false; }
+                            if constexpr (vmhook::detail::is_unique_ptr_v<argument_type>)
+                            {
+                                using value_wrapper = typename vmhook::detail::is_unique_ptr<argument_type>::value_type_t;
+                                if (!vmhook::detail::wrapper_descriptor_assignable<value_wrapper>(
+                                    argument->receiver ? std::string_view{receiver_descriptor} : argument->descriptor,
+                                    declaring, true)) { return false; }
+                            }
+                            request.argument_slots[indexes] = argument->slot;
+                            return true;
+                        }()) && ...);
+                    }(std::make_index_sequence<std::tuple_size_v<method_arg_tuple_t>>{});
                 }
                 catch (const std::bad_alloc&) { request.method = nullptr; request.allocation_failure = std::current_exception(); }
                 catch (...) { request.method = nullptr; }
@@ -9237,31 +9283,19 @@ export namespace vmhook
             if (!looked_up || !lookup.method || !lookup.pin)
             { throw vmhook::exception{ "Java method is unavailable or unsupported; native, abstract and constructor hooks are refused." }; }
             auto* const found_method{ lookup.method };
-            const auto access_flags{ lookup.access_flags };
             void* const i2i{ vmhook::detail::jit_backend::hook_interpreter_entry(found_method) };
             if (!i2i) { throw vmhook::exception{ "Java interpreter entry is unavailable." }; }
 
-            const auto signature{ found_method->get_signature() };
-            std::array<std::int32_t, std::tuple_size_v<method_arg_tuple_t>> argument_slots{};
-            const bool arguments_valid{ [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
-            {
-                return (([&]
-                {
-                    const auto argument{ vmhook::detail::interpreter_argument_layout(
-                        signature, (access_flags & 0x0008u) != 0, static_cast<std::int32_t>(indexes), true) };
-                    if (!argument || !vmhook::detail::interpreter_argument_type_matches<
-                        std::tuple_element_t<indexes, method_arg_tuple_t>>(argument->descriptor)) { return false; }
-                    argument_slots[indexes] = argument->slot;
-                    return true;
-                }()) && ...);
-            }(std::make_index_sequence<std::tuple_size_v<method_arg_tuple_t>>{}) };
-            if (!arguments_valid)
-            { throw vmhook::exception{ "Hook callback arguments do not match the Java descriptor and receiver." }; }
+            const auto argument_slots{lookup.argument_slots};
+            if (!lookup.arguments_valid)
+            { throw vmhook::exception{ "Hook callback arguments do not match the exact declared Java Classes and receiver." }; }
 
-            auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour), argument_slots]
+            auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour), argument_slots,
+                callback_bindings = std::move(lookup.callback_bindings)]
                 (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*,
                  vmhook::hotspot::return_slot* const slot) mutable
             {
+                const vmhook::detail::callback_class_binding_scope bindings{callback_bindings};
                 vmhook::return_value retval{ slot, frame_pointer };
                 [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
                 {
@@ -9280,7 +9314,7 @@ export namespace vmhook
             method_entry.interpreter_entry = i2i;
             method_entry.detour = std::make_shared<vmhook::hotspot::hook_callback_t>(std::move(wrapper_detour));
             method_entry.metadata_pin = std::move(lookup.pin);
-            method_entry.expected_class_name = registered_name;
+            method_entry.expected_class_name = std::move(lookup.owner_name);
             method_entry.expected_method_name = std::string{ method_name };
             method_entry.expected_signature = found_method->get_signature();
 
@@ -13179,6 +13213,22 @@ export namespace vmhook
 }
 
 // VMHOOK_NATIVE_FACADE_END
+
+export namespace vmhook::detail
+{
+    inline auto with_hook_metadata_state(void (*const callback)(void*) noexcept, void* const opaque) -> bool
+    {
+        // Declared-Class admission may call Java's defining loader. Create the
+        // rooted owner before entering VM state, including for a raw DLL thread.
+        std::unique_ptr<vmhook::native_thread_context> installer{};
+        if (!native_backend::active())
+        {
+            installer = std::make_unique<vmhook::native_thread_context>("VMHook-method-install");
+            if (!installer->valid()) { return false; }
+        }
+        return jit_backend::with_vm_state_checked(callback, opaque);
+    }
+}
 
 // VMHOOK_BORROWED_CALLBACK_BEGIN
 export namespace vmhook::detail::callback_backend
@@ -28510,9 +28560,9 @@ export namespace vmhook::detail
             if (original)
             {
                 auto* const identity{registered_class_klass(type, original)};
-                if (!identity) { throw vmhook::exception{"Field hook wrapper's exact class is unavailable"}; }
+                if (!identity) { throw vmhook::exception{"Hook wrapper's exact class is unavailable"}; }
                 auto mirror{retain_hook_klass_checked(identity)};
-                if (!mirror) { throw vmhook::exception{"Field hook wrapper Class could not be retained"}; }
+                if (!mirror) { throw vmhook::exception{"Hook wrapper Class could not be retained"}; }
                 captured = std::make_shared<class_binding>(*original);
                 captured->identity = identity;
                 captured->mirror = std::move(mirror);

@@ -31,6 +31,22 @@ counted. Argument writes already made by that callback are not rolled back.
 These callbacks observe method **entry**. `return_value::set()` chooses an early
 return; it does not report the original body's result or its duration.
 
+An installation retains the exact declaring class and the wrapper bindings used
+by its callback arguments, including the leaf wrappers of nested Java arrays.
+Re-registering those C++ wrapper types affects future installations; an existing
+callback keeps its captured classes for argument wrapping and construction.
+Nested callbacks select their own captured bindings, then restore the outer
+callback's bindings before it resumes. Native code outside callbacks uses the
+current registrations.
+
+Typed owning arguments are admitted only when they can represent the declared
+Java parameter or receiver in its defining loader. Identical class names from
+different loaders do not qualify. A wrapper for a verified superclass can accept
+a declared subclass; the reverse direction is refused because other values of
+the declared superclass would fail materialization. `any_object` retains its
+opaque reference behavior. Java null still produces an allocated C++ wrapper
+whose `get_instance()` is null.
+
 `control.throw_exception(throwable)` forwards an allocated, rooted
 `std::unique_ptr<vmhook::any_object>` containing a non-null Java `Throwable`.
 It skips the original body and uses the genuine interpreter exception
