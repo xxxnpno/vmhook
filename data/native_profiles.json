@@ -751,6 +751,19 @@
     ],
     "heap_iterate_parallel": [
       "?object_iterate@ParallelScavengeHeap@@UEAAXPEAVObjectClosure@@@Z"
+    ],
+    "monitor_lock_construct": [
+      "??0ObjectLocker@@QEAA@VHandle@@PEAVJavaThread@@@Z",
+      "??0ObjectLocker@@QEAA@VHandle@@PEAVThread@@@Z"
+    ],
+    "monitor_lock_construct_bool": [
+      "??0ObjectLocker@@QEAA@VHandle@@PEAVThread@@_N@Z"
+    ],
+    "monitor_lock_destroy": [
+      "??1ObjectLocker@@QEAA@XZ"
+    ],
+    "interpreter_remove_activation": [
+      "?_remove_activation_entry@TemplateInterpreter@@1PEAEEA"
     ]
   },
   "profile_types": [
@@ -847,7 +860,8 @@
     "InstanceKlass::<unnamed-enum-_misc_rewritten>",
     "frame",
     "OopClosure",
-    "ObjectClosure"
+    "ObjectClosure",
+    "ObjectLocker"
   ],
   "required_fields": {
     "JavaThread": [
@@ -869,7 +883,8 @@
       "_suspend_flags",
       "_special_runtime_exit_condition",
       "_vm_result",
-      "_vm_result_oop"
+      "_vm_result_oop",
+      "_vthread"
     ],
     "Thread": [
       "_active_handles",
@@ -1070,6 +1085,11 @@
       "_pc",
       "_fp",
       "_on_heap"
+    ],
+    "ObjectLocker": [
+      "_thread",
+      "_obj",
+      "_lock"
     ]
   },
   "required_enums": {
@@ -1261,7 +1281,8 @@
       "storage_size__stack_size",
       "storage_size__threadObj",
       "storage_size__thread_state",
-      "storage_size__tlab"
+      "storage_size__tlab",
+      "storage_size__vthread"
     ],
     "SafepointMechanism::ThreadData": [
       "storage_size__polling_word"
@@ -1508,6 +1529,11 @@
     "ObjectClosure": [
       "vtable_count",
       "vtable_do_object"
+    ],
+    "ObjectLocker": [
+      "storage_size__thread",
+      "storage_size__obj",
+      "storage_size__lock"
     ]
   },
   "alias_kinds": {
@@ -1556,7 +1582,8 @@
     "interpreter_throw_exception": "data",
     "bytecode_lengths": "data",
     "class_loader_data_head": "data",
-    "interpreter_entry_table": "data"
+    "interpreter_entry_table": "data",
+    "interpreter_remove_activation": "data"
   },
   "derived_profile_facts": {
     "ObservationABI": {
@@ -1643,6 +1670,10 @@
       "element_size": 8,
       "length_enum": "AbstractInterpreter::MethodKind::number_of_method_entries",
       "value": "inline normal/synchronized/intrinsic entry address array"
+    },
+    "interpreter_remove_activation": {
+      "storage_size": 8,
+      "value": "address interpreter activation removal codelet"
     }
   }
 }
