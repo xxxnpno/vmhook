@@ -57,6 +57,9 @@ CHECKS = {
                  "released_resource", "proxy_binding_lifetime", "loader_heap_snapshot", "rebound_heap_snapshot", "root_accounting", "builtin_identity", "builtin_heap", "unregister", "lifetime_complete"],
     "class_inventory": ["metadata", "native_attach", "inventory_bounds", "duplicate_loaders",
                         "rooted_mirrors", "inventory_context", "inventory_complete"],
+    "runtime_init": ["fresh_runtime", "fault_consumed", "passive_preflight",
+                     "native_context_result", "registration_result", "observer_result",
+                     "failure_cleanup", "runtime_init_complete"],
     "method_exit": ["context", "registration", "observers", "original_results_and_monitors",
                     "all_primitive_bits", "reference_kind_only", "empty_void_original",
                     "exception_has_no_normal_exit", "resident_stubs", "composition",
@@ -88,6 +91,7 @@ FIXTURES = {
     "hook_composition": "HookCompositionFixture",
     "lifetime": "LifetimeFixture",
     "class_inventory": "LifetimeFixture",
+    "runtime_init": "ExecutorFixture",
     "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
@@ -102,6 +106,7 @@ OPTIONAL_PROBES = {
     "hook_composition": "composition_probe",
     "lifetime": "lifetime_probe",
     "class_inventory": "class_inventory_probe",
+    "runtime_init": "runtime_init_probe",
     "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
@@ -116,6 +121,7 @@ TERMINAL_CHECK = {
     "hook_composition": "hook_composition_proof",
     "event_stream": "event_stream_proof",
     "class_inventory": "inventory_complete",
+    "runtime_init": "runtime_init_complete",
     "method_exit": "method_exit_proof",
 }
 
@@ -135,6 +141,7 @@ def report_failure(args, mode, directory, result, pid, error, process_alive=Fals
     if args.evidence:
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
         args.evidence.write_text(json.dumps({"native_windows": os.name == "nt",
+                                            "runtime_init_fault": args.runtime_init_fault,
                                             "java": str(args.java), "failed_mode": mode,
                                             "passed": False, "error": str(error),
                                             "partial_checks": values}, indent=2) + "\n")
@@ -182,6 +189,7 @@ def execute_mode(args, mode, directory):
                        VMHOOK_HOOK_COMPOSITION_REPORT=windows_path(result),
                        VMHOOK_EVENT_STREAM_REPORT=windows_path(result),
                        VMHOOK_TEST_RESULT=windows_path(result),
+                       VMHOOK_RUNTIME_INIT_FAULT=args.runtime_init_fault,
                        VMHOOK_MANAGEMENT_REPORT=windows_path(result),
                        VMHOOK_CALLBACK_THROW_REPORT=windows_path(result),
                        VMHOOK_METHOD_EXIT_REPORT=windows_path(result),
@@ -259,6 +267,7 @@ def execute_mode(args, mode, directory):
         if failed:
             raise RuntimeError("failed " + mode + " checks: " + ", ".join(sorted(set(failed))))
         return {"mode": mode, "checks": values, "java_output": captured,
+                "runtime_init_fault": args.runtime_init_fault if mode == "runtime_init" else None,
                 "seconds": round(time.monotonic() - started, 3)}
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         if process.poll() is not None:
@@ -312,6 +321,9 @@ def main():
     parser.add_argument("--emulator", type=Path)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--evidence", type=Path)
+    parser.add_argument("--runtime-init-fault", default="path",
+                        choices=["path", "profile", "diagnostic", "persistent_path", "unsupported", "builtin"],
+                        help="select the fresh-runtime fault case; runtime_init mode only")
     args = parser.parse_args()
     if os.name != "nt" and not args.emulator:
         parser.error("native Windows is required unless --emulator is specified")
