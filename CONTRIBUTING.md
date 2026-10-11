@@ -124,3 +124,19 @@ Describe the concrete behavior that changes and include the checks actually
 run. State live JVM limitations precisely. Avoid benchmark figures without a
 reproducible workload, toolchain, and environment. Use the private reporting
 process in [SECURITY.md](SECURITY.md) for memory safety vulnerabilities.
+
+
+## Distribution changes
+
+Keep package versions aligned with `version_string` in the canonical module.
+CMake reads that version directly; `vcpkg.json` is checked by the source-package
+tool. Verify installation from an independent copied project using
+`tools/verify_installed_package.py` for both interfaces. Module CMIs are rebuilt
+for each consumer compiler/options/configuration; do not publish them as
+portable release assets. See [packaging](docs/packaging.md).
+
+The compiled [standalone examples](examples/README.md) keep the first payload
+small. Add meaningful live checks when an example promises new behavior.
+Benchmark claims need the actual workload and execution metadata described in
+[benchmarks](docs/benchmarks.md). Preserve the existing license unless the
+copyright holder explicitly chooses new terms.

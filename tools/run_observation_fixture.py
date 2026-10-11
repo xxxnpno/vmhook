@@ -34,6 +34,24 @@ CHECKS = {
                 "class_failed_definition", "class_callback_state", "class_removal",
                 "class_persistent", "class_shutdown", "classes_complete"],
     "callbacks": ["callback_proof"],
+    "management": ["passive_preflight", "exact_runtime_identity", "preflight_no_attachment",
+                   "memory_observation", "runtime_counters", "real_gc_counters", "java_thread_identity",
+                   "compiled_java_stack", "zero_depth", "bounded_snapshot", "context_closed",
+                   "copied_observations_survive_close", "management_complete"],
+    "lifetime": ["metadata", "native_attach", "ambiguous_name", "loader_binding", "constructor_identity",
+                 "null_contract", "context_loader", "source_closed", "cross_context_gc",
+                 "released_resource", "unregister", "lifetime_complete"],
+    "event_stream": ["context", "queued_observer", "deferred_registration", "initial_wait",
+                     "copied_class_record", "deferred_native_install", "deferred_callback",
+                     "deferred_removal", "deferred_original_body", "deferred_reclamation",
+                     "throwable_observer", "exact_stack_trace_semantics", "throwable_removal",
+                     "class_removal", "class_capture_reclamation", "event_stream_proof"],
+    "hook_composition": ["context", "three_observers", "shared_policy", "priority_and_first_return",
+                         "remove_one", "remaining_original_body", "remove_remaining", "original_body",
+                         "recursive_observer", "suppressed_reentry", "same_thread_suppression",
+                         "remove_recursive", "callback_side_removal", "native_reclamation",
+                         "disabled_resources", "shutdown_original_body", "shutdown_resources",
+                         "hook_composition_proof"],
 }
 
 FIXTURES = {
@@ -41,6 +59,24 @@ FIXTURES = {
     "fields": "ObservationFieldFixture",
     "classes": "ObservationClassFixture",
     "callbacks": "ObservationCallbackFixture",
+    "hook_composition": "HookCompositionFixture",
+    "lifetime": "LifetimeFixture",
+    "event_stream": "EventStreamFixture",
+    "management": "ManagementFixture",
+}
+
+
+OPTIONAL_PROBES = {
+    "callbacks": "callback_probe",
+    "hook_composition": "composition_probe",
+    "lifetime": "lifetime_probe",
+    "event_stream": "event_stream_probe",
+    "management": "management_probe",
+}
+TERMINAL_CHECK = {
+    "callbacks": "callback_proof",
+    "hook_composition": "hook_composition_proof",
+    "event_stream": "event_stream_proof",
 }
 
 
@@ -102,7 +138,11 @@ def execute_mode(args, mode, directory):
     prefix = [str(args.emulator)] if args.emulator else []
     environment = dict(os.environ, VMHOOK_OBSERVATION_RESULT=windows_path(result),
                        VMHOOK_OBSERVATION_CONTROL=windows_path(control),
-                       VMHOOK_OBSERVATION_MODE=mode, VMHOOK_CALLBACK_RESULT=windows_path(result))
+                       VMHOOK_OBSERVATION_MODE=mode, VMHOOK_CALLBACK_RESULT=windows_path(result),
+                       VMHOOK_HOOK_COMPOSITION_REPORT=windows_path(result),
+                       VMHOOK_EVENT_STREAM_REPORT=windows_path(result),
+                       VMHOOK_TEST_RESULT=windows_path(result),
+                       VMHOOK_MANAGEMENT_REPORT=windows_path(result))
     command = prefix + [str(args.java), "-cp", windows_path(directory), FIXTURES[mode]]
     process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
@@ -145,7 +185,7 @@ def execute_mode(args, mode, directory):
             raise RuntimeError("Java fixture did not become ready")
         if not pid or not pid.isdecimal():
             raise RuntimeError("Java fixture did not publish its Windows process ID")
-        probe = args.callback_probe if mode == "callbacks" else args.probe
+        probe = getattr(args, OPTIONAL_PROBES.get(mode, "probe"))
         subprocess.run(prefix + [str(args.injector.resolve()), pid, windows_path(probe)],
                        check=True, timeout=30)
         values = {}
@@ -155,7 +195,7 @@ def execute_mode(args, mode, directory):
             if result.exists():
                 values = dict(line.split("=", 1) for line in result.read_text().splitlines()
                               if "=" in line)
-                completed = "callback_proof" if mode == "callbacks" else mode + "_complete"
+                completed = TERMINAL_CHECK.get(mode, mode + "_complete")
                 if values.get(completed) == "pass":
                     break
                 if "exception" in values or any(value in ("fail", "timeout", "unsupported")
@@ -204,8 +244,9 @@ def main():
     parser.add_argument("--javac", type=Path, default=Path("javac"))
     parser.add_argument("--injector", type=Path, required=True)
     parser.add_argument("--probe", type=Path, required=True)
-    parser.add_argument("--callback-probe", type=Path,
-                        help="also verify rooted, nested method callbacks during moving GC")
+    for mode, attribute in OPTIONAL_PROBES.items():
+        parser.add_argument("--" + attribute.replace("_", "-"), type=Path,
+                            help="also verify the " + mode.replace("_", " ") + " fixture")
     parser.add_argument("--mode", choices=["all", *FIXTURES], default="all")
     parser.add_argument("--emulator", type=Path)
     parser.add_argument("--timeout", type=int, default=180)
@@ -215,15 +256,18 @@ def main():
         parser.error("native Windows is required unless --emulator is specified")
     if not args.probe.is_file() or not args.injector.is_file():
         parser.error("the built probe and injector must exist")
-    if args.callback_probe and not args.callback_probe.is_file():
-        parser.error("the callback probe must exist")
-    if args.mode == "callbacks" and not args.callback_probe:
-        parser.error("--mode callbacks requires --callback-probe")
     digests = {str(args.probe.resolve()): checksum(args.probe)}
-    if args.callback_probe:
-        digests[str(args.callback_probe.resolve())] = checksum(args.callback_probe)
+    for mode, attribute in OPTIONAL_PROBES.items():
+        probe = getattr(args, attribute)
+        if probe:
+            if not probe.is_file():
+                parser.error("the " + mode + " probe must exist")
+            digests[str(probe.resolve())] = checksum(probe)
+        elif args.mode == mode:
+            parser.error("--mode " + mode + " requires --" + attribute.replace("_", "-"))
     prefix = [str(args.emulator)] if args.emulator else []
-    modes = [mode for mode in FIXTURES if mode != "callbacks" or args.callback_probe] if args.mode == "all" else [args.mode]
+    modes = [mode for mode in FIXTURES if mode not in OPTIONAL_PROBES
+             or getattr(args, OPTIONAL_PROBES[mode])] if args.mode == "all" else [args.mode]
     source = Path(__file__).resolve().parents[1] / "tests" / "runtime"
     results = []
     with tempfile.TemporaryDirectory(prefix="vmhook-observation-") as temporary:

@@ -477,6 +477,18 @@ add_subdirectory(vmhook)
 target_link_libraries(payload PRIVATE vmhook::vmhook)
 ```
 
+An installed package also supports independent consumers:
+
+```cmake
+find_package(vmhook CONFIG REQUIRED COMPONENTS header)
+target_link_libraries(payload PRIVATE vmhook::vmhook)
+```
+
+Use `COMPONENTS module` and `vmhook::module` for the installed module. Its
+sources are compiled in the consuming project with that project's compiler
+and common options. See [installation and source packages](docs/packaging.md)
+for both interfaces and their independent consumer checks.
+
 For the module, use CMake 4.0+, Python 3.10+ and a Windows G++ toolchain providing
 `import std`, C++26 reflection and named modules. Ninja is recommended:
 
@@ -514,7 +526,8 @@ flags of your application; compiled module caches are not portable releases.
 
 For affected GCC 16 Windows builds, the tool creates a standard-library header
 overlay **inside the build directory** so `import std` links correctly with
-`std::filesystem` and `std::future`. It preserves the libstdc++ ABI symbol and
+`std::filesystem`, `std::future` and GNU 16 constexpr exception copy/move
+constructors in unoptimized static builds. It preserves libstdc++ ABI linkage and
 leaves installed compiler and SDK headers untouched. CMake supplies the overlay
 include path automatically; manual consumers should use the flags printed by
 the tool.
@@ -567,3 +580,18 @@ tested collectors, not every vendor/collector combination. See
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for validation expectations and
 [CHANGELOG.md](CHANGELOG.md) for migration notes.
+
+
+## Working examples and measurements
+
+The [standalone DLL examples](examples/README.md) demonstrate a native worker,
+wrappers and collections, a method hook, and static field/class observers.
+They compile against an installation and run in an ordinary Java fixture.
+The [runtime benchmark guide](docs/benchmarks.md) explains executable workloads,
+p50/p99 observations and their limits.
+
+## License
+
+VMHook uses [PolyForm Noncommercial 1.0.0](LICENSE.txt). Read its permitted
+purposes and full terms before distribution or use; it does not grant general
+commercial use. The same license is included in installed/source packages.

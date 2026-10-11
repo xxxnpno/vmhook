@@ -8,6 +8,16 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Installed `find_package(vmhook COMPONENTS module)` support rebuilds module
+  sources with the consumer's compiler, configuration and common options.
+  Independent two-translation-unit consumers verify both installed interfaces.
+- Four standalone DLL examples cover native workers, wrappers/collections,
+  method hooks and field/class observation; CI runs them against ordinary JVMs.
+- An executable native-thread benchmark workload records p50/p99 timings with
+  artifact/JVM identity, without fixed performance promises.
+- Deterministic tracked-source ZIP packaging includes source hashes, Git identity,
+  generated-header/version checks and the existing PolyForm Noncommercial license.
+
 - `vmhook::native_thread_context` registers a DLL-created Windows OS thread with
   HotSpot through private VM operations. Java methods and constructors execute
   synchronously on that same OS thread, without JNI/JVMTI, a Java hook or a

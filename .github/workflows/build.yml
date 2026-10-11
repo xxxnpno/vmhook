@@ -61,6 +61,10 @@ jobs:
           -DVMHOOK_BUILD_MODULE=${{ matrix.module }}
           -DBUILD_TESTING=ON
           -DVMHOOK_BUILD_RUNTIME_TESTS=ON
+          -DVMHOOK_BUILD_EXAMPLES=ON
+          -DVMHOOK_EXAMPLES_MODULE=${{ matrix.module }}
+          -DVMHOOK_BUILD_BENCHMARKS=ON
+          -DVMHOOK_BENCHMARK_MODULE=${{ matrix.module }}
           -DVMHOOK_WARNINGS_AS_ERRORS=ON
       - name: Build
         run: cmake --build build --parallel
@@ -68,12 +72,45 @@ jobs:
         run: ctest --test-dir build --output-on-failure
       - name: Install package
         run: cmake --install build --prefix build/install
+      - name: Verify an independent installed package consumer
+        shell: pwsh
+        run: >-
+          python tools/verify_installed_package.py
+          --prefix build/install
+          --work-dir "$env:RUNNER_TEMP/vmhook-consumer-${{ matrix.toolchain }}-release"
+          --compiler "$env:GXX"
+          ${{ matrix.module == 'ON' && '--module' || '' }}
+      - name: Rebuild installed modules with another configuration and option
+        if: ${{ matrix.module == 'ON' }}
+        shell: pwsh
+        run: >-
+          python tools/verify_installed_package.py
+          --prefix build/install
+          --work-dir "$env:RUNNER_TEMP/vmhook-consumer-module-debug"
+          --compiler "$env:GXX"
+          --module --config Debug --flag=-DVMHOOK_INSTALLED_CONSUMER_VARIANT=1
+      - name: Stage the DLLs and injector without checkout paths
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/runtime-binaries | Out-Null
+          Copy-Item build/tests/vmhook*_probe.dll build/runtime-binaries
+          Copy-Item build/tests/vmhook_test_injector.exe build/runtime-binaries
+          Copy-Item build/examples/vmhook_example_*.dll build/runtime-binaries
+          Copy-Item build/benchmarks/vmhook_benchmark.dll build/runtime-binaries
       - uses: actions/upload-artifact@v4
         with:
           name: runtime-binaries-${{ matrix.toolchain }}
-          path: |
-            build/tests/vmhook*_probe.dll
-            build/tests/vmhook_test_injector.exe
+          path: build/runtime-binaries/*
+          retention-days: 7
+      - name: Package the exact source revision
+        if: ${{ matrix.toolchain == 'header' }}
+        shell: pwsh
+        run: python tools/package_source.py --output "$env:RUNNER_TEMP/vmhook-source"
+      - uses: actions/upload-artifact@v4
+        if: ${{ matrix.toolchain == 'header' }}
+        with:
+          name: source-package
+          path: ${{ runner.temp }}/vmhook-source/*
           retention-days: 7
 
   runtime:
@@ -148,10 +185,20 @@ jobs:
             probe: vmhook_native_probe.dll
             observation_probe: vmhook_observation_probe.dll
             callback_probe: vmhook_callback_probe.dll
+            composition_probe: vmhook_hook_composition_probe.dll
+            interop_probe: vmhook_interop_probe.dll
+            lifetime_probe: vmhook_lifetime_probe.dll
+            event_stream_probe: vmhook_event_stream_probe.dll
+            management_probe: vmhook_management_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
             observation_probe: vmhook_module_observation_probe.dll
             callback_probe: vmhook_module_callback_probe.dll
+            composition_probe: vmhook_module_hook_composition_probe.dll
+            interop_probe: vmhook_module_interop_probe.dll
+            lifetime_probe: vmhook_module_lifetime_probe.dll
+            event_stream_probe: vmhook_module_event_stream_probe.dll
+            management_probe: vmhook_module_management_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -178,6 +225,15 @@ jobs:
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.probe }}
           --native-threads
+      - name: Verify arrays, broad signatures and container mutation
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
+        shell: pwsh
+        run: >-
+          python tests/runtime/run_interop.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.interop_probe }}
       - name: Verify method hooks, field stubs, class notifications and rooted callbacks
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
@@ -188,6 +244,10 @@ jobs:
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.observation_probe }}
           --callback-probe runtime-binaries/${{ matrix.callback_probe }}
+          --composition-probe runtime-binaries/${{ matrix.composition_probe }}
+          --lifetime-probe runtime-binaries/${{ matrix.lifetime_probe }}
+          --event-stream-probe runtime-binaries/${{ matrix.event_stream_probe }}
+          --management-probe runtime-binaries/${{ matrix.management_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Repeat rooted callback transitions on legacy JVMs
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[8,9,10,11,15,16]'), matrix.java) }}
@@ -205,6 +265,28 @@ jobs:
               --evidence callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-$iteration.json
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+      - name: Run the standalone examples on an ordinary JVM
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[8,21,27]'), matrix.java) }}
+        shell: pwsh
+        run: >-
+          python tools/run_examples.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --binaries runtime-binaries
+          --evidence examples-${{ matrix.java }}-${{ matrix.toolchain }}.json
+      - name: Capture reproducible runtime benchmark observations
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && matrix.java == 21 }}
+        shell: pwsh
+        run: >-
+          python tools/run_examples.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --binaries runtime-binaries
+          --benchmark runtime-binaries/vmhook_benchmark.dll
+          --iterations 1000
+          --evidence benchmark-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -212,6 +294,8 @@ jobs:
           path: |
             observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
             callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-*.json
+            examples-${{ matrix.java }}-${{ matrix.toolchain }}.json
+            benchmark-${{ matrix.java }}-${{ matrix.toolchain }}.json
           if-no-files-found: ignore
           retention-days: 7
 

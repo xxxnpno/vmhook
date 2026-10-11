@@ -5,6 +5,6 @@
   "description": "Windows x64 GNU C++ library for inspecting and hooking HotSpot internals, with a C++23 header and a C++26 module.",
   "homepage": "https://github.com/xxxnpno/vmhook",
   "documentation": "https://github.com/xxxnpno/vmhook/blob/master/README.md",
-  "license": null,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "supports": "windows & x64 & mingw"
 }
