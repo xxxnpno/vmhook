@@ -28513,3 +28513,433 @@ export namespace vmhook::detail
     { return heap_iteration::config().ready; }
 }
 // VMHOOK_HEAP_ITERATION_END
+// VMHOOK_NATIVE_EXECUTOR_BEGIN
+export namespace vmhook::detail
+{
+    template<typename value_type> struct native_transferable_type : std::bool_constant<
+        std::is_arithmetic_v<value_type> || std::is_enum_v<value_type>
+        || std::is_same_v<value_type, std::string> || std::is_same_v<value_type, std::u16string>> {};
+    template<> struct native_transferable_type<void> : std::true_type {};
+    template<typename wrapper_type>
+    struct native_transferable_type<vmhook::retained_object<wrapper_type>> : std::true_type {};
+    template<typename value_type, typename allocator_type>
+    struct native_transferable_type<std::vector<value_type, allocator_type>> : native_transferable_type<value_type> {};
+    template<typename value_type, std::size_t length>
+    struct native_transferable_type<std::array<value_type, length>> : native_transferable_type<value_type> {};
+    template<typename value_type>
+    struct native_transferable_type<std::optional<value_type>> : native_transferable_type<value_type> {};
+    template<typename first_type, typename second_type>
+    struct native_transferable_type<std::pair<first_type, second_type>> : std::bool_constant<
+        native_transferable_type<first_type>::value && native_transferable_type<second_type>::value> {};
+    template<typename... value_types>
+    struct native_transferable_type<std::tuple<value_types...>> : std::bool_constant<
+        (native_transferable_type<value_types>::value && ...)> {};
+    template<typename value_type>
+    concept native_transferable = !std::is_reference_v<value_type>
+        && native_transferable_type<std::remove_cv_t<value_type>>::value;
+    inline thread_local const void* native_executor_worker{};
+    inline auto native_executor_can_wait() noexcept -> bool
+    {
+        try
+        {
+            auto& runtime{private_native::rt()};
+            auto* const current{runtime.ready ? runtime.current_thread() : nullptr};
+            return !current || private_native::thread_state(current) == 4;
+        }
+        catch (...) { return false; }
+    }
+    struct native_task_base;
+    struct native_task_state final
+    {
+        std::atomic<unsigned> phase{}; // 0 queued, 1 executing, 2 completed
+        std::atomic<bool> cancel_requested{};
+        std::chrono::steady_clock::time_point deadline{std::chrono::steady_clock::time_point::max()};
+        const void* executor{};
+        std::weak_ptr<native_task_base> task{};
+    };
+}
+export namespace vmhook
+{
+    class native_task_control final
+    {
+        std::shared_ptr<detail::native_task_state> state_;
+    public:
+        explicit native_task_control(std::shared_ptr<detail::native_task_state> state) noexcept
+            : state_{std::move(state)} {}
+        [[nodiscard]] auto stop_requested() const noexcept -> bool
+        { return state_->cancel_requested.load(std::memory_order_acquire)
+            || std::chrono::steady_clock::now() >= state_->deadline; }
+        auto throw_if_cancelled() const -> void
+        {
+            if (state_->cancel_requested.load(std::memory_order_acquire))
+            { throw vmhook::exception{"Native Java task was cancelled"}; }
+            if (std::chrono::steady_clock::now() >= state_->deadline)
+            { throw vmhook::exception{"Native Java task deadline expired"}; }
+        }
+    };
+}
+export namespace vmhook::detail
+{
+    struct native_task_base
+    {
+        std::shared_ptr<native_task_state> state{};
+        virtual ~native_task_base() = default;
+        virtual auto execute() noexcept -> void = 0;
+        virtual auto cancel_queued() noexcept -> void = 0;
+    };
+    template<bool with_control, typename function_type, typename... argument_types>
+    struct native_task_result;
+    template<typename function_type, typename... argument_types>
+    struct native_task_result<true, function_type, argument_types...>
+    { using type = std::invoke_result_t<function_type&, const vmhook::native_task_control&, argument_types&&...>; };
+    template<typename function_type, typename... argument_types>
+    struct native_task_result<false, function_type, argument_types...>
+    { using type = std::invoke_result_t<function_type&, argument_types&&...>; };
+    template<typename function_type, typename... argument_types>
+    inline constexpr bool native_task_with_control = std::is_invocable_v<function_type&,
+        const vmhook::native_task_control&, argument_types&&...>;
+    template<typename function_type, typename... argument_types>
+    using native_task_result_t = typename native_task_result<
+        native_task_with_control<function_type, argument_types...>, function_type, argument_types...>::type;
+    template<typename function_type, typename... argument_types>
+    concept native_task_callable = (std::is_empty_v<function_type> || std::is_pointer_v<function_type>)
+        && (native_task_with_control<function_type, argument_types...>
+            || std::is_invocable_v<function_type&, argument_types&&...>)
+        && native_transferable<native_task_result_t<function_type, argument_types...>>;
+
+    template<typename function_type, typename... argument_types>
+    class native_task_model final : public native_task_base
+    {
+        using result_type = native_task_result_t<function_type, argument_types...>;
+        function_type callable_;
+        std::tuple<argument_types...> arguments_;
+        std::promise<result_type> promise_{};
+        auto cancel_error() noexcept -> void
+        {
+            try { vmhook::native_task_control{state}.throw_if_cancelled();
+                throw vmhook::exception{"Native Java task was cancelled before execution"}; }
+            catch (...) { try { promise_.set_exception(std::current_exception()); } catch (...) {} }
+        }
+    public:
+        template<typename function_arg, typename... value_args>
+        native_task_model(std::shared_ptr<native_task_state> control,
+            function_arg&& function, value_args&&... values)
+            : callable_{std::forward<function_arg>(function)}, arguments_{std::forward<value_args>(values)...}
+        { state = std::move(control); }
+        auto future() -> std::future<result_type> { return promise_.get_future(); }
+        auto cancel_queued() noexcept -> void override
+        {
+            state->cancel_requested.store(true, std::memory_order_release);
+            unsigned expected{};
+            if (state->phase.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) { cancel_error(); }
+        }
+        auto execute() noexcept -> void override
+        {
+            unsigned expected{};
+            if (!state->phase.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) { return; }
+            try
+            {
+                const vmhook::native_task_control control{state};
+                control.throw_if_cancelled();
+                const auto invoke = [&]() -> result_type
+                {
+                    return std::apply([&](auto&... values) -> result_type
+                    {
+                        if constexpr (native_task_with_control<function_type, argument_types...>)
+                        { return std::invoke(callable_, control, std::move(values)...); }
+                        else { return std::invoke(callable_, std::move(values)...); }
+                    }, arguments_);
+                };
+                if constexpr (std::is_void_v<result_type>)
+                { invoke(); control.throw_if_cancelled(); promise_.set_value(); }
+                else
+                { auto result = invoke(); control.throw_if_cancelled(); promise_.set_value(std::move(result)); }
+            }
+            catch (...) { try { promise_.set_exception(std::current_exception()); } catch (...) {} }
+            state->phase.store(2, std::memory_order_release);
+        }
+    };
+}
+export namespace vmhook
+{
+    template<typename result_type>
+        requires detail::native_transferable<result_type>
+    class native_task final
+    {
+        std::future<result_type> future_{};
+        std::shared_ptr<detail::native_task_state> state_{};
+        auto check_wait() const -> void
+        {
+            if (!future_.valid()) { throw vmhook::exception{"Native Java task has no future"}; }
+            if (future_.wait_for(std::chrono::seconds{0}) != std::future_status::ready
+                && ((!detail::native_executor_can_wait())
+                    || detail::native_executor_worker))
+            { throw vmhook::exception{"Waiting here would block a VM callback or a native executor worker"}; }
+        }
+        friend class native_executor;
+        native_task(std::future<result_type> future, std::shared_ptr<detail::native_task_state> state)
+            : future_{std::move(future)}, state_{std::move(state)} {}
+    public:
+        native_task() noexcept = default;
+        native_task(native_task&&) noexcept = default;
+        auto operator=(native_task&&) noexcept -> native_task& = default;
+        native_task(const native_task&) = delete;
+        auto operator=(const native_task&) -> native_task& = delete;
+        [[nodiscard]] auto valid() const noexcept -> bool { return future_.valid(); }
+        [[nodiscard]] auto ready() const -> bool
+        {
+            if (!future_.valid()) { throw vmhook::exception{"Native Java task has no future"}; }
+            return future_.wait_for(std::chrono::seconds{0}) == std::future_status::ready;
+        }
+        auto cancel() noexcept -> bool
+        {
+            if (!state_ || state_->phase.load(std::memory_order_acquire) == 2) { return false; }
+            state_->cancel_requested.store(true, std::memory_order_release);
+            if (auto task{state_->task.lock()}) { task->cancel_queued(); }
+            return true;
+        }
+        auto wait() const -> void { check_wait(); future_.wait(); }
+        template<typename rep_type, typename period_type>
+        auto wait_for(std::chrono::duration<rep_type, period_type> timeout) const -> std::future_status
+        {
+            if (timeout <= timeout.zero())
+            {
+                if (!future_.valid()) { throw vmhook::exception{"Native Java task has no future"}; }
+                return future_.wait_for(timeout.zero());
+            }
+            check_wait();
+            return future_.wait_for(timeout);
+        }
+        auto get() -> result_type { check_wait(); return future_.get(); }
+    };
+    struct native_executor_options final
+    {
+        std::size_t worker_count{1};
+        std::size_t queue_capacity{64};
+    };
+    struct native_executor_stats final
+    {
+        std::size_t queued{};
+        std::size_t executing{};
+        std::size_t workers{};
+        bool accepting{};
+    };
+    class native_executor final
+    {
+        struct shared_state final
+        {
+            std::mutex mutex{};
+            std::condition_variable work{};
+            std::condition_variable initialized{};
+            std::vector<std::shared_ptr<detail::native_task_base>> queue{};
+            std::vector<std::weak_ptr<detail::native_task_state>> active{};
+            std::size_t head{}, count{}, reserved{}, started{}, executing{};
+            bool accepting{true}, stopping{}, cancel_pending{};
+            std::exception_ptr error{};
+            explicit shared_state(std::size_t capacity, std::size_t worker_count)
+                : queue(capacity), active(worker_count) {}
+        };
+        std::shared_ptr<shared_state> state_{};
+        std::vector<std::thread> workers_{};
+        std::mutex close_mutex_{};
+        static auto worker(std::shared_ptr<shared_state> state, std::size_t index) noexcept -> void
+        {
+            bool announced{};
+            try
+            {
+                vmhook::native_thread_context context{"VMHook-executor-" + std::to_string(index)};
+                if (!context.valid()) { throw vmhook::exception{context.error()}; }
+                detail::native_executor_worker = state.get();
+                {
+                    std::lock_guard lock{state->mutex};
+                    ++state->started;
+                    announced = true;
+                }
+                state->initialized.notify_all();
+                for (;;)
+                {
+                    std::shared_ptr<detail::native_task_base> task{};
+                    {
+                        std::unique_lock lock{state->mutex};
+                        state->work.wait(lock, [&] { return state->count != 0 || (state->stopping && state->reserved == 0); });
+                        if (state->count == 0) { break; }
+                        task = std::move(state->queue[state->head]);
+                        state->head = (state->head + 1) % state->queue.size();
+                        --state->count;
+                        ++state->executing;
+                        state->active[index] = task->state;
+                    }
+                    task->execute();
+                    task.reset();
+                    {
+                        std::lock_guard lock{state->mutex};
+                        --state->executing;
+                        state->active[index].reset();
+                    }
+                }
+                detail::native_executor_worker = nullptr;
+                if (!context.close()) { throw vmhook::exception{context.error()}; }
+            }
+            catch (...)
+            {
+                detail::native_executor_worker = nullptr;
+                {
+                    std::lock_guard lock{state->mutex};
+                    if (!state->error) { state->error = std::current_exception(); }
+                    if (!announced) { ++state->started; }
+                    state->accepting = false;
+                    state->stopping = true;
+                    state->cancel_pending = true;
+                    for (auto& task : state->queue) { if (task) { task->cancel_queued(); } }
+                    for (auto& active : state->active)
+                    { if (auto running{active.lock()}) { running->cancel_requested.store(true, std::memory_order_release); } }
+                }
+                state->initialized.notify_all();
+                state->work.notify_all();
+            }
+        }
+        auto request_stop(bool drain) noexcept -> void
+        {
+            if (!state_) { return; }
+            {
+                std::lock_guard lock{state_->mutex};
+                state_->accepting = false;
+                state_->stopping = true;
+                if (!drain)
+                {
+                    state_->cancel_pending = true;
+                    for (auto& task : state_->queue) { if (task) { task->cancel_queued(); } }
+                    for (auto& active : state_->active)
+                    { if (auto running{active.lock()}) { running->cancel_requested.store(true, std::memory_order_release); } }
+                }
+            }
+            state_->work.notify_all();
+        }
+        template<typename function_type, typename... argument_types>
+        auto submit_at(std::chrono::steady_clock::time_point deadline,
+            function_type&& function, argument_types&&... arguments)
+            -> native_task<detail::native_task_result_t<std::decay_t<function_type>, std::decay_t<argument_types>...>>
+        {
+            using result_type = detail::native_task_result_t<std::decay_t<function_type>, std::decay_t<argument_types>...>;
+            if constexpr (std::is_pointer_v<std::decay_t<function_type>>)
+            {
+                if (!function) { throw vmhook::exception{"Native executor callable pointer is null"}; }
+            }
+            // Reserve admission before moving resources from the caller. A
+            // full/closed queue therefore does not consume retained arguments.
+            {
+                std::lock_guard lock{state_->mutex};
+                if (!state_->accepting) { throw vmhook::exception{"Native Java executor is closed"}; }
+                if (state_->count + state_->reserved == state_->queue.size())
+                { throw vmhook::exception{"Native Java executor queue is full"}; }
+                ++state_->reserved;
+            }
+            std::shared_ptr<detail::native_task_state> control{};
+            std::shared_ptr<detail::native_task_model<std::decay_t<function_type>, std::decay_t<argument_types>...>> task{};
+            std::future<result_type> future{};
+            try
+            {
+                control = std::make_shared<detail::native_task_state>();
+                control->executor = state_.get();
+                control->deadline = deadline;
+                task = std::make_shared<detail::native_task_model<std::decay_t<function_type>,
+                    std::decay_t<argument_types>...>>(control, std::forward<function_type>(function),
+                        std::forward<argument_types>(arguments)...);
+                control->task = task;
+                future = task->future();
+            }
+            catch (...)
+            {
+                { std::lock_guard lock{state_->mutex}; --state_->reserved; }
+                state_->work.notify_all();
+                throw;
+            }
+            {
+                std::lock_guard lock{state_->mutex};
+                --state_->reserved;
+                if (state_->cancel_pending) { task->cancel_queued(); }
+                state_->queue[(state_->head + state_->count) % state_->queue.size()] = std::move(task);
+                ++state_->count;
+            }
+            state_->work.notify_one();
+            return native_task<result_type>{std::move(future), std::move(control)};
+        }
+    public:
+        explicit native_executor(native_executor_options options = {})
+        {
+            if (!detail::native_executor_can_wait() || detail::native_executor_worker)
+            { throw vmhook::exception{"Create a native executor outside VM callbacks and worker tasks"}; }
+            if (options.worker_count == 0 || options.worker_count > 64
+                || options.queue_capacity == 0 || options.queue_capacity > 1048576)
+            { throw vmhook::exception{"Native executor worker count or queue capacity is invalid"}; }
+            state_ = std::make_shared<shared_state>(options.queue_capacity, options.worker_count);
+            workers_.reserve(options.worker_count);
+            try
+            {
+                for (std::size_t index{}; index < options.worker_count; ++index)
+                { workers_.emplace_back(&worker, state_, index); }
+                std::unique_lock lock{state_->mutex};
+                state_->initialized.wait(lock, [&] { return state_->started >= options.worker_count; });
+                if (state_->error) { std::rethrow_exception(state_->error); }
+            }
+            catch (...)
+            {
+                request_stop(false);
+                for (auto& thread : workers_) { if (thread.joinable()) { thread.join(); } }
+                throw;
+            }
+        }
+        native_executor(const native_executor&) = delete;
+        native_executor(native_executor&&) = delete;
+        auto operator=(const native_executor&) -> native_executor& = delete;
+        auto operator=(native_executor&&) -> native_executor& = delete;
+        ~native_executor()
+        {
+            request_stop(false);
+            if (detail::native_executor_can_wait() && !detail::native_executor_worker)
+            { for (auto& thread : workers_) { if (thread.joinable()) { thread.join(); } } }
+            else
+            {
+                // A callback cannot wait for Java work. Workers own shared state
+                // and close their contexts themselves after cooperative completion.
+                for (auto& thread : workers_) { if (thread.joinable()) { thread.detach(); } }
+            }
+        }
+        auto close(bool drain = true) -> void
+        {
+            if (!detail::native_executor_can_wait() || detail::native_executor_worker)
+            { throw vmhook::exception{"Close and join the executor outside VM callbacks and worker tasks"}; }
+            std::lock_guard shutdown_lock{close_mutex_};
+            request_stop(drain);
+            for (auto& thread : workers_) { if (thread.joinable()) { thread.join(); } }
+            std::exception_ptr failure{};
+            { std::lock_guard lock{state_->mutex}; failure = state_->error; }
+            if (failure) { std::rethrow_exception(failure); }
+        }
+        [[nodiscard]] auto stats() const -> native_executor_stats
+        {
+            std::lock_guard lock{state_->mutex};
+            return {state_->count + state_->reserved, state_->executing, workers_.size(), state_->accepting};
+        }
+        template<typename function_type, typename... argument_types>
+            requires ((detail::native_transferable<std::decay_t<argument_types>> && ...)
+                && detail::native_task_callable<std::decay_t<function_type>, std::decay_t<argument_types>...>
+                && (std::is_constructible_v<std::decay_t<argument_types>, argument_types&&> && ...))
+        [[nodiscard]] auto submit(function_type&& function, argument_types&&... arguments)
+        {
+            return submit_at(std::chrono::steady_clock::time_point::max(),
+                std::forward<function_type>(function), std::forward<argument_types>(arguments)...);
+        }
+        template<typename function_type, typename... argument_types>
+            requires ((detail::native_transferable<std::decay_t<argument_types>> && ...)
+                && detail::native_task_callable<std::decay_t<function_type>, std::decay_t<argument_types>...>
+                && (std::is_constructible_v<std::decay_t<argument_types>, argument_types&&> && ...))
+        [[nodiscard]] auto submit_before(std::chrono::steady_clock::time_point deadline,
+            function_type&& function, argument_types&&... arguments)
+        {
+            return submit_at(deadline, std::forward<function_type>(function),
+                std::forward<argument_types>(arguments)...);
+        }
+    };
+}
+// VMHOOK_NATIVE_EXECUTOR_END
