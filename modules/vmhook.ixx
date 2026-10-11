@@ -1346,6 +1346,10 @@ export namespace vmhook
             vmhook::hotspot::klass* declaring_class) -> void;
         template<typename wrapper_type>
         inline auto require_object_wrapper_type(void* address) -> void;
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto object_matches_wrapper_type(const native_backend::root& source) -> bool;
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto loaded_array_wrapper_class() -> vmhook::hotspot::klass*;
 
         /*
             @brief Reflects a C++ type name for diagnostics.
@@ -15644,8 +15648,10 @@ export namespace vmhook
                 void* const desired_oop{ desired->vmhook::object_base::get_instance() };
                 using wrapper_type = typename value_type::element_type;
                 if (expected_oop) { vmhook::detail::require_object_wrapper_type<wrapper_type>(expected_oop); }
-                if (desired_oop) { vmhook::detail::require_object_wrapper_type<wrapper_type>(desired_oop); }
-                vmhook::detail::require_reference_argument(expected_oop, this->signature_text, this->reference_declaring_class);
+                if (desired_oop) { vmhook::detail::require_object_wrapper_type<wrapper_type>(
+                    desired->vmhook::object_base::get_instance()); }
+                vmhook::detail::require_reference_argument(expected->vmhook::object_base::get_instance(),
+                    this->signature_text, this->reference_declaring_class);
                 // The first type check can run Java and relocate both roots.
                 vmhook::detail::require_reference_argument(desired->vmhook::object_base::get_instance(),
                     this->signature_text, this->reference_declaring_class);
@@ -15902,7 +15908,8 @@ export namespace vmhook
             vmhook::detail::native_backend::operation access{};
             void* const address{ value->vmhook::object_base::get_instance() };
             if (address) { vmhook::detail::require_object_wrapper_type<wrapper_type>(address); }
-            vmhook::detail::require_reference_argument(address, this->signature_text, this->reference_declaring_class);
+            vmhook::detail::require_reference_argument(value->vmhook::object_base::get_instance(),
+                this->signature_text, this->reference_declaring_class);
             // Type resolution can call Java and move the object. Resolve the
             // owner's root again immediately before publishing the field slot.
             return this->store_object_oop(value->vmhook::object_base::get_instance());
@@ -18264,7 +18271,7 @@ export namespace vmhook
                         using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
                         void* const address{ a->get_instance() };
                         if (address) { vmhook::detail::require_object_wrapper_type<wrapper_type>(address); }
-                        vmhook::detail::require_reference_argument(address, full_descriptor, selected_holder);
+                        vmhook::detail::require_reference_argument(a->get_instance(), full_descriptor, selected_holder);
                         argument_owners[param_idx] = &a->instance;
                         params[param_idx++] = reinterpret_cast<std::intptr_t>(a->get_instance());
                     }
@@ -21043,9 +21050,74 @@ export namespace vmhook
         }
 
         template<typename wrapper_type>
-        inline auto require_object_wrapper_type(void* const address) -> void
+        [[nodiscard]] inline auto checked_wrapper_class() -> vmhook::hotspot::klass*
+        {
+            const std::type_index type{typeid(wrapper_type)};
+            const auto binding{registered_class_binding(type)};
+            if (binding)
+            {
+                auto* const expected{registered_class_klass(type, binding)};
+                if (!expected) { throw vmhook::exception{"Registered wrapper's exact Java class is unavailable"}; }
+                return expected;
+            }
+            if constexpr (requires { std::string_view{wrapper_type::java_contract}; })
+            {
+                constexpr std::string_view contract{wrapper_type::java_contract};
+                if constexpr (contract.starts_with("java/"))
+                {
+                    auto* const expected{vmhook::find_class(contract)};
+                    if (!expected) { throw vmhook::exception{"Built-in wrapper's Java class is unavailable"}; }
+                    return expected;
+                }
+            }
+            throw vmhook::exception{"Object wrapper is not registered with a Java class"};
+        }
+
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto array_component_matches_wrapper(const native_backend::root& mirror) -> bool
+        {
+            if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+            {
+                if (!static_cast<bool>(call_container_method(mirror, "isArray", "()Z")))
+                { return false; }
+                if constexpr (wrapper_type::java_contract.size() == 2)
+                {
+                    const std::string name = call_container_method(mirror, "getName", "()Ljava/lang/String;");
+                    return name == wrapper_type::java_contract;
+                }
+                else
+                {
+                    const auto component{container_result_root(call_container_method(mirror,
+                        "getComponentType", "()Ljava/lang/Class;"))};
+                    if (!component) { throw vmhook::exception{"Java array component Class is null"}; }
+                    return array_component_matches_wrapper<typename wrapper_type::java_element_type>(component);
+                }
+            }
+            else
+            {
+                if (static_cast<bool>(call_container_method(mirror, "isPrimitive", "()Z")))
+                { return false; }
+                if constexpr (!std::is_same_v<wrapper_type, vmhook::any_object>)
+                {
+                    auto* const expected{checked_wrapper_class<wrapper_type>()};
+                    const auto expected_mirror{native_backend::retain_class(expected)};
+                    if (!expected_mirror) { throw vmhook::exception{"Expected component Class could not be retained"}; }
+                    const auto component{materialize_object<vmhook::any_object>(0, mirror)};
+                    return static_cast<bool>(call_container_method(expected_mirror, "isAssignableFrom",
+                        "(Ljava/lang/Class;)Z", component));
+                }
+                else { return true; }
+            }
+        }
+
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto object_matches_wrapper_type(const native_backend::root& source) -> bool
         {
             static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>);
+            if (!source) { return true; }
+            native_backend::operation access{};
+            if (!access) { throw vmhook::exception{"Java type check requires a native-thread or callback VM context"}; }
+            void* const address{container_address(source)};
             auto* const runtime_class{ vmhook::klass_from_oop(address) };
             if (!runtime_class || !vmhook::hotspot::is_valid_pointer(runtime_class))
             { throw vmhook::exception{ "Java object runtime class cannot be resolved" }; }
@@ -21053,32 +21125,99 @@ export namespace vmhook
             {
                 if constexpr (wrapper_type::java_array_wrapper)
                 {
+                    const auto* const runtime_symbol{runtime_class->get_name()};
+                    if (!runtime_symbol) { throw vmhook::exception{"Java array runtime class name is unavailable"}; }
+                    const auto runtime_name{runtime_symbol->to_string()};
+                    if (runtime_name.empty()) { throw vmhook::exception{"Java array runtime class name is unreadable"}; }
+                    if (!runtime_name.starts_with("[")) { return false; }
                     const auto layout{ vmhook::detail::array_layout(runtime_class) };
-                    if (!layout) { throw vmhook::exception{ "Java object is not an array" }; }
+                    if (!layout) { throw vmhook::exception{"Java array layout metadata is unavailable"}; }
                     if (wrapper_type::java_contract.size() == 2)
                     {
-                        if (runtime_class->get_name()->to_string() != wrapper_type::java_contract)
-                        { throw vmhook::exception{ "Java primitive array does not match the wrapper element type" }; }
+                        return runtime_name == wrapper_type::java_contract;
                     }
                     else if (!layout->reference_elements)
-                    { throw vmhook::exception{ "Reference-array wrapper cannot wrap a primitive array" }; }
-                    return;
+                    { return false; }
+                    else
+                    {
+                        const auto mirror{native_backend::retain_class(runtime_class)};
+                        if (!mirror) { throw vmhook::exception{"Java array Class could not be retained"}; }
+                        return array_component_matches_wrapper<wrapper_type>(mirror);
+                    }
                 }
             }
             if constexpr (!std::is_same_v<wrapper_type, vmhook::any_object>)
             {
-                std::string expected_name{ vmhook::detail::registered_class_name<wrapper_type>() };
-                if (expected_name.empty())
+                auto* const expected_class{checked_wrapper_class<wrapper_type>()};
+                return container_class_assignable(runtime_class, expected_class);
+            }
+            else { return true; }
+        }
+
+        template<typename wrapper_type>
+        inline auto require_object_wrapper_type(void* const address) -> void
+        {
+            if (!address) { return; }
+            const auto source{retain_container_address(address)};
+            if (!object_matches_wrapper_type<wrapper_type>(source))
+            { throw vmhook::exception{"Java object does not match the wrapper's exact class, array component and loader",
+                                     vmhook::error_code::type_mismatch}; }
+        }
+
+        // Read only already-created ArrayKlasses. In particular this diagnostic
+        // does not create Base[] metadata merely because Derived[] exists.
+        template<typename wrapper_type>
+        [[nodiscard]] inline auto loaded_array_wrapper_class() -> vmhook::hotspot::klass*
+        {
+            static_assert(requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; });
+            native_backend::operation access{};
+            if (!access) { throw vmhook::exception{"Array class lookup requires a native-thread or callback VM context"}; }
+            if constexpr (wrapper_type::java_contract.size() == 2)
+            {
+                auto* expected{vmhook::resolve_array_klass(wrapper_type::java_contract)};
+                if (!expected)
                 {
-                    if constexpr (requires { std::string_view{ wrapper_type::java_contract }; })
-                    { expected_name = wrapper_type::java_contract; }
+                    const vmhook::hotspot::class_loader_data_graph graph{};
+                    graph.for_each_klass([&](const std::string_view name, vmhook::hotspot::klass* const klass)
+                    { if (name == wrapper_type::java_contract) { expected = klass; } });
                 }
-                if (expected_name.empty())
-                { throw vmhook::exception{ "Object wrapper is not registered with a Java class" }; }
-                auto* expected_class{ vmhook::detail::registered_class_klass<wrapper_type>() };
-                if (!expected_class) { expected_class = vmhook::find_class(expected_name); }
-                if (!expected_class || !container_class_assignable(runtime_class, expected_class))
-                { throw vmhook::exception{ std::format("Java object does not match wrapper class '{}'", expected_name) }; }
+                if (expected && !native_backend::retain_class(expected))
+                { throw vmhook::exception{"Primitive array Class could not be retained"}; }
+                if (expected && (!expected->get_name() || expected->get_name()->to_string() != wrapper_type::java_contract))
+                { throw vmhook::exception{"Primitive array metadata has an incompatible descriptor"}; }
+                return expected;
+            }
+            else
+            {
+                using element_type = typename wrapper_type::java_element_type;
+                vmhook::hotspot::klass* component{};
+                constexpr bool nested{requires { element_type::java_array_wrapper; typename element_type::java_element_type; }};
+                if constexpr (nested) { component = loaded_array_wrapper_class<element_type>(); }
+                else if constexpr (std::is_same_v<element_type, vmhook::any_object>)
+                {
+                    component = vmhook::find_class("java/lang/Object");
+                    if (!component || !native_backend::retain_class(component))
+                    { throw vmhook::exception{"Bootstrap Object Class could not be retained"}; }
+                }
+                else { component = checked_wrapper_class<element_type>(); }
+                if (!component) { return nullptr; }
+                const auto* const entry{vmhook::hotspot::iterate_struct_entries(
+                    nested ? "ArrayKlass" : "InstanceKlass", nested ? "_higher_dimension" : "_array_klasses")};
+                if (!entry) { throw vmhook::exception{"Exact array class metadata coordinate is unavailable"}; }
+                vmhook::hotspot::klass* expected{};
+                if (!vmhook::os::safe_read(&expected, reinterpret_cast<const std::byte*>(component)
+                        + entry->offset, sizeof(expected)))
+                { throw vmhook::exception{"Exact array class metadata is unreadable"}; }
+                if (!expected) { return nullptr; }
+                if (!vmhook::hotspot::is_valid_pointer(expected) || !native_backend::retain_class(expected))
+                { throw vmhook::exception{"Exact array Class could not be retained"}; }
+                if (!component->get_name() || !expected->get_name())
+                { throw vmhook::exception{"Exact array metadata descriptor is unavailable"}; }
+                const auto component_name{component->get_name()->to_string()};
+                const std::string descriptor{nested ? "[" + component_name : "[L" + component_name + ";"};
+                if (component_name.empty() || expected->get_name()->to_string() != descriptor)
+                { throw vmhook::exception{"Exact array metadata has an incompatible component descriptor"}; }
+                return expected;
             }
         }
 
@@ -21102,7 +21241,9 @@ export namespace vmhook
             }
             void* const address{ container_address(root) };
             require_object_wrapper_type<wrapper_type>(address);
-            auto result{ wrap_object<wrapper_type>(address) };
+            // Component Class checks can enter Java and collect. Construct the
+            // C++ owner from the retained object's current address afterward.
+            auto result{ wrap_object<wrapper_type>(container_address(root)) };
             result->set_native_root(root);
             return result;
         }

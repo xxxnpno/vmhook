@@ -52,6 +52,14 @@ Accessing a Java-null array is an error; converting it to a vector yields an
 empty snapshot. An incompatible element wrapper or a failed Java operation is
 an explicit error. A snapshot does not track later Java changes.
 
+Converting a Java result to `array<player>` checks the actual component Class
+against the wrapper's registered class and loader, including empty arrays.
+Nested arrays are checked recursively. Java covariance is preserved: a
+subclass array can be read through a base-class array wrapper. A same-named
+class from a different loader does not match. Type checks retain the object
+through their Java calls and refresh its address after collection; missing
+bindings or unavailable metadata remain explicit errors.
+
 ## Collections, lists, sets, queues, and maps
 
 Built-in wrappers include `collection`, `list`, `array_list`, `linked_list`,

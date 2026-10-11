@@ -114,8 +114,23 @@ namespace
                 && objects_destination->get(0)->id() == 11 && !objects_destination->get(1)->get_instance());
             const std::unique_ptr<vmhook::array<player>> returned = interop_fixture::method("objectArray")->call(first, last);
             check(output, "array_return", returned->get(0)->id() == 11 && returned->get(1) && !returned->get(1)->get_instance());
+            const auto empty_players = vmhook::make_array<player>(0);
+            const auto exact_player_root = empty_players->get_native_root();
+            bool wrong_array_refused{};
+            try { (void)vmhook::detail::materialize_object<vmhook::array<wide>>(0, exact_player_root); }
+            catch (const vmhook::exception& failure) { wrong_array_refused = failure.code() == vmhook::error_code::type_mismatch; }
+            check(output, "exact_empty_array_guard", wrong_array_refused
+                && vmhook::detail::object_matches_wrapper_type<vmhook::array<player>>(exact_player_root)
+                && !vmhook::detail::object_matches_wrapper_type<vmhook::array<wide>>(exact_player_root)
+                && vmhook::detail::loaded_array_wrapper_class<vmhook::array<player>>() == vmhook::klass_from_oop(empty_players->get_instance()));
             const auto rows = vmhook::make_array<vmhook::array<std::int32_t>>(2);
             rows->set(0, bulk);
+            const auto nested_int_root = rows->get_native_root();
+            check(output, "exact_nested_array_guard",
+                vmhook::detail::object_matches_wrapper_type<vmhook::array<vmhook::array<std::int32_t>>>(nested_int_root)
+                && vmhook::detail::object_matches_wrapper_type<vmhook::array<vmhook::any_object>>(nested_int_root)
+                && !vmhook::detail::object_matches_wrapper_type<vmhook::array<vmhook::array<vmhook::any_object>>>(nested_int_root)
+                && vmhook::detail::loaded_array_wrapper_class<vmhook::array<vmhook::array<std::int32_t>>>() == vmhook::klass_from_oop(rows->get_instance()));
             const auto player_rows = vmhook::make_array<vmhook::array<player>>(2);
             player_rows->set(0, objects);
             check(output, "multidimensional", rows->get(0)->get(99999) == 99999 && !rows->get(1)->get_instance()
