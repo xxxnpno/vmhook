@@ -324,25 +324,23 @@ namespace vmhook
 namespace vmhook::detail
 {
     /*
-        @brief Format a log line using std::format if available, otherwise stream-format.
-        @details
-        Provides a single API used by log_line() so callers do not need to know whether
-        the host toolchain has shipped std::format / std::print.  When std::format is
-        present we use it; otherwise we ignore the format specifiers and concatenate
-        the format string verbatim, which is enough for diagnostic output.
+        @brief Format a diagnostic with a compile-time-checked format string.
+        @details Formatting and allocation errors propagate to the caller.
+        Use format_log_runtime() when the format string is chosen at runtime.
     */
-    template <typename... args_t>
-    inline auto format_log(std::string_view fmt, args_t&&... args)
+    template<typename... argument_types>
+    inline auto format_log(std::format_string<argument_types...> format,
+                           argument_types&&... arguments)
         -> std::string
     {
-        try
-        {
-            return std::vformat(fmt, std::make_format_args(args...));
-        }
-        catch (...)
-        {
-            return std::string{ fmt };
-        }
+        return std::format(format, std::forward<argument_types>(arguments)...);
+    }
+
+    template<typename... argument_types>
+    inline auto format_log_runtime(const std::string_view format,
+                                   argument_types&&... arguments) -> std::string
+    {
+        return std::vformat(format, std::make_format_args(arguments...));
     }
 
     inline auto emit_log_line(std::string const& line) noexcept
@@ -377,27 +375,34 @@ namespace vmhook::detail
 namespace vmhook::detail
 {
     /*
-        @brief One diagnostic line.  Was the log_line() macro.
-        @details
-        A function template rather than a macro, so its arguments are type
-        checked, it has a name a debugger can break on, and it survives being
-        imported from a module -- which a macro does not.
-
-        WHEN `debug_logs` IS FALSE this still touches every argument, because
-        the macro it replaces did: the old no-op form was
-        `(void)sizeof(format_log(__VA_ARGS__))`, which existed to keep a variable
-        that is only ever logged from being reported as unused. `if constexpr`
-        would discard the call entirely and bring those warnings back, so the
-        arguments are folded into a `(void)` expression instead. Neither form
-        emits code.
+        @brief Emit one diagnostic with a compile-time-checked format string.
+        @details Formatting errors and allocation failures are contained at this
+        noexcept logging boundary. Disabled logging does not format or allocate;
+        its arguments are still evaluated normally by the caller.
     */
     template<typename... argument_types>
-    inline auto log_line(const std::string_view format,
+    inline auto log_line(std::format_string<argument_types...> format,
                          argument_types&&... arguments) noexcept -> void
     {
         if constexpr (vmhook::debug_logs)
         {
-            emit_log_line(format_log(format, std::forward<argument_types>(arguments)...));
+            try { emit_log_line(format_log(format, std::forward<argument_types>(arguments)...)); }
+            catch (...) { /* Logging must not escape into the VM or replace a caller's error. */ }
+        }
+        else
+        {
+            ((void)format, ..., (void)arguments);
+        }
+    }
+
+    template<typename... argument_types>
+    inline auto log_line_runtime(const std::string_view format,
+                                 argument_types&&... arguments) noexcept -> void
+    {
+        if constexpr (vmhook::debug_logs)
+        {
+            try { emit_log_line(format_log_runtime(format, std::forward<argument_types>(arguments)...)); }
+            catch (...) { /* Keep dynamic formatting failures inside the logging boundary. */ }
         }
         else
         {
@@ -9362,7 +9367,7 @@ namespace vmhook
                     if (!request.pin) { request.method = nullptr; }
                     if (!request.method) { return; }
                     const auto signature{request.method->get_signature()};
-                    const std::string receiver_descriptor{"L" + request.owner_name + ";"};
+                    const std::string receiver_descriptor{std::format("L{};", request.owner_name)};
                     auto* const declaring{vmhook::detail::callback_declaring_class(request.method)};
                     request.arguments_valid = [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
                     {
@@ -10075,7 +10080,7 @@ namespace vmhook
             {
                 using element_type = typename wrapper_type::java_element_type;
                 if constexpr (std::is_base_of_v<vmhook::object_base, element_type>)
-                { return "[" + java_wrapper_descriptor<element_type>(); }
+                { return std::format("[{}", java_wrapper_descriptor<element_type>()); }
                 else { return wrapper_type::descriptor(); }
             }
             else if constexpr (vmhook::detail::has_annotated_class_name_v<wrapper_type>)
@@ -10086,13 +10091,13 @@ namespace vmhook
                 if (binding)
                 {
                     if (binding->name.empty()) { throw vmhook::exception{"Registered Java wrapper has no class name"}; }
-                    return binding->name.front() == '[' ? binding->name : "L" + binding->name + ";";
+                    return binding->name.front() == '[' ? binding->name : std::format("L{};", binding->name);
                 }
                 if constexpr (requires { std::string_view{wrapper_type::java_contract}; })
                 {
                     constexpr std::string_view contract{wrapper_type::java_contract};
                     if constexpr (contract.starts_with("java/"))
-                    { return "L" + std::string{contract} + ";"; }
+                    { return std::format("L{};", contract); }
                 }
                 throw vmhook::exception{"Register the Java wrapper before inferring its JVM descriptor"};
             }
@@ -10383,7 +10388,7 @@ class private_profile final {
         if(inheritance.size()>128 || std::find(inheritance.begin(),inheritance.end(),spelling)!=inheritance.end())
             throw profile_error("Cyclic private PDB class inheritance");
         const auto found=classes_.find(spelling);
-        if(found==classes_.end()) throw profile_error("Required private PDB type missing: "+std::string(spelling));
+        if(found==classes_.end()) throw profile_error(std::format("Required private PDB type missing: {}", spelling));
         inheritance.emplace_back(spelling);
         type_layout result; bool first=true;
         for(const auto& definition:found->second) {
@@ -10505,7 +10510,7 @@ public:
     bool has_type(std::string_view type) const {return classes_.contains(type);}
     std::uint32_t symbol(std::string_view exact) const {
         const auto found=symbols_.find(exact);
-        if(found==symbols_.end()) throw profile_error("Required private HotSpot symbol missing: "+std::string(exact));
+        if(found==symbols_.end()) throw profile_error(std::format("Required private HotSpot symbol missing: {}", exact));
         return found->second;
     }
     bool has_symbol(std::string_view exact) const noexcept {return symbols_.contains(exact);}
@@ -10513,16 +10518,16 @@ public:
         bool found=false; std::uint32_t result{};
         for(auto candidate=symbols_.lower_bound(prefix);candidate!=symbols_.end() && candidate->first.starts_with(prefix);++candidate) {
             if(!required.empty() && candidate->first.find(required)==std::string::npos) continue;
-            if(found && result!=candidate->second) throw profile_error("Ambiguous private HotSpot symbol selector: "+std::string(prefix));
+            if(found && result!=candidate->second) throw profile_error(std::format("Ambiguous private HotSpot symbol selector: {}", prefix));
             result=candidate->second; found=true;
         }
-        if(!found) throw profile_error("Required private HotSpot symbol selector missing: "+std::string(prefix));
+        if(!found) throw profile_error(std::format("Required private HotSpot symbol selector missing: {}", prefix));
         return result;
     }
     std::uint64_t type_size(std::string_view type) const {return layout(type).size;}
     std::uint64_t offset(std::string_view type,std::string_view field) const {
         const auto& members=layout(type).members;const auto found=members.find(field);
-        if(found==members.end()) throw profile_error("Required private HotSpot field missing: "+std::string(type)+"::"+std::string(field));
+        if(found==members.end()) throw profile_error(std::format("Required private HotSpot field missing: {}::{}", type, field));
         return found->second;
     }
     bool has_field(std::string_view type,std::string_view field) const {return has_type(type) && layout(type).members.contains(field);}
@@ -10533,7 +10538,7 @@ public:
     }
     std::int64_t enum_value(std::string_view type,std::string_view enumerator) const {
         const auto& members=layout(type).enums;const auto found=members.find(enumerator);
-        if(found==members.end()) throw profile_error("Required private HotSpot enum missing: "+std::string(type)+"::"+std::string(enumerator));
+        if(found==members.end()) throw profile_error(std::format("Required private HotSpot enum missing: {}::{}", type, enumerator));
         return found->second;
     }
 };
@@ -10960,7 +10965,7 @@ public:
   if(initialization_failure_)std::rethrow_exception(initialization_failure_);
  }
  std::size_t size(std::string_view type)const{for(auto& e:profile->sizes)if(e.type==type)return e.size;throw std::runtime_error("Required PDB type missing");}
- std::size_t off(std::string_view type,std::string_view name)const{for(auto& e:profile->fields)if(e.type==type&&e.name==name)return e.offset;throw std::runtime_error("Required PDB member missing: "+std::string(type)+"::"+std::string(name));}
+ std::size_t off(std::string_view type,std::string_view name)const{for(auto& e:profile->fields)if(e.type==type&&e.name==name)return e.offset;throw std::runtime_error(std::format("Required PDB member missing: {}::{}", type, name));}
  bool has_field(std::string_view type,std::string_view name)const{for(auto& e:profile->fields)if(e.type==type&&e.name==name)return true;return false;}
  int enum_value(std::string_view type,std::string_view name)const{for(auto& e:profile->enums)if(e.type==type&&e.name==name)return e.value;throw std::runtime_error("Required PDB enumerator missing");}
  bool has_type(std::string_view name)const{for(auto&e:profile->sizes)if(e.type==name)return true;return false;}
@@ -13242,7 +13247,7 @@ namespace vmhook
                 { this->error_ = "Detected collector or VM metadata cannot support direct native access"; return; }
                 std::string name{ requested_name };
                 if (name.empty())
-                { name = "VMHook-native-" + std::to_string(vmhook::windows::GetCurrentThreadId()); }
+                { name = std::format("VMHook-native-{}", vmhook::windows::GetCurrentThreadId()); }
                 if (name.find('\0') != std::string::npos)
                 { this->error_ = "Native thread name contains an interior NUL"; return; }
                 auto context{ std::make_shared<native_backend::context_lifetime>() };
@@ -16080,8 +16085,8 @@ namespace vmhook
                 void* const object{ result.object ? result.object->resolve_under_vm() : nullptr };
                 return value_t{ vmhook::hotspot::encode_oop_pointer(object), this->signature_text, result.object };
             }
-            const auto name{ std::string{"get"} + std::string{this->primitive_accessor_name()} + "Volatile" };
-            const auto descriptor{ std::string{"(Ljava/lang/Object;J)"} + this->signature_text };
+            const auto name{ std::format("get{}Volatile", this->primitive_accessor_name()) };
+            const auto descriptor{ std::format("(Ljava/lang/Object;J){}", this->signature_text) };
             const auto result{ vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
                 name, {}, descriptor) };
             if (this->signature_text == "Z") { return value_t{ result.bits != 0, this->signature_text }; }
@@ -16097,8 +16102,8 @@ namespace vmhook
 
         auto write_volatile(const std::uint64_t bits) const -> void
         {
-            const auto name{ std::string{"put"} + std::string{this->primitive_accessor_name()} + "Volatile" };
-            const auto descriptor{ std::string{"(Ljava/lang/Object;J"} + this->signature_text + ")V" };
+            const auto name{ std::format("put{}Volatile", this->primitive_accessor_name()) };
+            const auto descriptor{ std::format("(Ljava/lang/Object;J{})V", this->signature_text) };
             (void)vmhook::detail::field_memory_backend::invoke(this->holder_root, this->field_offset,
                 name, {}, descriptor, bits, {}, true);
         }
@@ -21519,7 +21524,8 @@ namespace vmhook
                 if (!component->get_name() || !expected->get_name())
                 { throw vmhook::exception{"Exact array metadata descriptor is unavailable"}; }
                 const auto component_name{component->get_name()->to_string()};
-                const std::string descriptor{nested ? "[" + component_name : "[L" + component_name + ";"};
+                const std::string descriptor{nested ? std::format("[{}", component_name)
+                                                    : std::format("[L{};", component_name)};
                 if (component_name.empty() || expected->get_name()->to_string() != descriptor)
                 { throw vmhook::exception{"Exact array metadata has an incompatible component descriptor"}; }
                 return expected;
@@ -22131,7 +22137,7 @@ namespace vmhook
             if constexpr (!references)
             { return std::string{vmhook::detail::primitive_array_descriptor<element_type>}; }
             else if constexpr (requires { element_type::java_array_wrapper; typename element_type::java_element_type; })
-            { return "[" + element_type::descriptor(); }
+            { return std::format("[{}", element_type::descriptor()); }
             else
             {
                 std::string component{ vmhook::detail::registered_class_name<element_type>() };
@@ -22141,7 +22147,7 @@ namespace vmhook
                     { component = element_type::java_contract; }
                 }
                 if (component.empty()) { throw vmhook::exception{ "Java array element wrapper is not registered" }; }
-                return "[L" + component + ";";
+                return std::format("[L{};", component);
             }
         }
         auto size() const -> std::int32_t
@@ -24472,13 +24478,7 @@ namespace hotspot
         auto to_string() const
             -> std::string
         {
-            static constexpr char digits[]{ "0123456789abcdef" };
-            char buffer[20]{ 'o', 'i', 'd', ':' };
-            for (std::size_t nibble{ 0 }; nibble < 16u; ++nibble)
-            {
-                buffer[4 + nibble] = digits[(this->token_ >> ((15u - nibble) * 4u)) & 0xFull];
-            }
-            return std::string{ buffer, buffer + 20 };
+            return std::format("oid:{:016x}", this->token_);
         }
 
         friend constexpr auto operator==(const vmhook::object_id left,
@@ -26795,13 +26795,13 @@ namespace hotspot
         inline static constexpr std::string_view java_contract{ contracts[index] };
         auto value() const -> primitive_type
         {
-            const std::string signature{ "()" + std::string{vmhook::detail::primitive_array_descriptor<primitive_type>.substr(1)} };
+            const std::string signature{ std::format("(){}", vmhook::detail::primitive_array_descriptor<primitive_type>.substr(1)) };
             return vmhook::detail::invoke_container(*this, java_contract, accessors[index], signature);
         }
         static auto value_of(const primitive_type value) -> std::unique_ptr<boxed>
         {
-            const std::string signature{ "(" + std::string{vmhook::detail::primitive_array_descriptor<primitive_type>.substr(1)}
-                + ")L" + std::string{java_contract} + ";" };
+            const std::string signature{ std::format("({})L{};",
+                vmhook::detail::primitive_array_descriptor<primitive_type>.substr(1), java_contract) };
             return vmhook::detail::call_bootstrap_method(java_contract, "valueOf", signature, value);
         }
     };
@@ -30618,7 +30618,7 @@ namespace vmhook
             bool announced{};
             try
             {
-                vmhook::native_thread_context context{"VMHook-executor-" + std::to_string(index)};
+                vmhook::native_thread_context context{std::format("VMHook-executor-{}", index)};
                 if (!context.valid()) { throw vmhook::exception{context.error()}; }
                 detail::native_executor_worker = state.get();
                 {
@@ -30910,7 +30910,7 @@ namespace vmhook::detail::monitor_backend
                 { return result; }
                 for (const auto member : {"_thread", "_obj", "_lock"})
                 {
-                    if (runtime.enum_value("ObjectLocker", std::string{"storage_size_"} + member) != 8
+                    if (runtime.enum_value("ObjectLocker", std::format("storage_size_{}", member)) != 8
                         || runtime.off("ObjectLocker", member) + 8 > result.size) { return configuration{}; }
                 }
                 result.boolean_argument = runtime.has_function("monitor_lock_construct_bool");
