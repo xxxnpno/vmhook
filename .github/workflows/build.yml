@@ -220,6 +220,7 @@ jobs:
             special_reference_probe: vmhook_special_reference_probe.dll
             hook_roots_probe: vmhook_hook_roots_probe.dll
             method_binding_probe: vmhook_method_binding_probe.dll
+            argument_descriptor_probe: vmhook_argument_descriptor_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
             observation_probe: vmhook_module_observation_probe.dll
@@ -243,6 +244,7 @@ jobs:
             special_reference_probe: vmhook_module_special_reference_probe.dll
             hook_roots_probe: vmhook_module_hook_roots_probe.dll
             method_binding_probe: vmhook_module_method_binding_probe.dll
+            argument_descriptor_probe: vmhook_module_argument_descriptor_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -325,6 +327,7 @@ jobs:
           --special-reference-probe runtime-binaries/${{ matrix.special_reference_probe }}
           --hook-roots-probe runtime-binaries/${{ matrix.hook_roots_probe }}
           --method-binding-probe runtime-binaries/${{ matrix.method_binding_probe }}
+          --argument-descriptor-probe runtime-binaries/${{ matrix.argument_descriptor_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify the heap liveness gate with class unloading disabled
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[9,16,17,21,27]'), matrix.java) }}
