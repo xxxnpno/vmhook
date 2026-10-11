@@ -17434,7 +17434,7 @@ export namespace vmhook
                            void** const* const argument_owners = nullptr) const
             -> value_t
         {
-            if (!this->callable_candidate(selected_method) || param_idx > 20
+            if (!this->callable_candidate(selected_method) || param_idx > 255
                 || (param_idx != 0 && !params)
                 || selected_signature != selected_method->get_signature())
             { return value_t{ std::monostate{} }; }

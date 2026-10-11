@@ -33,6 +33,10 @@ namespace
     auto check(std::ostream& output, const std::string_view label, const bool condition) -> void
     { require(condition, label); output << label << "=pass\n"; output.flush(); }
 
+    template<std::size_t... index>
+    auto call_many_references(const std::unique_ptr<player>& value, std::index_sequence<index...>) -> std::int32_t
+    { return interop_fixture::method("manyReferences")->call((static_cast<void>(index), value)...); }
+
     template<typename element_type>
     auto primitive_array(const element_type first, const element_type last) -> bool
     {
@@ -60,6 +64,22 @@ namespace
             const auto first = vmhook::make_unique<player>(std::int32_t{11});
             const auto last = vmhook::make_unique<player>(std::int32_t{22});
             const auto java_null = std::make_unique<player>(nullptr);
+            bool maximum_parameters{};
+            {
+                vmhook::detail::native_backend::operation access{};
+                require(static_cast<bool>(access), "maximum parameter VM operation");
+                const auto maximum = interop_fixture::method("maximumReferences");
+                std::vector<vmhook::method_proxy::java_arg> arguments(255,
+                    vmhook::method_proxy::java_arg::of_object(first->get_instance()));
+                maximum_parameters = static_cast<std::int32_t>(maximum->call_packed(maximum->raw_method(), arguments)) == 255;
+                arguments.push_back(vmhook::method_proxy::java_arg::of_object(first->get_instance()));
+                bool overflow_refused{};
+                try { overflow_refused = !maximum->call_packed(maximum->raw_method(), arguments).was_invoked(); }
+                catch (const vmhook::exception&) { overflow_refused = true; }
+                require(overflow_refused, "256 parameter refusal");
+            }
+            require(maximum_parameters, "255 packed reference arguments");
+            require(call_many_references(first, std::make_index_sequence<64>{}) == 64, "64 typed reference arguments");
             check(output, "arity", static_cast<std::int64_t>(interop_fixture::method("mixed")->call(
                 std::int32_t{1}, std::int64_t{0x1234567812345678}, 3.25, first,
                 std::int32_t{5}, std::int64_t{-9000000000}, -7.5, last, std::string{"ninth"}, std::int32_t{10})) == 1234);
