@@ -77,7 +77,7 @@ export namespace vmhook::detail::native_backend
         [[nodiscard]] auto valid() const noexcept -> bool { return this->valid_; }
         explicit operator bool() const noexcept { return this->valid_; }
     };
-    inline auto retain_oop(void*) noexcept -> root;
+    inline auto retain_oop(void*) -> root;
     inline auto active_context_lifetime() noexcept -> std::shared_ptr<context_lifetime>;
     inline auto refresh(void**, const root&) noexcept -> void*;
 }
@@ -953,9 +953,42 @@ export namespace vmhook
 
     namespace detail
     {
+        struct class_binding final
+        {
+            std::string name{};
+            vmhook::hotspot::klass* identity{};
+            std::shared_ptr<void> mirror{};
+        };
+        inline std::unordered_map<std::type_index, std::shared_ptr<class_binding>> class_bindings{};
+        inline auto make_class_binding(std::string_view, void* = nullptr) -> std::shared_ptr<class_binding>;
+        inline auto registered_class_klass(std::type_index) -> vmhook::hotspot::klass*;
+        template<typename wrapper_type>
+        inline auto registered_class_klass() -> vmhook::hotspot::klass*
+        { return registered_class_klass(std::type_index{typeid(wrapper_type)}); }
+        inline auto install_class_binding(std::type_index type, std::shared_ptr<class_binding> binding) -> void
+        {
+            std::unordered_map<std::type_index, std::string> names{};
+            std::unordered_map<std::type_index, std::shared_ptr<class_binding>> bindings{};
+            {
+                std::lock_guard lock{vmhook::registration_mutex};
+                names = vmhook::type_to_class_map;
+                bindings = class_bindings;
+                names.insert_or_assign(type, binding->name);
+                bindings.insert_or_assign(type, std::move(binding));
+                vmhook::type_to_class_map.swap(names);
+                class_bindings.swap(bindings);
+            }
+        }
+        inline auto prepare_durable_roots() noexcept -> bool;
+        inline auto retain_durable_oop(void*) -> std::shared_ptr<void>;
+        inline auto resolve_durable_oop(const std::shared_ptr<void>&) noexcept -> void*;
+    }
+
+    namespace detail
+    {
         // Return a copy while holding the registry lock. No map iterator,
         // reference or string_view may outlive this critical section.
-        inline auto registered_class_name(const std::type_index wrapper_type) noexcept
+        inline auto registered_class_name(const std::type_index wrapper_type)
             -> std::string
         {
             try
@@ -964,14 +997,12 @@ export namespace vmhook
                 const auto entry{ vmhook::type_to_class_map.find(wrapper_type) };
                 return entry != vmhook::type_to_class_map.end() ? entry->second : std::string{};
             }
-            catch (const std::exception&)
-            {
-                return {};
-            }
+            catch (const std::bad_alloc&) { throw; }
+            catch (const std::exception&) { return {}; }
         }
 
         template<typename wrapper_type>
-        inline auto registered_class_name() noexcept -> std::string
+        inline auto registered_class_name() -> std::string
         {
             if constexpr (std::is_void_v<wrapper_type>) { return {}; }
             else { return registered_class_name(std::type_index{ typeid(wrapper_type) }); }
@@ -979,7 +1010,7 @@ export namespace vmhook
     }
 
     template<class wrapper_type>
-    inline auto register_class(std::string_view class_name) noexcept
+    inline auto register_class(std::string_view class_name)
         -> bool;
 
     /*
@@ -6910,9 +6941,10 @@ export namespace vmhook
                           (e.g. "java/lang/String", "net/minecraft/client/Minecraft").
         @return Pointer to the matching klass if found, nullptr otherwise.
         @details
-        Searches all loaded classloaders for a class matching the given name by walking
+        Searches all loaded classloaders for one unambiguous matching name by walking
         the HotSpot ClassLoaderDataGraph entirely via gHotSpotVMStructs, without any
-        JNI or JVMTI calls. Results are cached on first lookup.
+        JNI or JVMTI calls. An ambiguous name is refused unless an explicit
+        global preference selects a currently observed loaded class.
 
         Cache operations are serialized by klass_lookup_cache_mutex. The
         exported VMStructs describe layouts; they do not provide a coherent
@@ -6957,58 +6989,40 @@ export namespace vmhook
             }
         }
 
+        // A free-standing metadata observation cannot acquire a lifetime guard.
+        // Only explicit overrides are consulted; ordinary results are not cached.
+        vmhook::hotspot::klass* preferred{};
         {
-            std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
-            const auto cache_entry{ vmhook::klass_lookup_cache.find(std::string{ class_name }) };
-            if (cache_entry != vmhook::klass_lookup_cache.end())
-            {
-                vmhook::hotspot::klass* const cached_klass{ cache_entry->second };
-
-                // This name check can reject an obviously stale raw cache
-                // entry. Readable memory and a matching name do not establish
-                // identity or lifetime after unloading/address reuse. Use a
-                // rooted native context for operations requiring those guarantees.
-                if (cached_klass && vmhook::hotspot::is_valid_pointer(cached_klass))
-                {
-                    const vmhook::hotspot::symbol* const name_sym{ cached_klass->get_name() };
-                    if (name_sym && vmhook::hotspot::is_valid_pointer(name_sym))
-                    {
-                        const std::string actual_name{ name_sym->to_string() };
-                        if (actual_name == class_name)
-                        {
-                            return cached_klass;
-                        }
-                    }
-                }
-
-                // Cached klass is stale - evict and fall through to the
-                // fresh ClassLoaderDataGraph walk below.
-                vmhook::klass_lookup_cache.erase(cache_entry);
-                ::vmhook::detail::log_line("{} find_class: cached klass for '{}' is stale (likely class "
-                           "redefinition or unload); evicting and re-resolving.",
-                           vmhook::warning_tag, class_name);
-            }
+            std::lock_guard lock{vmhook::klass_lookup_cache_mutex};
+            if (const auto found{vmhook::klass_lookup_cache.find(std::string{class_name})};
+                found != vmhook::klass_lookup_cache.end()) { preferred = found->second; }
         }
-
         try
         {
             const vmhook::hotspot::class_loader_data_graph graph{};
-            vmhook::hotspot::klass* found_klass{ graph.find_klass(class_name) };
+            vmhook::hotspot::klass* found_klass{};
+            bool ambiguous{};
+            bool preferred_found{};
+            graph.for_each_klass([&](std::string_view name, vmhook::hotspot::klass* candidate)
+            {
+                if (name != class_name) { return; }
+                if (candidate == preferred) { found_klass = candidate; preferred_found = true; }
+                else if (!preferred_found)
+                {
+                    if (found_klass && found_klass != candidate) { ambiguous = true; }
+                    else { found_klass = candidate; }
+                }
+            });
+            if (ambiguous && !preferred_found) { return nullptr; }
 
             if (!found_klass)
             {
-                // No fallback: the CLDG walk above enumerates every LOADED class
-                // across all loaders, so a miss means the class is not loaded yet.
+                // No fallback: a miss means the class is not loaded, or its
+                // name is ambiguous across defining class loaders.
                 // vmhook observes live VM state and never triggers class loading.
                 return nullptr;
             }
 
-            {
-                std::lock_guard<std::mutex> lock{ vmhook::klass_lookup_cache_mutex };
-                // Use insert (not assign) so a racing thread that beat us to
-                // the punch with the same name doesn't overwrite their entry.
-                vmhook::klass_lookup_cache.insert({ std::string{ class_name }, found_klass });
-            }
             // The loaded class lookup can retain a context-loader anchor; no native thread is attached.
             vmhook::detail::capture_host_classloader_klass(found_klass);
             return found_klass;
@@ -7721,7 +7735,7 @@ export namespace vmhook
                        vmhook::error_tag);
             return 0;
         }
-        vmhook::hotspot::klass* const target_klass{ vmhook::find_class(registered_name) };
+        vmhook::hotspot::klass* const target_klass{ vmhook::detail::registered_class_klass<value_type>() };
         if (!target_klass)
         {
             ::vmhook::detail::log_line("{} for_each_instance: find_class('{}') returned null - the registered "
@@ -8001,25 +8015,50 @@ export namespace vmhook
         Registration is required before calling hook<T>().
     */
     template<class wrapper_type>
-    inline auto register_class(const std::string_view class_name) noexcept
-        -> bool
+    inline auto register_class(const std::string_view class_name) -> bool
     {
-        vmhook::hotspot::klass* const verified_klass{ vmhook::find_class(class_name) };
-
-        if (!verified_klass)
+        try
         {
-            ::vmhook::detail::log_line("{} register_class() for {}: class not found in JVM.", vmhook::error_tag, class_name);
-            return false;
+            auto binding{ vmhook::detail::make_class_binding(class_name) };
+            if (!binding) { return false; }
+            vmhook::detail::install_class_binding(std::type_index{typeid(wrapper_type)}, std::move(binding));
+            return true;
         }
+        catch (const std::bad_alloc&) { throw; }
+        catch (...) { return false; }
+    }
 
-        // Serialize registration map updates. Concurrent readers must use
-        // the same mutex or a copied registration snapshot. This C++ lock does
-        // not protect the lifetime of the corresponding HotSpot metadata.
-        std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
-
-        vmhook::type_to_class_map.insert_or_assign(std::type_index{ typeid(wrapper_type) }, std::string{ class_name });
-
+    /* Bind a wrapper to the loaded copy defined by an owning anchor's loader.
+       Duplicate class names are deliberately not resolved by graph order. */
+    template<class wrapper_type, class anchor_type>
+    inline auto register_class(const std::string_view class_name,
+        const std::unique_ptr<anchor_type>& anchor) -> bool
+    {
+        if (!anchor) { throw vmhook::exception{ "A class binding requires an allocated anchor wrapper" }; }
+        vmhook::detail::native_backend::operation access{};
+        if (!access) { throw vmhook::exception{ "Anchored registration requires the anchor's VM context" }; }
+        auto* const address{ anchor->get_instance() };
+        if (!address) { throw vmhook::exception{ "Java null cannot select a defining class loader" }; }
+        if (!anchor->get_native_root() || !anchor->get_native_root()->valid())
+        { throw vmhook::exception{ "A defining-loader anchor requires a live VM-scanned reference" }; }
+        auto binding{ vmhook::detail::make_class_binding(class_name, address) };
+        if (!binding || !binding->mirror) { return false; }
+        vmhook::detail::install_class_binding(std::type_index{typeid(wrapper_type)}, std::move(binding));
         return true;
+    }
+
+    template<class wrapper_type>
+    inline auto unregister_class() -> bool
+    {
+        std::shared_ptr<vmhook::detail::class_binding> released{};
+        {
+            std::lock_guard lock{ vmhook::registration_mutex };
+            const auto type{std::type_index{typeid(wrapper_type)}};
+            if (const auto found{vmhook::detail::class_bindings.find(type)};
+                found != vmhook::detail::class_bindings.end())
+            { released = std::move(found->second); vmhook::detail::class_bindings.erase(found); }
+            return vmhook::type_to_class_map.erase(type) != 0;
+        }
     }
 
     /*
@@ -8050,7 +8089,7 @@ export namespace vmhook
 
     template<class wrapper_type>
         requires vmhook::detail::has_annotated_class_name_v<wrapper_type>
-    inline auto register_class() noexcept -> bool
+    inline auto register_class() -> bool
     {
         return vmhook::register_class<wrapper_type>(
             vmhook::detail::annotated_class_name<wrapper_type>());
@@ -8151,7 +8190,7 @@ export namespace vmhook
             {
                 return {};
             }
-            return vmhook::detail::collect_klass_methods(vmhook::find_class(registered_name));
+            return vmhook::detail::collect_klass_methods(vmhook::detail::registered_class_klass<wrapper_type>());
         }
         catch (...)
         {
@@ -12632,7 +12671,7 @@ export namespace vmhook::detail::native_backend
         catch (...) { return nullptr; }
     }
 
-    inline auto retain_root_slot(void** const slot) noexcept -> root
+    inline auto retain_root_slot(void** const slot) -> root
     {
         const auto context{ active_context_lifetime() };
         if (!context || !slot || context->temporary_depth != 0) { return {}; }
@@ -12650,10 +12689,11 @@ export namespace vmhook::detail::native_backend
             ticket->slot = slot;
             return ticket;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (...) { return {}; }
     }
 
-    inline auto retain_oop(void* const oop) noexcept -> root
+    inline auto retain_oop(void* const oop) -> root
     {
         if (!oop) { return {}; }
         const auto context{ active_context_lifetime() };
@@ -12662,7 +12702,13 @@ export namespace vmhook::detail::native_backend
         {
             if (vmhook::detail::private_native::thread_state(context->thread) != 6) { return {}; }
             void** const slot{ vmhook::detail::private_native::detail::root_oop(context->thread, oop) };
-            auto ticket{ retain_root_slot(slot) };
+            root ticket{};
+            try { ticket = retain_root_slot(slot); }
+            catch (...)
+            {
+                if (slot) { void* null{}; std::memcpy(slot, &null, sizeof(null)); }
+                throw;
+            }
             if (slot && !ticket)
             {
                 void* null{};
@@ -12671,15 +12717,16 @@ export namespace vmhook::detail::native_backend
             }
             return ticket;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (...) { return {}; }
     }
 
-    inline auto retain_class(vmhook::hotspot::klass* const klass) noexcept -> root
+    inline auto retain_class(vmhook::hotspot::klass* const klass) -> root
     {
         return klass ? retain_oop(klass->get_java_mirror()) : root{};
     }
 
-    inline auto reserve_result_root(vmhook::hotspot::klass* const klass) noexcept -> root
+    inline auto reserve_result_root(vmhook::hotspot::klass* const klass) -> root
     {
         auto result{ retain_class(klass) };
         if (result)
@@ -12731,14 +12778,19 @@ export namespace vmhook::detail::native_backend
             if (name.front() == '[') { return vmhook::resolve_array_klass(name); }
             vmhook::hotspot::klass* result{};
             bool found_preferred{};
+            bool ambiguous{};
             const vmhook::hotspot::class_loader_data_graph graph{};
             graph.for_each_klass([&](const std::string_view observed_name, vmhook::hotspot::klass* const klass)
             {
                 if (observed_name != name) { return; }
                 if (klass == preferred) { result = klass; found_preferred = true; }
-                else if (!result && !found_preferred) { result = klass; }
+                else if (!found_preferred)
+                {
+                    if (result && result != klass) { ambiguous = true; }
+                    else { result = klass; }
+                }
             });
-            return result;
+            return found_preferred || !ambiguous ? result : nullptr;
         }
         catch (...) { return nullptr; }
     }
@@ -13050,6 +13102,8 @@ export namespace vmhook
         }
         explicit operator bool() const noexcept { return this->valid(); }
         [[nodiscard]] auto error() const noexcept -> const char* { return this->error_.c_str(); }
+        template<typename loader_type>
+        auto set_context_class_loader(const std::unique_ptr<loader_type>& loader) -> void;
 
         auto close() noexcept -> bool
         {
@@ -13489,79 +13543,46 @@ export namespace vmhook::detail
 
 export namespace vmhook
 {
-    // -------------------------------------------------------------------------
-    // Class resolution under multiple classloaders.
-    //
-    // vmhook::find_class() resolves a class by NAME across the whole
-    // ClassLoaderDataGraph and returns the first match.  When a process has two
-    // copies of a class under different loaders (modded games with a custom
-    // launcher loader, OSGi, app servers, any plugin host), "first by name" is
-    // graph-iteration-order-dependent and routinely resolves the WRONG copy —
-    // the only symptom being a ClassCastException thrown deep in host code when
-    // the result is handed back.  These helpers were written to give the
-    // corrective half: "resolve the copy visible from an object I already hold",
-    // and "make every find_class() consumer pick up that copy".  Surfaced by the
-    // NPNOQOL deep-dive (Lunar/Forge ship duplicate net.kyori.* / com.mojang.*
-    // classes).
-    //
-    // CURRENT LIMITATION: only the second half still works.  Selecting a copy by
-    // an anchor's loader needed a Java-level loadClass() call, which this build
-    // cannot make, so find_class_via_oop() now validates the anchor and returns
-    // the same first-by-name result as find_class().  override_class_lookup() /
-    // evict_class_lookup() are unaffected — they remain the supported way to pin
-    // a Klass* you resolved by some other means.
-    // -------------------------------------------------------------------------
-
-    /*
-        @brief Validates an anchor object, then resolves `class_name` exactly as
-        find_class() would.  It does NOT currently disambiguate by classloader.
-        @details
-        The name and the reason this function exists are loader disambiguation,
-        but that capability is gone.  Selecting the copy visible from the anchor's
-        loader required walking anchor -> getClass() -> getClassLoader() ->
-        loadClass(name), i.e. calling Java code, which this build cannot do.  What
-        remains is: reject a null or implausible anchor, then delegate to
-        vmhook::find_class(), which walks the whole ClassLoaderDataGraph and
-        returns the FIRST class of that name in graph-iteration order.
-
-        Consequences for callers:
-          * With two loaded copies of `class_name`, the result is the same
-            arbitrary copy find_class() would have returned — passing an anchor
-            does not steer it.  The ClassCastException failure mode this helper
-            was meant to cure is not cured.
-          * The class must already be LOADED.  Nothing here triggers class
-            loading any more, so a not-yet-loaded class resolves to nullptr where
-            it previously would have been loaded on demand.
-          * The anchor is still load-bearing as a guard: a null or non-pointer
-            anchor short-circuits to nullptr without touching the graph.
-
-        Complexity: O(ClassLoaderDataGraph walk), or O(1) on a find_class cache
-        hit.  Exception safety: noexcept — returns nullptr on any failure (null
-        or invalid anchor, no JVM, class not loaded).
-
-        @param anchor_oop   Raw decoded heap OOP; validated, but not used to
-                            select among same-named classes.
-        @param class_name   Internal ('/'-separated) JVM class name.
-        @return  The Klass* find_class() resolves for `class_name`, or nullptr.
-    */
-    inline auto find_class_via_oop(void* const anchor_oop, const std::string_view class_name) noexcept
-        -> vmhook::hotspot::klass*
+    /* Resolve an already-loaded class defined by the anchor object's loader.
+       Requires a native/callback context. The anchor must be live and rooted.
+       This does not invoke loadClass, initialize a class or choose an arbitrary
+       same-named class from another loader. Bootstrap definitions are fallback. */
+    inline auto find_class_via_oop(void* const anchor_oop,
+        const std::string_view class_name) noexcept -> vmhook::hotspot::klass*
     {
-        if (!anchor_oop || !vmhook::hotspot::is_valid_pointer(anchor_oop))
+        vmhook::detail::native_backend::operation access{};
+        if (!access || !anchor_oop || class_name.empty()) { return nullptr; }
+        try
         {
-            return nullptr;
+            auto* const anchor_class{ vmhook::klass_from_oop(anchor_oop) };
+            const auto* offset{vmhook::hotspot::iterate_struct_entries("Klass", "_class_loader_data")};
+            if (!offset) { offset = vmhook::hotspot::iterate_struct_entries("InstanceKlass", "_class_loader_data"); }
+            if (!anchor_class || !offset) { return nullptr; }
+            void* const selected{vmhook::detail::private_native::load<void*>(anchor_class, offset->offset)};
+            if (!selected) { return nullptr; }
+            vmhook::hotspot::klass* result{};
+            vmhook::hotspot::klass* bootstrap{};
+            const vmhook::hotspot::class_loader_data_graph graph{};
+            graph.for_each_klass([&](std::string_view name, vmhook::hotspot::klass* candidate)
+            {
+                if (name != class_name) { return; }
+                auto* const data{vmhook::detail::private_native::load<vmhook::hotspot::class_loader_data*>(candidate, offset->offset)};
+                if (data == selected) { result = candidate; }
+                else if (data && !data->get_class_loader_oop()) { bootstrap = candidate; }
+            });
+            return result ? result : bootstrap;
         }
-        return vmhook::find_class(class_name);
+        catch (...) { return nullptr; }
     }
 
     /*
         @brief Installs / replaces the find_class cache entry for `class_name`.
         @details
         After this call, every subsequent vmhook::find_class(class_name) returns
-        `k` directly without walking the ClassLoaderDataGraph.  Pair it with
-        find_class_via_oop() to nail the correct loader's copy once and have the
-        whole SDK (every wrapper that calls find_class) follow it — the supported
-        replacement for reaching into the internal cache.  The cache is a single
+        `k` when a fresh loaded-class graph walk observes the same pointer/name.
+        This is an advanced global preference, not a class-lifetime guarantee.
+        Registered wrappers use their own retained mirror and are independent
+        of this global name preference.  The cache is a single
         process-global map (last writer wins; no scoping or refcount), so an
         override is visible to every caller until evicted or overwritten.
 
@@ -13614,11 +13635,9 @@ export namespace vmhook
         (e.g. once a world/context is loaded) can poll until it returns true.
         Names that don't resolve are left un-overridden.
 
-        @note The anchor no longer selects a loader (see find_class_via_oop), so
-        what this caches is whichever copy find_class() returns first, not the
-        anchor loader's copy.  It still pins that choice so it stops varying
-        between calls; it does not make the choice correct under duplicate
-        classes.
+        @note This advanced helper changes a global name preference. Prefer
+        register_class<W>(name, anchor) for independent per-wrapper bindings
+        whose class mirror is retained; a raw cache preference is not a root.
 
         Complexity: O(N · ClassLoaderDataGraph walk).  Exception safety: noexcept.
     */
@@ -19647,7 +19666,7 @@ export namespace vmhook
                 return nullptr;
             }
 
-            vmhook::hotspot::klass* const found_klass{ vmhook::find_class(registered_name) };
+            vmhook::hotspot::klass* const found_klass{ vmhook::detail::registered_class_klass(wrapper_type) };
             if (!found_klass)
             {
                 ::vmhook::detail::log_line("{} object::resolve_klass() class '{}' not found in JVM.", vmhook::error_tag, registered_name);
@@ -20935,7 +20954,8 @@ export namespace vmhook
                 }
                 if (expected_name.empty())
                 { throw vmhook::exception{ "Object wrapper is not registered with a Java class" }; }
-                auto* const expected_class{ vmhook::find_class(expected_name) };
+                auto* expected_class{ vmhook::detail::registered_class_klass<wrapper_type>() };
+                if (!expected_class) { expected_class = vmhook::find_class(expected_name); }
                 if (!expected_class || !container_class_assignable(runtime_class, expected_class))
                 { throw vmhook::exception{ std::format("Java object does not match wrapper class '{}'", expected_name) }; }
             }
@@ -24487,7 +24507,8 @@ namespace hotspot
             if (owner.empty()) { owner = vmhook::detail::registered_class_name<element_type>(); }
             if (owner.empty() || this->field_name_.empty())
             { throw vmhook::exception{ "Static object field owner and name are required" }; }
-            auto* const owner_class{ vmhook::find_class(owner) };
+            auto* const owner_class{ owner == vmhook::detail::registered_class_name<element_type>()
+                ? vmhook::detail::registered_class_klass<element_type>() : vmhook::find_class(owner) };
             if (!owner_class) { throw vmhook::exception{ "Static object field owner class is not loaded" }; }
             const auto entry{ vmhook::find_field(owner_class, this->field_name_) };
             if (!entry || !entry->is_static || entry->signature.empty() || entry->signature.front() != 'L')
@@ -24760,6 +24781,98 @@ namespace hotspot
         vmhook::detail::native_backend::root native_root_{};
     };
 
+    /* A move-only GC root resource, independent of the creating native context.
+       acquire() creates a fresh unique_ptr wrapper in the receiving context.
+       Its parked root keeper never executes Java calls on the caller's behalf. */
+    template<typename wrapper_type = vmhook::any_object>
+        requires vmhook::detail::container_wrapper<wrapper_type>
+    class retained_object final
+    {
+        std::shared_ptr<void> root_{};
+        bool initialized_{};
+        template<typename other_type>
+            requires vmhook::detail::container_wrapper<other_type>
+        friend auto retain(const std::unique_ptr<other_type>&) -> retained_object<other_type>;
+        retained_object(std::shared_ptr<void> root, bool initialized) noexcept
+            : root_{std::move(root)}, initialized_{initialized} {}
+    public:
+        retained_object() noexcept = default;
+        retained_object(const retained_object&) = delete;
+        auto operator=(const retained_object&) -> retained_object& = delete;
+        retained_object(retained_object&& other) noexcept
+            : root_{std::move(other.root_)}, initialized_{std::exchange(other.initialized_, false)} {}
+        auto operator=(retained_object&& other) noexcept -> retained_object&
+        {
+            if (this != &other)
+            { root_ = std::move(other.root_); initialized_ = std::exchange(other.initialized_, false); }
+            return *this;
+        }
+        [[nodiscard]] auto valid() const noexcept -> bool { return initialized_; }
+        explicit operator bool() const noexcept { return valid(); }
+        auto reset() noexcept -> void { root_.reset(); initialized_ = false; }
+        [[nodiscard]] auto acquire() const -> std::unique_ptr<wrapper_type>
+        {
+            if (!initialized_) { throw vmhook::exception{"Retained Java reference is empty or released"}; }
+            if (!root_) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
+            vmhook::detail::native_backend::operation access{};
+            if (!access) { throw vmhook::exception{"Acquiring a retained Java reference requires a VM context"}; }
+            auto* const current{vmhook::detail::resolve_durable_oop(root_)};
+            if (!current) { throw vmhook::exception{"Retained Java reference cannot be resolved in this JVM"}; }
+            const auto local{vmhook::detail::native_backend::retain_oop(current)};
+            if (!local) { throw vmhook::exception{"Retained Java reference cannot be acquired by this context"}; }
+            return vmhook::detail::materialize_object<wrapper_type>(0, local);
+        }
+    };
+
+    template<typename wrapper_type>
+        requires vmhook::detail::container_wrapper<wrapper_type>
+    [[nodiscard]] auto retain(const std::unique_ptr<wrapper_type>& value) -> retained_object<wrapper_type>
+    {
+        if (!value) { throw vmhook::exception{"Retaining a Java object requires an allocated C++ wrapper"}; }
+        // A rooted non-null wrapper must remain on its owner thread/context.
+        // Initialize the parked keeper before entering VM state and waiting.
+        const bool prepared{vmhook::detail::prepare_durable_roots()};
+        vmhook::detail::native_backend::operation access{};
+        auto* const current{value->get_instance()};
+        if (!current) { return retained_object<wrapper_type>{{}, true}; }
+        if (!access || !prepared)
+        { throw vmhook::exception{"Durable Java roots are unavailable for this VM profile or context"}; }
+        if (!value->get_native_root() || !value->get_native_root()->valid())
+        { throw vmhook::exception{"Durable retention requires an existing live VM-scanned reference"}; }
+        const auto rooted{vmhook::detail::retain_durable_oop(current)};
+        if (!rooted) { throw vmhook::exception{"Java object could not be retained independently of its context"}; }
+        return retained_object<wrapper_type>{rooted, true};
+    }
+
+    template<typename loader_type>
+    auto native_thread_context::set_context_class_loader(const std::unique_ptr<loader_type>& loader) -> void
+    {
+        if (!valid() || !loader) { throw vmhook::exception{"Context class loader requires its owner context and an allocated wrapper"}; }
+        vmhook::detail::native_backend::operation access{};
+        (void)loader->get_instance();
+        auto* const thread_class{vmhook::find_class("java/lang/Thread")};
+        if (!access || !thread_class) { throw vmhook::exception{"Java Thread metadata is unavailable"}; }
+        auto* const methods{thread_class->get_methods_ptr()};
+        const auto count{thread_class->get_methods_count()};
+        vmhook::hotspot::method* getter{};
+        vmhook::hotspot::method* setter{};
+        for (std::int32_t index{}; methods && index < count; ++index)
+        {
+            auto* const candidate{methods[index]};
+            if (candidate && candidate->get_name() == "currentThread" && candidate->get_signature() == "()Ljava/lang/Thread;")
+            { getter = candidate; }
+            if (candidate && candidate->get_name() == "setContextClassLoader"
+                && candidate->get_signature() == "(Ljava/lang/ClassLoader;)V") { setter = candidate; }
+        }
+        if (!getter || !setter) { throw vmhook::exception{"Java Thread context class loader methods are unavailable"}; }
+        const std::unique_ptr<vmhook::any_object> thread = vmhook::method_proxy{nullptr, getter, getter->get_signature(), true}.call();
+        if (!thread || !thread->get_instance()) { throw vmhook::exception{"Current Java Thread object is unavailable"}; }
+        const auto result{vmhook::method_proxy{thread->get_instance(), setter, setter->get_signature(), false,
+            nullptr, thread->get_native_root()}.call(loader)};
+        if (!result.was_invoked() || result.threw())
+        { throw vmhook::exception{"Java context class loader setter failed"}; }
+    }
+
     /*
         @brief Out-of-line definition of object<derived>::self().
         @details Clones the C++ view, retaining the same context-scanned Java
@@ -24877,7 +24990,7 @@ namespace hotspot
             throw vmhook::exception{ "Java object wrapper is not registered" };
         }
 
-        vmhook::hotspot::klass* const target_klass{ vmhook::find_class(class_name) };
+        vmhook::hotspot::klass* const target_klass{ vmhook::detail::registered_class_klass<wrapper_type>() };
         if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
         {
             ::vmhook::detail::log_line("{} make_unique(): class '{}' is not loaded in this VM.",
@@ -26932,7 +27045,7 @@ public:
         initialized_.wait(lock, [this] { return status_.load(std::memory_order_acquire) != 0; });
         return ready();
     }
-    std::shared_ptr<void> retain(void* oop) noexcept {
+    std::shared_ptr<void> retain(void* oop) {
         if (!oop || !writer_in_vm()) { return {}; }
         try {
             auto result = std::make_shared<ticket>();
@@ -26947,7 +27060,17 @@ public:
             result->owner = this;
             result->slot = slot;
             return result;
-        } catch (...) { return {}; }
+        } catch (const std::bad_alloc&) { throw; }
+        catch (...) { return {}; }
+    }
+    void* resolve(const std::shared_ptr<void>& root) const noexcept {
+        if (!root || !writer_in_vm()) { return nullptr; }
+        try {
+            auto& runtime = pn::rt();
+            if (runtime.has_function("vm_exited") && pn::load<bool>(runtime.function("vm_exited"), 0)) { return nullptr; }
+            const auto* value = static_cast<const ticket*>(root.get());
+            return value->owner == this && value->slot ? pn::detail::resolve_root(value->slot) : nullptr;
+        } catch (...) { return nullptr; }
     }
     void release(void** slot) noexcept {
         if (!slot) { return; }
@@ -27022,6 +27145,75 @@ export namespace vmhook::detail {
             private_native::vm_state_guard access{thread};
             persistent_hook_roots::drain();
         } catch (...) {}
+    }
+}
+export namespace vmhook::detail
+{
+    inline auto prepare_durable_roots() noexcept -> bool
+    {
+        if (auto* pool{persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)})
+        { return pool->ready(); }
+        return persistent_hook_roots::prepare();
+    }
+    inline auto retain_durable_oop(void* oop) -> std::shared_ptr<void>
+    {
+        auto* const pool{persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)};
+        return pool ? pool->retain(oop) : std::shared_ptr<void>{};
+    }
+    inline auto resolve_durable_oop(const std::shared_ptr<void>& root) noexcept -> void*
+    {
+        auto* const pool{persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)};
+        return pool ? pool->resolve(root) : nullptr;
+    }
+    inline auto make_class_binding(std::string_view name, void* anchor) -> std::shared_ptr<class_binding>
+    {
+        if (name.empty()) { return {}; }
+        const bool durable{prepare_durable_roots()};
+        std::unique_ptr<vmhook::native_thread_context> temporary{};
+        if (!native_backend::active_context_lifetime())
+        {
+            temporary = std::make_unique<vmhook::native_thread_context>("VMHook-class-binding");
+            if (!temporary->valid()) { return {}; }
+        }
+        native_backend::operation access{};
+        if (!access) { return {}; }
+        auto* const identity{anchor ? vmhook::find_class_via_oop(anchor, name) : vmhook::find_class(name)};
+        if (!identity) { return {}; }
+        auto result{std::make_shared<class_binding>()};
+        result->name = name;
+        if (durable)
+        {
+            result->mirror = retain_durable_oop(identity->get_java_mirror());
+            if (!result->mirror) { return {}; }
+            result->identity = identity;
+        }
+        // Unsupported keeper collectors still permit unambiguous name bindings.
+        // They are resolved afresh inside each local VM context; no raw metadata
+        // is cached as a class-lifetime guarantee.
+        return result;
+    }
+    inline auto registered_class_klass(std::type_index type) -> vmhook::hotspot::klass*
+    {
+        std::shared_ptr<class_binding> binding{};
+        {
+            std::lock_guard lock{vmhook::registration_mutex};
+            if (const auto found{class_bindings.find(type)}; found != class_bindings.end())
+            { binding = found->second; }
+        }
+        if (binding && binding->mirror)
+        {
+            native_backend::operation access{};
+            auto& runtime{private_native::rt()};
+            if (runtime.has_function("vm_exited") && private_native::load<bool>(runtime.function("vm_exited"), 0))
+            { return nullptr; }
+            if (access && !resolve_durable_oop(binding->mirror)) { return nullptr; }
+            // Preserve the mirror in this context even if another thread rebinds
+            // or unregisters the wrapper immediately after this snapshot.
+            if (access && !native_backend::retain_class(binding->identity)) { return nullptr; }
+            return binding->identity;
+        }
+        const auto name{registered_class_name(type)};
+        return name.empty() ? nullptr : vmhook::find_class(name);
     }
 }
 // VMHOOK_PERSISTENT_ROOTS_END
