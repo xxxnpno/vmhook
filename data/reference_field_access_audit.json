@@ -1,0 +1,283 @@
+{
+  "schema": 1,
+  "scope": "Resolved bootstrap java.lang.ref.Reference.referent only; ordinary same-named fields remain supported",
+  "reason": "A raw strong-edge load/root publication omits weak-edge keepalive; strong-slot stores do not establish complete Reference processing semantics.",
+  "profiles": [
+    {
+      "java_feature": 8,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/prims/unsafe.cpp",
+      "sha256": "ef4d6bece5e28aa6f15b172a624fce13093d64928905879f380b5476e5dd537c",
+      "weak_load_mechanism": "G1 referent-offset and Reference-kind check followed by SATB enqueue",
+      "source_lines": [
+        226,
+        240,
+        276,
+        304
+      ]
+    },
+    {
+      "java_feature": 9,
+      "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/prims/unsafe.cpp",
+      "sha256": "240e364d1255011a0e12f003e70677f3c4711fd760c25fb0361f167e6d37ad02",
+      "weak_load_mechanism": "G1 referent-offset and Reference-kind check followed by SATB enqueue",
+      "source_lines": [
+        292,
+        314,
+        347
+      ]
+    },
+    {
+      "java_feature": 10,
+      "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "0c32aa322e7e1491bcb47e2e197053bb7217feb4e28726b8a584a1eeacd73a4f",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        257,
+        265,
+        271,
+        279,
+        866,
+        897
+      ]
+    },
+    {
+      "java_feature": 11,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "777a444c73f791b0f68285c89e6e46e946b3ec211d5941899d8b79589ac29276",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        263,
+        271,
+        277,
+        285,
+        872,
+        903
+      ]
+    },
+    {
+      "java_feature": 12,
+      "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "ce3f16d22e7060c1cbb402886ba34845ae806b9bd1d72c7aa466af8f1d738757",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        263,
+        271,
+        277,
+        285,
+        872,
+        903
+      ]
+    },
+    {
+      "java_feature": 13,
+      "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "a21cab52a2c38da6ed96ba8deb1d2a714385a817a5bac48d0fdb24bb64abcedf",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        265,
+        273,
+        279,
+        287,
+        852,
+        883
+      ]
+    },
+    {
+      "java_feature": 14,
+      "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "319ca5708f049487b91a3d6b3dce7ffea9f3de84e2e8e509b7b2526cab68c770",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        265,
+        273,
+        279,
+        287,
+        905,
+        936
+      ]
+    },
+    {
+      "java_feature": 15,
+      "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "da99fe7f7688721bfbeb656e7d967f87af3df66f17ea734c0d25f8d17c11c99c",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        267,
+        275,
+        281,
+        289,
+        916,
+        947
+      ]
+    },
+    {
+      "java_feature": 16,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "073c675dd19cc6290b034b1979f83681a06e5d5bdbc23ae0e61381c9c6ba2873",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        265,
+        273,
+        279,
+        287,
+        914,
+        945
+      ]
+    },
+    {
+      "java_feature": 17,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "fb5d5cb6d4338dc12dc35e12dfbe6fa27a4a1a0899d7c6547c1b282e3a12d203",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        264,
+        272,
+        278,
+        286,
+        738,
+        769
+      ]
+    },
+    {
+      "java_feature": 18,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "e08626734a33a7cd466f491b5867776a33e460974b8bd53730ff77534be301bc",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        250,
+        258,
+        264,
+        272,
+        717,
+        738
+      ]
+    },
+    {
+      "java_feature": 19,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "200c65b4fc4771ca7d4fbd7e2dc85e914a4090221cb7bee57970908fc0ebe6f2",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        250,
+        258,
+        264,
+        272,
+        717,
+        738
+      ]
+    },
+    {
+      "java_feature": 20,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "df138aa7ac8a38fa551134d148b63b72cc686c8cddacf5d4815b9b570536d5b9",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        250,
+        258,
+        264,
+        272,
+        717,
+        738
+      ]
+    },
+    {
+      "java_feature": 21,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "7bf616ae2e10023e9a15eb5ec06577c03527c788bbe8e7d64ccaee7ca3d42c63",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        250,
+        258,
+        264,
+        272,
+        717,
+        738
+      ]
+    },
+    {
+      "java_feature": 22,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "959f2f1761a843eb9189a57831ae76a44949d8c705ec740b33a27e4489eafd49",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        272,
+        280,
+        286,
+        294,
+        722,
+        743
+      ]
+    },
+    {
+      "java_feature": 23,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "cda3063a9d7cff4ca32e1b19c94a042ae46831f518fc60cc0198e21eb07211d9",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        273,
+        281,
+        287,
+        295,
+        728,
+        749
+      ]
+    },
+    {
+      "java_feature": 24,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "d655f890c36407bab66136635c27cd75710af3edf6d654751b3a014ea6c693d6",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        273,
+        281,
+        287,
+        295,
+        728,
+        749
+      ]
+    },
+    {
+      "java_feature": 25,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "b81e60e6eb4c5bf780b52127b017c0b3580a71ba99b03fa9183d37579d89d827",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        272,
+        280,
+        286,
+        294,
+        727,
+        748
+      ]
+    },
+    {
+      "java_feature": 26,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "c48e8562dba9323a516ea694e20bfeb9f04f62b8f39000ce10371e46b182e3b6",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        272,
+        280,
+        286,
+        294,
+        733,
+        754
+      ]
+    },
+    {
+      "java_feature": 27,
+      "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/prims/unsafe.cpp",
+      "sha256": "c9d6348826eb4e1a7b3ad5ddde69b6756554df44ef56fab64a90140df7d1e4c9",
+      "weak_load_mechanism": "HeapAccess with ON_UNKNOWN_OOP_REF; this decorator distinguishes weak referent accesses",
+      "source_lines": [
+        248,
+        256,
+        262,
+        270,
+        729,
+        750
+      ]
+    }
+  ],
+  "implementation_policy": "Direct resolved Reference.referent fields are refused for read, write, CAS, raw echo and hooks; use ordinary Reference Java methods"
+}

@@ -78,3 +78,44 @@ remain usable after marking completes. The diagnostic flag offsets are
 matching-PDB facts guarded by the full build GUID; they do not select production
 addresses. This runtime witness complements the source proof that remark drains
 partial VMThread SATB queues before the cycle ends.
+
+Direct access to the bootstrap `java.lang.ref.Reference.referent` field is
+refused, including reads, writes, atomic updates, raw compressed-oop echoes,
+and field-hook installation. This field is a weak edge: Java 8/9 Unsafe loads
+explicitly apply the G1 referent SATB barrier, and Java 10–27 use
+`ON_UNKNOWN_OOP_REF` access decorators. Rooting a plain memory load does not
+supply that barrier or the complete Reference processing rules. Use the
+ordinary Java `Reference.get()` and `clear()` methods through `get_method`.
+The guard matches the actual bootstrap declaring class and field offset;
+application fields named `referent`, including fields shadowing that inherited
+name, remain ordinary fields. The caller-supplied raw-address constructor
+carries no declaring-field identity and remains an unsafe escape hatch.
+Exact source URLs, hashes and relevant line numbers are recorded in
+[`reference_field_access_audit.json`](../data/reference_field_access_audit.json).
+
+## Field memory semantics
+
+Ordinary primitive `get()`/`set()` accesses do not create a cross-thread
+happens-before edge. Synchronize shared access with Java volatile fields, Java
+monitors or the atomic operations below. A field declared `volatile` uses
+HotSpot's matching Java Unsafe getter/setter, including its Java Memory Model
+barriers, rather than raw C++ reads and writes.
+
+Reference setters invoke the VM's actual Java accessor through rooted
+JavaCalls. The selected implementation supplies collector write barriers and
+volatile ordering when needed. Java 8 uses its existing Unsafe methods, so
+VarHandle is not required. Object values are passed as
+`const std::unique_ptr<wrapper>&`; Java null is an allocated wrapper whose
+`get_instance()` returns null. An empty C++ owner is refused. The VMHook
+library does not call JNI/JVMTI APIs, and requires no module-opening flags.
+
+`compare_exchange(expected, desired)` provides a strong compare-and-swap for
+exact Java `int`, `long` or reference fields. It returns success, uses volatile
+ordering and collector barriers, and leaves the C++ `expected` argument
+unchanged. Reference comparison uses Java object identity. Other primitive
+CAS types and arbitrary memory-order settings are unavailable.
+
+Final fields are readable; all setters and CAS operations refuse their
+mutation. A low-level write would bypass Java final-field semantics and could
+contradict an already-folded compiled constant. The library does not promise
+that raw writes invalidate those compiler assumptions.

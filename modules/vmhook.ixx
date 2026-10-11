@@ -1245,7 +1245,7 @@ export namespace vmhook
     inline auto set_str_field(const field_proxy& field, std::string_view value)
         -> void;
 
-    inline auto field_oop(const field_proxy& field) noexcept
+    inline auto field_oop(const field_proxy& field)
         -> void*;
 
     inline auto set_bool_array(const field_proxy& field, const std::vector<bool>& values) noexcept
@@ -14665,6 +14665,26 @@ export namespace vmhook
             return result;
         }
 
+        // Reference.referent is a weak edge with collector-specific load and
+        // reference-processing rules. Match the actual bootstrap declaring
+        // class and slot, preserving same-named ordinary application fields.
+        inline auto is_reference_referent(vmhook::hotspot::klass* const declaring_class,
+                                           const std::size_t offset) -> bool
+        {
+            if (!declaring_class) { return false; }
+            const auto* const name{ declaring_class->get_name() };
+            if (!name || name->to_string() != "java/lang/ref/Reference") { return false; }
+            auto* const bootstrap{ bootstrap_class("java/lang/ref/Reference") };
+            if (!bootstrap)
+            { throw vmhook::exception{ "Reference field access cannot verify its bootstrap declaring class" }; }
+            if (bootstrap != declaring_class) { return false; }
+            const auto field{ declaring_class->find_field("referent") };
+            if (!field)
+            { throw vmhook::exception{ "Reference field access cannot verify its weak referent slot" }; }
+            return !field->is_static && field->signature == "Ljava/lang/Object;"
+                && field->offset == offset;
+        }
+
         /* Unsafe is an already-loaded Java class. Calling its Java methods
            through JavaCalls executes HotSpot's real Access<...> collector and
            volatile barriers. No native interface table or Unsafe native symbol
@@ -15201,6 +15221,7 @@ export namespace vmhook
             , field_flags{ access_flags }
         {
             this->reference_declaring_class = mirror_klass;
+            this->special_reference_field = vmhook::detail::field_memory_backend::is_reference_referent(mirror_klass, field_offset);
             vmhook::detail::native_backend::operation access{};
             if (access)
             {
@@ -15218,6 +15239,7 @@ export namespace vmhook
               field_flags{ access_flags }
         {
             this->native_bound = this->holder_root != nullptr || vmhook::detail::native_backend::active();
+            this->special_reference_field = vmhook::detail::field_memory_backend::is_reference_referent(declaring_class, offset);
         }
 
         /*
@@ -15231,6 +15253,7 @@ export namespace vmhook
         auto get_unchecked() const
             -> value_t
         {
+            this->require_ordinary_reference_field();
             vmhook::detail::native_backend::operation access{};
             if (this->is_volatile()) { return this->read_volatile(); }
             if (this->is_reference()
@@ -15381,6 +15404,7 @@ export namespace vmhook
         auto set(const value_type& value) const
             -> void
         {
+            this->require_ordinary_reference_field();
             vmhook::detail::require_object_argument(value);
             vmhook::detail::native_backend::operation access{};
             if constexpr (std::is_arithmetic_v<std::remove_cvref_t<value_type>>)
@@ -15692,6 +15716,7 @@ export namespace vmhook
                 || vmhook::detail::is_java_object_pointer_v<value_type>)
         auto compare_exchange(const value_type& expected, const value_type& desired) const -> bool
         {
+            this->require_ordinary_reference_field();
             vmhook::detail::native_backend::operation access{};
             if (this->is_final())
             { throw vmhook::exception{ "Final Java fields cannot be mutated through compare_exchange" }; }
@@ -15767,9 +15792,10 @@ export namespace vmhook
             @brief Returns the compressed OOP stored in this field (for reference/array types).
             @return The compressed OOP as uint32_t, or 0 if field_pointer is null.
         */
-        auto get_compressed_oop() const noexcept
+        auto get_compressed_oop() const
             -> std::uint32_t
         {
+            this->require_ordinary_reference_field();
             vmhook::detail::native_backend::operation access{};
             // FLAW C fix: only reference/array fields hold a compressed OOP.  On a
             // PRIMITIVE field, memcpy'ing the first 4 bytes returns the primitive's
@@ -15823,6 +15849,12 @@ export namespace vmhook
         }
 
     private:
+        auto require_ordinary_reference_field() const -> void
+        {
+            if (this->special_reference_field)
+            { throw vmhook::exception{ "Direct java.lang.ref.Reference.referent access is refused: use Reference.get()/clear()" }; }
+        }
+
         auto primitive_accessor_name() const -> std::string_view
         {
             if (this->signature_text == "Z") { return "Boolean"; }
@@ -16048,6 +16080,7 @@ export namespace vmhook
         // It supplies type identity only; it never selects the storage holder.
         vmhook::hotspot::klass* reference_declaring_class{ nullptr };
         std::uint16_t field_flags{};
+        bool special_reference_field{};
         std::shared_ptr<void> metadata_lifetime_{};
     };
 
@@ -22199,12 +22232,12 @@ export namespace vmhook
         set_bool_array(), set_prim_array(), and set_str_array().
 
         Complexity: O(1).
-        Exception safety: noexcept — returns nullptr if the field OOP is null or invalid.
+        Exception safety: invalid slots return nullptr; special weak-field refusals propagate.
 
         @param field  A field_proxy whose underlying field holds a reference or array OOP.
         @return  Decoded 64-bit heap pointer to the array/object, or nullptr on failure.
     */
-    inline auto field_oop(const vmhook::field_proxy& field) noexcept
+    inline auto field_oop(const vmhook::field_proxy& field)
         -> void*
     {
         if (!vmhook::detail::reference_reads_supported()) { return nullptr; }
@@ -28385,7 +28418,9 @@ export namespace vmhook::detail
                     auto* klass=registered_class_klass<wrapper_type>();
                     if(!klass) { return 0; }
                     const auto field=vmhook::find_field(klass,name);
-                    if(!field||!field->is_static||field->signature.empty()) { return 0; }
+                    if(!field || field_memory_backend::is_reference_referent(
+                        field->declaring_klass ? field->declaring_klass : klass, field->offset)
+                        || !field->is_static || field->signature.empty()) { return 0; }
                     if constexpr (vmhook::detail::is_java_object_pointer_v<field_type>)
                     {
                         // The reflected Class identity below validates the complete
