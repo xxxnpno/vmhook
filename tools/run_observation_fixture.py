@@ -55,6 +55,8 @@ CHECKS = {
     "lifetime": ["metadata", "native_attach", "ambiguous_name", "loader_binding", "constructor_identity",
                  "null_contract", "context_loader", "source_closed", "cross_context_gc",
                  "released_resource", "proxy_binding_lifetime", "loader_heap_snapshot", "rebound_heap_snapshot", "root_accounting", "builtin_identity", "builtin_heap", "unregister", "lifetime_complete"],
+    "class_inventory": ["metadata", "native_attach", "inventory_bounds", "duplicate_loaders",
+                        "rooted_mirrors", "inventory_context", "inventory_complete"],
     "event_stream": ["context", "queued_observer", "deferred_registration", "initial_wait",
                      "copied_class_record", "deferred_native_install", "deferred_callback",
                      "deferred_removal", "deferred_original_body", "deferred_reclamation",
@@ -76,6 +78,7 @@ FIXTURES = {
     "callbacks": "ObservationCallbackFixture",
     "hook_composition": "HookCompositionFixture",
     "lifetime": "LifetimeFixture",
+    "class_inventory": "LifetimeFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
     "executor": "ExecutorFixture",
@@ -88,6 +91,7 @@ OPTIONAL_PROBES = {
     "callbacks": "callback_probe",
     "hook_composition": "composition_probe",
     "lifetime": "lifetime_probe",
+    "class_inventory": "class_inventory_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
     "executor": "executor_probe",
@@ -100,6 +104,7 @@ TERMINAL_CHECK = {
     "virtual_thread": "virtual_thread_proof",
     "hook_composition": "hook_composition_proof",
     "event_stream": "event_stream_proof",
+    "class_inventory": "inventory_complete",
 }
 
 
@@ -323,7 +328,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="vmhook-observation-") as temporary:
         directory = Path(temporary)
         target = str(directory) if os.name == "nt" else "Z:" + str(directory).replace("/", "\\")
-        sources = [str(source / (FIXTURES[mode] + ".java")) for mode in modes]
+        fixture_names = dict.fromkeys(FIXTURES[mode] for mode in modes)
+        sources = [str(source / (name + ".java")) for name in fixture_names]
         subprocess.run(prefix + [str(args.javac), "-d", target, *sources], check=True, timeout=90)
         for mode in modes:
             results.append(execute_mode(args, mode, directory))
