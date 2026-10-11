@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 namespace {
@@ -83,17 +84,17 @@ auto worker(void*) -> DWORD {
         auto regular_null=read_ordinary(regular), shadow_null=read_ordinary(shadow);
         auto live=reference->get(), absent=empty->get();
         const bool ordinary_java_api=live && live->value()==41 && absent && !absent->get_instance();
-        output << "reference_read_refusal=" << (read ? "pass" : "fail") << '\n';
-        output << "reference_write_refusal=" << (write ? "pass" : "fail") << '\n';
-        output << "reference_atomic_refusal=" << (atomic ? "pass" : "fail") << '\n';
-        output << "reference_raw_refusal=" << (raw ? "pass" : "fail") << '\n';
-        output << "reference_hook_refusal=" << (hook ? "pass" : "fail") << '\n';
-        output << "ordinary_referent=" << (initial && changed && swapped && regular_null && shadow_null
-            && !regular_null->get_instance() && !shadow_null->get_instance() ? "pass" : "fail") << '\n';
-        output << "reference_java_api=" << (ordinary_java_api ? "pass" : "fail") << '\n';
+        output << std::format("reference_read_refusal={}\n", (read ? "pass" : "fail"));
+        output << std::format("reference_write_refusal={}\n", (write ? "pass" : "fail"));
+        output << std::format("reference_atomic_refusal={}\n", (atomic ? "pass" : "fail"));
+        output << std::format("reference_raw_refusal={}\n", (raw ? "pass" : "fail"));
+        output << std::format("reference_hook_refusal={}\n", (hook ? "pass" : "fail"));
+        output << std::format("ordinary_referent={}\n", (initial && changed && swapped && regular_null && shadow_null
+            && !regular_null->get_instance() && !shadow_null->get_instance() ? "pass" : "fail"));
+        output << std::format("reference_java_api={}\n", (ordinary_java_api ? "pass" : "fail"));
         output << "native_complete=pass\n" << std::flush;
         return read && write && atomic && raw && hook && initial && changed && swapped && ordinary_java_api ? 0 : 2;
-    } catch(const std::exception& error) { output << "exception=" << error.what() << '\n' << std::flush; return 3; }
+    } catch(const std::exception& error) { output << std::format("exception={}\n", error.what()) << std::flush; return 3; }
 }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance,DWORD reason,LPVOID) {

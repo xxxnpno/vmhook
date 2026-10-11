@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 namespace
 {
@@ -27,7 +28,7 @@ namespace
         std::ofstream output{path ? path : "vmhook-callback-throw-report.txt"}; output.setf(std::ios::unitbuf);
         bool valid = true;
         const auto check = [&](std::string_view name, bool value)
-        { output << name << '=' << (value ? "pass" : "fail") << '\n'; valid = valid && value; };
+        { output << std::format("{}={}\n", name, (value ? "pass" : "fail")); valid = valid && value; };
         try
         {
             vmhook::native_thread_context context{"VMHook-callback-throw"};
@@ -42,15 +43,15 @@ namespace
             unsigned forwarded{}, invalid{}, null_ref{}, later{};
             const auto integer = vmhook::add_hook<fixture>("target_int", "(Ljava/lang/Throwable;)I",
                 [&](vmhook::return_value& result, const std::unique_ptr<vmhook::any_object>& failure)
-                { fixture::collect(); result.set(std::int32_t{3}); try { result.throw_exception(failure); ++forwarded; } catch (const std::exception& error) { output << "throw_error=" << error.what() << '\n'; throw; } });
+                { fixture::collect(); result.set(std::int32_t{3}); try { result.throw_exception(failure); ++forwarded; } catch (const std::exception& error) { output << std::format("throw_error={}\n", error.what()); throw; } });
             const auto ignored = vmhook::add_hook<fixture>("target_int", "(Ljava/lang/Throwable;)I",
                 [&](vmhook::return_value&, const std::unique_ptr<vmhook::any_object>&) { ++later; }, {.priority = 1});
             const auto nothing = vmhook::add_hook<fixture>("target_void", "(Ljava/lang/Throwable;)V",
                 [&](vmhook::return_value& result, const std::unique_ptr<vmhook::any_object>& failure)
-                { try { result.throw_exception(failure); ++forwarded; } catch (const std::exception& error) { output << "throw_error=" << error.what() << '\n'; throw; } });
+                { try { result.throw_exception(failure); ++forwarded; } catch (const std::exception& error) { output << std::format("throw_error={}\n", error.what()); throw; } });
             const auto object = vmhook::add_hook<fixture>("target_object", "(Ljava/lang/Throwable;)Ljava/lang/Object;",
                 [&](vmhook::return_value& result, const std::unique_ptr<vmhook::any_object>& failure)
-                { try { result.throw_exception(failure); ++forwarded; } catch (const std::exception& error) { output << "throw_error=" << error.what() << '\n'; throw; } });
+                { try { result.throw_exception(failure); ++forwarded; } catch (const std::exception& error) { output << std::format("throw_error={}\n", error.what()); throw; } });
             const auto wrong = vmhook::add_hook<fixture>("invalid_object", "(Ljava/lang/Object;)I",
                 [&](vmhook::return_value& result, const std::unique_ptr<vmhook::any_object>& value)
                 { try { result.throw_exception(value); } catch (const vmhook::exception&) { ++invalid; } });
@@ -85,11 +86,11 @@ namespace
                 && vmhook::remove_hook(resume) && vmhook::remove_hook(early) && vmhook::remove_hook(instance));
             check("synchronized_original_after_remove", fixture::original_checks() == 1);
             vmhook::shutdown_hooks();
-            output << "callback_throw_proof=" << (valid ? "pass" : "fail") << '\n';
+            output << std::format("callback_throw_proof={}\n", (valid ? "pass" : "fail"));
             return valid ? 0 : 2;
         }
         catch (const std::exception& failure)
-        { output << "exception=" << failure.what() << "\ncallback_throw_proof=fail\n"; return 3; }
+        { output << std::format("exception={}\ncallback_throw_proof=fail\n", failure.what()); return 3; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE self, DWORD reason, LPVOID)

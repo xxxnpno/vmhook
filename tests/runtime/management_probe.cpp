@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 
 namespace
@@ -27,7 +28,7 @@ namespace
         output.setf(std::ios::unitbuf);
         bool valid{ true };
         const auto check = [&](std::string_view name, bool passed)
-        { output << name << '=' << (passed ? "pass" : "fail") << '\n'; valid = valid && passed; };
+        { output << std::format("{}={}\n", name, (passed ? "pass" : "fail")); valid = valid && passed; };
         try
         {
             check("passive_preflight", !vmhook::detail::native_backend::current_context_lifetime());
@@ -108,11 +109,11 @@ namespace
             check("context_closed", context.close());
             check("copied_observations_survive_close", before.heap.committed_bytes > 0 && found && !threads.empty()
                 && !pools.empty() && later_bytes.has_value());
-            output << "management_complete=" << (valid ? "pass" : "fail") << '\n';
+            output << std::format("management_complete={}\n", (valid ? "pass" : "fail"));
             return valid ? 0 : 3;
         }
         catch (const std::exception& error)
-        { output << "exception=" << error.what() << '\n'; return 4; }
+        { output << std::format("exception={}\n", error.what()); return 4; }
     }
 }
 

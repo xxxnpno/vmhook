@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 
 namespace
@@ -24,7 +25,7 @@ namespace
         output.setf(std::ios::unitbuf);
         bool valid = true;
         const auto check = [&](std::string_view name, bool value)
-        { output << name << '=' << (value ? "pass" : "fail") << '\n'; valid = valid && value; };
+        { output << std::format("{}={}\n", name, (value ? "pass" : "fail")); valid = valid && value; };
         try
         {
             vmhook::native_thread_context context{"VMHook-hook-composition"};
@@ -89,11 +90,11 @@ namespace
                 && stopped.physical_stubs == 0 && stopped.dll_must_remain_loaded);
             check("resident_markers_after_shutdown", stopped.resident_return_markers == marker_after.resident_return_markers
                 && stopped.resident_return_marker_bytes == marker_after.resident_return_marker_bytes);
-            output << "hook_composition_proof=" << (valid ? "pass" : "fail") << '\n';
+            output << std::format("hook_composition_proof={}\n", (valid ? "pass" : "fail"));
             return valid ? 0 : 2;
         }
         catch (const std::exception& failure)
-        { output << "exception=" << failure.what() << "\nhook_composition_proof=fail\n"; return 3; }
+        { output << std::format("exception={}\nhook_composition_proof=fail\n", failure.what()); return 3; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE self, DWORD reason, LPVOID)

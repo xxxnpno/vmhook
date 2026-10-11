@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 namespace
 {
@@ -21,7 +22,7 @@ namespace
         std::ofstream output{path ? path : "vmhook-virtual-thread-report.txt"}; output.setf(std::ios::unitbuf);
         bool valid = true;
         const auto check = [&](std::string_view name, bool value)
-        { output << name << '=' << (value ? "pass" : "fail") << '\n'; valid = valid && value; };
+        { output << std::format("{}={}\n", name, (value ? "pass" : "fail")); valid = valid && value; };
         try
         {
             vmhook::native_thread_context context{"VMHook-virtual-thread"};
@@ -46,11 +47,11 @@ namespace
             check("removal", vmhook::remove_hook(method) && vmhook::unhook_field<fixture>("field_value"));
             check("originals_after_remove", fixture::originals() == 1);
             vmhook::shutdown_hooks();
-            output << "virtual_thread_proof=" << (valid ? "pass" : "fail") << '\n';
+            output << std::format("virtual_thread_proof={}\n", (valid ? "pass" : "fail"));
             return valid ? 0 : 2;
         }
         catch (const std::exception& failure)
-        { output << "exception=" << failure.what() << "\nvirtual_thread_proof=fail\n"; return 3; }
+        { output << std::format("exception={}\nvirtual_thread_proof=fail\n", failure.what()); return 3; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE self, DWORD reason, LPVOID)

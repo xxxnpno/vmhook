@@ -7,6 +7,7 @@ import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
 #include <fstream>
+#include <format>
 #endif
 
 namespace example
@@ -23,13 +24,13 @@ namespace example
         }
         auto check(std::string_view name, bool passed) -> void
         {
-            output << name << '=' << (passed ? "pass" : "fail") << '\n';
+            output << std::format("{}={}\n", name, (passed ? "pass" : "fail"));
             if (!passed) { throw std::runtime_error{std::string{name}}; }
         }
         auto value(std::string_view name, std::string_view value) -> void
-        { output << name << '=' << value << '\n'; }
+        { output << std::format("{}={}\n", name, value); }
         auto number(std::string_view name, std::uint64_t value) -> void
-        { output << name << '=' << value << '\n'; }
+        { output << std::format("{}={}\n", name, value); }
     };
 
     class player : public vmhook::object<player>

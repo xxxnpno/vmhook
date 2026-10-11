@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 namespace
 {
@@ -35,7 +36,7 @@ namespace
         std::ofstream output{path ? path : "vmhook-event-stream-report.txt"};
         output.setf(std::ios::unitbuf); bool valid = true;
         const auto check = [&](std::string_view name, bool value)
-        { output << name << '=' << (value ? "pass" : "fail") << '\n'; valid = valid && value; };
+        { output << std::format("{}={}\n", name, (value ? "pass" : "fail")); valid = valid && value; };
         try
         {
             vmhook::native_thread_context context{"VMHook-event-stream"};
@@ -97,11 +98,11 @@ namespace
             events.reset();
             check("class_capture_reclamation", vmhook::reclaim_class_observers() && weak.expired());
             vmhook::shutdown_hooks();
-            output << "event_stream_proof=" << (valid ? "pass" : "fail") << '\n';
+            output << std::format("event_stream_proof={}\n", (valid ? "pass" : "fail"));
             return valid ? 0 : 2;
         }
         catch (const std::exception& failure)
-        { output << "exception=" << failure.what() << "\nevent_stream_proof=fail\n"; return 3; }
+        { output << std::format("exception={}\nevent_stream_proof=fail\n", failure.what()); return 3; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE self, DWORD reason, LPVOID)

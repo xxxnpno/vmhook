@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -119,7 +120,7 @@ namespace
             std::ofstream{control}.put('1');
             return 0;
         }
-        catch (const std::exception& error) { output << "exception=" << error.what() << '\n'; return 2; }
+        catch (const std::exception& error) { output << std::format("exception={}\n", error.what()); return 2; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance, DWORD reason, LPVOID)

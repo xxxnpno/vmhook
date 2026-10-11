@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #include <cstdlib>
 #include <new>
@@ -76,17 +77,17 @@ auto worker(void*) -> DWORD {
         const bool balanced=!owner->held();
         bool retry{};
         { vmhook::monitor_lock locked{owner}; retry=locked.owns_lock() && owner->held(); }
-        output << "fault_provider_calls=" << provider_calls << '\n';
-        output << "monitor_cpp_allocation=" << (allocation_failed && provider_calls==2 ? "pass" : "fail") << '\n';
-        output << "monitor_pending_cleanup=" << (clean ? "pass" : "fail") << '\n';
-        output << "monitor_fault_balance=" << (balanced && !owner->held() ? "pass" : "fail") << '\n';
-        output << "monitor_fault_retry=" << (retry ? "pass" : "fail") << '\n';
+        output << std::format("fault_provider_calls={}\n", provider_calls);
+        output << std::format("monitor_cpp_allocation={}\n", (allocation_failed && provider_calls==2 ? "pass" : "fail"));
+        output << std::format("monitor_pending_cleanup={}\n", (clean ? "pass" : "fail"));
+        output << std::format("monitor_fault_balance={}\n", (balanced && !owner->held() ? "pass" : "fail"));
+        output << std::format("monitor_fault_retry={}\n", (retry ? "pass" : "fail"));
         output << "native_complete=pass\n" << std::flush;
         return allocation_failed && clean && balanced && retry ? 0 : 2;
     } catch(const std::exception& error) {
         pn::root_reuse_callback()=original_provider;
         fail_allocation=false;
-        output << "exception=" << error.what() << '\n' << std::flush;
+        output << std::format("exception={}\n", error.what()) << std::flush;
         return 3;
     }
 }

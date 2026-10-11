@@ -3,6 +3,8 @@ import std;
 import vmhook;
 import vmhook.windows;
 #else
+#include <format>
+#include <iostream>
 #include <vmhook/vmhook.hpp>
 #endif
 
@@ -14,7 +16,7 @@ int main()
     {
         if (!condition)
         {
-            std::cerr << "FAIL: " << description << '\n';
+            std::cerr << std::format("FAIL: {}\n", description);
             ++failures;
         }
     };

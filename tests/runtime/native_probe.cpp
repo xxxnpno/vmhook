@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -103,11 +104,11 @@ namespace
     }
 
     auto thread_name() -> std::string
-    { return "VMHook-native-" + std::to_string(::GetCurrentThreadId()); }
+    { return std::format("VMHook-native-{}", ::GetCurrentThreadId()); }
 
     auto passed(std::ostream& output, const std::string_view label, const bool correct) -> bool
     {
-        output << label << '=' << (correct ? "pass" : "fail") << '\n';
+        output << std::format("{}={}\n", label, (correct ? "pass" : "fail"));
         output.flush();
         return correct;
     }
@@ -173,7 +174,7 @@ namespace
         if (!cases || !cases->get_instance()) { return false; }
         const auto expect = [&](const std::string_view name, const bool correct)
         {
-            if (!correct) { output << "collection_case=" << name << '\n'; output.flush(); }
+            if (!correct) { output << std::format("collection_case={}\n", name); output.flush(); }
             return correct;
         };
         const std::vector<std::int32_t> array_order{1, -1, 2, 3};
@@ -540,7 +541,7 @@ namespace
             vmhook::native_thread_context context{name};
             if (!passed(output, "native_attach", context.valid()))
             {
-                output << "attach_error=" << context.error() << '\n';
+                output << std::format("attach_error={}\n", context.error());
                 return false;
             }
             if (!passed(output, "same_thread", native_fixture::thread_name() == name
@@ -559,12 +560,12 @@ namespace
                 conversion_refused([] { (void)vmhook::make_unique<native_fixture>(true); })
                 && conversion_refused([] { (void)vmhook::make_unique<native_fixture>(std::int32_t{-100}); })))
             { return false; }
-            output << "object_stores=collector_barrier_accessor" << '\n';
+            output << "object_stores=collector_barrier_accessor\n";
             if (!passed(output, "object_contract", check_object_contract(first, second))) { return false; }
             if (!passed(output, "field_memory", check_field_memory(first, second))) { return false; }
             if (!passed(output, "heap_iteration", check_heap_iteration())) { return false; }
             if (!passed(output, "monitor_locks", check_monitor_locks(context, output))) { return false; }
-            output << "monitor_backend=" << (vmhook::monitor_locks_supported() ? "vm_object_locker" : "refused_profile") << '\n';
+            output << std::format("monitor_backend={}\n", (vmhook::monitor_locks_supported() ? "vm_object_locker" : "refused_profile"));
 
             const auto virtual_call = base_method(*first, "virtualValue");
             const auto private_call = base_method(*first, "privateValue");
@@ -800,7 +801,7 @@ namespace
         }
         catch (const std::exception& error)
         {
-            output << "exception=" << error.what() << '\n';
+            output << std::format("exception={}\n", error.what());
             return 8;
         }
     }

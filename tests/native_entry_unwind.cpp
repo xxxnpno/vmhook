@@ -3,8 +3,9 @@ import std;
 import vmhook;
 import vmhook.windows;
 #else
+#include <format>
+#include <iostream>
 #include <vmhook/vmhook.hpp>
-#include <cstdio>
 #endif
 
 // CPU stack effects are simulated independently; the operating system consumes
@@ -198,7 +199,7 @@ auto unwind_at(std::byte* code, std::size_t offset, CONTEXT context, unsigned sa
     DWORD64 image_base{};
     auto* function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
     if (!function || image_base != reinterpret_cast<DWORD64>(code)) {
-        std::printf("feature=%d hook=%zu pc=%zu function_lookup=fail\n", feature, hook, offset);
+        std::cout << std::format("feature={} hook={} pc={} function_lookup=fail\n", feature, hook, offset);
         return false;
     }
     PVOID handler_data{};
@@ -210,12 +211,12 @@ auto unwind_at(std::byte* code, std::size_t offset, CONTEXT context, unsigned sa
     for (const auto index : nonvolatile) passed &= reg(context, index) == original_value(index);
     if (passed != expect_pass) {
         if (!report_failure) return false;
-        std::printf("feature=%d hook=%zu pc=%zu unwind=fail rip=%llx rsp=%llx"
-                    " expected_rip=%llx expected_rsp=%llx\n", feature, hook, offset,
+        std::cout << std::format("feature={} hook={} pc={} unwind=fail rip={:x} rsp={:x}"
+                    " expected_rip={:x} expected_rsp={:x}\n", feature, hook, offset,
                     static_cast<unsigned long long>(context.Rip), static_cast<unsigned long long>(context.Rsp),
                     static_cast<unsigned long long>(return_address), static_cast<unsigned long long>(entry_rsp + 8));
         for (const auto index : nonvolatile) if (reg(context, index) != original_value(index))
-            std::printf("register=%u actual=%llx expected=%llx\n", index,
+            std::cout << std::format("register={} actual={:x} expected={:x}\n", index,
                         static_cast<unsigned long long>(reg(context, index)), static_cast<unsigned long long>(original_value(index)));
         return false;
     }
@@ -238,7 +239,7 @@ auto main() -> int {
             const auto prefix = profile.prefix;
             std::vector<instruction> instructions;
             if (!decode(prefix, instructions)) {
-                std::printf("feature=%d hook=%zu prefix_decode=fail\n", profile.feature, index);
+                std::cout << std::format("feature={} hook={} prefix_decode=fail\n", profile.feature, index);
                 all_passed = false;
                 continue;
             }
@@ -279,7 +280,7 @@ auto main() -> int {
             if (!FlushInstructionCache(GetCurrentProcess(), target, allocation_size)) return 3;
             vmhook::detail::class_events::native_entry_hook hook;
             if (!hook.install(target, reinterpret_cast<const void*>(&detour), prefix) || !hook.matches()) {
-                std::printf("feature=%d hook=%zu install=fail error=%lu\n", profile.feature, index, GetLastError());
+                std::cout << std::format("feature={} hook={} install=fail error={}\n", profile.feature, index, GetLastError());
                 all_passed = false;
                 continue;
             }
@@ -307,7 +308,7 @@ auto main() -> int {
                     && info[2] == 1 && info[3] == 0 && info[4] == 4 && info[5] == 0x50;
                 passed &= metadata_ok;
                 ++rbp_lea_metadata_checks;
-                std::printf("feature=%d hook=%zu rbp_lea_rsp_unwind_metadata=%s\n",
+                std::cout << std::format("feature={} hook={} rbp_lea_rsp_unwind_metadata={}\n",
                             profile.feature, index, metadata_ok ? "pass" : "fail");
             }
             const auto continuation_ok = code[prefix.size()] == std::byte{0x49}
@@ -321,7 +322,7 @@ auto main() -> int {
                 const auto returned = reinterpret_cast<std::uint64_t(*)()>(code)();
                 passed &= returned == 1;
                 ++anchor_execution_checks;
-                std::printf("feature=%d hook=%zu r11_anchor_execution=%s continuation_r10=%s\n", profile.feature, index,
+                std::cout << std::format("feature={} hook={} r11_anchor_execution={} continuation_r10={}\n", profile.feature, index,
                             returned == 1 ? "pass" : "fail", continuation_ok ? "pass" : "fail");
             }
             for (const auto& ins : instructions) if (ins.action == operation::call || ins.action == operation::jump) {
@@ -333,7 +334,7 @@ auto main() -> int {
                 passed &= returned == callee_result;
                 if (ins.action == operation::call) ++relocated_call_checks;
                 else ++relocated_jump_checks;
-                std::printf("feature=%d hook=%zu %s_relocation=%s %s_execution=%s\n", profile.feature, index,
+                std::cout << std::format("feature={} hook={} {}_relocation={} {}_execution={}\n", profile.feature, index,
                             ins.action == operation::call ? "call" : "tail_jump",
                             code + ins.offset + ins.size + moved == expected_callee ? "pass" : "fail",
                             ins.action == operation::call ? "call" : "tail_jump",
@@ -352,7 +353,7 @@ auto main() -> int {
                         entry_rsp, return_address, profile.feature, index, true, true, false);
                     passed &= state_ok && restored;
                     ++rbp_lea_checks;
-                    std::printf("feature=%d hook=%zu rbp_lea_state_and_unwind=%s\n",
+                    std::cout << std::format("feature={} hook={} rbp_lea_state_and_unwind={}\n",
                                 profile.feature, index, state_ok && restored ? "pass" : "fail");
                 }
             }
@@ -384,20 +385,20 @@ auto main() -> int {
                 if (!FlushInstructionCache(GetCurrentProcess(), code, 4096)) return 5;
                 ff25_detected = unwind_at(code, prefix.size(), context, saved_mask, entry_rsp, return_address,
                                            profile.feature, index, false, false) ? 1 : 0;
-                std::printf("old_ff25_epilogue_recognition=%s\n", ff25_detected ? "detected" : "absent_in_this_unwind_engine");
+                std::cout << std::format("old_ff25_epilogue_recognition={}\n", ff25_detected ? "detected" : "absent_in_this_unwind_engine");
                 code[prefix.size()] = std::byte{0xc3};
                 if (!FlushInstructionCache(GetCurrentProcess(), code, 4096)) return 8;
                 const auto caught = unwind_at(code, prefix.size(), context, saved_mask, entry_rsp, return_address,
                                               profile.feature, index, false);
                 passed &= caught;
-                std::printf("ret_epilogue_negative_control=%s\n", caught ? "pass" : "fail");
+                std::cout << std::format("ret_epilogue_negative_control={}\n", caught ? "pass" : "fail");
                 ++negative_controls;
                 std::memcpy(code + prefix.size(), old_bytes.data(), old_bytes.size());
                 if (!FlushInstructionCache(GetCurrentProcess(), code, 4096)) return 6;
                 DWORD ignored{};
                 if (!VirtualProtect(code, 4096, old, &ignored)) return 7;
             }
-            std::printf("feature=%d hook=%zu prefix_bytes=%zu prefix_instructions=%zu unwind=%s\n",
+            std::cout << std::format("feature={} hook={} prefix_bytes={} prefix_instructions={} unwind={}\n",
                         profile.feature, index, prefix.size(), instructions.size(), passed ? "pass" : "fail");
             all_passed &= passed;
             // Entry patches, code pages, and dynamic function tables deliberately
@@ -406,11 +407,11 @@ auto main() -> int {
     all_passed &= profiles == fixtures.size() && negative_controls == 1 && relocated_call_checks == 1
         && relocated_jump_checks == 1 && anchor_execution_checks == 2
         && rbp_lea_checks == 1 && rbp_lea_metadata_checks == 1;
-    std::printf("profiles=%zu instruction_boundary_checks=%zu relay_checks=%zu negative_controls=%zu relocated_call_checks=%zu relocated_jump_checks=%zu r11_anchor_checks=%zu continuation_r10_checks=%zu\n",
+    std::cout << std::format("profiles={} instruction_boundary_checks={} relay_checks={} negative_controls={} relocated_call_checks={} relocated_jump_checks={} r11_anchor_checks={} continuation_r10_checks={}\n",
                 profiles, boundary_checks, relay_checks, negative_controls, relocated_call_checks,
                 relocated_jump_checks, anchor_execution_checks, continuation_encoding_checks);
-    std::printf("rbp_lea_checks=%zu rbp_lea_rsp_unwind_metadata_checks=%zu\n",
+    std::cout << std::format("rbp_lea_checks={} rbp_lea_rsp_unwind_metadata_checks={}\n",
                 rbp_lea_checks, rbp_lea_metadata_checks);
-    std::printf("synthetic_unwind=%s\n", all_passed ? "pass" : "fail");
+    std::cout << std::format("synthetic_unwind={}\n", all_passed ? "pass" : "fail");
     return all_passed ? 0 : 1;
 }

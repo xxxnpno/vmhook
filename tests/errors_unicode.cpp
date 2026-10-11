@@ -3,6 +3,8 @@ import std;
 import vmhook;
 import vmhook.windows;
 #else
+#include <format>
+#include <iostream>
 #include <vmhook/vmhook.hpp>
 #endif
 
@@ -29,7 +31,7 @@ int main()
     int failures{};
     const auto check = [&](bool condition, const char* description)
     {
-        if (!condition) { std::cerr << "FAIL: " << description << '\n'; ++failures; }
+        if (!condition) { std::cerr << std::format("FAIL: {}\n", description); ++failures; }
     };
     const auto decode = [](std::string_view bytes)
     {

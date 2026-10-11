@@ -3,6 +3,8 @@ import std;
 import vmhook;
 import vmhook.windows;
 #else
+#include <format>
+#include <iostream>
 #include <latch>
 #include <vmhook/vmhook.hpp>
 #endif
@@ -11,7 +13,7 @@ int main()
 {
     int failures{};
     const auto check = [&](bool value, const char* name)
-    { if (!value) { std::cerr << "FAIL: " << name << '\n'; ++failures; } };
+    { if (!value) { std::cerr << std::format("FAIL: {}\n", name); ++failures; } };
     auto* const method = reinterpret_cast<vmhook::hotspot::method*>(0x1000);
     auto* const identity = reinterpret_cast<const vmhook::hotspot::const_method*>(0x2000);
     vmhook::hotspot::hook_dispatch_snapshot snapshot;

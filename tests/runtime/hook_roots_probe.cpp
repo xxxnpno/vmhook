@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #endif
 
 namespace allocation_fault
@@ -75,7 +76,7 @@ namespace
         output.setf(std::ios::unitbuf);
         bool passed{true};
         const auto check = [&](std::string_view name, bool correct)
-        { output << name << '=' << (correct ? "pass" : "fail") << '\n'; passed = passed && correct; };
+        { output << std::format("{}={}\n", name, (correct ? "pass" : "fail")); passed = passed && correct; };
         try
         {
             namespace detail = vmhook::detail;
@@ -94,7 +95,7 @@ namespace
             allocation_fault::measure = false;
             const auto ticket_size{allocation_fault::observed};
             measurement.reset();
-            output << "ticket_allocation=" << ticket_size << '\n';
+            output << std::format("ticket_allocation={}\n", ticket_size);
             vmhook::hotspot::klass* klass{};
             vmhook::hotspot::method* method{};
             {
@@ -162,7 +163,7 @@ namespace
             return passed ? 0 : 3;
         }
         catch (const std::exception& error)
-        { output << "exception=" << error.what() << '\n'; return 4; }
+        { output << std::format("exception={}\n", error.what()); return 4; }
     }
 }
 extern "C" BOOL __attribute__((ms_abi)) DllMain(HINSTANCE instance, DWORD reason, LPVOID)

@@ -3,6 +3,8 @@ import std;
 import vmhook;
 import vmhook.windows;
 #else
+#include <format>
+#include <iostream>
 #include <vmhook/vmhook.hpp>
 #endif
 
@@ -11,7 +13,7 @@ int main()
     int failures{};
     const auto check = [&](const bool condition, const char* description)
     {
-        if (!condition) { std::cerr << "FAIL: " << description << '\n'; ++failures; }
+        if (!condition) { std::cerr << std::format("FAIL: {}\n", description); ++failures; }
     };
     static_assert(!std::is_copy_constructible_v<vmhook::watch_handle>);
     static_assert(!std::is_copy_assignable_v<vmhook::watch_handle>);

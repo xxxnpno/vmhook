@@ -17,12 +17,12 @@ namespace
             samples.push_back(static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock_type::now() - start).count()));
         }
-        results.number(std::string{name} + ".first_ns", samples.front());
+        results.number(std::format("{}.first_ns", name), samples.front());
         samples.erase(samples.begin());
         std::sort(samples.begin(), samples.end());
-        results.number(std::string{name} + ".samples", count);
-        results.number(std::string{name} + ".repeated_p50_ns", samples[(samples.size() - 1) * 50 / 100]);
-        results.number(std::string{name} + ".repeated_p99_ns", samples[(samples.size() - 1) * 99 / 100]);
+        results.number(std::format("{}.samples", name), count);
+        results.number(std::format("{}.repeated_p50_ns", name), samples[(samples.size() - 1) * 50 / 100]);
+        results.number(std::format("{}.repeated_p99_ns", name), samples[(samples.size() - 1) * 99 / 100]);
     }
 }
 
@@ -93,66 +93,66 @@ namespace
     auto record_hooks(example::report& results, std::string_view name) -> vmhook::hook_resource_stats
     {
         const auto value = vmhook::hook_resources();
-        const auto prefix = std::string{name};
-        results.number(prefix + ".active_observers", value.active_observers);
-        results.number(prefix + ".retained_method_policies", value.retained_method_policies);
-        results.number(prefix + ".physical_stubs", value.physical_stubs);
-        results.number(prefix + ".retained_snapshots", value.retained_snapshots);
-        results.number(prefix + ".dispatch_readers", value.dispatch_readers);
-        results.number(prefix + ".active_callbacks", value.active_callbacks);
-        results.number(prefix + ".resident_return_markers", value.resident_return_markers);
-        results.number(prefix + ".resident_return_marker_bytes", value.resident_return_marker_bytes);
-        results.number(prefix + ".callback_failures", value.callback_failures);
-        results.number(prefix + ".suppressed_recursions", value.suppressed_recursions);
-        results.number(prefix + ".registry_sizes_available", value.registry_sizes_available);
-        results.number(prefix + ".shutdown_requested", value.shutdown_requested);
-        results.number(prefix + ".dll_must_remain_loaded", value.dll_must_remain_loaded);
+        const auto prefix = name;
+        results.number(std::format("{}.active_observers", prefix), value.active_observers);
+        results.number(std::format("{}.retained_method_policies", prefix), value.retained_method_policies);
+        results.number(std::format("{}.physical_stubs", prefix), value.physical_stubs);
+        results.number(std::format("{}.retained_snapshots", prefix), value.retained_snapshots);
+        results.number(std::format("{}.dispatch_readers", prefix), value.dispatch_readers);
+        results.number(std::format("{}.active_callbacks", prefix), value.active_callbacks);
+        results.number(std::format("{}.resident_return_markers", prefix), value.resident_return_markers);
+        results.number(std::format("{}.resident_return_marker_bytes", prefix), value.resident_return_marker_bytes);
+        results.number(std::format("{}.callback_failures", prefix), value.callback_failures);
+        results.number(std::format("{}.suppressed_recursions", prefix), value.suppressed_recursions);
+        results.number(std::format("{}.registry_sizes_available", prefix), value.registry_sizes_available);
+        results.number(std::format("{}.shutdown_requested", prefix), value.shutdown_requested);
+        results.number(std::format("{}.dll_must_remain_loaded", prefix), value.dll_must_remain_loaded);
         return value;
     }
 
     auto record_roots(example::report& results, std::string_view name) -> vmhook::root_resource_snapshot
     {
         const auto value = vmhook::root_resources();
-        const auto prefix = std::string{name};
-        results.number(prefix + ".durable_allocated_slots", value.durable_allocated_slots);
-        results.number(prefix + ".durable_leases", value.durable_leases);
-        results.number(prefix + ".durable_occupied_slots", value.durable_occupied_slots);
-        results.number(prefix + ".durable_reusable_slots", value.durable_reusable_slots);
-        results.number(prefix + ".durable_pending_releases", value.durable_pending_releases);
-        results.number(prefix + ".durable_unreclaimed_slots", value.durable_unreclaimed_slots);
-        results.number(prefix + ".durable_internal_slots", value.durable_internal_slots);
-        results.number(prefix + ".context_active", value.context_active);
-        results.number(prefix + ".context_allocated_slots", value.context_allocated_slots);
-        results.number(prefix + ".context_live_ticket_slots", value.context_live_ticket_slots);
-        results.number(prefix + ".context_occupied_ticket_slots", value.context_occupied_ticket_slots);
-        results.number(prefix + ".context_reusable_slots", value.context_reusable_slots);
-        results.number(prefix + ".context_pending_releases", value.context_pending_releases);
+        const auto prefix = name;
+        results.number(std::format("{}.durable_allocated_slots", prefix), value.durable_allocated_slots);
+        results.number(std::format("{}.durable_leases", prefix), value.durable_leases);
+        results.number(std::format("{}.durable_occupied_slots", prefix), value.durable_occupied_slots);
+        results.number(std::format("{}.durable_reusable_slots", prefix), value.durable_reusable_slots);
+        results.number(std::format("{}.durable_pending_releases", prefix), value.durable_pending_releases);
+        results.number(std::format("{}.durable_unreclaimed_slots", prefix), value.durable_unreclaimed_slots);
+        results.number(std::format("{}.durable_internal_slots", prefix), value.durable_internal_slots);
+        results.number(std::format("{}.context_active", prefix), value.context_active);
+        results.number(std::format("{}.context_allocated_slots", prefix), value.context_allocated_slots);
+        results.number(std::format("{}.context_live_ticket_slots", prefix), value.context_live_ticket_slots);
+        results.number(std::format("{}.context_occupied_ticket_slots", prefix), value.context_occupied_ticket_slots);
+        results.number(std::format("{}.context_reusable_slots", prefix), value.context_reusable_slots);
+        results.number(std::format("{}.context_pending_releases", prefix), value.context_pending_releases);
         return value;
     }
 
     auto record_runtime(example::report& results, std::string_view name) -> std::uint64_t
     {
         const auto value = vmhook::observe_runtime();
-        const auto prefix = std::string{name};
-        results.number(prefix + ".heap_used_bytes", static_cast<std::uint64_t>(value.heap.used_bytes));
-        results.number(prefix + ".heap_committed_bytes", static_cast<std::uint64_t>(value.heap.committed_bytes));
-        results.number(prefix + ".non_heap_used_bytes", static_cast<std::uint64_t>(value.non_heap.used_bytes));
-        results.number(prefix + ".live_java_threads", static_cast<std::uint64_t>(value.live_threads));
-        if (value.compilation_time_ms) { results.number(prefix + ".compilation_time_ms", static_cast<std::uint64_t>(*value.compilation_time_ms)); }
+        const auto prefix = name;
+        results.number(std::format("{}.heap_used_bytes", prefix), static_cast<std::uint64_t>(value.heap.used_bytes));
+        results.number(std::format("{}.heap_committed_bytes", prefix), static_cast<std::uint64_t>(value.heap.committed_bytes));
+        results.number(std::format("{}.non_heap_used_bytes", prefix), static_cast<std::uint64_t>(value.non_heap.used_bytes));
+        results.number(std::format("{}.live_java_threads", prefix), static_cast<std::uint64_t>(value.live_threads));
+        if (value.compilation_time_ms) { results.number(std::format("{}.compilation_time_ms", prefix), static_cast<std::uint64_t>(*value.compilation_time_ms)); }
         std::uint64_t collections{};
         for (std::size_t index{}; index < value.garbage_collectors.size(); ++index)
         {
             const auto& collector = value.garbage_collectors[index];
-            const auto key = prefix + ".collector_" + std::to_string(index);
-            results.value(key + ".name", collector.name);
+            const auto key = std::format("{}.collector_{}", prefix, index);
+            results.value(std::format("{}.name", key), collector.name);
             if (collector.collection_count)
             {
                 const auto count = static_cast<std::uint64_t>(*collector.collection_count);
-                results.number(key + ".collections", count);
+                results.number(std::format("{}.collections", key), count);
                 collections += count;
             }
             if (collector.collection_time_ms)
-            { results.number(key + ".collection_time_ms", static_cast<std::uint64_t>(*collector.collection_time_ms)); }
+            { results.number(std::format("{}.collection_time_ms", key), static_cast<std::uint64_t>(*collector.collection_time_ms)); }
         }
         return collections;
     }
@@ -198,12 +198,12 @@ namespace
     auto record_jit(example::report& results, std::string_view name, jit_snapshot& value) -> void
     {
         refresh_jit(value);
-        const auto prefix = std::string{name};
-        results.number(prefix + ".target_compiled", value.target_compiled);
-        results.number(prefix + ".caller_compiled", value.caller_compiled);
-        results.number(prefix + ".unrelated_compiled", value.unrelated_compiled);
-        results.number(prefix + ".target_excluded", value.target_excluded);
-        results.number(prefix + ".unrelated_excluded", value.unrelated_excluded);
+        const auto prefix = name;
+        results.number(std::format("{}.target_compiled", prefix), value.target_compiled);
+        results.number(std::format("{}.caller_compiled", prefix), value.caller_compiled);
+        results.number(std::format("{}.unrelated_compiled", prefix), value.unrelated_compiled);
+        results.number(std::format("{}.target_excluded", prefix), value.target_excluded);
+        results.number(std::format("{}.unrelated_excluded", prefix), value.unrelated_excluded);
     }
 
     template<typename target_operation, typename unrelated_operation>

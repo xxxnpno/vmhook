@@ -4,6 +4,7 @@ import vmhook;
 import vmhook.windows;
 #else
 #include <vmhook/vmhook.hpp>
+#include <format>
 #include <fstream>
 #endif
 
@@ -52,7 +53,7 @@ namespace
         explicit report(const char* path) : output{path} { output.setf(std::ios::unitbuf); }
         auto check(std::string_view name, bool condition) -> bool
         {
-            output << name << '=' << (condition ? "pass" : "fail") << '\n';
+            output << std::format("{}={}\n", name, (condition ? "pass" : "fail"));
             valid = valid && condition;
             return condition;
         }
@@ -334,7 +335,7 @@ namespace
             "referenceValue", [](vmhook::field_access<vmhook::oop_t>&) {});
         results.check("field_refusals", duplicate_refused && width_refused && reference_refused);
         mark(control);
-        if (!await(control + ".done")) { results.check("field_callbacks", false); return; }
+        if (!await(std::format("{}.done", control))) { results.check("field_callbacks", false); return; }
         results.check("field_callbacks", field_events_valid.load() && field_calls.load() == 20044
             && field_reads[0].load() == 20004 && field_writes[0].load() == 4
             && field_reads[3].load() == 1 && field_writes[3].load() == 0);
@@ -350,8 +351,8 @@ namespace
         results.check("field_removal", removed && !vmhook::unhook_field<field_fixture>("intValue"));
         vmhook::shutdown_hooks();
         const auto after_shutdown = field_calls.load();
-        mark(control + ".restore");
-        results.check("field_shutdown", await(control + ".restore.done")
+        mark(std::format("{}.restore", control));
+        results.check("field_shutdown", await(std::format("{}.restore.done", control))
             && field_calls.load() == after_shutdown && vmhook::verify_hooks() == 0);
         results.check("fields_complete", results.valid);
     }
@@ -398,7 +399,7 @@ namespace
         });
         if (!results.check("class_registration", observer != 0)) { return; }
         mark(control);
-        if (!await(control + ".done")) { results.check("class_identity", false); return; }
+        if (!await(std::format("{}.done", control))) { results.check("class_identity", false); return; }
         std::array<std::uintptr_t, 6> template_clds{};
         unsigned templates{}, buffers{}, hidden{}, arrays{}, bootstrap{};
         bool valid = !class_overflow.load();
@@ -436,14 +437,14 @@ namespace
         results.check("class_callback_state", callback_state);
         const bool removed = vmhook::remove_class_observer(observer);
         const auto after_remove = class_count.load();
-        mark(control + ".remove");
-        const bool removed_stage = await(control + ".remove.done");
+        mark(std::format("{}.remove", control));
+        const bool removed_stage = await(std::format("{}.remove.done", control));
         results.check("class_removal", removed && removed_stage && class_count.load() == after_remove
             && !vmhook::remove_class_observer(observer));
         results.check("class_persistent", persistent_after_remove.load() == 1);
         vmhook::shutdown_hooks();
-        mark(control + ".shutdown");
-        results.check("class_shutdown", await(control + ".shutdown.done")
+        mark(std::format("{}.shutdown", control));
+        results.check("class_shutdown", await(std::format("{}.shutdown.done", control))
             && class_count.load() == after_remove && persistent_after_shutdown.load() == 0);
         results.check("classes_complete", results.valid);
     }
@@ -462,7 +463,7 @@ namespace
             else if (std::string_view{mode} == "classes") { test_classes(results, control); }
             else { results.check("mode", false); }
         }
-        catch (const std::exception& error) { results.output << "exception=" << error.what() << '\n'; return 2; }
+        catch (const std::exception& error) { results.output << std::format("exception={}\n", error.what()); return 2; }
         return results.valid ? 0 : 3;
     }
 }
