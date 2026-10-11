@@ -11,7 +11,7 @@ namespace allocation_fault
 {
     inline std::atomic<std::size_t> rejected_size{};
 }
-auto operator new(std::size_t size) -> void*
+[[gnu::noinline]] auto operator new(std::size_t size) -> void*
 {
     auto expected = size;
     if (size && allocation_fault::rejected_size.compare_exchange_strong(expected, 0))
@@ -19,8 +19,8 @@ auto operator new(std::size_t size) -> void*
     if (void* value = std::malloc(size ? size : 1)) { return value; }
     throw std::bad_alloc{};
 }
-auto operator delete(void* value) noexcept -> void { std::free(value); }
-auto operator delete(void* value, std::size_t) noexcept -> void { std::free(value); }
+[[gnu::noinline]] auto operator delete(void* value) noexcept -> void { std::free(value); }
+[[gnu::noinline]] auto operator delete(void* value, std::size_t) noexcept -> void { std::free(value); }
 
 namespace
 {

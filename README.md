@@ -15,7 +15,7 @@ HotSpot and gives its Java objects GC-scanned roots.
 | `import vmhook;` | C++26/latest with static reflection | Windows G++ 16 with the required module/reflection features |
 
 Both interfaces share one implementation. The shipped private ABI profiles span
-**Java 8–27**, including a Java 27 early-access image. Compatibility identifies
+**Java 8–27**, including Temurin 27+35. Compatibility identifies
 an exact `jvm.dll` build and collector: a Java version alone does not guarantee
 support for every vendor rebuild. See [runtime diagnostics](docs/runtime-diagnostics.md)
 and the [image manifest](data/native_profiles.json).

@@ -3,7 +3,7 @@
 VMHook resolves an exact Windows x64 HotSpot image. A Java major version is not
 an ABI identifier: a vendor rebuild or security update can change private
 symbols and layouts. The shipped manifest pins one image for every Java major
-from 8 through 27; Java 27 is an early-access build.
+from 8 through 27, including the publisher's Temurin 27+35 release.
 
 Inspect an image before injection:
 
