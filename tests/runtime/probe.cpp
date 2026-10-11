@@ -45,7 +45,7 @@ namespace
         auto text_value() const -> std::string { return get_field("textValue")->get(); }
         static auto throw_result() -> vmhook::method_proxy::value_t
         {
-            return static_members::get_method("fail", "()V")->call();
+            return static_members::get_method("fail", "()V")->try_call();
         }
     };
 

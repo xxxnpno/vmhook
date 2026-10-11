@@ -245,29 +245,45 @@ export namespace vmhook
     inline constexpr std::string_view warning_tag{ "[VMHook WARNING]" };
     inline constexpr std::string_view info_tag{ "[VMHook INFO]" };
 
-    /*
-        @brief Exception reported when a checked lookup is used after it failed.
-        @details Low-level operations generally log a failure and return an empty
-        result. member_lookup::value() and operator-> throw this exception so
-        concise wrapper accessors never dereference a missing member.
-    */
+    class any_object;
+
+    /* Operation failures are separate from successful zero/false/void/null.
+       C++ allocation failures remain std::bad_alloc, including try_* APIs. */
+    enum class error_code : std::uint8_t
+    {
+        none,
+        refused,
+        java_exception,
+        result_unavailable,
+        type_mismatch,
+        null_reference,
+        invalid_memory,
+    };
+
     class exception final : public std::exception
     {
     public:
-        explicit exception(const std::string_view msg)
-            : message{ msg }
-        {
+        explicit exception(const std::string_view message,
+                           const vmhook::error_code code = vmhook::error_code::refused,
+                           std::string exception_class = {},
+                           vmhook::detail::native_backend::root throwable = {})
+            : message_{ message }, code_{ code }, exception_class_{ std::move(exception_class) },
+              throwable_{ std::move(throwable) } {}
 
-        }
-
-        auto what() const noexcept
-            -> const char* override
-        {
-            return this->message.c_str();
-        }
+        auto what() const noexcept -> const char* override { return this->message_.c_str(); }
+        [[nodiscard]] auto code() const noexcept -> vmhook::error_code { return this->code_; }
+        [[nodiscard]] auto exception_class() const noexcept -> std::string_view { return this->exception_class_; }
+        [[nodiscard]] auto has_throwable() const noexcept -> bool { return bool(this->throwable_); }
+        /* Native Throwables retain their original root. Materialization requires
+           its still-live originating native/callback context on the same thread.
+           Diagnostic class/message copies remain usable after that context closes. */
+        [[nodiscard]] auto get_throwable() const -> std::unique_ptr<vmhook::any_object>;
 
     private:
-        std::string message;
+        std::string message_;
+        vmhook::error_code code_;
+        std::string exception_class_;
+        vmhook::detail::native_backend::root throwable_;
     };
 
     // Windows memory, module, and thread helpers. Failures are reported through returned values.
@@ -978,9 +994,9 @@ export namespace vmhook
         never fix itself; "the field does not exist" is a name typo or an
         obfuscated build that renamed it; "the object is null" is ordinary Java.
 
-        The try_* accessors return std::expected<value_type, access_error> so the caller
-        can branch on the cause without giving up the one-liner in the happy
-        path.  @see vmhook::error_message.
+        member_lookup::error() reports access_error. Method try_call() and field
+        try_get() preserve operation result status; field try_set() returns
+        std::expected<void, vmhook::exception>. @see vmhook::error_message.
     */
     enum class access_error : std::uint8_t
     {
@@ -12734,7 +12750,23 @@ export namespace vmhook::detail::native_backend
         return current;
     }
 
-    inline auto allocate(vmhook::hotspot::klass* const klass) noexcept -> root
+    inline auto raise_pending_exception(const std::shared_ptr<context_lifetime>& context,
+                                        const root& reserved,
+                                        const std::string_view message) -> void
+    {
+        void* const pending{ vmhook::detail::private_native::pending_exception(context->thread) };
+        if (!pending) { return; }
+        if (reserved && reserved->valid()) { std::memcpy(reserved->slot, &pending, sizeof(pending)); }
+        // Copying diagnostics may allocate. Consume the thread slot before that
+        // work while the Throwable remains retained by the reserved VM root.
+        context->session->clear_exception();
+        std::string class_name;
+        if (auto* const klass{ vmhook::klass_from_oop(pending) })
+        { if (auto* const name{ klass->get_name() }) { class_name = name->to_string(); } }
+        throw vmhook::exception{ message, vmhook::error_code::java_exception, std::move(class_name), reserved };
+    }
+
+    inline auto allocate(vmhook::hotspot::klass* const klass) -> root
     {
         operation access{};
         const auto context{ active_context_lifetime() };
@@ -12745,15 +12777,15 @@ export namespace vmhook::detail::native_backend
             if (!metadata) { return {}; }
             auto result{ reserve_result_root(klass) };
             if (!result) { return {}; }
+            const auto reserved_exception{ reserve_result_root(klass) };
+            if (!reserved_exception) { return {}; }
             temporary_vm_scope temporary{ context };
             result = promote_root(std::move(result), context->session->allocate(klass));
-            if (vmhook::detail::private_native::pending_exception(context->thread))
-            {
-                context->session->clear_exception();
-                return {};
-            }
+            raise_pending_exception(context, reserved_exception, "Java allocation threw an exception");
             return result;
         }
+        catch (const std::bad_alloc&) { throw; }
+        catch (const vmhook::exception&) { throw; }
         catch (...) { return {}; }
     }
 
@@ -12767,16 +12799,15 @@ export namespace vmhook::detail::native_backend
             auto* const klass{ vmhook::find_class("java/lang/String") };
             auto result{ reserve_result_root(klass) };
             if (!result) { return {}; }
+            const auto reserved_exception{ reserve_result_root(klass) };
+            if (!reserved_exception) { return {}; }
             temporary_vm_scope temporary{ context };
             result = promote_root(std::move(result), context->session->new_string(text));
-            if (vmhook::detail::private_native::pending_exception(context->thread))
-            {
-                context->session->clear_exception();
-                return {};
-            }
+            raise_pending_exception(context, reserved_exception, "Java allocation threw an exception");
             return result;
         }
         catch (const std::bad_alloc&) { throw; }
+        catch (const vmhook::exception&) { throw; }
         catch (...) { return {}; }
     }
 
@@ -12805,7 +12836,7 @@ inline auto invoke_packed(vmhook::hotspot::method* const method,
                           const std::string_view signature,
                           std::intptr_t* const parameters, const std::size_t slot_count,
                           void** const receiver_owner,
-                          void** const* const argument_owners) noexcept -> native_call_result
+                          void** const* const argument_owners) -> native_call_result
 {
     native_call_result result{};
     operation access{};
@@ -12908,6 +12939,7 @@ inline auto invoke_packed(vmhook::hotspot::method* const method,
             {
                 result.exception = promote_root(std::move(reserved_exception), called.exception_root);
                 void* const exception{ result.exception ? result.exception->resolve_under_vm() : nullptr };
+                if (called.threw) { context->session->clear_exception(); }
                 if (auto* const klass{ vmhook::klass_from_oop(exception) })
                 {
                     if (auto* const name{ klass->get_name() }) { result.exception_class = name->to_string(); }
@@ -12936,6 +12968,11 @@ inline auto invoke_packed(vmhook::hotspot::method* const method,
         // native context ready for a subsequent call on the same OS thread.
         if (result.threw) { context->session->clear_exception(); }
         return result;
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (result.threw && context->session) { context->session->clear_exception(); }
+        throw;
     }
     catch (...)
     {
@@ -14606,7 +14643,9 @@ export namespace vmhook
                     parameters.data(), slots, nullptr, nullptr) };
                 if (!called.invoked || called.threw || !called.error.empty())
                 { throw vmhook::exception{ called.threw ? "Java field accessor threw an exception"
-                    : !called.error.empty() ? called.error : "Java field accessor refused invocation" }; }
+                    : !called.error.empty() ? called.error : "Java field accessor refused invocation",
+                    called.threw ? vmhook::error_code::java_exception : vmhook::error_code::refused,
+                    called.exception_class, called.exception }; }
                 return called;
             }
             throw vmhook::exception{ "No already-initialized Java Unsafe field accessor matches this JVM" };
@@ -14639,11 +14678,44 @@ export namespace vmhook
             > data;
             std::string signature{};
             vmhook::detail::native_backend::root native_root{};
+            bool read_succeeded{};
+            std::optional<vmhook::exception> failure{};
 
-            auto reference_address(const std::uint32_t compressed) const noexcept -> void*
+            value_t() = default;
+            template<typename stored_type>
+            value_t(stored_type&& value, std::string signature,
+                    vmhook::detail::native_backend::root root = {})
+                : data{ std::forward<stored_type>(value) }, signature{ std::move(signature) },
+                  native_root{ std::move(root) }, read_succeeded{ true } {}
+
+            static auto failed(std::string signature) -> value_t
+            { value_t result; result.signature = std::move(signature); return result; }
+            static auto failed(vmhook::exception error) -> value_t
+            { value_t result; result.failure = std::move(error); return result; }
+            [[nodiscard]] auto status() const noexcept -> vmhook::error_code
+            { return failure ? failure->code() : read_succeeded ? vmhook::error_code::none : vmhook::error_code::refused; }
+            auto require_success() const -> void
             {
-                return native_root ? native_root->resolve_under_vm()
-                                   : vmhook::hotspot::decode_oop_pointer(compressed);
+                if (failure) { throw *failure; }
+                if (!read_succeeded) { throw vmhook::exception{ "Java field read refused or failed" }; }
+            }
+            [[nodiscard]] auto error() const -> std::optional<vmhook::exception>
+            {
+                if (failure) { return failure; }
+                if (!read_succeeded) { return vmhook::exception{ "Java field read refused or failed" }; }
+                return {};
+            }
+
+
+            auto reference_address(const std::uint32_t compressed) const -> void*
+            {
+                if (!this->native_root) { return vmhook::hotspot::decode_oop_pointer(compressed); }
+                if (!this->native_root->valid())
+                { throw vmhook::exception{ "Java result belongs to an expired or different native context" }; }
+                void* const address{ this->native_root->resolve_under_vm() };
+                if (!address)
+                { throw vmhook::exception{ "Retained Java result could not be resolved", vmhook::error_code::result_unavailable }; }
+                return address;
             }
 
             /*
@@ -14652,7 +14724,7 @@ export namespace vmhook
                 Reads the element as uint8_t and converts non-zero to true.
                 Complexity: O(1). Exception safety: noexcept.
             */
-            static auto append_array_value(std::vector<bool>& result, void* const array_oop, const std::int32_t index, std::string_view) noexcept
+            static auto append_array_value(std::vector<bool>& result, void* const array_oop, const std::int32_t index, std::string_view)
                 -> void
             {
                 result.push_back(vmhook::get_array_element<std::uint8_t>(array_oop, index) != 0);
@@ -14664,7 +14736,7 @@ export namespace vmhook
                 Reads the compressed OOP at index, decodes it, then calls read_java_string().
                 Complexity: O(S) where S = string length. Exception safety: noexcept.
             */
-            static auto append_array_value(std::vector<std::string>& result, void* const array_oop, const std::int32_t index, std::string_view) noexcept
+            static auto append_array_value(std::vector<std::string>& result, void* const array_oop, const std::int32_t index, std::string_view)
                 -> void
             {
                 const std::uint32_t element_compressed{ vmhook::get_array_element<std::uint32_t>(array_oop, index) };
@@ -14678,7 +14750,7 @@ export namespace vmhook
                 reads directly as char.
                 Complexity: O(1). Exception safety: noexcept.
             */
-            static auto append_array_value(std::vector<char>& result, void* const array_oop, const std::int32_t index, const std::string_view signature) noexcept
+            static auto append_array_value(std::vector<char>& result, void* const array_oop, const std::int32_t index, const std::string_view signature)
                 -> void
             {
                 if (signature == "[C")
@@ -14699,7 +14771,7 @@ export namespace vmhook
                 Complexity: O(1). Exception safety: noexcept.
             */
             template<typename element_type>
-            static auto append_array_value(std::vector<element_type>& result, void* const array_oop, const std::int32_t index, std::string_view) noexcept
+            static auto append_array_value(std::vector<element_type>& result, void* const array_oop, const std::int32_t index, std::string_view)
                 -> void
             {
                 result.push_back(vmhook::get_array_element<element_type>(array_oop, index));
@@ -14721,7 +14793,7 @@ export namespace vmhook
                 @return  Vector containing all decoded elements, or an empty vector on failure.
             */
             template<typename target_type>
-            static auto read_array_value(const std::uint32_t compressed, const std::string_view signature) noexcept
+            static auto read_array_value(const std::uint32_t compressed, const std::string_view signature)
                 -> target_type
             {
                 target_type result{};
@@ -14856,7 +14928,7 @@ export namespace vmhook
                     }
                     else
                     {
-                        return {};
+                        throw vmhook::exception{ "Java field value cannot be converted to the requested C++ type", vmhook::error_code::type_mismatch };
                     }
                 }
                 else if constexpr (vmhook::detail::is_vector_v<clean_target_type>)
@@ -14867,7 +14939,7 @@ export namespace vmhook
                     }
                     else
                     {
-                        return {};
+                        throw vmhook::exception{ "Java field value cannot be converted to the requested C++ type", vmhook::error_code::type_mismatch };
                     }
                 }
                 else if constexpr (vmhook::detail::is_unique_ptr_v<clean_target_type>)
@@ -14891,11 +14963,13 @@ export namespace vmhook
                 }
                 else if constexpr (requires { static_cast<target_type>(value); })
                 {
+                    if constexpr (std::is_same_v<clean_source_type, std::uint32_t>)
+                    { throw vmhook::exception{ "A Java reference cannot be converted to a C++ primitive", vmhook::error_code::type_mismatch }; }
                     return static_cast<target_type>(value);
                 }
                 else
                 {
-                    return target_type{};
+                    throw vmhook::exception{ "Java field value cannot be converted to the requested C++ type", vmhook::error_code::type_mismatch };
                 }
             }
 
@@ -14907,6 +14981,7 @@ export namespace vmhook
                 requires vmhook::detail::value_t_convertible_target_v<target_type>
             operator target_type() const
             {
+                this->require_success();
                 return std::visit([this](auto value)
                     -> target_type
                     {
@@ -14919,6 +14994,9 @@ export namespace vmhook
             */
             auto as_string() const -> std::string
             {
+                this->require_success();
+                if (this->signature != "Ljava/lang/String;")
+                { throw vmhook::exception{ "String conversion requires a Java String field", vmhook::error_code::type_mismatch }; }
                 vmhook::detail::native_backend::operation access{};
                 return std::visit([this](const auto& v)
                     -> std::string
@@ -14933,6 +15011,15 @@ export namespace vmhook
                             return std::string{};
                         }
                     }, data);
+            }
+
+            auto as_utf16() const -> std::u16string
+            {
+                this->require_success();
+                if (this->signature != "Ljava/lang/String;" || !std::holds_alternative<std::uint32_t>(this->data))
+                { throw vmhook::exception{ "UTF-16 conversion requires a Java String field", vmhook::error_code::type_mismatch }; }
+                vmhook::detail::native_backend::operation access{};
+                return vmhook::read_java_string_utf16(this->reference_address(std::get<std::uint32_t>(this->data)));
             }
 
             /*
@@ -14969,7 +15056,7 @@ export namespace vmhook
             @param signature     JVM type descriptor, e.g. "I", "Z", "Ljava/lang/String;"
             @param is_static     true when JVM_ACC_STATIC is set on the field.
         */
-        field_proxy(void* field_pointer, std::string sig, const bool is_static_flag) noexcept
+        field_proxy(void* field_pointer, std::string sig, const bool is_static_flag)
             : field_pointer{ field_pointer }
             , signature_text{ std::move(sig) }
             , static_field{ is_static_flag }
@@ -14987,7 +15074,7 @@ export namespace vmhook
         */
         field_proxy(void* field_pointer, std::string sig, const bool is_static_flag,
                     vmhook::hotspot::klass* mirror_klass, const std::size_t field_offset,
-                    const std::uint16_t access_flags = 0) noexcept
+                    const std::uint16_t access_flags = 0)
             : field_pointer{ field_pointer }
             , signature_text{ std::move(sig) }
             , static_field{ is_static_flag }
@@ -15007,7 +15094,7 @@ export namespace vmhook
         field_proxy(void* field_pointer, std::string sig, const bool is_static_flag,
                     vmhook::detail::native_backend::root holder, const std::size_t offset,
                     vmhook::hotspot::klass* const declaring_class = nullptr,
-                    const std::uint16_t access_flags = 0) noexcept
+                    const std::uint16_t access_flags = 0)
             : field_pointer{ field_pointer }, signature_text{ std::move(sig) }, static_field{ is_static_flag },
               field_offset{ offset }, holder_root{ std::move(holder) }, reference_declaring_class{ declaring_class },
               field_flags{ access_flags }
@@ -15022,7 +15109,8 @@ export namespace vmhook
             or the context closes. Legacy detour results remain non-owning snapshots.
             Typed heap-field decoding requires verified narrow-oop support.
         */
-        auto get() const
+    private:
+        auto get_unchecked() const
             -> value_t
         {
             vmhook::detail::native_backend::operation access{};
@@ -15033,7 +15121,7 @@ export namespace vmhook
             {
                 ::vmhook::detail::log_line("{} field_proxy::get(): typed reference reads require verified narrow oops.",
                                           vmhook::error_tag);
-                return value_t{ std::int32_t{}, this->signature_text };
+                return value_t::failed(this->signature_text);
             }
             // Read the static mirror again instead of retaining its previously observed address.
             // This narrows staleness but does not synchronize with GC or class unloading.
@@ -15043,14 +15131,14 @@ export namespace vmhook
                 void* const live_mirror{ this->mirror_klass->get_java_mirror() };
                 if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
                 {
-                    return value_t{ std::int32_t{}, this->signature_text };
+                    return value_t::failed(this->signature_text);
                 }
                 read_pointer = reinterpret_cast<std::uint8_t*>(live_mirror) + this->field_offset;
             }
 
             if (!read_pointer)
             {
-                return value_t{ std::int32_t{}, this->signature_text };
+                return value_t::failed(this->signature_text);
             }
 
             // Read JVM memory through the Windows memory API and stop on unreadable data.
@@ -15059,7 +15147,7 @@ export namespace vmhook
                 && !vmhook::hotspot::is_valid_pointer(reinterpret_cast<const void*>(
                        reinterpret_cast<std::uintptr_t>(read_pointer) & ~std::uintptr_t{ 1 })))
             {
-                return value_t{ std::int32_t{}, this->signature_text };
+                return value_t::failed(this->signature_text);
             }
 
             // Read JVM memory through the Windows memory API and stop on unreadable data.
@@ -15067,63 +15155,87 @@ export namespace vmhook
             if (this->signature_text == "Z")
             {
                 bool value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "B")
             {
                 std::int8_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "S")
             {
                 std::int16_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "I")
             {
                 std::int32_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "J")
             {
                 std::int64_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "F")
             {
                 float value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "D")
             {
                 double value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
             if (this->signature_text == "C")
             {
                 std::uint16_t value{};
-                vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+                if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+                { return value_t::failed(this->signature_text); }
                 return value_t{ value, this->signature_text };
             }
 
+            if (!this->is_reference())
+            { return value_t::failed(vmhook::exception{ "Java field descriptor is malformed", vmhook::error_code::type_mismatch }); }
             // Reference or array type - store compressed OOP
             std::uint32_t value{};
             if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
-            { return value_t{ std::int32_t{}, this->signature_text }; }
+            { return value_t::failed(this->signature_text); }
             value_t result{ value, this->signature_text };
             if (access)
             {
                 result.native_root = vmhook::detail::native_backend::retain_oop(
                     vmhook::hotspot::decode_oop_pointer(value));
-                if (value != 0 && !result.native_root) { result.data = std::int32_t{}; }
+                if (value != 0 && !result.native_root) { return value_t::failed(this->signature_text); }
             }
+            return result;
+        }
+
+    public:
+        auto try_get() const -> value_t
+        {
+            try { return this->get_unchecked(); }
+            catch (const vmhook::exception& error) { return value_t::failed(error); }
+        }
+
+        auto get() const -> value_t
+        {
+            auto result{ this->try_get() };
+            result.require_success();
             return result;
         }
 
@@ -15153,6 +15265,15 @@ export namespace vmhook
         {
             vmhook::detail::require_object_argument(value);
             vmhook::detail::native_backend::operation access{};
+            if constexpr (std::is_arithmetic_v<std::remove_cvref_t<value_type>>)
+            {
+                constexpr auto descriptor{ vmhook::detail::descriptor_of_v<value_type> };
+                const bool widened_character{ std::is_integral_v<std::remove_cvref_t<value_type>>
+                    && !std::is_same_v<std::remove_cvref_t<value_type>, bool>
+                    && sizeof(value_type) == 1 && this->signature_text == "C" };
+                if (descriptor != this->signature_text && !widened_character)
+                { throw vmhook::exception{ "Java primitive field write requires its matching C++ type", vmhook::error_code::type_mismatch }; }
+            }
             if (this->is_final())
             { throw vmhook::exception{ "Final Java fields cannot be mutated through a VMHook field setter" }; }
 
@@ -15188,6 +15309,7 @@ export namespace vmhook
         /*
             @brief The primitive / string / array write.  @see set().
         */
+    private:
         template<typename value_type>
             requires (vmhook::detail::supported_field_value_v<value_type>
                       && !vmhook::detail::is_java_object_pointer_v<value_type>)
@@ -15213,7 +15335,7 @@ export namespace vmhook
                           && !std::is_same_v<clean_value_type, std::vector<std::string>>)
             {
                 // Reuse an existing primitive array; its reference is unchanged.
-                if (!vmhook::detail::reference_reads_supported()) { return; }
+                if (!vmhook::detail::reference_reads_supported()) { throw vmhook::exception{ "Java array write requires a verified reference layout" }; }
             }
             else
             {
@@ -15221,7 +15343,7 @@ export namespace vmhook
                     && !vmhook::detail::reference_stores_supported())
                 {
                     ::vmhook::detail::log_line("{} reference store refused: collector write barriers are unavailable.", vmhook::error_tag);
-                    return;
+                    throw vmhook::exception{ "Java field write refused: incompatible type, collector, or unresolved storage" };
                 }
             }
 
@@ -15252,7 +15374,7 @@ export namespace vmhook
                                vmhook::error_tag, this->signature_text,
                                this->field_pointer,
                                this->static_field ? "static" : "instance");
-                    return;
+                    throw vmhook::exception{ "Java field write refused: incompatible type, collector, or unresolved storage" };
                 }
             }
 
@@ -15260,13 +15382,15 @@ export namespace vmhook
             {
                 // Build an independent Java String and attempt a reference-field store.
                 // The public store path enforces the supported collector gate.
-                this->store_string(std::string_view{ value });
+                if (!this->store_string(std::string_view{ value }))
+                { throw vmhook::exception{ "Java String field allocation or reference store failed" }; }
             }
             else if constexpr (std::is_convertible_v<value_type, std::string_view> && !std::is_same_v<clean_value_type, std::string>)
             {
                 // string_view / const char* / std::string-like: same real-String
                 // construction + reference store as the std::string arm above.
-                this->store_string(std::string_view{ value });
+                if (!this->store_string(std::string_view{ value }))
+                { throw vmhook::exception{ "Java String field allocation or reference store failed" }; }
             }
             else if constexpr (vmhook::detail::is_vector_v<clean_value_type>)
             {
@@ -15287,7 +15411,7 @@ export namespace vmhook
             {
                 if (!this->field_pointer)
                 {
-                    return;
+                    throw vmhook::exception{ "Java field write refused: incompatible type, collector, or unresolved storage" };
                 }
 
                 // Special case: passing a 1-byte C++ `char` to a Java `char` field
@@ -15317,10 +15441,12 @@ export namespace vmhook
                         if (!this->native_bound && !this->holder_root && this->mirror_klass)
                         {
                             void* const live_mirror{ this->mirror_klass->get_java_mirror() };
-                            if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror)) { return; }
+                            if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
+                            { throw vmhook::exception{ "Java field write requires a live declaring class mirror" }; }
                             write_pointer = reinterpret_cast<std::uint8_t*>(live_mirror) + this->field_offset;
                         }
-                        (void)vmhook::os::safe_write(write_pointer, &wide_value, sizeof(wide_value));
+                        if (!vmhook::os::safe_write(write_pointer, &wide_value, sizeof(wide_value)))
+                        { throw vmhook::exception{ "Java field write failed: destination is unreadable or unwritable", vmhook::error_code::invalid_memory }; }
                         return;
                     }
                 }
@@ -15350,7 +15476,7 @@ export namespace vmhook
                                vmhook::error_tag, this->field_pointer,
                                this->static_field ? "static" : "instance",
                                value_size, field_size, this->signature_text);
-                    return;
+                    throw vmhook::exception{ "Java field write refused: incompatible type, collector, or unresolved storage" };
                 }
 
 
@@ -15360,15 +15486,16 @@ export namespace vmhook
                     void* const live_mirror{ this->mirror_klass->get_java_mirror() };
                     if (!live_mirror || !vmhook::hotspot::is_valid_pointer(live_mirror))
                     {
-                        return;
+                        throw vmhook::exception{ "Java field write refused: incompatible type, collector, or unresolved storage" };
                     }
                     write_pointer = reinterpret_cast<std::uint8_t*>(live_mirror) + this->field_offset;
                 }
                 if (!write_pointer)
                 {
-                    return;
+                    throw vmhook::exception{ "Java field write refused: incompatible type, collector, or unresolved storage" };
                 }
-                (void)vmhook::os::safe_write(write_pointer, &value, value_size);
+                if (!vmhook::os::safe_write(write_pointer, &value, value_size))
+                { throw vmhook::exception{ "Java field write failed: destination is unreadable or unwritable", vmhook::error_code::invalid_memory }; }
             }
             else
             {
@@ -15380,6 +15507,15 @@ export namespace vmhook
                               "error or runtime warning.  Convert the value to one of those, or "
                               "extend the if-constexpr chain above with a specific branch.");
             }
+        }
+
+    public:
+        template<typename value_type>
+            requires vmhook::detail::supported_field_value_v<value_type>
+        auto try_set(const value_type& value) const -> std::expected<void, vmhook::exception>
+        {
+            try { this->set(value); return {}; }
+            catch (const vmhook::exception& error) { return std::unexpected{ error }; }
         }
 
         /*
@@ -16485,7 +16621,7 @@ export namespace vmhook
         class call_handles_guard
         {
         public:
-            call_handles_guard() noexcept
+            call_handles_guard()
             {
                 if (call_handle_depth >= 64) { return; }
                 try
@@ -16493,12 +16629,13 @@ export namespace vmhook
                     auto& pool{ vmhook::detail::call_handle_pool() };
                     if (pool.size() <= call_handle_depth)
                     {
-                        auto entry{ std::unique_ptr<reusable_call_handles>{ new (std::nothrow) reusable_call_handles{} } };
+                        auto entry{ std::make_unique<reusable_call_handles>() };
                         if (!entry) { return; }
                         pool.push_back(std::move(entry));
                     }
                     this->handles_ = pool[call_handle_depth++]->bytes.data();
                 }
+                catch (const std::bad_alloc&) { throw; }
                 catch (...) { this->handles_ = nullptr; }
             }
             ~call_handles_guard()
@@ -16662,8 +16799,9 @@ export namespace vmhook
                 get_method("sayString")->call(value);
             }
 
-        Inspect was_invoked() and threw() when refusal or Java exceptions matter.
-        Primitive conversions otherwise produce a default value on refusal.
+        call() checks refusal, Java exceptions and result bookkeeping even for
+        void wrappers. try_call() preserves structured status for explicit handling;
+        conversions are always checked. C++ allocation failures propagate.
     */
     class method_proxy final
     {
@@ -16697,25 +16835,32 @@ export namespace vmhook
                 JavaThread and leaves the stub's result slot holding garbage.
                 call() detects that, clears the pending exception (a pure-VM
                 write to ThreadShadow::_pending_exception — no JNI involved),
-                logs it, and returns a value-initialised result for the declared
-                return type with this flag set, so "the method returned 0" and
-                "the method threw" are distinguishable.  Callers that ignore the
-                flag see a deterministic zero instead of the previous silent
-                garbage.
+                returns a status-bearing result with this flag set. call() raises
+                vmhook::exception; try_call() lets callers inspect the result.
+                Conversions reject failure, including primitive and void calls.
             */
             vmhook::detail::native_backend::root native_root{};
             vmhook::detail::native_backend::root native_receiver_root{};
+            vmhook::detail::native_backend::root native_exception_root{};
+            std::string failure_message{};
+            std::optional<vmhook::exception> failure{};
 
-            auto reference_address(const std::uint32_t compressed) const noexcept -> void*
+            auto reference_address(const std::uint32_t compressed) const -> void*
             {
-                return native_root ? native_root->resolve_under_vm()
-                                   : vmhook::hotspot::decode_oop_pointer(compressed);
+                if (!this->native_root) { return vmhook::hotspot::decode_oop_pointer(compressed); }
+                if (!this->native_root->valid())
+                { throw vmhook::exception{ "Java result belongs to an expired or different native context" }; }
+                void* const address{ this->native_root->resolve_under_vm() };
+                if (!address)
+                { throw vmhook::exception{ "Retained Java result could not be resolved", vmhook::error_code::result_unavailable }; }
+                return address;
             }
 
             bool invoked{ false };
             // Distinguishes an actual null reference result from void or failure.
             bool reference_result{ false };
             bool reference_array_result{ false };
+            bool string_result{ false };
             bool primitive_array_result{ false };
             // A callee may run successfully while result-root bookkeeping fails.
             bool result_failed{ false };
@@ -16723,6 +16868,29 @@ export namespace vmhook
             void* receiver_address{ nullptr };
 
             [[nodiscard]] auto was_invoked() const noexcept -> bool { return this->invoked; }
+
+            [[nodiscard]] auto status() const noexcept -> vmhook::error_code
+            {
+                if (this->failure) { return this->failure->code(); }
+                if (this->exception_thrown) { return vmhook::error_code::java_exception; }
+                if (!this->invoked) { return vmhook::error_code::refused; }
+                return this->result_failed ? vmhook::error_code::result_unavailable : vmhook::error_code::none;
+            }
+            [[nodiscard]] auto error() const -> std::optional<vmhook::exception>
+            {
+                if (this->failure) { return this->failure; }
+                if (this->status() == vmhook::error_code::none) { return {}; }
+                const std::string_view message{ !this->failure_message.empty() ? std::string_view{this->failure_message}
+                    : this->threw() ? std::string_view{"Java method threw an exception"}
+                    : this->result_failed ? std::string_view{"Java method result could not be retained or decoded"}
+                    : std::string_view{"Java method invocation refused"} };
+                return vmhook::exception{ message, this->status(), this->exception_class, this->native_exception_root };
+            }
+            auto require_success() const -> void
+            { if (auto failed{ this->error() }) { throw std::move(*failed); } }
+            [[nodiscard]] auto get_throwable() const -> std::unique_ptr<vmhook::any_object>;
+            static auto failed(vmhook::exception error) -> value_t
+            { value_t result; result.failure = std::move(error); return result; }
 
             template<typename stored_type>
             static auto completed(stored_type&& value, void* const receiver = nullptr) -> value_t
@@ -16756,6 +16924,8 @@ export namespace vmhook
                 result.invoked = called.invoked;
                 result.exception_thrown = called.threw;
                 result.exception_class = called.exception_class;
+                result.native_exception_root = called.exception;
+                result.failure_message = called.error;
                 result.result_failed = !called.error.empty()
                     || (!called.threw && called.bits != 0 && !called.object);
                 return result;
@@ -16780,12 +16950,14 @@ export namespace vmhook
             }
 
             /*
-                @brief Converts the stored value to T via static_cast. Falls back to a default-constructed T for variant alternatives that cannot be cast to the target type (std::monostate, std::string).
+                @brief Checked conversion: failed invocation and incompatible alternatives throw.
+                Successful primitive zero and false are preserved.
             */
             template<typename target_type>
                 requires vmhook::detail::value_t_convertible_target_v<target_type>
             operator target_type() const
             {
+                this->require_success();
                 vmhook::detail::native_backend::operation access{};
                 if constexpr (vmhook::detail::is_unique_ptr_v<target_type>)
                 {
@@ -16815,24 +16987,25 @@ export namespace vmhook
                             if constexpr (std::is_same_v<stored_type, std::string>) { return value; }
                             else if constexpr (std::is_same_v<stored_type, std::uint32_t>)
                             { return vmhook::read_java_string(this->reference_address(value)); }
-                            else { return {}; }
+                            else { throw vmhook::exception{ "Java method result cannot be converted to a C++ string", vmhook::error_code::type_mismatch }; }
                         }
                         else if constexpr (requires { static_cast<target_type>(value); })
-                        { return static_cast<target_type>(value); }
-                        else { return {}; }
+                        {
+                            if (this->reference_result)
+                            { throw vmhook::exception{ "A Java reference cannot be converted to a C++ primitive", vmhook::error_code::type_mismatch }; }
+                            return static_cast<target_type>(value);
+                        }
+                        else { throw vmhook::exception{ "Java method result cannot be converted to the requested C++ type", vmhook::error_code::type_mismatch }; }
                     }, this->data);
                 }
             }
 
             /*
-                @brief True when the call returned void or failed (variant holds monostate).
-                Distinguishes "method returned void / the call failed" from a
-                primitive zero or an empty string.  Parity with the richer
-                introspection field_proxy::value_t users have asked for.
+                @brief True only for a successful void result. Failure has a separate status.
             */
             auto is_void() const noexcept -> bool
             {
-                return std::holds_alternative<std::monostate>(data);
+                return this->status() == vmhook::error_code::none && std::holds_alternative<std::monostate>(data);
             }
 
             /*
@@ -16840,7 +17013,8 @@ export namespace vmhook
             */
             auto is_string() const noexcept -> bool
             {
-                return std::holds_alternative<std::string>(data);
+                return this->status() == vmhook::error_code::none
+                    && (this->string_result || std::holds_alternative<std::string>(data));
             }
 
             /*
@@ -16848,6 +17022,7 @@ export namespace vmhook
             */
             auto as_string() const -> std::string
             {
+                this->require_success();
                 vmhook::detail::native_backend::operation access{};
                 return std::visit([this](const auto& v)
                     -> std::string
@@ -16863,10 +17038,23 @@ export namespace vmhook
                         }
                         else
                         {
-                            return std::string{};
+                            throw vmhook::exception{ "String conversion requires a Java String result", vmhook::error_code::type_mismatch };
                         }
                     }
                 , data);
+            }
+
+            auto as_utf16() const -> std::u16string
+            {
+                this->require_success();
+                if (!this->reference_result || this->reference_array_result)
+                { throw vmhook::exception{ "UTF-16 conversion requires a Java String result", vmhook::error_code::type_mismatch }; }
+                vmhook::detail::native_backend::operation access{};
+                // Eager UTF-8 is intentionally bypassed: the root retains exact
+                // Java code units, including isolated surrogates and interior NUL.
+                const auto narrow{ std::holds_alternative<std::uint32_t>(this->data)
+                    ? std::get<std::uint32_t>(this->data) : std::uint32_t{} };
+                return vmhook::read_java_string_utf16(this->reference_address(narrow));
             }
 
             /* The destination of a deferred conversion supplies the wrapper
@@ -16894,7 +17082,7 @@ export namespace vmhook
         */
         method_proxy(void* owning_object, vmhook::hotspot::method* method_ptr, std::string sig,
                      const bool pinned = false, void** const receiver_slot = nullptr,
-                     vmhook::detail::native_backend::root receiver_root = {}) noexcept
+                     vmhook::detail::native_backend::root receiver_root = {})
             : object{ owning_object }
             , method{ method_ptr }
             , signature_text{ std::move(sig) }
@@ -16924,6 +17112,7 @@ export namespace vmhook
                         this->native_declaring_class);
                 }
             }
+            catch (const std::bad_alloc&) { throw; }
             catch (...) {}
         }
 
@@ -17003,10 +17192,10 @@ export namespace vmhook
                 user typing "09" would get 0 -- a real footgun for a field editor
                 or a scripted call.
             */
-            static auto from_descriptor(const char letter, const std::string_view literal) noexcept
+            static auto from_descriptor(const char letter, const std::string_view literal)
                 -> std::optional<java_arg>
             {
-                const auto as_int{ [&]() noexcept -> std::int64_t
+                const auto as_int{ [&]() -> std::int64_t
                 {
                     const std::string owned{ literal };
                     const char* text{ owned.c_str() };
@@ -17047,8 +17236,23 @@ export namespace vmhook
             remain rooted until the owning context ends. Raw incoming addresses
             must be valid when handed to the library.
         */
+        auto try_call_packed(vmhook::hotspot::method* const requested_method,
+                             const std::span<const java_arg> args) const -> value_t
+        {
+            try { return this->call_packed_unchecked(requested_method, args); }
+            catch (const vmhook::exception& error) { return value_t::failed(error); }
+        }
         auto call_packed(vmhook::hotspot::method* const requested_method,
-                         const std::span<const java_arg> args) const noexcept
+                         const std::span<const java_arg> args) const -> value_t
+        {
+            auto result{ this->try_call_packed(requested_method, args) };
+            result.require_success();
+            return result;
+        }
+
+    private:
+        auto call_packed_unchecked(vmhook::hotspot::method* const requested_method,
+                                  const std::span<const java_arg> args) const
             -> value_t
         {
             vmhook::detail::native_backend::operation native_operation{};
@@ -17289,7 +17493,7 @@ export namespace vmhook
                            const std::string& selected_signature,
                            std::intptr_t* const params,
                            const std::size_t param_idx,
-                           void** const* const argument_owners = nullptr) const noexcept
+                           void** const* const argument_owners = nullptr) const
             -> value_t
         {
             if (!this->callable_candidate(selected_method) || param_idx > 20
@@ -17673,6 +17877,10 @@ export namespace vmhook
                                           sizeof(pending))
                     && pending)
                 {
+                    // Restoration above is complete. Clear the thread slot first,
+                    // while pending remains a valid borrowed oop in VM state.
+                    std::memcpy(thread_bytes + layout.pending_exception_offset, &cleared, sizeof(cleared));
+                    const auto exception_root{ vmhook::detail::native_backend::retain_oop(pending) };
                     std::string exception_class{};
                     if (vmhook::hotspot::klass* const exception_klass{ method_proxy::klass_from_object_header(pending) })
                     {
@@ -17707,6 +17915,7 @@ export namespace vmhook
                     thrown.invoked = true;
                     thrown.receiver_address = receiver_after;
                     thrown.exception_thrown = true;
+                    thrown.native_exception_root = exception_root;
                     thrown.exception_class  = std::move(exception_class);
                     return thrown;
                 }
@@ -17753,13 +17962,14 @@ export namespace vmhook
                 result.reference_array_result = ret_char == '[';
                 result.primitive_array_result = ret_char == '[' && rparen + 2 < sig.size()
                     && sig[rparen + 2] != 'L' && sig[rparen + 2] != '[';
+                result.string_result = rparen != std::string_view::npos
+                    && sig.substr(rparen + 1) == "Ljava/lang/String;";
                 if (!result_oop) { return result; }
                 result.native_root = vmhook::detail::native_backend::retain_oop(result_oop);
                 if (!result.native_root) { result.result_failed = true; return result; }
                 result.data = vmhook::hotspot::encode_oop_pointer(result_oop);
-                if (rparen != std::string_view::npos
-                    && sig.substr(rparen + 1) == "Ljava/lang/String;")
-                { result.data = vmhook::read_java_string(result_oop); }
+                result.string_result = rparen != std::string_view::npos
+                    && sig.substr(rparen + 1) == "Ljava/lang/String;";
                 return result;
             }
             }
@@ -17779,7 +17989,24 @@ export namespace vmhook
     public:
         template<typename... args_t>
             requires (vmhook::detail::supported_java_argument_v<args_t> && ...)
-        auto call(args_t&&... args) const
+        auto try_call(args_t&&... args) const -> value_t
+        {
+            try { return this->call_unchecked(std::forward<args_t>(args)...); }
+            catch (const vmhook::exception& error) { return value_t::failed(error); }
+        }
+        template<typename... args_t>
+            requires (vmhook::detail::supported_java_argument_v<args_t> && ...)
+        auto call(args_t&&... args) const -> value_t
+        {
+            auto result{ this->try_call(std::forward<args_t>(args)...) };
+            result.require_success();
+            return result;
+        }
+
+    private:
+        template<typename... args_t>
+            requires (vmhook::detail::supported_java_argument_v<args_t> && ...)
+        auto call_unchecked(args_t&&... args) const
             -> value_t
         {
             (vmhook::detail::require_object_argument(args), ...);
@@ -18054,10 +18281,11 @@ export namespace vmhook
                                        argument_owners.data());
         }
 
+    public:
         /*
             @brief Returns the method name.
         */
-        auto name() const noexcept
+        auto name() const
             -> std::string
         {
             if (!this->method_name.empty()) { return this->method_name; }
@@ -18311,7 +18539,7 @@ export namespace vmhook
         }
 
         static auto pack_string(const std::string_view value, const bool native_call,
-                                vmhook::detail::native_backend::root& root) noexcept -> void*
+                                vmhook::detail::native_backend::root& root) -> void*
         {
             if (!native_call) { return vmhook::make_java_string(value); }
             root = vmhook::detail::native_backend::make_string(value);
@@ -18321,11 +18549,16 @@ export namespace vmhook
         auto invoke_native_packed(vmhook::hotspot::method* const selected_method,
                                   const std::string_view signature,
                                   std::intptr_t* const params, const std::size_t count,
-                                  void** const* const argument_owners) const noexcept -> value_t
+                                  void** const* const argument_owners) const -> value_t
         {
             const auto result{ vmhook::detail::native_backend::invoke_packed(
                 selected_method, signature, params, count, this->receiver_slot, argument_owners) };
-            if (!result.invoked && !result.threw) { return value_t{ std::monostate{} }; }
+            if (!result.invoked && !result.threw)
+            {
+                value_t refused{};
+                refused.failure_message = result.error;
+                return refused;
+            }
             void* const receiver{ result.receiver ? result.receiver->resolve_under_vm() : nullptr };
             if (result.receiver)
             {
@@ -18359,11 +18592,7 @@ export namespace vmhook
             case 'L':
             case '[':
                 converted = value_t::completed_native_reference(result);
-                if (!result.threw && result.object)
-                {
-                    if (signature.substr(close + 1) == "Ljava/lang/String;")
-                    { converted.data = vmhook::read_java_string(result.object->resolve_under_vm()); }
-                }
+                converted.string_result = signature.substr(close + 1) == "Ljava/lang/String;";
                 break;
             default: break;
             }
@@ -18377,6 +18606,8 @@ export namespace vmhook
             converted.native_receiver_root = result.receiver;
             converted.exception_thrown = result.threw;
             converted.exception_class = result.exception_class;
+            converted.native_exception_root = result.exception;
+            converted.failure_message = result.error;
             return converted;
         }
 
@@ -21442,7 +21673,7 @@ export namespace vmhook
     inline auto read_java_string_utf16(void* const string_oop) -> std::u16string
     {
         if (!string_oop)
-        { throw vmhook::exception{ "A Java null String cannot be copied to a C++ string" }; }
+        { throw vmhook::exception{ "A Java null String cannot be copied to a C++ string", vmhook::error_code::null_reference }; }
         if (!vmhook::detail::reference_reads_supported()
             || vmhook::detail::reference_storage_width() != sizeof(std::uint32_t)
             || !vmhook::hotspot::is_valid_pointer(string_oop))
@@ -24884,6 +25115,23 @@ namespace hotspot
         const auto root{ vmhook::detail::native_backend::make_string_utf16(value) };
         if (!root) { throw vmhook::exception{ "Java String allocation failed" }; }
         return vmhook::detail::materialize_object<wrapper_type>(0, root);
+    }
+
+    inline auto exception::get_throwable() const -> std::unique_ptr<vmhook::any_object>
+    {
+        if (!this->throwable_)
+        { throw vmhook::exception{ "This failure has no retained Java Throwable", vmhook::error_code::result_unavailable }; }
+        vmhook::detail::native_backend::operation access{};
+        return vmhook::detail::materialize_object<vmhook::any_object>(0, this->throwable_);
+    }
+
+    inline auto method_proxy::value_t::get_throwable() const -> std::unique_ptr<vmhook::any_object>
+    {
+        if (this->failure) { return this->failure->get_throwable(); }
+        if (!this->exception_thrown || !this->native_exception_root)
+        { throw vmhook::exception{ "This result has no retained Java Throwable", vmhook::error_code::result_unavailable }; }
+        vmhook::detail::native_backend::operation access{};
+        return vmhook::detail::materialize_object<vmhook::any_object>(0, this->native_exception_root);
     }
 
     inline auto field_proxy::value_t::operator->() const -> std::unique_ptr<vmhook::any_object>

@@ -6,6 +6,23 @@ import vmhook.windows;
 #include <vmhook/vmhook.hpp>
 #endif
 
+namespace
+{
+    std::atomic<bool> fail_next_allocation{};
+}
+
+[[gnu::noinline]] void* operator new(const std::size_t size)
+{
+    if (fail_next_allocation.exchange(false)) { throw std::bad_alloc{}; }
+    if (void* result = std::malloc(size == 0 ? 1 : size)) { return result; }
+    throw std::bad_alloc{};
+}
+[[gnu::noinline]] void* operator new[](const std::size_t size) { return ::operator new(size); }
+[[gnu::noinline]] void operator delete(void* pointer) noexcept { std::free(pointer); }
+[[gnu::noinline]] void operator delete[](void* pointer) noexcept { std::free(pointer); }
+[[gnu::noinline]] void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); }
+[[gnu::noinline]] void operator delete[](void* pointer, std::size_t) noexcept { std::free(pointer); }
+
 int main()
 {
     int failures{};
@@ -49,5 +66,76 @@ int main()
     try { (void)vmhook::read_java_string_utf16(nullptr); }
     catch (const vmhook::exception&) { null_refused = true; }
     check(null_refused, "Java null String is distinct from an empty C++ string");
+    const auto refused = vmhook::method_proxy::value_t{};
+    check(refused.status() == vmhook::error_code::refused && !refused.is_void(),
+          "a refused invocation is distinct from successful void");
+    bool refused_zero{};
+    try { (void)static_cast<std::int32_t>(refused); }
+    catch (const vmhook::exception& error) { refused_zero = error.code() == vmhook::error_code::refused; }
+    check(refused_zero, "primitive conversion cannot hide refusal as zero");
+    check(static_cast<std::int32_t>(vmhook::method_proxy::value_t::completed(std::int32_t{})) == 0,
+          "successful primitive zero remains zero");
+    check(!static_cast<bool>(vmhook::method_proxy::value_t::completed(false)),
+          "successful false remains false");
+    check(vmhook::method_proxy::value_t::completed(std::monostate{}).is_void(),
+          "successful void is explicit");
+    auto thrown = vmhook::method_proxy::value_t::completed(std::int32_t{});
+    thrown.exception_thrown = true;
+    thrown.exception_class = "java/lang/IllegalStateException";
+    check(thrown.status() == vmhook::error_code::java_exception,
+          "Java throw status is distinct from refusal");
+    bool thrown_zero{};
+    try { (void)static_cast<std::int32_t>(thrown); }
+    catch (const vmhook::exception& error)
+    { thrown_zero = error.code() == vmhook::error_code::java_exception
+            && error.exception_class() == "java/lang/IllegalStateException"; }
+    check(thrown_zero, "Java exception diagnostics survive checked primitive conversion");
+    vmhook::method_proxy invalid_method{nullptr, nullptr, "()V"};
+    check(invalid_method.try_call().status() == vmhook::error_code::refused,
+          "try_call returns explicit refusal");
+    bool checked_void{};
+    try { invalid_method.call(); }
+    catch (const vmhook::exception& error) { checked_void = error.code() == vmhook::error_code::refused; }
+    check(checked_void, "ignored void calls still report failure");
+    vmhook::field_proxy invalid_field{nullptr, "I", false};
+    check(invalid_field.try_get().status() == vmhook::error_code::refused,
+          "try_get reports failure without a fabricated field value");
+    bool checked_field{};
+    try { (void)invalid_field.get(); }
+    catch (const vmhook::exception&) { checked_field = true; }
+    check(checked_field, "field get checks failure immediately");
+    alignas(8) std::int32_t storage{};
+    vmhook::field_proxy valid_field{&storage, "I", false};
+    check(valid_field.try_get().status() == vmhook::error_code::none
+          && static_cast<std::int32_t>(valid_field.get()) == 0,
+          "successful zero field is distinct from unreadable storage");
+    valid_field.set(std::int32_t{19});
+    check(storage == 19 && valid_field.try_set(std::int32_t{23}) && storage == 23,
+          "checked and try setters report successful writes");
+    check(!valid_field.try_set(1.0f) && storage == 23,
+          "same-width incompatible primitive types cannot reinterpret field bits");
+    check(!valid_field.try_set(std::int64_t{1}) && storage == 23,
+          "a wrong-width write is an explicit refusal and leaves the field unchanged");
+    vmhook::field_proxy unmapped_field{reinterpret_cast<void*>(0x10000), "I", false};
+    check(unmapped_field.try_get().status() == vmhook::error_code::refused
+          && !unmapped_field.try_set(std::int32_t{1}),
+          "unmapped primitive reads and writes are explicit failures");
+    bool utf_allocation{};
+    fail_next_allocation.store(true);
+    try { (void)vmhook::detail::utf8_to_utf16("allocate"); }
+    catch (const std::bad_alloc&) { utf_allocation = true; }
+    check(utf_allocation, "Unicode allocation failure propagates std::bad_alloc");
+    bool handle_allocation{};
+    fail_next_allocation.store(true);
+    try { vmhook::detail::call_handles_guard handles; }
+    catch (const std::bad_alloc&) { handle_allocation = true; }
+    check(handle_allocation && vmhook::detail::call_handle_depth == 0,
+          "call-handle allocation failure propagates and preserves nesting state");
+    const auto copied = vmhook::method_proxy::value_t::completed(std::string(512, 'x'));
+    bool copy_allocation{};
+    fail_next_allocation.store(true);
+    try { (void)copied.as_string(); }
+    catch (const std::bad_alloc&) { copy_allocation = true; }
+    check(copy_allocation, "String-copy allocation failure propagates without terminate or Java null");
     return failures ? 1 : 0;
 }

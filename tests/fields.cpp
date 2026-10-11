@@ -53,22 +53,22 @@ int main()
     vmhook::field_proxy reference_proxy{&object.value, "Ljava/lang/Object;", false};
     check(reference_proxy.get_compressed_oop() == 0,
           "a typed reference read refuses an unknown compression layout");
-    check(static_cast<std::uint32_t>(reference_proxy.get()) == 0,
-          "a typed value does not reinterpret field bytes as an unverified oop");
+    check(reference_proxy.try_get().status() == vmhook::error_code::refused,
+          "a refused reference read is distinct from a successful primitive zero");
     check(vmhook::detail::reference_slot_width() == 0
           && vmhook::detail::read_reference_slot(&object, 0) == nullptr,
           "an anchor read refuses an unknown reference width");
 
     vmhook::field_proxy stale_static{&object.value, "I", true, klass, 0};
-    check(static_cast<std::int32_t>(stale_static.get()) == 0,
+    check(stale_static.try_get().status() == vmhook::error_code::refused,
           "a missing class mirror cannot fall back to a cached static address");
-    stale_static.set(std::int32_t{73});
+    check(!stale_static.try_set(std::int32_t{73}), "a checked static write reports a missing mirror");
     check(object.value == 29, "a missing mirror refuses a static write");
     vmhook::field_proxy stale_character{&object.value, "C", true, klass, 0};
-    stale_character.set('X');
+    check(!stale_character.try_set('X'), "character widening reports a missing mirror");
     check(object.value == 29, "character widening also refuses a missing mirror");
     vmhook::field_proxy unmapped_character{reinterpret_cast<void*>(0x10000), "C", false};
-    unmapped_character.set('X');
+    check(!unmapped_character.try_set('X'), "an unmapped character write reports refusal");
 
     // Identity hash, age and lock transitions must preserve a compact Klass.
     const vmhook::detail::compact_header_constants_t compact{42, 3, 0, 1, 2, 3};
