@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "name": "H2 Database Engine",
+  "version": "2.2.224",
+  "maven_coordinates": "com.h2database:h2:2.2.224",
+  "jar_url": "https://repo.maven.apache.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.jar",
+  "sha256": "b9d8f19358ada82a4f6eb5b174c6cfe320a375b5a9cb5a4fe456d623e6e55497",
+  "publisher_sha256_url": "https://repo.maven.apache.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.jar.sha256",
+  "bytes": 2614933,
+  "base_class_major": 52,
+  "base_class_count": 1049,
+  "multi_release_class_majors": {
+    "9": 53,
+    "10": 54,
+    "21": 65
+  },
+  "manifest_build_jdk": "1.8",
+  "license_expression": "MPL-2.0 OR EPL-1.0",
+  "license_url": "https://github.com/h2database/h2database/blob/version-2.2.224/h2/src/docsrc/html/license.html",
+  "license_document_sha256": "3181f86d92d9d8d4490da0b6017a33a7b5270a01ca882e88f98554b15e5cc61f",
+  "source_url": "https://repo.maven.apache.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224-sources.jar",
+  "source_sha256": "a9ef0da88c18389008358558d401d75c7f49dd142855717d4e28bb4756aaf8d6",
+  "pom_url": "https://repo.maven.apache.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.pom",
+  "pom_sha256": "0d4503a01a4c7a62f91ae1a6271339cf806f2a462defe0beff5effd5a611e398",
+  "audited_utc_date": "2026-10-11",
+  "notes": "Publisher SHA256 matches the downloaded JAR. All root class entries are Java8 major52; the three newer entries are only in correctly versioned MultiRelease directories. No compiled dependency is committed.",
+  "source_publisher_sha256_url": "https://repo.maven.apache.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224-sources.jar.sha256",
+  "pom_publisher_sha256_url": "https://repo.maven.apache.org/maven2/com/h2database/h2/2.2.224/h2-2.2.224.pom.sha256"
+}

@@ -8,6 +8,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Optional pinned H2 TCP application validation runs real JDBC transactions,
+  isolation/rollback, Unicode/null/array results, SQL exceptions and moving GC
+  from an injected C++ OS worker, with dependency provenance and workload timings.
 - Passive exact-image capability reporting and offline DLL/PDB inspection.
 - Durable retained objects with explicit cross-context acquisition, exact
   per-wrapper defining-loader bindings and generation-pinned proxies/caches.
