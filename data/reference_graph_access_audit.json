@@ -1,0 +1,5049 @@
+{
+  "schema": 1,
+  "scope": "Bounded graph from one caller-owned scanned root: nonstatic Java-declared reference fields, inherited fields and object-array elements; primitive arrays are leaves.",
+  "exclusions": [
+    "All reference fields declared by the exact bootstrap java/lang/ref/Reference, before slot load",
+    "Static fields",
+    "Injected/VM-only fields and Class metadata edges",
+    "Arbitrary VM root and retained-size analysis"
+  ],
+  "protocol": [
+    "Use existing verified native VMoperation, actual safepoint-aware Heap_lock and VMThread callback; same exact-profile and collector admission as heap_iteration.",
+    "Caller root is refreshed from its scanned slot only at the actual safepoint; strong declared edges are copied while mutators are stopped. No discovered oop is published as a new root or retained after the callback.",
+    "Fixed node/edge/class/hash/label buffers are allocated before the callback. Array/Symbol/oop decoding helpers are prewarmed on the caller; no C++ allocation, JavaCalls, callbacks or first-use C++ static guard inside traversal.",
+    "Only copied IDs, labels, kind/length and field/index records survive the safepoint; class and oop identity dedup uses exact pointer equality within that operation.",
+    "Well-known bootstrap Reference identity is cached only for the audited JVM lifetime and its mirror is locally retained for each capture. Application class identity is never cached between captures.",
+    "All Reference-declared reference fields are conservatively excluded, including queue/next/discovered. This deliberately narrower scope avoids assuming physical oop-map edges are ordinary strong Java fields.",
+    "Symbol labels preserve raw modified UTF-8 bytes. Java String conversion is not applied inside VMThread.",
+    "All six budgets explicitly mark partial results. C++ materialization happens after the safepoint and preserves original bad_alloc including derived exceptions."
+  ],
+  "existing_abi_and_gc_proof": [
+    "data/native_profiles.json",
+    "data/native_audits.json",
+    "data/reference_field_access_audit.json",
+    "docs/heap-memory.md"
+  ],
+  "profiles": [
+    {
+      "java_feature": 8,
+      "build": "jdk8u504-b01",
+      "runtime_source": "https://github.com/adoptium/jdk8u/tree/jdk8u504-b01",
+      "jvm_sha256": "d3f1564b31a25f280d633d33234bdf88fd12dbe0ae34e15e2e89db3f0ca2d407",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "Parallel",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/runtime/vmStructs.cpp",
+          "sha256": "449a9d92ee21c89c3d655f284068f6e6ad3e9e7e32e2d455e2f5815f3bbb7c4a",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                335,
+                341,
+                343,
+                344,
+                1031
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                302,
+                303,
+                304
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                399,
+                400
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                292
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/fieldStreams.hpp",
+          "sha256": "c32329fe6a7eea0e484152f57a280feeb00615259e189212bfde79a6c005fd99",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                199,
+                247,
+                248
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/constantPool.hpp",
+          "sha256": "e2885c9b3114eb87b6115a1b0ad74c4c22f88346fb8d4cfd04948ca7c9120f2f",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                129,
+                743
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                309
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/symbol.hpp",
+          "sha256": "c8e22507085950425cfd90ddc99ad9fa6179b47254f7f31abfb9bd6e8dbd33d0",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                121,
+                135,
+                148,
+                172
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                28,
+                111,
+                150,
+                172,
+                194,
+                204,
+                205,
+                206
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/utilities/array.hpp",
+          "sha256": "e1211c0e1ebb2d2e2f4c6996a0eb7dbafe436d28e234345c9f0ce2a26b54d5e2",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                40,
+                86,
+                310,
+                311
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/arrayOop.hpp",
+          "sha256": "262610dade524f18f9d2f962e668d43904e149dd2c26e8b5aa8a2b52bb8c04ec",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                52,
+                67,
+                73,
+                79,
+                88,
+                91
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/objArrayKlass.inline.hpp",
+          "sha256": "cc584bc1baba7b83d4e6abdb63ff25fd0a80ed577fd7b8d17694a391cbf8f731",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                47,
+                81
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/instanceKlass.hpp",
+          "sha256": "ad57075993e3d4cc687e23c2a99c841789173076f3c793021fd6a86970043e60",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                78,
+                79,
+                225,
+                306,
+                664,
+                960,
+                965
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/fieldInfo.hpp",
+          "sha256": "c805df0d1158313b02a28e7ec14d4a4ef49459938b4da83eb26000a3ca448848",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk8u/jdk8u504-b01/hotspot/src/share/vm/oops/instanceRefKlass.cpp",
+          "sha256": "858d0d57ff33a95ef57d6793b6c6f042641cd603f893f8eae7106120d03e6d2a",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                52,
+                53,
+                78,
+                87,
+                91,
+                94,
+                131,
+                132
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 9,
+      "build": "jdk-9+181",
+      "runtime_source": "https://github.com/openjdk/jdk9/tree/jdk-9+181",
+      "jvm_sha256": "d833b1172646fa19b7f2f9bea8aea2d844c9ebd1cf390764f3ba3779762d5014",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/runtime/vmStructs.cpp",
+          "sha256": "7c0778a67760be4cd097dc16231e9b38fa161ddf25cd742a13f18c91be7289df",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                278,
+                284,
+                286,
+                287,
+                1066
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                249,
+                250,
+                251
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                353,
+                354,
+                355
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                239
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/fieldStreams.hpp",
+          "sha256": "7e1e936718384e4c713c7474c37e7bdf23df8e74db72b103a96dd325c6b5d319",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                199,
+                247,
+                248
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/constantPool.hpp",
+          "sha256": "70bbc9d531d7186690edffb23856e27f2ca8fa8e79bb54390d8b521feb513321",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                118,
+                709
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                297
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/symbol.hpp",
+          "sha256": "b1ea566508d96dc4ae7c64782317111a43f06f65673f88dd1330dfb46282e399",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                129,
+                141,
+                150,
+                175
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                31,
+                112,
+                143,
+                175,
+                197,
+                207,
+                208,
+                209
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/array.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/utilities/array.hpp",
+          "sha256": "e25e6ad819479ca3d0ae8eab130d33c69964f607e4f5a9ceb82ea4340d79d20f",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                49,
+                50
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/arrayOop.hpp",
+          "sha256": "aa7508716d897051dda4c639c530eba3afd76b8e3927be7474f0d5ca62aad324",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                68,
+                74,
+                80,
+                89,
+                92
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/objArrayKlass.inline.hpp",
+          "sha256": "20104c0495503790648bb8a955610644f8323f68af58b9fec6e922402660f845",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                38,
+                40,
+                48,
+                55,
+                70,
+                72,
+                74,
+                79
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/instanceKlass.hpp",
+          "sha256": "b94807c5a879befeacf8bfda4269ded37bf82199daa3bae610dceac4ab69e1a0",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                52,
+                53,
+                188,
+                294,
+                696,
+                1078,
+                1083
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/fieldInfo.hpp",
+          "sha256": "f5df3a3fa1313602cf1b63ffc913c2fc61d8a5894bd458ad63272bc8a305d93b",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk9/jdk-9+181/hotspot/src/share/vm/oops/instanceRefKlass.inline.hpp",
+          "sha256": "f4843aac9a6479ed1d468dd725e6a8c0cb6ee3ec168ce90c918662cc8b7c0abc",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                40,
+                45,
+                46,
+                53,
+                55
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 10,
+      "build": "jdk-10.0.2+13.1",
+      "runtime_source": "https://github.com/openjdk/jdk10u/tree/jdk-10.0.2+13",
+      "jvm_sha256": "5d6d6d5ec754c8e12a3088011808841f5fab23686d879da6fd1e734c2fc71410",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "7df851faee06c5ce8310f2baddc7a79d55d3a082c7b5601494e133b8ba4acb57",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                281,
+                287,
+                289,
+                290,
+                1002
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                253,
+                254,
+                255
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                357,
+                358,
+                359
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                243
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "54926e076ae9d01acb9a081c67517b14b4f657c4a9bb0b977a927576201adc01",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                191,
+                239
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "1f5abc33012c6194fa8c4e7cca6ce9283e2c44944916548720d072b1658eaf7b",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                143,
+                769
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                335
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "b1f44b42af53c00386986684a2a10a7a3579c08c049cf3d8727cfd2609cd63d2",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                133,
+                145,
+                158,
+                186
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                31,
+                112,
+                147,
+                148,
+                186,
+                190,
+                217,
+                227
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/array.hpp",
+          "sha256": "560248c79b2f9f67f43c60772044903bcda49bda90485a0c9df2b9068817995f",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                44,
+                45
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "d190c6a0b589ad6180697d3c0d0ce4f64858eb0ec3088cf253f743bb9585cac3",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                54,
+                69,
+                75,
+                81,
+                90,
+                93
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "20104c0495503790648bb8a955610644f8323f68af58b9fec6e922402660f845",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                38,
+                40,
+                48,
+                55,
+                70,
+                72,
+                74,
+                79
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "5ad96c36dfcbac1aaced3203d70a4ff09cae7b32937ea1c0008709c774f50457",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                51,
+                52,
+                189,
+                295,
+                685,
+                1074,
+                1079
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "f5df3a3fa1313602cf1b63ffc913c2fc61d8a5894bd458ad63272bc8a305d93b",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk10u/jdk-10.0.2+13/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "e0bf477a44af2d1913f4520ad5c104f6d385ec719c7ac93d24e7559886ef7e40",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                39,
+                40,
+                41,
+                42,
+                55,
+                56,
+                57,
+                58
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 11,
+      "build": "jdk-11.0.32.1+1",
+      "runtime_source": "https://github.com/adoptium/jdk11u/tree/jdk-11.0.32.1+1",
+      "jvm_sha256": "804f87699263454c6c026afb8d6870ceb0a37e696c6ba1fd2f8a485d6b8a733c",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "dd3238f342478a8e131c8d6a66bb9ad0ad6c8d82d2693525564581b377a48016",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                258,
+                264,
+                266,
+                267,
+                879
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                230,
+                231,
+                232
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                334,
+                335,
+                336
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                220
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "54926e076ae9d01acb9a081c67517b14b4f657c4a9bb0b977a927576201adc01",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                191,
+                239
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "59de7041ab63691137f0305ccf6b0457eceb370c447b5e0baabd2f8b73d4d8d0",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                144,
+                776
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                337
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "6e28c05ccbe85cbe550b2df7da1abc446e976c7bc0532ad658672db73944a323",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                141,
+                154,
+                175
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                31,
+                112,
+                143,
+                144,
+                175,
+                179,
+                206,
+                216
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/array.hpp",
+          "sha256": "f998ad4f1a7e5b5a9c5d8e142bf498f8b3e07ecde885e2a715b5fccbde5022a9",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                44,
+                45
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "d0d94824837ee985c8409fcdc8d67aba391ba4d081e1424bde594189b08a8f94",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                54,
+                76,
+                82,
+                109,
+                115
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "86976bdab687c68591415e5952a6a78510232b55f2457c80977f59aedfefaa64",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                39,
+                41,
+                49,
+                56,
+                79,
+                97,
+                107
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "5dd01bbcc89543caaa813074ebefb3720615e15a74a1f16fd05575501911e94f",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                53,
+                54,
+                201,
+                308,
+                726,
+                1090,
+                1095
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "5e9ad533f00bb8bce9074510b5a1d59fa9d7b4d1f8e703b7f908d92ccd78bab0",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk11u/jdk-11.0.32.1+1/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "3b6b32212ede2aa5eaef2633e812e30fe3f9df5ef86c0b719d17d4b5b6837fff",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                41,
+                42,
+                43,
+                44,
+                49,
+                50,
+                51,
+                52
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 12,
+      "build": "java-12-openjdk-12.0.2.9-1",
+      "runtime_source": "https://github.com/openjdk/jdk12u/tree/jdk-12.0.2+9",
+      "jvm_sha256": "14f33aabe6910fc2313d8b98fefa8324cd39aacbca56e7abb5bb561ce22717c8",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "78694f381066a1f3bd96833c0302c4937b1a3c31842abc65568e08b0b2f6ec63",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                255,
+                261,
+                263,
+                264,
+                850
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                227,
+                228,
+                229
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                330,
+                332,
+                333
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                217
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "54926e076ae9d01acb9a081c67517b14b4f657c4a9bb0b977a927576201adc01",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                191,
+                239
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "e84929b27a586e5b78b9aaf200e5d3297faa3d69b6c18b49f8488651625b5b25",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                144,
+                776
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                337
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "3b773bb62f53517ba2b38fad7b6495caa384ea9f04e6c22cf6bb84a1e7c92f08",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                113,
+                115,
+                133,
+                151,
+                164
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                31,
+                112,
+                153,
+                154,
+                190,
+                194,
+                221,
+                231
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/array.hpp",
+          "sha256": "ca5f96fbcdbd4f9865281a4aa58375eb01df359181f3568ba0112dc824c02801",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                43,
+                44
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "d0d94824837ee985c8409fcdc8d67aba391ba4d081e1424bde594189b08a8f94",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                54,
+                76,
+                82,
+                109,
+                115
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "86976bdab687c68591415e5952a6a78510232b55f2457c80977f59aedfefaa64",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                39,
+                41,
+                49,
+                56,
+                79,
+                97,
+                107
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "8acf579499fb497743818a0ed43bd43e413a9c492d087c3f547fe6570d06c24c",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                53,
+                54,
+                204,
+                312,
+                718,
+                1083,
+                1088
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "5e9ad533f00bb8bce9074510b5a1d59fa9d7b4d1f8e703b7f908d92ccd78bab0",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk12u/jdk-12.0.2+9/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "9166fa6a2e404ca77e5d6c41bb8c3a62196069112e630f345eae3db407972f6a",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                41,
+                42,
+                43,
+                44,
+                49,
+                50,
+                51,
+                52
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 13,
+      "build": "java-13-openjdk-13.0.4.8-1",
+      "runtime_source": "https://github.com/openjdk/jdk13u/tree/jdk-13.0.4+8",
+      "jvm_sha256": "15f676375c60a73302fa6210fca253ac054d2926c54b6233ff86c5fe05363ee6",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "548953ac3b3bbf1e57bce0c1637501aaed1fc236be4fe953700a52b1f781f5e5",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                256,
+                262,
+                264,
+                265,
+                862
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                228,
+                229,
+                230
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                331,
+                333,
+                334
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                218
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "e9b74eaadd2d5d05ba645d7dfbdd8085cb286ccbf687614f7ab428e640c55266",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                191,
+                239
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "cb8973cf0fc7fed4d528127f23e63ba1793dd0c08bd2975e5da8d11dc5459df9",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                144,
+                772
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                343
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "66899efa48a2afc74602fc5e5513b5331c88f5eba9965e831a55ae086cffa810",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                111,
+                113,
+                131,
+                148,
+                161
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                110,
+                150,
+                151,
+                186,
+                190,
+                214,
+                222,
+                223
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/array.hpp",
+          "sha256": "b49a1fbb836c11340bea05f2df57b38497d5bb8dee870751433d29ff27471b89",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                44,
+                45
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "64745e1b5f416caeb9f5b5457f2e7b4fb4bdc393410f49340c17de0fbd39186b",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                75,
+                81,
+                108,
+                114
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "6de44618abaaac1d9c0140a84eb525986dc1539fab5f3f4eef57c5e0f9ed186e",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                39,
+                41,
+                49,
+                56,
+                79,
+                97,
+                107
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "2cc7eeedd4a6d4588276a5d10a094d67fa903554b02afcec477b557c66c1a6a9",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                50,
+                51,
+                205,
+                313,
+                704,
+                1059,
+                1064
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "b680dba56f7a5072aa386ef1b66a195b0da0f0445f890c6c9d6d3acc2849f449",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk13u/jdk-13.0.4+8/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "662384d09d7f775e897a0425e49899d6f24b39c721e77ba1ca6d08a128377eab",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                40,
+                41,
+                42,
+                43,
+                48,
+                49,
+                50,
+                51
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 14,
+      "build": "java-14-openjdk-14.0.2.12-1",
+      "runtime_source": "https://github.com/openjdk/jdk14u/tree/jdk-14.0.2+12",
+      "jvm_sha256": "3b6497e2b27eaf0322a84cbd9407eaa6a3bf1ec964619fb7f259c4a3b0af6ee7",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "fc497d341f44c297ac7940fea93f5b9124a244650515f69246059a52be78c05d",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                255,
+                261,
+                263,
+                264,
+                861
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                227,
+                228,
+                229
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                330,
+                332,
+                333
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                217
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "0d882cb361b16fe37253b84c0df6bde2f104308697697dc7ebc74c92c2ae96b1",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                168,
+                216
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "cb8973cf0fc7fed4d528127f23e63ba1793dd0c08bd2975e5da8d11dc5459df9",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                144,
+                772
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                343
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "66899efa48a2afc74602fc5e5513b5331c88f5eba9965e831a55ae086cffa810",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                111,
+                113,
+                131,
+                148,
+                161
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                110,
+                150,
+                151,
+                186,
+                190,
+                214,
+                222,
+                223
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/array.hpp",
+          "sha256": "920f829d6bab52fbf10e9fc1cc318f4719dff3f667c7927d68e2bfff3aefbe56",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                45,
+                46
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "e367f52cfd8af502a9c8a1e3bb898242b571f5a59505b81316ed60490d9a6186",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                75,
+                81,
+                108,
+                114
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "6de44618abaaac1d9c0140a84eb525986dc1539fab5f3f4eef57c5e0f9ed186e",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                39,
+                41,
+                49,
+                56,
+                79,
+                97,
+                107
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "c702cdbc1a20271b15545442c586adfd2d36d224f83a8cb39535aa03c4917edf",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                51,
+                52,
+                209,
+                317,
+                726,
+                1080,
+                1085
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "d8e80cac0b525e53bcb5712d5cd7a7f4d7e2c268e2ba959cf4aed286a83c0da8",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk14u/jdk-14.0.2+12/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "662384d09d7f775e897a0425e49899d6f24b39c721e77ba1ca6d08a128377eab",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                40,
+                41,
+                42,
+                43,
+                48,
+                49,
+                50,
+                51
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 15,
+      "build": "java-15-openjdk-15.0.2.7-1",
+      "runtime_source": "https://github.com/openjdk/jdk15u/tree/jdk-15.0.2+7",
+      "jvm_sha256": "0a72da41360e0f5dea79fd808ac787ae6f0d7237349b582d28d73dc6e758d128",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "d6d35b45ff3676caa7c4bc95ee02391805e3ded7d10a321f0c8826f7bcc26b1f",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                251,
+                257,
+                259,
+                260,
+                850
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                227,
+                228,
+                229
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                327,
+                328,
+                329
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                213
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "0f152263e6cd984f63333e450db7eb172638bf805d1614e42f893af196161346",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                168,
+                216
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "faa849fb6727db2f00332ee2b942c9e5e9f86dbb09bead2132330b6ae6508734",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                153,
+                805
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                376
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "0107e0ba21aa0c9f8fe6a5b908831f1fee610bd116633200e3e73933ca9167bc",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                112,
+                113,
+                130,
+                143,
+                147,
+                160
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                110,
+                149,
+                150,
+                186,
+                190,
+                192,
+                198,
+                208
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/array.hpp",
+          "sha256": "920f829d6bab52fbf10e9fc1cc318f4719dff3f667c7927d68e2bfff3aefbe56",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                45,
+                46
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "e367f52cfd8af502a9c8a1e3bb898242b571f5a59505b81316ed60490d9a6186",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                75,
+                81,
+                108,
+                114
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "b84d38ec1b391911639a9480b20bbad82f33ad98eed00fefbdc0f13644d6fff0",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                39,
+                41,
+                49,
+                56,
+                79,
+                97,
+                107
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "dd4c309862d34ddf89b62ed97d34f4986e67cc4d1efc30d6ab6ec3c4c51aff6b",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                51,
+                52,
+                218,
+                328,
+                750,
+                1110,
+                1115
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "d8e80cac0b525e53bcb5712d5cd7a7f4d7e2c268e2ba959cf4aed286a83c0da8",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                64,
+                65,
+                67,
+                68,
+                69
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                48,
+                50,
+                68,
+                100,
+                107,
+                108,
+                130,
+                146
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/openjdk/jdk15u/jdk-15.0.2+7/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "662384d09d7f775e897a0425e49899d6f24b39c721e77ba1ca6d08a128377eab",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                40,
+                41,
+                42,
+                43,
+                48,
+                49,
+                50,
+                51
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 16,
+      "build": "jdk-16.0.2+7",
+      "runtime_source": "https://github.com/adoptium/jdk16u/tree/jdk-16.0.2+7",
+      "jvm_sha256": "71b15624e2299fbdbd2468d2c91a39fd28a7de595f90f0d2f71072fded5d2c29",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "bf7f668884ced64e930d4857851d3d6a3a0d532581895c91befba86ce7bc99f1",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                251,
+                257,
+                259,
+                260,
+                835
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                227,
+                228,
+                229
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                328,
+                329,
+                330
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                213
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "3198431abecba2b696e0c0ccf72228c3250b4e7f1c83779621763dc79de9279a",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                164,
+                212
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "aba27d29ac41be660b2ca18a229fced3fe6a566d2ba4f1baa8d33fa8bd22521f",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                153,
+                806
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                376
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "010d98a21c7d8d988122d1947ba8a42f2f67b80b422c5d4746df9b7f3bcf272f",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                143,
+                147,
+                160
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                149,
+                150,
+                186,
+                190,
+                192,
+                198,
+                208
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/array.hpp",
+          "sha256": "920f829d6bab52fbf10e9fc1cc318f4719dff3f667c7927d68e2bfff3aefbe56",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                45,
+                46
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "90b44746804a4aab289fd77ff57318e7ccb0bba4e2db8e7511f5ac736810a39d",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                64,
+                67,
+                81,
+                87,
+                111
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "a8ffbf72a413b156d10b9c1402def61a572537e2dee39dfe42dc492483153bf8",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                39,
+                41,
+                49,
+                56,
+                79,
+                97,
+                107
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "0ad47f5318492ba1af33e855dad708a53cb2068074f389e59ddbe5dce08e484c",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                51,
+                52,
+                218,
+                328,
+                730,
+                1088
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "0a49574771265694688bf51ed578b4f93cdd28f1ac3afdd80a8baa15cf6c24ff",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                67,
+                68,
+                70,
+                71,
+                72
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                49,
+                50,
+                71,
+                103,
+                108,
+                109,
+                117,
+                119
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk16u/jdk-16.0.2+7/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "662384d09d7f775e897a0425e49899d6f24b39c721e77ba1ca6d08a128377eab",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                40,
+                41,
+                42,
+                43,
+                48,
+                49,
+                50,
+                51
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 17,
+      "build": "17.0.20.1+1",
+      "runtime_source": "https://github.com/adoptium/jdk17u/tree/79597447bd94",
+      "jvm_sha256": "6b9a2354b41134986d61d1f8ff0f9614e3a6b7e235469b7e9260fe7a1d9bb84a",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "49d2efc19950fe764dc803e2ca58752972d0ab39905c2df4c0ac19b4dc49e3db",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                258,
+                264,
+                266,
+                267,
+                832
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                234,
+                235,
+                236
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                329,
+                330,
+                331
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                220
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "3198431abecba2b696e0c0ccf72228c3250b4e7f1c83779621763dc79de9279a",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                164,
+                212
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "e73bb874f1c23e3716de8ba2c117e69abfbe92d617d18b92477d08cba10bd5cc",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                153,
+                779
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                375
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "e4a3361158e65aa6a67aed3e758752f3945ad34e350c6324371f7ed94b68dac4",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                144,
+                148,
+                161
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                150,
+                151,
+                187,
+                191,
+                193,
+                199,
+                209
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/array.hpp",
+          "sha256": "a2b1a9f9852a84329351d279cbc417b33154b7307058ebe4feb41f0d9087e76e",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                45,
+                46
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "103d7efad8aa4d2946561b7d7000b71cd24db743e59e84d52e990c16ca24284d",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                64,
+                67,
+                81,
+                87,
+                94,
+                113
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "cd63bcca7d742eff7ed67c490fbeee54ab9053d42bfd0c9419c0f98d421f599d",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "2ecbc01f2431043765769010a12e7bb90b8f76bedea28ec4ef31bde21e7f58c4",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                49,
+                50,
+                211,
+                318,
+                715,
+                1055
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "0a49574771265694688bf51ed578b4f93cdd28f1ac3afdd80a8baa15cf6c24ff",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                67,
+                68,
+                70,
+                71,
+                72
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                49,
+                50,
+                71,
+                103,
+                108,
+                109,
+                117,
+                119
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk17u/79597447bd94/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "d24b12b6f8507a4fd9cb6e3b84a99bc85bca028b7ad0c805416fcbac3ae255d0",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                41,
+                42,
+                43,
+                44,
+                49,
+                50,
+                51,
+                52
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 18,
+      "build": "18.0.2.1+1",
+      "runtime_source": "https://github.com/adoptium/jdk18u/tree/16a1166b0c89",
+      "jvm_sha256": "41b720bf5ab0bcc4fef705da954ca7f1d4a3dcca2b80a87bcb53dad67210092a",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "9993d2a51eb4da8b3d61a033cdaea71935b3ec65b3099ff21e2d472769399631",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                253,
+                259,
+                261,
+                262,
+                804
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                229,
+                230,
+                231
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                323,
+                324,
+                325
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                215
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "3198431abecba2b696e0c0ccf72228c3250b4e7f1c83779621763dc79de9279a",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                164,
+                212
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "929473068d0e8191da5b4b552cd1ae8075e863cc5157435d3ba7712d22aa9913",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                137,
+                759
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                356
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "e640db6e4fa02bcb1b800b2f5c54bf3693cfd9e7b0a70499a6a819bf8c15cb61",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                143,
+                147,
+                160
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                149,
+                150,
+                186,
+                190,
+                192,
+                198,
+                208
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/array.hpp",
+          "sha256": "6e71adb7ff9dceea280e6a2e7a5b191c2ab54a744e11f9778464a51e513b0f21",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                45,
+                46
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "103d7efad8aa4d2946561b7d7000b71cd24db743e59e84d52e990c16ca24284d",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                64,
+                67,
+                81,
+                87,
+                94,
+                113
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "cd63bcca7d742eff7ed67c490fbeee54ab9053d42bfd0c9419c0f98d421f599d",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "26d97a9ff0619cf27181efac5c27d094a971f783454852377a1994512cd5b5a0",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                49,
+                50,
+                211,
+                318,
+                720,
+                1059
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "0a49574771265694688bf51ed578b4f93cdd28f1ac3afdd80a8baa15cf6c24ff",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                67,
+                68,
+                70,
+                71,
+                72
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                49,
+                50,
+                71,
+                103,
+                108,
+                109,
+                117,
+                119
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk18u/16a1166b0c89/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "d24b12b6f8507a4fd9cb6e3b84a99bc85bca028b7ad0c805416fcbac3ae255d0",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                41,
+                42,
+                43,
+                44,
+                49,
+                50,
+                51,
+                52
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 19,
+      "build": "19.0.2+7",
+      "runtime_source": "https://github.com/adoptium/jdk19u/tree/270cc4fdaf91",
+      "jvm_sha256": "8d9023d71a99dd1fa04d8a2da7e57f0a698c5a77ebd9d40f2773a1d89edd2a44",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "e42432ad9708b7ea6254c2992f42536b9e35aed39d7b27aae8b3792098958b7a",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                254,
+                260,
+                262,
+                263,
+                809
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                230,
+                231,
+                232
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                325,
+                326,
+                327
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                216
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "3198431abecba2b696e0c0ccf72228c3250b4e7f1c83779621763dc79de9279a",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                164,
+                212
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "e7d7249acb3a66d32f5f6476fe2cbbcc5ba51882ea0da17a9e6e98f7d0e1d007",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                137,
+                760
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                357
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "26555ed2af56e16b146d5cb131b76d0339c13838e91644b724e664c9b1848470",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                143,
+                147,
+                160
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                149,
+                150,
+                186,
+                190,
+                192,
+                198,
+                208
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/array.hpp",
+          "sha256": "a2b1a9f9852a84329351d279cbc417b33154b7307058ebe4feb41f0d9087e76e",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                45,
+                46
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "103d7efad8aa4d2946561b7d7000b71cd24db743e59e84d52e990c16ca24284d",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                64,
+                67,
+                81,
+                87,
+                94,
+                113
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "cd63bcca7d742eff7ed67c490fbeee54ab9053d42bfd0c9419c0f98d421f599d",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "43db10ee392697b258919fee8ff2c5a332757be0e644c857fa7d7c9fb41b2ecf",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                49,
+                50,
+                211,
+                309,
+                707,
+                1027
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "0068fbeeed99d1b31e2532e58e154c10ebc43a6fec6f528eaa7c7de862aeed6b",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                67,
+                68,
+                70,
+                71,
+                72
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                49,
+                50,
+                71,
+                103,
+                108,
+                109,
+                117,
+                119
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk19u/270cc4fdaf91/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "d24b12b6f8507a4fd9cb6e3b84a99bc85bca028b7ad0c805416fcbac3ae255d0",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                41,
+                42,
+                43,
+                44,
+                49,
+                50,
+                51,
+                52
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 20,
+      "build": "20.0.2+9",
+      "runtime_source": "https://github.com/adoptium/jdk20u/tree/ad6ee4a7d769",
+      "jvm_sha256": "6d2c90e14342f429649afee88eb16101147fe891e03981af710e165a3bc9d54f",
+      "field_encoding": "six-u2 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "2f1bc7d7761db9c79bcbce95e51d13abad029e9afaa3c1f55ca8dd126e660168",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                251,
+                257,
+                259,
+                260,
+                805
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                228,
+                229,
+                230
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                321,
+                322,
+                323
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                214
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "3198431abecba2b696e0c0ccf72228c3250b4e7f1c83779621763dc79de9279a",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                164,
+                212
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "69a3cc731cc1aa1c8a178e1f4e3f8db77d4f31c6969fe055a5b997d4a6dad153",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                137,
+                757
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                357
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "611f3b7fc6b458c89476ec2325ae4e2d7b745e153b6643a8a7d9e535a1ae2791",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                143,
+                147,
+                160
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                149,
+                150,
+                196,
+                200,
+                202,
+                209,
+                219
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/array.hpp",
+          "sha256": "8380001f816e2603e027e56380fc88bd434fd9bd064405d02bfe24661d5284cf",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                45,
+                46
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "103d7efad8aa4d2946561b7d7000b71cd24db743e59e84d52e990c16ca24284d",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                64,
+                67,
+                81,
+                87,
+                94,
+                113
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "2285463a737961b532bd00b2e77a7e344db34f4302fc600c42255cbe21f435e7",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "8203b5596387f7f40247fc6e4a30d3ebcaf9f99d58b63ce4a27d85a7ce637807",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                50,
+                51,
+                213,
+                292,
+                670,
+                959
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "0068fbeeed99d1b31e2532e58e154c10ebc43a6fec6f528eaa7c7de862aeed6b",
+          "facts": [
+            {
+              "fact": "six u2 field slots contain name/signature and split packed offset",
+              "source_lines": [
+                67,
+                68,
+                70,
+                71,
+                72
+              ]
+            },
+            {
+              "fact": "offset tag and shift decode actual instance byte offset",
+              "source_lines": [
+                49,
+                50,
+                71,
+                103,
+                108,
+                109,
+                117,
+                119
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk20u/ad6ee4a7d769/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "def68cce121dbf156aa4b95e33a4f78c604c4bf3bc230622a55a99e8f250d296",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                42,
+                43,
+                44,
+                45,
+                50,
+                51,
+                52,
+                53
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 21,
+      "build": "21.0.12.1+1-LTS",
+      "runtime_source": "https://github.com/adoptium/jdk21u/tree/1c417fbfc2f7",
+      "jvm_sha256": "3df13bd73c7dbeef26693cef664b4ede84649720f7a12f0203215a65656d25f4",
+      "field_encoding": "UNSIGNED5 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "ad07ff9ac20443031d0a72f71d56a66dcfbdfc97e1fe2aeff4806756dbc8bf5e",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                254,
+                260,
+                262,
+                263,
+                806
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                232,
+                233
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                323,
+                324,
+                325
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                216
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "3811b0578ae9dff24ed31d1c5a288e8cb0b9dee2b09152988c08c822857e8f0f",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                142,
+                173
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "10edf48aa2c1b6323f50d25da3c9029f4fbfebd1904e650a96ea203b8b08273c",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                137,
+                754
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                346
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "6ae47c70447f31bd6a3b15a0be069ce2a600a7f0eb014addadaf6466451e3d5f",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                140,
+                146,
+                161
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                148,
+                149,
+                197,
+                201,
+                203,
+                210,
+                220
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/array.hpp",
+          "sha256": "ba5f889486a9c19d12a35ef56b353a5e41b6cc5b5ce459c57494dea07677d3eb",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                46,
+                47
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "e77cf6c04f58cdbe88001620a528d098ecd2b5b8ff472a862e564f0c4a801406",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                64,
+                67,
+                81,
+                87,
+                94,
+                113
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "2285463a737961b532bd00b2e77a7e344db34f4302fc600c42255cbe21f435e7",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "ac90c124e75e2921c1151f5f7bdec3414349f5a105fa1d1f3251d0222ded86f1",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                52,
+                53,
+                215,
+                285,
+                658,
+                949
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "adbd80b7b33d987a5a70c4b15344107e404ec43d33596a3a4b1df0378110dfb1",
+          "facts": [
+            {
+              "fact": "field flags enumerate initialized/injected/generic/stable/contended in this order",
+              "source_lines": [
+                74,
+                75,
+                76,
+                77,
+                78,
+                114,
+                115,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/fieldInfo.inline.hpp",
+          "sha256": "a480b856c400f0e136fe1a906ba45246c520b0a59a81cf862251cdc1e9e674b8",
+          "facts": [
+            {
+              "fact": "stream begins with declared Java and injected field counts",
+              "source_lines": [
+                67
+              ]
+            },
+            {
+              "fact": "record order is name/signature/offset/access flags/field flags followed by optionals",
+              "source_lines": [
+                72,
+                73,
+                74,
+                75,
+                76,
+                78,
+                79,
+                81
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/unsigned5.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/utilities/unsigned5.hpp",
+          "sha256": "534241bac1d26969a85cc5bfb54a6cca2c03d89bb73972253477b850d113bd09",
+          "facts": [
+            {
+              "fact": "bounded UNSIGNED5 byte exclusion, base64 accumulation and five-byte maximum",
+              "source_lines": [
+                87,
+                88,
+                89,
+                91,
+                94,
+                131,
+                132,
+                230
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/fieldInfo.cpp",
+          "sha256": "e64c71cc9e9706650fe3e716c159c7b9d621ccc4ce8821b5f51d19ea777d9c95",
+          "facts": [
+            {
+              "fact": "field stream sizing and writing publishes the counted record payload",
+              "source_lines": [
+                51,
+                75,
+                76,
+                77
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk21u/1c417fbfc2f7/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "f0ecd82469b882cb397600e5db58724a8c3a611ce5a2a9bb84184127590e3aee",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                43,
+                44,
+                45,
+                46,
+                51,
+                52,
+                53,
+                54
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 22,
+      "build": "22.0.2+9",
+      "runtime_source": "https://github.com/adoptium/jdk22u/tree/da29d838c007",
+      "jvm_sha256": "dee5f53781ff6c55c5ab104b8102e3ea73b50ff7ff760225218f63732cb8241c",
+      "field_encoding": "UNSIGNED5 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "98c436ce6609e8d4e041b6b58ef3e4d56b69e308b0db4c4acbb823a1b8bde145",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                263,
+                269,
+                271,
+                272,
+                745
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                240,
+                241
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                332,
+                333,
+                334
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                221
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "8ab585ed99a257874a4f03fcc18f257d3f6bf90eb18ef516ce65f160430a770b",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                142,
+                173
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "b5a24596cdc3cd6532bbd59e2a7912589c2ad9e4c8efd321b6349c1d83daa02c",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                137,
+                746
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                344
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "6ae47c70447f31bd6a3b15a0be069ce2a600a7f0eb014addadaf6466451e3d5f",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                140,
+                146,
+                161
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                148,
+                149,
+                197,
+                201,
+                203,
+                210,
+                220
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/array.hpp",
+          "sha256": "ba5f889486a9c19d12a35ef56b353a5e41b6cc5b5ce459c57494dea07677d3eb",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                46,
+                47
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "0af34ddbf21e9dc5d6e4c01ae518fefaf8c29e5e4c4988b621471ca1dc493dfb",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                53,
+                64,
+                67,
+                81,
+                87,
+                94,
+                113
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "2285463a737961b532bd00b2e77a7e344db34f4302fc600c42255cbe21f435e7",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "358cb3885991e63c6e227a1b255cdbe8c0575ba3bc400811f3ab70ee35d786e1",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                55,
+                56,
+                218,
+                282,
+                674,
+                954
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "adbd80b7b33d987a5a70c4b15344107e404ec43d33596a3a4b1df0378110dfb1",
+          "facts": [
+            {
+              "fact": "field flags enumerate initialized/injected/generic/stable/contended in this order",
+              "source_lines": [
+                74,
+                75,
+                76,
+                77,
+                78,
+                114,
+                115,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/fieldInfo.inline.hpp",
+          "sha256": "719489dd39d30d397fa3b7413d9b78c821530ecc61c86bf8f0f6835e81e15123",
+          "facts": [
+            {
+              "fact": "stream begins with declared Java and injected field counts",
+              "source_lines": [
+                68
+              ]
+            },
+            {
+              "fact": "record order is name/signature/offset/access flags/field flags followed by optionals",
+              "source_lines": [
+                73,
+                74,
+                75,
+                76,
+                77,
+                79,
+                80,
+                82
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/unsigned5.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/utilities/unsigned5.hpp",
+          "sha256": "534241bac1d26969a85cc5bfb54a6cca2c03d89bb73972253477b850d113bd09",
+          "facts": [
+            {
+              "fact": "bounded UNSIGNED5 byte exclusion, base64 accumulation and five-byte maximum",
+              "source_lines": [
+                87,
+                88,
+                89,
+                91,
+                94,
+                131,
+                132,
+                230
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/fieldInfo.cpp",
+          "sha256": "e64c71cc9e9706650fe3e716c159c7b9d621ccc4ce8821b5f51d19ea777d9c95",
+          "facts": [
+            {
+              "fact": "field stream sizing and writing publishes the counted record payload",
+              "source_lines": [
+                51,
+                75,
+                76,
+                77
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk22u/da29d838c007/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "f0ecd82469b882cb397600e5db58724a8c3a611ce5a2a9bb84184127590e3aee",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                43,
+                44,
+                45,
+                46,
+                51,
+                52,
+                53,
+                54
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 23,
+      "build": "23.0.2+7",
+      "runtime_source": "https://github.com/adoptium/jdk23u/tree/ff87e76b386d",
+      "jvm_sha256": "d9f6e0988b5647cbb4efbcf7be7b4e9050e007e29e3df2d0dd1010a89f91cb8b",
+      "field_encoding": "UNSIGNED5 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "685bf359ce7d277afda5f094b57dc14db2f0bc1395e2aaceca48aea5bda2a85e",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                262,
+                268,
+                270,
+                271,
+                735
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                238,
+                239
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                331,
+                332,
+                333
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                219
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "8ab585ed99a257874a4f03fcc18f257d3f6bf90eb18ef516ce65f160430a770b",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                142,
+                173
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "c4ae37b4b730bbc7928c7c5559ce2f6ad072eba26e2eaff5ac5a35ee8f692fe5",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                137,
+                738
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                336
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "6ae47c70447f31bd6a3b15a0be069ce2a600a7f0eb014addadaf6466451e3d5f",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                140,
+                146,
+                161
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                148,
+                149,
+                197,
+                201,
+                203,
+                210,
+                220
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/array.hpp",
+          "sha256": "ba5f889486a9c19d12a35ef56b353a5e41b6cc5b5ce459c57494dea07677d3eb",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                46,
+                47
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "e3a6bcb358d5bd3ad5960a17c5e5ce96f52e730bfd4b7486545a7e3bf67fc455",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                50,
+                53,
+                71,
+                84,
+                90,
+                98,
+                117,
+                137
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "2285463a737961b532bd00b2e77a7e344db34f4302fc600c42255cbe21f435e7",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "7d81d3292e2c95f5b6cd0eb7a06aaa0b02ec893cd33dc1aa125013b7c041b5e9",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                55,
+                56,
+                217,
+                287,
+                661,
+                938
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "adbd80b7b33d987a5a70c4b15344107e404ec43d33596a3a4b1df0378110dfb1",
+          "facts": [
+            {
+              "fact": "field flags enumerate initialized/injected/generic/stable/contended in this order",
+              "source_lines": [
+                74,
+                75,
+                76,
+                77,
+                78,
+                114,
+                115,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/fieldInfo.inline.hpp",
+          "sha256": "719489dd39d30d397fa3b7413d9b78c821530ecc61c86bf8f0f6835e81e15123",
+          "facts": [
+            {
+              "fact": "stream begins with declared Java and injected field counts",
+              "source_lines": [
+                68
+              ]
+            },
+            {
+              "fact": "record order is name/signature/offset/access flags/field flags followed by optionals",
+              "source_lines": [
+                73,
+                74,
+                75,
+                76,
+                77,
+                79,
+                80,
+                82
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/unsigned5.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/utilities/unsigned5.hpp",
+          "sha256": "534241bac1d26969a85cc5bfb54a6cca2c03d89bb73972253477b850d113bd09",
+          "facts": [
+            {
+              "fact": "bounded UNSIGNED5 byte exclusion, base64 accumulation and five-byte maximum",
+              "source_lines": [
+                87,
+                88,
+                89,
+                91,
+                94,
+                131,
+                132,
+                230
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/fieldInfo.cpp",
+          "sha256": "e64c71cc9e9706650fe3e716c159c7b9d621ccc4ce8821b5f51d19ea777d9c95",
+          "facts": [
+            {
+              "fact": "field stream sizing and writing publishes the counted record payload",
+              "source_lines": [
+                51,
+                75,
+                76,
+                77
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk23u/ff87e76b386d/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "9b235d135cf8e86a6e8dd950df47c0f7666856afbf6040651e81e719d66eb9d4",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                43,
+                44,
+                45,
+                46,
+                51,
+                52,
+                53,
+                54
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 24,
+      "build": "24.0.2+12",
+      "runtime_source": "https://github.com/adoptium/jdk24u/tree/cbfbc6d95c1e",
+      "jvm_sha256": "ed7e75396f25ae35d369a3e4d36ac503a1524747aa761ba3b896291e0cd7200e",
+      "field_encoding": "UNSIGNED5 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "d2a5af4a5c510c0a8e5456b98c80ac23a03466ff2066a63ca69abbaebab33a23",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                261,
+                267,
+                269,
+                270,
+                741
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                238,
+                239
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                330,
+                331,
+                332
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                219
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "8ab585ed99a257874a4f03fcc18f257d3f6bf90eb18ef516ce65f160430a770b",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                142,
+                173
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "74e97d854b28a96c9b9fccc6a6663493bbd37c77bed86dfec28f83883180c6d6",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                139,
+                750
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                342
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "83d01a833dcff670055209bb543ca619b643ec50060e947ffedd24db7f8b8fc0",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                140,
+                146,
+                159
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                148,
+                149,
+                195,
+                199,
+                201,
+                208,
+                218
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/array.hpp",
+          "sha256": "ba5f889486a9c19d12a35ef56b353a5e41b6cc5b5ce459c57494dea07677d3eb",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                46,
+                47
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "ae1421d4b765db2594d089d58eb770005307f698d81eae0d7da78d586864080a",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                50,
+                53,
+                71,
+                85,
+                86,
+                90,
+                98,
+                117
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "a3955bebbe34b0d947701fe277649f38b35b08c20c605c29299fd65ba9fdd7bb",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "fbfc8660b79364aa3f3ebccab567fbf94bc19bb19db67a37cdc1b506d0be330e",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                55,
+                56,
+                218,
+                284,
+                666,
+                940
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "adbd80b7b33d987a5a70c4b15344107e404ec43d33596a3a4b1df0378110dfb1",
+          "facts": [
+            {
+              "fact": "field flags enumerate initialized/injected/generic/stable/contended in this order",
+              "source_lines": [
+                74,
+                75,
+                76,
+                77,
+                78,
+                114,
+                115,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/fieldInfo.inline.hpp",
+          "sha256": "719489dd39d30d397fa3b7413d9b78c821530ecc61c86bf8f0f6835e81e15123",
+          "facts": [
+            {
+              "fact": "stream begins with declared Java and injected field counts",
+              "source_lines": [
+                68
+              ]
+            },
+            {
+              "fact": "record order is name/signature/offset/access flags/field flags followed by optionals",
+              "source_lines": [
+                73,
+                74,
+                75,
+                76,
+                77,
+                79,
+                80,
+                82
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/unsigned5.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/utilities/unsigned5.hpp",
+          "sha256": "534241bac1d26969a85cc5bfb54a6cca2c03d89bb73972253477b850d113bd09",
+          "facts": [
+            {
+              "fact": "bounded UNSIGNED5 byte exclusion, base64 accumulation and five-byte maximum",
+              "source_lines": [
+                87,
+                88,
+                89,
+                91,
+                94,
+                131,
+                132,
+                230
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/fieldInfo.cpp",
+          "sha256": "e64c71cc9e9706650fe3e716c159c7b9d621ccc4ce8821b5f51d19ea777d9c95",
+          "facts": [
+            {
+              "fact": "field stream sizing and writing publishes the counted record payload",
+              "source_lines": [
+                51,
+                75,
+                76,
+                77
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk24u/cbfbc6d95c1e/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "9b235d135cf8e86a6e8dd950df47c0f7666856afbf6040651e81e719d66eb9d4",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                43,
+                44,
+                45,
+                46,
+                51,
+                52,
+                53,
+                54
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 25,
+      "build": "25.0.4.1+1-LTS",
+      "runtime_source": "https://github.com/adoptium/jdk25u/tree/520406d87195",
+      "jvm_sha256": "3c780198deffd7f9b321c24bbf9810c07e2f48dfedf86886a5bc7f78e5d11a4e",
+      "field_encoding": "UNSIGNED5 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "1b7fa870740dd936844397266910afc7bf651fc2f195204efc43a7fb50d877a8",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                222,
+                227,
+                229,
+                230
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                199,
+                200
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                290,
+                291,
+                292
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                180
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "5641de4fee19afa033bc500e696adaf37246761dfadfe1529f0ee53ed84210d9",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                150,
+                185
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "8b9c62b49206852d5e77dcd7daf46f6b244efd05a4ef0513d8f84fb60553c821",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                139,
+                747
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                341
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "83d01a833dcff670055209bb543ca619b643ec50060e947ffedd24db7f8b8fc0",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                140,
+                146,
+                159
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                148,
+                149,
+                195,
+                199,
+                201,
+                208,
+                218
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/array.hpp",
+          "sha256": "966e73a1ebfcb6f99e9441048c64f406806fb812c6b0787655fef3007e8ea848",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                46,
+                47
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "ae1421d4b765db2594d089d58eb770005307f698d81eae0d7da78d586864080a",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                50,
+                53,
+                71,
+                85,
+                86,
+                90,
+                98,
+                117
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "a3955bebbe34b0d947701fe277649f38b35b08c20c605c29299fd65ba9fdd7bb",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "6a6f8b0f4c94b7779b3b7bb4f86c25e8c8b58416b43372f3f658e12a16d5e7d3",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                55,
+                56,
+                216,
+                283,
+                664,
+                936
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "61e726b6e1ce14695b33691dda0e6617e5e6a1c33aa4aa98c32de817428443c9",
+          "facts": [
+            {
+              "fact": "field flags enumerate initialized/injected/generic/stable/contended in this order",
+              "source_lines": [
+                74,
+                75,
+                76,
+                77,
+                78,
+                114,
+                115,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/fieldInfo.inline.hpp",
+          "sha256": "211661d210d4e491bfb6c8e48b6881e9d5ab68e118f079e0810499925b5eac1a",
+          "facts": [
+            {
+              "fact": "stream begins with declared Java and injected field counts",
+              "source_lines": [
+                61,
+                69,
+                73,
+                77,
+                111
+              ]
+            },
+            {
+              "fact": "record order is name/signature/offset/access flags/field flags followed by optionals",
+              "source_lines": [
+                84,
+                85,
+                86,
+                87,
+                88,
+                90,
+                91,
+                93
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/unsigned5.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/utilities/unsigned5.hpp",
+          "sha256": "325ccf55d61c2e19a50f570756197a88f3dfb38fe61915938351ce091735330a",
+          "facts": [
+            {
+              "fact": "bounded UNSIGNED5 byte exclusion, base64 accumulation and five-byte maximum",
+              "source_lines": [
+                87,
+                88,
+                89,
+                91,
+                94,
+                131,
+                132,
+                230
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/fieldInfo.cpp",
+          "sha256": "32d376d61576cf2a738785a7a79eac71cbf457400b3d96b7ccc47e86da871b82",
+          "facts": [
+            {
+              "fact": "field stream sizing and writing publishes the counted record payload",
+              "source_lines": [
+                55,
+                83,
+                84,
+                85
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk25u/520406d87195/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "9b235d135cf8e86a6e8dd950df47c0f7666856afbf6040651e81e719d66eb9d4",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                43,
+                44,
+                45,
+                46,
+                51,
+                52,
+                53,
+                54
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 26,
+      "build": "26.0.2.1+1",
+      "runtime_source": "https://github.com/adoptium/jdk26u/tree/6b28bd7149bb",
+      "jvm_sha256": "016c18055cc0bfa58500ddd3619b35f65b4b669e1cde2c6c5460c83d30fcfcda",
+      "field_encoding": "UNSIGNED5 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "51cd80500508ccbdf91bef88911cc66ffe3f16eedf1dcad0e65a0e6a7ba747ec",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                219,
+                224,
+                226,
+                227
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                196,
+                197
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                287,
+                288,
+                289
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                177
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "0498d2d087f3b4a3a2eb33248e8d9f57c85fd22eb4363133c1f0ad270bb62746",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                150,
+                185
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "b4669e6d1398acf0efd86f6632d5d7b9b3888d7bf2850d92bf62997b661c971b",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                139,
+                669
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                347
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "83d01a833dcff670055209bb543ca619b643ec50060e947ffedd24db7f8b8fc0",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                115,
+                116,
+                140,
+                146,
+                159
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                113,
+                148,
+                149,
+                195,
+                199,
+                201,
+                208,
+                218
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/array.hpp",
+          "sha256": "0d75d438dd0288f5cda90f7e4363dea263c578819b022a40af3ab128888fd602",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                46,
+                47
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "ae1421d4b765db2594d089d58eb770005307f698d81eae0d7da78d586864080a",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                50,
+                53,
+                71,
+                85,
+                86,
+                90,
+                98,
+                117
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "a3955bebbe34b0d947701fe277649f38b35b08c20c605c29299fd65ba9fdd7bb",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                42,
+                50,
+                57,
+                80,
+                98,
+                108
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "5159924c07514d48ba1ccfe06307074165c3ccf34db9183d7991110fad163c82",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                55,
+                56,
+                216,
+                283,
+                668,
+                945
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "61e726b6e1ce14695b33691dda0e6617e5e6a1c33aa4aa98c32de817428443c9",
+          "facts": [
+            {
+              "fact": "field flags enumerate initialized/injected/generic/stable/contended in this order",
+              "source_lines": [
+                74,
+                75,
+                76,
+                77,
+                78,
+                114,
+                115,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/fieldInfo.inline.hpp",
+          "sha256": "44f9839f03e6371f2b683e7f5a3aa1a95fa256053bbbbdcbbf2a6a94c9a894fc",
+          "facts": [
+            {
+              "fact": "stream begins with declared Java and injected field counts",
+              "source_lines": [
+                61,
+                69,
+                73,
+                77,
+                111
+              ]
+            },
+            {
+              "fact": "record order is name/signature/offset/access flags/field flags followed by optionals",
+              "source_lines": [
+                84,
+                85,
+                86,
+                87,
+                88,
+                90,
+                91,
+                93
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/unsigned5.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/utilities/unsigned5.hpp",
+          "sha256": "325ccf55d61c2e19a50f570756197a88f3dfb38fe61915938351ce091735330a",
+          "facts": [
+            {
+              "fact": "bounded UNSIGNED5 byte exclusion, base64 accumulation and five-byte maximum",
+              "source_lines": [
+                87,
+                88,
+                89,
+                91,
+                94,
+                131,
+                132,
+                230
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/fieldInfo.cpp",
+          "sha256": "beaf8c56221a7005b895077b503f3a29b7f52ca9efd5aaf7932d9c82344b5130",
+          "facts": [
+            {
+              "fact": "field stream sizing and writing publishes the counted record payload",
+              "source_lines": [
+                55,
+                83,
+                84,
+                85
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk26u/6b28bd7149bb/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "9b235d135cf8e86a6e8dd950df47c0f7666856afbf6040651e81e719d66eb9d4",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                43,
+                44,
+                45,
+                46,
+                51,
+                52,
+                53,
+                54
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "java_feature": 27,
+      "build": "27+35",
+      "runtime_source": "https://github.com/adoptium/jdk/tree/efe86855fd73",
+      "jvm_sha256": "eae6c00b80f738a9ea0ebf6dc2a0110ea93438b23290ec1d4d140ed981f1960b",
+      "field_encoding": "UNSIGNED5 Java-record prefix",
+      "collector": "G1",
+      "sources": [
+        {
+          "path": "runtime/vmStructs.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/runtime/vmStructs.cpp",
+          "sha256": "6fc501bfa289802f5e7cd5b9bc8d83430f6b908aabbf7f6a25dd3b8db179e7e5",
+          "facts": [
+            {
+              "fact": "exported class name, superclass and array layout",
+              "source_lines": [
+                221,
+                226,
+                228,
+                229
+              ]
+            },
+            {
+              "fact": "exported field metadata and constant pool",
+              "source_lines": [
+                197,
+                198
+              ]
+            },
+            {
+              "fact": "exported Symbol length/body",
+              "source_lines": [
+                268,
+                269,
+                270
+              ]
+            },
+            {
+              "fact": "exported ConstantPool length",
+              "source_lines": [
+                178
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldStreams.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/fieldStreams.hpp",
+          "sha256": "4035cd82bc9d85f94cf397a9b9b3b5c1f889b14ad211c09215d89c05a5b47907",
+          "facts": [
+            {
+              "fact": "declared Java records are separate from injected records",
+              "source_lines": [
+                152,
+                187
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/constantPool.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/constantPool.hpp",
+          "sha256": "ed6a8f6329f8427704d293144c9c4355fc3ba7363ed74b0410f72f621dca0244",
+          "facts": [
+            {
+              "fact": "constant-pool payload starts after exact exported header size",
+              "source_lines": [
+                138,
+                668
+              ]
+            },
+            {
+              "fact": "symbols occupy indexed pointer-width pool slots",
+              "source_lines": [
+                346
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/symbol.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/symbol.hpp",
+          "sha256": "8e972eac09e5de2787edaedf75108d8adff04670e8815f2b557ce9466bf8f0bb",
+          "facts": [
+            {
+              "fact": "Symbol length and body geometry",
+              "source_lines": [
+                114,
+                115,
+                139,
+                145,
+                158
+              ]
+            },
+            {
+              "fact": "Symbol contains UTF-8 byte data",
+              "source_lines": [
+                112,
+                147,
+                148,
+                194,
+                198,
+                200,
+                207,
+                217
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/array.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/array.hpp",
+          "sha256": "e734f2b4a38e6d2f0f6d7b8204c7a4b5396d2e0956a30389e3d9ca4cccaf7a08",
+          "facts": [
+            {
+              "fact": "metadata array integer count precedes typed payload",
+              "source_lines": [
+                48,
+                49
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/arrayOop.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/arrayOop.hpp",
+          "sha256": "47be1f7e19197f3ffb228814e057a6e90d3f3a65610505ec0b4b0384e3409b5f",
+          "facts": [
+            {
+              "fact": "array length and payload offsets are layout-dependent",
+              "source_lines": [
+                50,
+                53,
+                71,
+                84,
+                85,
+                89,
+                97,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/objArrayKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/objArrayKlass.inline.hpp",
+          "sha256": "b23ebf729aadfdb4c017c4cacfe37af0cab7e5417c4f192060689c822254759c",
+          "facts": [
+            {
+              "fact": "object-array GC iterators visit reference elements",
+              "source_lines": [
+                40,
+                41,
+                47,
+                58,
+                65,
+                88,
+                106
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceKlass.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/instanceKlass.hpp",
+          "sha256": "835b066a7eb8ed99419a0fb5fae448569e32bbbfb62035115746e959c3e24f32",
+          "facts": [
+            {
+              "fact": "embedded nonstatic oop-map placement is separate from declared-field metadata",
+              "source_lines": [
+                55,
+                56,
+                215,
+                284,
+                685,
+                962
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/fieldInfo.hpp",
+          "sha256": "e7b63cbb0bcc722635f355b8cb2516edb4ec4ee81841906cd37779346e0f4035",
+          "facts": [
+            {
+              "fact": "field flags enumerate initialized/injected/generic/stable/contended in this order",
+              "source_lines": [
+                74,
+                75,
+                76,
+                77,
+                78,
+                114,
+                115,
+                116
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/fieldInfo.inline.hpp",
+          "sha256": "44f9839f03e6371f2b683e7f5a3aa1a95fa256053bbbbdcbbf2a6a94c9a894fc",
+          "facts": [
+            {
+              "fact": "stream begins with declared Java and injected field counts",
+              "source_lines": [
+                61,
+                69,
+                73,
+                77,
+                111
+              ]
+            },
+            {
+              "fact": "record order is name/signature/offset/access flags/field flags followed by optionals",
+              "source_lines": [
+                84,
+                85,
+                86,
+                87,
+                88,
+                90,
+                91,
+                93
+              ]
+            }
+          ]
+        },
+        {
+          "path": "utilities/unsigned5.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/utilities/unsigned5.hpp",
+          "sha256": "bfc0f0489ed881139b14336c1fc10de7edce043a4dabaf65a04e8ca8e1166d0d",
+          "facts": [
+            {
+              "fact": "bounded UNSIGNED5 byte exclusion, base64 accumulation and five-byte maximum",
+              "source_lines": [
+                87,
+                88,
+                89,
+                91,
+                94,
+                131,
+                132,
+                230
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/fieldInfo.cpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/fieldInfo.cpp",
+          "sha256": "beaf8c56221a7005b895077b503f3a29b7f52ca9efd5aaf7932d9c82344b5130",
+          "facts": [
+            {
+              "fact": "field stream sizing and writing publishes the counted record payload",
+              "source_lines": [
+                55,
+                83,
+                84,
+                85
+              ]
+            }
+          ]
+        },
+        {
+          "path": "oops/instanceRefKlass.inline.hpp",
+          "url": "https://raw.githubusercontent.com/adoptium/jdk/efe86855fd73/src/hotspot/share/oops/instanceRefKlass.inline.hpp",
+          "sha256": "9b235d135cf8e86a6e8dd950df47c0f7666856afbf6040651e81e719d66eb9d4",
+          "facts": [
+            {
+              "fact": "Reference referent and discovery links have separate collector semantics",
+              "source_lines": [
+                43,
+                44,
+                45,
+                46,
+                51,
+                52,
+                53,
+                54
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

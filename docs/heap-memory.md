@@ -7,6 +7,11 @@ require a live standalone `native_thread_context`. A snapshot observes heap
 objects, not a reachability graph: a parsable object awaiting collection can
 still appear. It does not report subclass instances or allocation events.
 
+For a bounded graph of strong Java fields starting from an object you already
+own, use [`snapshot_references(object)`](reference-graphs.md). Its copied IDs
+and explicit weak-reference exclusions have a different scope from a heap
+instance snapshot.
+
 The verified backend currently covers the pinned Java 8–27 Windows x64 HotSpot
 images with Java 8 Parallel GC and later G1. Java 9–16 G1 additionally requires
 the immutable `ClassUnloadingWithConcurrentMark` launch setting to retain its
