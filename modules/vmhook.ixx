@@ -27663,6 +27663,27 @@ export namespace vmhook
         std::optional<std::int64_t> collection_count{}, collection_time_ms{};
     };
 
+    struct memory_pool_snapshot final
+    {
+        std::string name{}, type{};
+        bool valid{};
+        std::optional<memory_usage_snapshot> usage{}, peak_usage{}, collection_usage{};
+        std::optional<std::int64_t> usage_threshold_count{}, collection_threshold_count{};
+    };
+
+    struct thread_allocation_sample final
+    {
+        std::int64_t thread_id{};
+        std::optional<std::int64_t> allocated_bytes{};
+    };
+
+    struct thread_allocation_snapshot final
+    {
+        std::chrono::steady_clock::time_point capture_started{}, capture_finished{};
+        bool supported{}, enabled{};
+        std::vector<thread_allocation_sample> threads{};
+    };
+
     struct runtime_snapshot final
     {
         std::chrono::steady_clock::time_point capture_started{}, capture_finished{};
@@ -27723,6 +27744,104 @@ export namespace vmhook
             result.maximum_bytes = observed_nonnegative(maximum);
             return result;
         }
+
+        inline auto observe_optional_memory_usage(const std::unique_ptr<any_object>& usage)
+            -> std::optional<memory_usage_snapshot>
+        {
+            if (!usage) { throw exception{"Memory usage requires an allocated C++ owner"}; }
+            if (!usage->get_instance()) { return std::nullopt; }
+            return observe_memory_usage(usage);
+        }
+    }
+
+    [[nodiscard]] inline auto observe_memory_pools(const std::size_t max_pools = 128)
+        -> std::vector<memory_pool_snapshot>
+    {
+        if (max_pools == 0 || max_pools > 65536)
+        { throw exception{ "Java memory pool snapshot limit is out of range" }; }
+        const std::vector<std::unique_ptr<any_object>> pools{
+            detail::call_bootstrap_method("java/lang/management/ManagementFactory", "getMemoryPoolMXBeans",
+                                          "()Ljava/util/List;").to_vector() };
+        if (pools.size() > max_pools)
+        { throw exception{ "Java memory pool snapshot exceeds the requested pool limit" }; }
+        std::vector<memory_pool_snapshot> result{};
+        result.reserve(pools.size());
+        for (const auto& pool : pools)
+        {
+            constexpr std::string_view contract{ "java/lang/management/MemoryPoolMXBean" };
+            memory_pool_snapshot snapshot{};
+            snapshot.name = static_cast<std::string>(detail::management_call(pool, contract, "getName", "()Ljava/lang/String;"));
+            const std::unique_ptr<any_object> type{
+                detail::management_call(pool, contract, "getType", "()Ljava/lang/management/MemoryType;") };
+            snapshot.type = static_cast<std::string>(detail::management_call(type, "java/lang/Enum", "name", "()Ljava/lang/String;"));
+            snapshot.valid = detail::management_call(pool, contract, "isValid", "()Z");
+            for (const auto& [method_name, destination] : std::array{
+                std::pair{std::string_view{"getUsage"}, &snapshot.usage},
+                std::pair{std::string_view{"getPeakUsage"}, &snapshot.peak_usage},
+                std::pair{std::string_view{"getCollectionUsage"}, &snapshot.collection_usage}})
+            {
+                const std::unique_ptr<any_object> usage{
+                    detail::management_call(pool, contract, method_name, "()Ljava/lang/management/MemoryUsage;") };
+                *destination = detail::observe_optional_memory_usage(usage);
+            }
+            const bool usage_supported{
+                detail::management_call(pool, contract, "isUsageThresholdSupported", "()Z") };
+            const bool collection_supported{
+                detail::management_call(pool, contract, "isCollectionUsageThresholdSupported", "()Z") };
+            if (usage_supported)
+            {
+                const std::int64_t count{detail::management_call(pool, contract, "getUsageThresholdCount", "()J")};
+                snapshot.usage_threshold_count = detail::observed_nonnegative(count);
+            }
+            if (collection_supported)
+            {
+                const std::int64_t count{detail::management_call(pool, contract, "getCollectionUsageThresholdCount", "()J")};
+                snapshot.collection_threshold_count = detail::observed_nonnegative(count);
+            }
+            result.push_back(std::move(snapshot));
+        }
+        return result;
+    }
+
+    // The optional HotSpot management extension counts allocated bytes. It is
+    // queried on its real receiver and never enabled by VMHook. A sample is a
+    // cumulative counter, not an allocation notification or retained size.
+    [[nodiscard]] inline auto observe_thread_allocations(const std::size_t max_threads = 4096)
+        -> thread_allocation_snapshot
+    {
+        if (max_threads == 0 || max_threads > 65536)
+        { throw exception{ "Java thread allocation snapshot limit is out of range" }; }
+        thread_allocation_snapshot result{};
+        result.capture_started = std::chrono::steady_clock::now();
+        const auto bean{detail::management_bean("getThreadMXBean", "()Ljava/lang/management/ThreadMXBean;")};
+        const auto supported{bean->get_method("isThreadAllocatedMemorySupported", "()Z")};
+        if (!supported)
+        { result.capture_finished = std::chrono::steady_clock::now(); return result; }
+        result.supported = supported->call();
+        if (result.supported)
+        {
+            const auto enabled{bean->get_method("isThreadAllocatedMemoryEnabled", "()Z")};
+            const auto allocated{bean->get_method("getThreadAllocatedBytes", "(J)J")};
+            if (!enabled || !allocated)
+            { throw exception{"Java allocation management extension has an inconsistent method contract"}; }
+            result.enabled = enabled->call();
+            if (result.enabled)
+            {
+                const std::unique_ptr<array<std::int64_t>> ids{
+                    detail::management_call(bean, "java/lang/management/ThreadMXBean", "getAllThreadIds", "()[J")};
+                if (static_cast<std::size_t>(ids->size()) > max_threads)
+                { throw exception{"Java thread allocation snapshot exceeds the requested thread limit"}; }
+                const auto copied_ids{ids->to_vector()};
+                result.threads.reserve(copied_ids.size());
+                for (const auto id : copied_ids)
+                {
+                    const std::int64_t bytes{allocated->call(id)};
+                    result.threads.push_back({id, detail::observed_nonnegative(bytes)});
+                }
+            }
+        }
+        result.capture_finished = std::chrono::steady_clock::now();
+        return result;
     }
 
     // Ordinary Java management calls on the current native context. Counters

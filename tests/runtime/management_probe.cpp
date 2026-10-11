@@ -14,6 +14,10 @@ namespace
         using vmhook::object<fixture>::object;
         static auto collect() -> void
         { (void)static_members::get_method("collect", "()V")->call(); }
+        static auto current_thread_id() -> std::int64_t
+        { return static_members::get_method("currentThreadId", "()J")->call(); }
+        static auto allocate_burst() -> void
+        { (void)static_members::get_method("allocateBurst", "()V")->call(); }
     };
 
     auto worker(void*) -> DWORD
@@ -54,6 +58,32 @@ namespace
             { if (gc.collection_count) later_collections += *gc.collection_count; }
             check("real_gc_counters", !after.garbage_collectors.empty()
                 && later_collections > first_collections && after.uptime_ms >= before.uptime_ms);
+            const auto pools{vmhook::observe_memory_pools()};
+            check("memory_pool_observation", !pools.empty() && std::all_of(pools.begin(), pools.end(),
+                [](const auto& pool) {
+                    return !pool.name.empty() && !pool.type.empty()
+                        && (!pool.usage || (pool.usage->used_bytes >= 0
+                            && pool.usage->committed_bytes >= pool.usage->used_bytes));
+                }));
+            const auto id{fixture::current_thread_id()};
+            const auto first_allocation{vmhook::observe_thread_allocations()};
+            fixture::allocate_burst();
+            const auto later_allocation{vmhook::observe_thread_allocations()};
+            const auto allocated_bytes = [id](const auto& snapshot) -> std::optional<std::int64_t> {
+                for (const auto& thread : snapshot.threads)
+                { if (thread.thread_id == id) { return thread.allocated_bytes; } }
+                return {};
+            };
+            const auto first_bytes{allocated_bytes(first_allocation)};
+            const auto later_bytes{allocated_bytes(later_allocation)};
+            check("real_allocation_counters", first_allocation.supported && first_allocation.enabled
+                && later_allocation.supported && later_allocation.enabled && first_bytes && later_bytes
+                && *later_bytes - *first_bytes >= 2 * 1024 * 1024
+                && later_allocation.capture_finished >= later_allocation.capture_started);
+            bool allocation_bounded{};
+            try { (void)vmhook::observe_thread_allocations(1); }
+            catch (const vmhook::exception&) { allocation_bounded = true; }
+            check("bounded_allocation_snapshot", allocation_bounded);
             const auto threads{ vmhook::observe_java_threads() };
             bool found{}, caller{}, leaf{};
             for (const auto& thread : threads)
@@ -76,7 +106,8 @@ namespace
             catch (const vmhook::exception&) { refused = true; }
             check("bounded_snapshot", refused);
             check("context_closed", context.close());
-            check("copied_observations_survive_close", before.heap.committed_bytes > 0 && found && !threads.empty());
+            check("copied_observations_survive_close", before.heap.committed_bytes > 0 && found && !threads.empty()
+                && !pools.empty() && later_bytes.has_value());
             output << "management_complete=" << (valid ? "pass" : "fail") << '\n';
             return valid ? 0 : 3;
         }
