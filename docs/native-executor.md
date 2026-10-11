@@ -30,7 +30,8 @@ executor.close();
 The callable must be stateless or a function pointer. Pass owned input data as
 explicit arguments: arithmetic values, enums, `std::string`, `std::u16string`,
 `retained_object`, and recursively supported vectors, arrays, optionals, pairs,
-and tuples. Results use the same types, or `void`. Context-bound wrappers,
+and tuples. Vectors require their default `std::allocator`: a custom allocator
+may itself carry borrowed state. Results use the same types, or `void`. Context-bound wrappers,
 `std::unique_ptr<wrapper>`, references, raw pointers, and string views are rejected
 as task arguments and results. C++23 cannot inspect arbitrary lambda captures;
 requiring a stateless callable prevents a captured context-bound wrapper from

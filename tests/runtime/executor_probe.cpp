@@ -29,6 +29,14 @@ namespace
     };
     static_assert(vmhook::detail::native_transferable<std::int32_t>);
     static_assert(vmhook::detail::native_transferable<std::vector<std::string>>);
+    template<typename value_type>
+    struct context_allocator : std::allocator<value_type>
+    {
+        node* borrowed_wrapper{};
+        template<typename other_type> struct rebind { using other = context_allocator<other_type>; };
+    };
+    static_assert(!vmhook::detail::native_transferable<std::vector<std::int32_t,
+        context_allocator<std::int32_t>>>);
     static_assert(vmhook::detail::native_transferable<vmhook::retained_object<node>>);
     static_assert(!vmhook::detail::native_transferable<std::unique_ptr<node>>);
     static_assert(!vmhook::detail::native_transferable<node>);

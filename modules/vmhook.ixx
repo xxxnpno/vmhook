@@ -28523,7 +28523,9 @@ export namespace vmhook::detail
     template<typename wrapper_type>
     struct native_transferable_type<vmhook::retained_object<wrapper_type>> : std::true_type {};
     template<typename value_type, typename allocator_type>
-    struct native_transferable_type<std::vector<value_type, allocator_type>> : native_transferable_type<value_type> {};
+    struct native_transferable_type<std::vector<value_type, allocator_type>> : std::bool_constant<
+        std::is_same_v<allocator_type, std::allocator<value_type>>
+        && native_transferable_type<value_type>::value> {};
     template<typename value_type, std::size_t length>
     struct native_transferable_type<std::array<value_type, length>> : native_transferable_type<value_type> {};
     template<typename value_type>
