@@ -26,10 +26,26 @@ vmhook::hook_field<game, std::unique_ptr<player>>("currentPlayer",
 vmhook::unhook_field<game>("currentPlayer");
 ```
 
-The owner wrapper and reference value wrapper must be registered against their
-loaded Java classes. Primitive fields use their matching C++ primitive type
+The owner wrapper and custom reference value wrappers must be registered against
+their loaded Java classes; built-in wrappers use their bootstrap class contracts.
+Primitive fields use their matching C++ primitive type
 instead of `std::unique_ptr<player>`. Duplicate hooks and incompatible field
-types are refused. Installation and removal run from a native OS worker.
+types are refused. Reference installation compares the field's declared Java
+`Class` mirror with the wrapper's exact class and defining loader; a matching
+class name from another loader is insufficient. Array wrappers must also match
+the declared component class and dimensions. Use the declared field type,
+rather than a base-class wrapper, when installing a hook. Installation and
+removal run from a native OS worker. Allocation failure propagates before a
+hook is published.
+
+An installed hook retains its declaring class and the registered class bindings
+of its owner and reference value, including nested array components. Rebinding
+or unregistering a wrapper afterward does not change that hook's callback
+types. During its callback, normal wrapper calls and `make_unique` use those
+retained bindings. A nested field callback uses its own bindings and restores
+the outer callback's bindings when it returns. Outside callbacks, wrapper
+operations continue to use the current registrations. Removal releases the
+retained bindings after active callbacks finish.
 
 Callbacks run synchronously on the Java thread performing the access, with
 VMHook's borrowed native callback context. Normal wrapper calls, object

@@ -985,9 +985,38 @@ export namespace vmhook
             std::shared_ptr<void> mirror{};
         };
         inline std::unordered_map<std::type_index, std::shared_ptr<class_binding>> class_bindings{};
+        struct callback_class_binding final
+        {
+            std::type_index type{typeid(void)};
+            std::shared_ptr<class_binding> binding{};
+        };
+        struct callback_class_binding_scope;
+        thread_local const callback_class_binding_scope* active_callback_class_bindings{};
+        struct callback_class_binding_scope final
+        {
+            const std::vector<callback_class_binding>& bindings;
+            const callback_class_binding_scope* previous{};
+            explicit callback_class_binding_scope(const std::vector<callback_class_binding>& values) noexcept
+                : bindings{values}, previous{active_callback_class_bindings}
+            { active_callback_class_bindings = this; }
+            ~callback_class_binding_scope() { active_callback_class_bindings = this->previous; }
+            callback_class_binding_scope(const callback_class_binding_scope&) = delete;
+            auto operator=(const callback_class_binding_scope&) -> callback_class_binding_scope& = delete;
+        };
+        inline auto callback_class_binding_for(const std::type_index type) noexcept
+            -> const callback_class_binding*
+        {
+            for (auto* scope{active_callback_class_bindings}; scope; scope = scope->previous)
+            {
+                for (const auto& value : scope->bindings)
+                { if (value.type == type) { return &value; } }
+            }
+            return nullptr;
+        }
         inline auto make_class_binding(std::string_view, void* = nullptr) -> std::shared_ptr<class_binding>;
         inline auto registered_class_binding(std::type_index type) -> std::shared_ptr<class_binding>
         {
+            if (const auto* captured{callback_class_binding_for(type)}) { return captured->binding; }
             std::lock_guard lock{vmhook::registration_mutex};
             const auto found{class_bindings.find(type)};
             return found == class_bindings.end() ? std::shared_ptr<class_binding>{} : found->second;
@@ -1039,6 +1068,8 @@ export namespace vmhook
         inline auto registered_class_name(const std::type_index wrapper_type)
             -> std::string
         {
+            if (const auto* captured{callback_class_binding_for(wrapper_type)})
+            { return captured->binding ? captured->binding->name : std::string{}; }
             try
             {
                 std::lock_guard<std::mutex> lock{ vmhook::registration_mutex };
@@ -27712,6 +27743,8 @@ export namespace vmhook::detail::field_backend
         std::type_index wrapper{typeid(void)};
         std::string name{};
         std::shared_ptr<void> metadata_root{};
+        std::shared_ptr<void> value_class_root{};
+        std::vector<vmhook::detail::callback_class_binding> callback_bindings{};
         std::function<void(packet&)> invoke{};
     };
     struct snapshot { std::vector<std::shared_ptr<binding>> fields{}; };
@@ -27779,6 +27812,7 @@ export namespace vmhook::detail::field_backend
         const auto selected=*call.selected;
         call.hazard->release();
         collect_native();
+        const vmhook::detail::callback_class_binding_scope bindings{selected->callback_bindings};
         selected->invoke(call.event);
     }
     inline auto bridge(void* frame, void* thread, scratch_frame* scratch, site* current) noexcept -> void
@@ -28237,6 +28271,64 @@ export namespace vmhook::detail
             }
         }
     };
+    template<class wrapper_type>
+    inline auto capture_field_wrapper_bindings(std::vector<callback_class_binding>& values) -> void
+    {
+        const std::type_index type{typeid(wrapper_type)};
+        if (std::none_of(values.begin(), values.end(), [&](const auto& value) { return value.type == type; }))
+        {
+            const auto original{registered_class_binding(type)};
+            std::shared_ptr<class_binding> captured{};
+            if (original)
+            {
+                auto* const identity{registered_class_klass(type, original)};
+                if (!identity) { throw vmhook::exception{"Field hook wrapper's exact class is unavailable"}; }
+                auto mirror{retain_hook_klass(identity)};
+                if (!mirror) { throw vmhook::exception{"Field hook wrapper Class could not be retained"}; }
+                captured = std::make_shared<class_binding>(*original);
+                captured->identity = identity;
+                captured->mirror = std::move(mirror);
+            }
+            values.push_back({type, std::move(captured)});
+        }
+        if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+        {
+            using element_type = typename wrapper_type::java_element_type;
+            if constexpr (std::is_base_of_v<vmhook::object_base, element_type>)
+            { capture_field_wrapper_bindings<element_type>(values); }
+        }
+    }
+
+    template<class wrapper_type>
+    inline auto retain_field_value_class(vmhook::hotspot::klass* const holder,
+        const std::string_view name) -> std::shared_ptr<void>
+    {
+        const auto holder_mirror{native_backend::retain_class(holder)};
+        if (!holder_mirror) { throw vmhook::exception{"Declaring field Class could not be retained"}; }
+        const auto field{container_result_root(call_container_method(holder_mirror, "getDeclaredField",
+            "(Ljava/lang/String;)Ljava/lang/reflect/Field;", std::string{name}))};
+        if (!field) { throw vmhook::exception{"Declaring Java field metadata is unavailable"}; }
+        const auto declared{container_result_root(call_container_method(field, "getType", "()Ljava/lang/Class;"))};
+        if (!declared) { throw vmhook::exception{"Declared Java field type Class is null"}; }
+        vmhook::hotspot::klass* expected{};
+        if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+        { expected = loaded_array_wrapper_class<wrapper_type>(); }
+        else if constexpr (std::is_same_v<wrapper_type, vmhook::any_object>)
+        {
+            const auto binding{registered_class_binding(std::type_index{typeid(wrapper_type)})};
+            expected = binding ? registered_class_klass(std::type_index{typeid(wrapper_type)}, binding)
+                               : registered_bootstrap_klass("java/lang/Object");
+        }
+        else { expected = checked_wrapper_class<wrapper_type>(); }
+        const auto expected_mirror{expected ? native_backend::retain_class(expected) : native_backend::root{}};
+        if (!expected_mirror || container_address(expected_mirror) != container_address(declared))
+        { throw vmhook::exception{"Field hook value wrapper does not match the exact declared Class and loader",
+                                 vmhook::error_code::type_mismatch}; }
+        auto persistent{retain_durable_oop(container_address(declared))};
+        if (!persistent) { throw vmhook::exception{"Declared field value Class could not be retained"}; }
+        return persistent;
+    }
+
     template<class wrapper_type,typename field_type,typename callback_type>
     inline auto install_field_hook(std::string_view name,callback_type callback) -> std::uint64_t
     {
@@ -28269,21 +28361,42 @@ export namespace vmhook::detail
                 {
                     native_backend::operation access{};
                     if(!access) { return 0; }
+                    capture_field_wrapper_bindings<wrapper_type>(added->callback_bindings);
+                    if constexpr (vmhook::detail::is_java_object_pointer_v<field_type>)
+                    {
+                        using value_wrapper = typename vmhook::detail::is_unique_ptr<field_type>::value_type_t;
+                        capture_field_wrapper_bindings<value_wrapper>(added->callback_bindings);
+                    }
+                    const callback_class_binding_scope bindings{added->callback_bindings};
                     auto* klass=registered_class_klass<wrapper_type>();
                     if(!klass) { return 0; }
                     const auto field=vmhook::find_field(klass,name);
-                    if(!field||!field->is_static||field->signature!=jvm_descriptor_for_arg<field_type>()) { return 0; }
+                    if(!field||!field->is_static||field->signature.empty()) { return 0; }
+                    if constexpr (vmhook::detail::is_java_object_pointer_v<field_type>)
+                    {
+                        // The reflected Class identity below validates the complete
+                        // reference type, including array dimensions and loader.
+                        // Generic argument descriptors cannot express that identity.
+                        if(field->signature.front()!='L'&&field->signature.front()!='[') { return 0; }
+                    }
+                    else if(field->signature!=jvm_descriptor_for_arg<field_type>()) { return 0; }
                     added->holder=field->declaring_klass?field->declaring_klass:klass;
                     added->offset=field->offset;
                     added->descriptor=field->signature.front();
                     added->signature=field->signature;
                     added->metadata_root=retain_hook_klass(added->holder);
                     if(!added->metadata_root) { return 0; }
+                    if constexpr (vmhook::detail::is_java_object_pointer_v<field_type>)
+                    {
+                        using value_wrapper = typename vmhook::detail::is_unique_ptr<field_type>::value_type_t;
+                        added->value_class_root = retain_field_value_class<value_wrapper>(added->holder, name);
+                    }
                 }
                 const auto id=field_backend::add(std::move(added));
                 flush_hook_roots();
                 return id;
             }
+            catch(const std::bad_alloc&) { throw; }
             catch(const std::exception& error)
             { vmhook::detail::log_line("{} hook_field('{}'): {}",vmhook::error_tag,name,error.what()); return 0; }
             catch(...) { return 0; }
