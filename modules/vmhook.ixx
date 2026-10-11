@@ -28223,6 +28223,7 @@ export namespace vmhook::detail
 export namespace vmhook::detail
 {
     inline auto verified_heap_iteration_available() noexcept -> bool;
+    inline auto verified_monitor_locks_available() noexcept -> bool;
 }
 export namespace vmhook
 {
@@ -28233,7 +28234,7 @@ export namespace vmhook
         native_calls, object_construction, rooted_object_access, reference_field_writes,
         persistent_references, method_entry_hooks, static_primitive_field_hooks,
         class_definition_events, original_method_exit_events, exact_heap_iteration,
-        mixed_stack_sampling, virtual_thread_hooks, count
+        mixed_stack_sampling, virtual_thread_hooks, java_monitors, count
     };
 
     struct feature_support final
@@ -28336,6 +28337,9 @@ export namespace vmhook
             "No verified Windows mixed-stack sampling backend");
         set(runtime_feature::virtual_thread_hooks, feature_state::unavailable,
             "Carrier, continuation and virtual-thread root transitions are not verified");
+        set(runtime_feature::java_monitors,
+            detail::verified_monitor_locks_available() ? feature_state::conditional : feature_state::unavailable,
+            "Verified ObjectLocker ABI; requires a rooted non-null object and an owner-stack native context");
         return report;
     }
 }
@@ -29506,3 +29510,8 @@ export namespace vmhook
     { return vmhook::detail::monitor_backend::config().ready; }
 }
 // VMHOOK_MONITOR_LOCKS_END
+export namespace vmhook::detail
+{
+    inline auto verified_monitor_locks_available() noexcept -> bool
+    { return monitor_backend::config().ready; }
+}

@@ -132,6 +132,10 @@ Unsafe methods. Volatile primitive/reference access and supported atomic
 compare/exchange follow VM semantics; unsupported final writes are refused.
 Raw reference-memory writes retain their stricter collector gate.
 
+`monitor_lock` and `with_monitor` synchronize on the actual Java object's
+monitor, interoperating with `synchronized`. Their stack-owned guard keeps the
+native context alive through acquisition and release. See [Java monitors](docs/monitors.md).
+
 ## Collections, arrays and standard Java types
 
 A declared return type supplies collection element types:
@@ -193,6 +197,11 @@ and routes through reflection, Unsafe or native VM code have separate boundaries
 `on_class_loaded` reports successful class definitions. Use copied class records,
 bounded event queues and `hook_when_loaded` for deferred native-side installation;
 class callbacks run in VM state and must stay short.
+
+The optional [interface callback bridge](docs/interface_callbacks.md) combines
+an ordinarily loaded Java `InvocationHandler`, JDK proxies and method hooks.
+Java interface calls invoke a rooted C++ callback synchronously, with explicit
+closure and normal Java result/exception semantics.
 
 Method entry is distinct from original method exit, and Throwable stack-trace
 construction is distinct from a throw/catch event. The [hook guide](docs/hooks.md)

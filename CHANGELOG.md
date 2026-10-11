@@ -20,6 +20,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - Runtime, Java stack, memory-pool and per-thread allocated-byte observations.
 - Exact safepoint G1/Parallel instance snapshots with roots published before
   the VM resumes; user visitors execute outside the safepoint.
+- Owner-stack Java monitor guards use the verified private `ObjectLocker` ABI,
+  with reentrancy, Java contention and explicit context-lifetime checks.
+- Optional ordinary Java interface proxies dispatch to rooted C++ callbacks,
+  with overload metadata, original Throwable forwarding and explicit closure.
 
 - Installed `find_package(vmhook COMPONENTS module)` support rebuilds module
   sources with the consumer's compiler, configuration and common options.
