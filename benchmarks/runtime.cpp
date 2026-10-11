@@ -100,7 +100,12 @@ namespace
         results.number(prefix + ".retained_snapshots", value.retained_snapshots);
         results.number(prefix + ".dispatch_readers", value.dispatch_readers);
         results.number(prefix + ".active_callbacks", value.active_callbacks);
+        results.number(prefix + ".resident_return_markers", value.resident_return_markers);
+        results.number(prefix + ".resident_return_marker_bytes", value.resident_return_marker_bytes);
         results.number(prefix + ".callback_failures", value.callback_failures);
+        results.number(prefix + ".suppressed_recursions", value.suppressed_recursions);
+        results.number(prefix + ".registry_sizes_available", value.registry_sizes_available);
+        results.number(prefix + ".shutdown_requested", value.shutdown_requested);
         results.number(prefix + ".dll_must_remain_loaded", value.dll_must_remain_loaded);
         return value;
     }
@@ -184,16 +189,59 @@ namespace
         value.unrelated_excluded = vmhook::detail::jit_backend::method_is_excluded(value.unrelated);
     }
 
-    auto record_jit(example::report& results, std::string_view name, jit_snapshot& value) -> void
+    auto refresh_jit(jit_snapshot& value) -> void
     {
         if (!vmhook::detail::jit_backend::at_safepoint(&capture_jit, &value))
         { throw std::runtime_error{"Benchmark JIT snapshot safepoint failed"}; }
+    }
+
+    auto record_jit(example::report& results, std::string_view name, jit_snapshot& value) -> void
+    {
+        refresh_jit(value);
         const auto prefix = std::string{name};
         results.number(prefix + ".target_compiled", value.target_compiled);
         results.number(prefix + ".caller_compiled", value.caller_compiled);
         results.number(prefix + ".unrelated_compiled", value.unrelated_compiled);
         results.number(prefix + ".target_excluded", value.target_excluded);
         results.number(prefix + ".unrelated_excluded", value.unrelated_excluded);
+    }
+
+    template<typename target_operation, typename unrelated_operation>
+    auto warm_compiled_entries(example::report& results, jit_snapshot& value,
+                               target_operation target, unrelated_operation unrelated) -> void
+    {
+        const auto started = clock_type::now();
+        const auto deadline = started + std::chrono::seconds{30};
+        std::size_t pairs{};
+        results.number("jit_warmup.timeout_seconds", 30);
+        for (;;)
+        {
+            refresh_jit(value);
+            if (value.target_compiled && value.caller_compiled && value.unrelated_compiled) { break; }
+            if (clock_type::now() >= deadline)
+            {
+                results.number("jit_warmup.wall_ns", elapsed_ns(started));
+                results.number("jit_warmup.bridge_loop_pairs", pairs);
+                results.number("jit_warmup.completed", false);
+                results.number("jit_warmup.timeout_target_compiled", value.target_compiled);
+                results.number("jit_warmup.timeout_caller_compiled", value.caller_compiled);
+                results.number("jit_warmup.timeout_unrelated_compiled", value.unrelated_compiled);
+                throw std::runtime_error{"Ordinary Java warmup did not compile all benchmark entry points within 30 seconds"};
+            }
+            // Invocation counters and background compiler scheduling differ
+            // between ordinary JVMs. Run checked Java bodies until actual
+            // entry-point metadata proves the measured precondition.
+            for (std::size_t index{}; index < 32; ++index)
+            {
+                target();
+                unrelated();
+                ++pairs;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+        results.number("jit_warmup.wall_ns", elapsed_ns(started));
+        results.number("jit_warmup.bridge_loop_pairs", pairs);
+        results.number("jit_warmup.completed", true);
     }
 
     auto soak(example::report& results, std::size_t cycles, std::size_t batch,
@@ -282,8 +330,6 @@ auto run_example(example::report& results) -> void
         measure(results, "reference_field_write_read", iterations, [&]
         { instance->selected(player); const auto value = instance->selected(); if (!cross_context.is_same_object(value) || value->id() != 71) { throw std::runtime_error{"Reference field failed"}; } ++blackhole; });
         jit_snapshot jit{find_method("plain"), find_method("throughput_loop"), find_method("unrelated_loop")};
-        record_jit(results, "jit_before_hook", jit);
-        results.check("warmed_java_methods", jit.target_compiled && jit.caller_compiled && jit.unrelated_compiled);
         const auto loop_samples = std::min<std::size_t>(iterations, 32);
         constexpr std::int32_t loop_count{1024};
         results.number("java_loop.operations_per_sample", loop_count);
@@ -293,6 +339,10 @@ auto run_example(example::report& results) -> void
         const auto unrelated_result = example::fixture::unrelated_loop(loop_count);
         const auto unrelated_loop = [&]
         { const auto value = example::fixture::unrelated_loop(loop_count); if (value != unrelated_result) { throw std::runtime_error{"Unrelated loop changed semantics"}; } blackhole += static_cast<std::uint64_t>(value); };
+        record_jit(results, "jit_before_adaptive_warmup", jit);
+        warm_compiled_entries(results, jit, target_loop, unrelated_loop);
+        record_jit(results, "jit_before_hook", jit);
+        results.check("warmed_java_methods", jit.target_compiled && jit.caller_compiled && jit.unrelated_compiled);
         measure(results, "java_target_loop_before_hook", loop_samples, target_loop);
         measure(results, "java_unrelated_loop_before_hook", loop_samples, unrelated_loop);
         const auto before_hooks = record_hooks(results, "hooks_before");

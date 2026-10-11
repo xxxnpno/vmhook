@@ -32,12 +32,16 @@ def summarize(evidence: dict) -> dict:
             "host": evidence.get("host"), "dll_sha256": runs[0]["sha256"],
             "jvm_image_sha256": evidence.get("jvm_image_sha256"),
             "parameters": {key: evidence.get(key) for key in ("iterations", "soak_cycles", "soak_batch")},
-            "jit_transitions": {key: int(value) for key, value in metrics.items() if key.startswith("jit_")},
+            "jit_transitions": {key: int(value) for key, value in metrics.items()
+                                if key.startswith("jit_") and not key.startswith("jit_warmup.")},
+            "jit_warmup": {key: int(value) for key, value in metrics.items() if key.startswith("jit_warmup.")},
             "install_wall_ns": int(metrics["method_hook.install_wall_ns"]),
             "shutdown_wall_ns": int(metrics["method_hook.shutdown_wall_ns"]),
             "java_operations_per_sample": int(metrics["java_loop.operations_per_sample"]),
             "loop_comparisons": comparisons,
             "root_resources": {key: int(value) for key, value in metrics.items() if key.startswith("roots_")},
+            "hook_resources": {key: int(value) for key, value in metrics.items()
+                               if key.startswith("hooks_") and "." in key},
             "soak": {key: value for key, value in metrics.items()
                      if key.startswith(("soak.", "soak_before.", "soak_after."))}}
 

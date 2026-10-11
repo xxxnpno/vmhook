@@ -309,6 +309,7 @@ jobs:
           --binaries runtime-binaries
           --evidence examples-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Capture reproducible runtime benchmark observations
+        id: benchmark
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && (matrix.java == 8 || matrix.java == 21 || matrix.java == 27) }}
         shell: pwsh
         run: >-
@@ -322,6 +323,13 @@ jobs:
           --soak-cycles 32
           --soak-batch 16
           --evidence benchmark-${{ matrix.java }}-${{ matrix.toolchain }}.json
+      - name: Summarize the measured hook cost and resource observations
+        if: ${{ !cancelled() && steps.benchmark.outcome == 'success' }}
+        shell: pwsh
+        run: >-
+          python tools/summarize_benchmark.py
+          benchmark-${{ matrix.java }}-${{ matrix.toolchain }}.json
+          --output benchmark-summary-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -331,6 +339,7 @@ jobs:
             callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-*.json
             examples-${{ matrix.java }}-${{ matrix.toolchain }}.json
             benchmark-${{ matrix.java }}-${{ matrix.toolchain }}.json
+            benchmark-summary-${{ matrix.java }}-${{ matrix.toolchain }}.json
             interface-${{ matrix.java }}-${{ matrix.toolchain }}.json
             reference-fields-${{ matrix.java }}-${{ matrix.toolchain }}.json
           if-no-files-found: ignore

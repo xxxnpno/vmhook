@@ -18,7 +18,8 @@ import time
 
 REQUIRED = (
     'context', 'arity', 'constructor_arity', 'primitive_arrays', 'bulk_copy',
-    'object_arrays', 'array_return', 'multidimensional', 'list_add', 'list_crud',
+    'object_arrays', 'array_return', 'exact_empty_array_guard', 'exact_nested_array_guard',
+    'multidimensional', 'list_add', 'list_crud',
     'iterator', 'map_crud', 'gc_roots', 'clear', 'refusals', 'string_wrapper',
     'lossless_utf16', 'boxing', 'optional', 'class_wrapper', 'throwable_wrapper',
     'nio_buffers', 'interop_complete',

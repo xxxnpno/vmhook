@@ -58,8 +58,12 @@ The active hook records entry counts using a relaxed atomic counter.
 Installing a method policy currently performs **VM-wide compiled-code
 deoptimization** and excludes its target from compilation/inlining. The
 benchmark verifies that all three fixture methods were compiled before
-installation. It then records their actual states at safepoints. Unrelated
-methods can recompile; target exclusion lasts through observer removal until
+installation. If ordinary fixture warmup has not yet compiled an entry point,
+it executes checked target/unrelated loop pairs and reads their actual states
+at safepoints for at most 30 seconds. Warmup wall time and call counts are
+recorded separately from measured phases; failure to compile remains a failed
+precondition. It then records the installation's actual states at safepoints.
+Unrelated methods can recompile; target exclusion lasts through observer removal until
 policy shutdown. Shared observer add/remove timings reuse the existing
 physical hook and therefore do not represent first-time hook installation.
 Installer wall time includes compiler coordination, deoptimization and code
@@ -72,6 +76,10 @@ They are not an atomic heap census, C++ process-memory measurement or proof
 that every internal root slot was reclaimed. C++ owner creation counts are
 explicitly labelled separately. Published hook return PCs require the DLL
 to remain loaded even after observers and policies have been removed.
+The hook resource snapshots report resident forced-reference-return scanner
+markers and their bytes separately from reusable root slots and active
+callbacks. This benchmark's counting callback returns primitives, so it does
+not exercise allocation of those reference-return markers.
 
 Evidence records the DLL, injector, fixture, Java launcher and JVM-image
 hashes, host platform/CPU information, workload parameters and observations.
@@ -81,8 +89,9 @@ and background load, and repeat in several fresh JVM processes. The summary
 tool reports paired workload ratios without asserting statistical significance.
 
 CI runs the short workload on Java 8, 21 and 27 for both interfaces and saves
-results without timing thresholds. Wine runs are supplemental executable
-checks, identified as provisional emulator evidence. Native Windows is
+raw results and paired summaries without timing thresholds. Wine runs are
+supplemental executable checks, identified as provisional emulator evidence.
+Native Windows is
 required for published performance conclusions. This suite does not measure
 contention, virtual threads, original method-exit latency, mixed-stack sampling
 or compare another Java bridge.
