@@ -144,6 +144,42 @@ this path. Exceptions with disabled or overridden stack-trace collection can
 avoid it. The compatibility `on_exception` watcher retains these same limits;
 it is not a general throw/catch event.
 
+## Shared-class interpreter entries
+
+The calibrated Java 12–16 builds can keep a shared method's `_i2i_entry` in a
+CDS trampoline outside the interpreter codelets. VMHook accepts the observed
+16-byte form `49 BA <imm64> 41 FF E2 00 00 00` only when its destination is the
+independently validated normal or synchronized interpreter entry for that
+method. Other trampoline forms remain unsupported. The three padding bytes
+are checked runtime observations; the source reserves 16 bytes and emits a
+13-byte far jump.
+
+Installation decodes and patches the actual interpreter prologue, shares that
+physical patch with other methods reaching the same entry, and rechecks the
+destination at its commit safepoint. Its immutable callback snapshot retains the
+actual interpreter PC for frame anchors during nested Java calls and GC.
+It leaves both the CDS trampoline and shared Method entry fields intact, as
+`Method::link_method` expects. Compilation exclusion and deoptimization use the
+existing method policy. This support does not relax prologue decoding or the
+mounted-virtual-thread refusal.
+
+The exact source revisions defining these CDS jumps are:
+
+| Calibrated Java | CDS entry generation | Shared Method linking |
+| --- | --- | --- |
+| 12 | [update_cds_entry_table](https://github.com/openjdk/jdk12u/blob/75d7a31bc5c7ed56da4fea525a3f4bf6206acf87/src/hotspot/share/interpreter/abstractInterpreter.cpp#L214) | [link_method](https://github.com/openjdk/jdk12u/blob/75d7a31bc5c7ed56da4fea525a3f4bf6206acf87/src/hotspot/share/oops/method.cpp#L1023) |
+| 13 | [update_cds_entry_table](https://github.com/openjdk/jdk13u/blob/0a2532b9fe3feb683aad789b485415350b857fc5/src/hotspot/share/interpreter/abstractInterpreter.cpp#L217) | [link_method](https://github.com/openjdk/jdk13u/blob/0a2532b9fe3feb683aad789b485415350b857fc5/src/hotspot/share/oops/method.cpp#L1066) |
+| 14 | [update_cds_entry_table](https://github.com/openjdk/jdk14u/blob/a718f22fc087a923ccb873ee76d8f0b2e6a16863/src/hotspot/share/interpreter/abstractInterpreter.cpp#L217) | [link_method](https://github.com/openjdk/jdk14u/blob/a718f22fc087a923ccb873ee76d8f0b2e6a16863/src/hotspot/share/oops/method.cpp#L1164) |
+| 15 | [update_cds_entry_table](https://github.com/openjdk/jdk15u/blob/03fb8436dc5f86be1a9633658d6295b9dc04fa0e/src/hotspot/share/interpreter/abstractInterpreter.cpp#L212) | [link_method](https://github.com/openjdk/jdk15u/blob/03fb8436dc5f86be1a9633658d6295b9dc04fa0e/src/hotspot/share/oops/method.cpp#L1176) |
+| 16 | [generate_entry_for_cds_method](https://github.com/adoptium/jdk16u/blob/3b56f0b15cee132d6366e8ec03e05c918a42b4f1/src/hotspot/share/interpreter/abstractInterpreter.cpp#L223) | [link_method](https://github.com/adoptium/jdk16u/blob/3b56f0b15cee132d6366e8ec03e05c918a42b4f1/src/hotspot/share/oops/method.cpp#L1199) |
+
+[SharedRuntime::generate_trampoline](https://github.com/openjdk/jdk13u/blob/0a2532b9fe3feb683aad789b485415350b857fc5/src/hotspot/cpu/x86/sharedRuntime_x86_64.cpp#L407)
+and [MacroAssembler::jump](https://github.com/openjdk/jdk13u/blob/0a2532b9fe3feb683aad789b485415350b857fc5/src/hotspot/cpu/x86/macroAssembler_x86.cpp#L3023)
+describe the reserved slot and jump emission. `event_stream_probe` checks shared
+non-synchronized `Integer.parseInt`, physical-patch reuse, original bodies and
+removal, plus synchronized `Throwable.fillInStackTrace` with nested Java GC,
+before-monitor callback timing and stack-trace refresh semantics.
+
 ## Reproduce the public observation fixtures
 
 Configure with `VMHOOK_BUILD_RUNTIME_TESTS=ON` and build the DLLs and injector.

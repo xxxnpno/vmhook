@@ -26,6 +26,7 @@ export namespace vmhook::detail::jit_backend
     inline auto pending_exception_slot(void*) noexcept -> void**;
     inline auto metadata_contains(void*, vmhook::hotspot::method*) noexcept -> bool;
     inline auto method_is_excluded(vmhook::hotspot::method*) noexcept -> bool;
+    inline auto hook_interpreter_entry(vmhook::hotspot::method*) noexcept -> void*;
     inline auto holder_linked(vmhook::hotspot::klass*) noexcept -> bool;
     inline auto install_method_policy(vmhook::hotspot::method*, bool (*)(void*) noexcept, void*, std::shared_ptr<void>&) noexcept -> bool;
     inline auto release_method_policy_at_safepoint(const std::shared_ptr<void>&) noexcept -> void;
@@ -6364,6 +6365,7 @@ export namespace vmhook
             std::shared_ptr<method_observer_control> observer{};
             vmhook::hotspot::method* method{};
             const vmhook::hotspot::const_method* const_method_identity{};
+            void* interpreter_entry{};
             std::shared_ptr<vmhook::hotspot::hook_callback_t> detour{};
             std::shared_ptr<void> metadata_pin{};
             std::shared_ptr<void> jit_policy{};
@@ -6624,7 +6626,10 @@ export namespace vmhook
                 const auto sp{ reinterpret_cast<std::uintptr_t>(slot)
                     + vmhook::hotspot::trampoline_pushed_words * sizeof(void*) };
                 const auto fp{ reinterpret_cast<std::uintptr_t>(frame_pointer) };
-                void* const pc{ current_method->get_i2i_entry() };
+                // A CDS i2i trampoline lies outside the interpreter codelets.
+                // Anchor this established frame at the verified codelet whose
+                // physical patch called us, copied at hook installation.
+                void* const pc{ found->interpreter_entry };
                 if (fp > sp && pc && vmhook::hotspot::is_valid_pointer(pc))
                 {
                     anchor.last_java_sp = reinterpret_cast<void*>(sp);
@@ -9221,7 +9226,7 @@ export namespace vmhook
             { throw vmhook::exception{ "Java method is unavailable or unsupported; native, abstract and constructor hooks are refused." }; }
             auto* const found_method{ lookup.method };
             const auto access_flags{ lookup.access_flags };
-            void* const i2i{ found_method->get_i2i_entry() };
+            void* const i2i{ vmhook::detail::jit_backend::hook_interpreter_entry(found_method) };
             if (!i2i) { throw vmhook::exception{ "Java interpreter entry is unavailable." }; }
 
             const auto signature{ found_method->get_signature() };
@@ -9260,6 +9265,7 @@ export namespace vmhook
             const auto observer_id{ method_entry.observer->id };
             method_entry.method = found_method;
             method_entry.const_method_identity = found_method->get_const_method();
+            method_entry.interpreter_entry = i2i;
             method_entry.detour = std::make_shared<vmhook::hotspot::hook_callback_t>(std::move(wrapper_detour));
             method_entry.metadata_pin = std::move(lookup.pin);
             method_entry.expected_class_name = registered_name;
@@ -9328,6 +9334,10 @@ export namespace vmhook
                 [](void* const opaque) noexcept -> bool
                 {
                     auto& transaction{ *static_cast<prepared_install*>(opaque) };
+                    // Revalidate the logical destination after compiler
+                    // quiescence, without changing shared Method entries.
+                    if (vmhook::detail::jit_backend::hook_interpreter_entry(transaction.method->method)
+                        != transaction.i2i) { return false; }
                     if (*transaction.stub && !(*transaction.stub)->activate_at_safepoint()) { return false; }
                     // Capacities, callback objects, metadata roots and code bytes
                     // are ready before this safepoint. Publication cannot allocate.
@@ -11552,6 +11562,32 @@ export namespace vmhook::detail::jit_backend
         }
     };
     auto config() noexcept -> const configuration& { static const configuration value{}; return value; }
+    inline auto hook_interpreter_entry(vmhook::hotspot::method* const method) noexcept -> void*
+    {
+        const auto& c{ config() };
+        if (!c.ready || !method) { return nullptr; }
+        auto* const original{ pn::load<void*>(method, c.i2i_offset) };
+        if (!original) { return nullptr; }
+        auto* const normal{ (pn::method_access_flags(method) & 0x0020u)
+            ? c.synchronized_method_entry : c.normal_method_entry };
+        if (original == normal) { return original; }
+        const auto feature{ pn::rt().profile->java_feature };
+        if (feature < 12 || feature > 16) { return original; }
+        // These CDS builds use SharedRuntime::generate_trampoline in a
+        // 16-byte slot. Accept only its observed far-jump form, and only to
+        // the independently calibrated normal entry for this method kind.
+        // Never follow arbitrary jump chains or relax the frame decoder.
+        std::array<std::uint8_t, 16> bytes{};
+        const auto region{ vmhook::os::query_region(original) };
+        if (!region.committed || !region.executable || region.guarded
+            || !vmhook::os::safe_read(bytes.data(), original, bytes.size())
+            || bytes[0] != 0x49 || bytes[1] != 0xba
+            || bytes[10] != 0x41 || bytes[11] != 0xff || bytes[12] != 0xe2
+            || bytes[13] != 0 || bytes[14] != 0 || bytes[15] != 0) { return original; }
+        void* destination{};
+        std::memcpy(&destination, bytes.data() + 2, sizeof(destination));
+        return destination == normal ? normal : original;
+    }
     inline auto holder_linked(vmhook::hotspot::klass* klass) noexcept -> bool
     {
         try {

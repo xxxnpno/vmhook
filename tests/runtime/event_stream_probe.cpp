@@ -13,12 +13,21 @@ namespace
         using vmhook::object<fixture>::object;
         static auto load_late_class() -> void { static_members::get_method("load_late_class")->call(); }
         static auto stack_trace_events() -> void { static_members::get_method("stack_trace_events")->call(); }
+        static auto callback_gc(const std::unique_ptr<vmhook::any_object>& value) -> bool
+        { return static_members::get_method("callback_gc")->call(value); }
     };
     class late final : public vmhook::object<late>
     {
     public:
         using vmhook::object<late>::object;
         static auto target(std::int32_t value) -> std::int32_t { return static_members::get_method("target")->call(value); }
+    };
+    class integer final : public vmhook::object<integer>
+    {
+    public:
+        using vmhook::object<integer>::object;
+        static auto parse(std::string_view value) -> std::int32_t
+        { return static_members::get_method("parseInt", "(Ljava/lang/String;)I")->call(value); }
     };
     auto worker(void*) -> DWORD
     {
@@ -57,16 +66,30 @@ namespace
                 && vmhook::deferred_hook_status(deferred)->state == vmhook::deferred_hook_state::cancelled);
             check("deferred_original_body", late::target(5) == 6 && late_calls == 1);
             check("deferred_reclamation", vmhook::reclaim_deferred_hooks() && vmhook::reclaim_hook_callbacks());
-            unsigned stack_events{}; bool owning = true;
+            const auto stubs_before_shared = vmhook::hook_resources().physical_stubs;
+            unsigned shared_calls{};
+            const auto shared_observer = vmhook::register_class<integer>("java/lang/Integer")
+                ? vmhook::add_hook<integer>("parseInt", "(Ljava/lang/String;)I",
+                    [&](vmhook::return_value&, const std::unique_ptr<vmhook::any_object>&) { ++shared_calls; }) : 0;
+            check("shared_nonsynchronized_observer", shared_observer != 0);
+            check("shared_cds_physical_stub", vmhook::hook_resources().physical_stubs == stubs_before_shared);
+            check("shared_nonsynchronized_body", integer::parse("12345") == 12345 && shared_calls == 1);
+            check("shared_nonsynchronized_removal", vmhook::remove_hook(shared_observer)
+                && integer::parse("-7") == -7 && shared_calls == 1);
+            unsigned stack_events{}; bool owning = true; bool synchronized_entry_gc = true;
             const auto throwable_observer = vmhook::on_throwable_stack_trace(
                 [&](const vmhook::throwable_stack_trace_event& event)
                 {
                     if (event.internal_name == "java/lang/RuntimeException")
-                    { ++stack_events; owning = owning && event.throwable && event.throwable->get_instance(); }
+                    {
+                        ++stack_events; owning = owning && event.throwable && event.throwable->get_instance();
+                        synchronized_entry_gc = synchronized_entry_gc && fixture::callback_gc(event.throwable);
+                    }
                 });
             check("throwable_observer", throwable_observer != 0);
             fixture::stack_trace_events();
             check("exact_stack_trace_semantics", stack_events == 2 && owning);
+            check("synchronized_entry_gc", synchronized_entry_gc && stack_events == 2);
             check("throwable_removal", vmhook::remove_hook(throwable_observer));
             check("class_removal", vmhook::remove_class_observer(observer) && !vmhook::remove_class_observer(observer)
                 && vmhook::class_observers_idle());
