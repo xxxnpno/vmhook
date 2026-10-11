@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import queue
 import subprocess
@@ -32,6 +33,9 @@ def main() -> int:
     parser.add_argument("--example", choices=EXAMPLES, action="append")
     parser.add_argument("--benchmark", type=Path, help="run this benchmark DLL instead of the four examples")
     parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--soak-cycles", type=int, default=8)
+    parser.add_argument("--soak-batch", type=int, default=16)
+    parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--emulator", type=Path)
     parser.add_argument("--evidence", type=Path)
     args = parser.parse_args()
@@ -39,6 +43,10 @@ def main() -> int:
         parser.error("use native Windows, or select an explicit development emulator")
     if not 20 <= args.iterations <= 100000:
         parser.error("--iterations must be in [20, 100000]")
+    if not 2 <= args.soak_cycles <= 10000 or not 1 <= args.soak_batch <= 256:
+        parser.error("--soak-cycles must be in [2, 10000]; --soak-batch must be in [1, 256]")
+    if not 30 <= args.timeout <= 86400:
+        parser.error("--timeout must be in [30, 86400] seconds")
     prefix = [str(args.emulator)] if args.emulator else []
 
     def windows_path(path: Path) -> str:
@@ -63,10 +71,12 @@ def main() -> int:
         for name, binary in binaries:
             result = directory / f"{name}.txt"
             environment = dict(os.environ, VMHOOK_EXAMPLE_RESULT=windows_path(result),
-                               VMHOOK_BENCHMARK_ITERATIONS=str(args.iterations))
+                               VMHOOK_BENCHMARK_ITERATIONS=str(args.iterations),
+                               VMHOOK_BENCHMARK_SOAK_CYCLES=str(args.soak_cycles),
+                               VMHOOK_BENCHMARK_SOAK_BATCH=str(args.soak_batch))
             command = prefix + [str(args.java), "-cp", windows_path(directory), "ExampleFixture"]
             process = subprocess.Popen(command, env=environment, text=True,
-                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=directory)
             output: queue.Queue[str] = queue.Queue()
 
             def read_output() -> None:
@@ -76,6 +86,7 @@ def main() -> int:
             reader = threading.Thread(target=read_output, daemon=True)
             reader.start()
             captured = []
+            values = {}
             before = digest(binary)
             started = time.monotonic()
             try:
@@ -101,7 +112,7 @@ def main() -> int:
                 subprocess.run(prefix + [str(args.injector.resolve()), pid, windows_path(binary)],
                                check=True, timeout=30)
                 values = {}
-                deadline = time.monotonic() + 180
+                deadline = time.monotonic() + args.timeout
                 while time.monotonic() < deadline:
                     if result.is_file():
                         values = dict(line.split("=", 1) for line in result.read_text().splitlines() if "=" in line)
@@ -119,6 +130,21 @@ def main() -> int:
                 runs.append({"name": name, "dll": str(binary.resolve()), "sha256": before,
                              "checks_and_metrics": values, "java_output": captured,
                              "seconds": round(time.monotonic() - started, 3)})
+            except Exception as error:
+                fatal_reports = []
+                for fatal in sorted(directory.glob("hs_err_pid*.log")):
+                    text = fatal.read_text(errors="replace")
+                    print(f"{name}: fatal JVM report {fatal.name}\n{text[:100000]}", flush=True)
+                    fatal_reports.append({"name": fatal.name, "text": text})
+                if args.evidence:
+                    args.evidence.parent.mkdir(parents=True, exist_ok=True)
+                    args.evidence.write_text(json.dumps({
+                        "schema": 1, "native_windows": os.name == "nt", "passed": False,
+                        "failed_workload": name, "error": str(error), "dll_sha256": before,
+                        "partial_checks_and_metrics": values, "java_output": captured,
+                        "fatal_reports": fatal_reports,
+                    }, indent=2) + "\n", encoding="utf-8")
+                raise
             finally:
                 process.terminate()
                 try:
@@ -130,8 +156,14 @@ def main() -> int:
     if args.evidence:
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
         args.evidence.write_text(json.dumps({
-            "schema": 1, "native_windows": os.name == "nt", "java": str(args.java.resolve()),
+            "schema": 1, "passed": True, "native_windows": os.name == "nt", "java": str(args.java.resolve()),
             "java_launcher_sha256": digest(args.java), "iterations": args.iterations,
+            "soak_cycles": args.soak_cycles, "soak_batch": args.soak_batch, "timeout_seconds": args.timeout,
+            "fixture_sha256": digest(source), "injector_sha256": digest(args.injector),
+            "host": {"platform": platform.platform(), "machine": platform.machine(),
+                     "processor": platform.processor(), "logical_cpu_count": os.cpu_count()},
+            "java_arguments": ["-cp", "<temporary compiled fixture>", "ExampleFixture"],
+            "performance_scope": "native Windows required for performance conclusions; emulator execution is provisional",
             "jvm_image": str(jvm_image.resolve()) if jvm_image else None,
             "jvm_image_sha256": digest(jvm_image) if jvm_image else None,
             "runs": runs,

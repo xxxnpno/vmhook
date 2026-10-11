@@ -282,7 +282,7 @@ jobs:
           --binaries runtime-binaries
           --evidence examples-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Capture reproducible runtime benchmark observations
-        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && matrix.java == 21 }}
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && (matrix.java == 8 || matrix.java == 21 || matrix.java == 27) }}
         shell: pwsh
         run: >-
           python tools/run_examples.py
@@ -292,6 +292,8 @@ jobs:
           --binaries runtime-binaries
           --benchmark runtime-binaries/vmhook_benchmark.dll
           --iterations 1000
+          --soak-cycles 32
+          --soak-batch 16
           --evidence benchmark-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}

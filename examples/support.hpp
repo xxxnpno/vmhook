@@ -46,6 +46,22 @@ namespace example
         auto value() const -> std::int32_t { return get_field("value")->get(); }
         auto add(std::int32_t amount) const -> std::int32_t
         { return get_method("add", "(I)I")->call(amount); }
+        auto selected() const -> std::unique_ptr<player>
+        { return get_field("selected")->get(); }
+        auto selected(const std::unique_ptr<player>& value) -> void
+        { get_field("selected")->set(value); }
+        auto append(const std::unique_ptr<player>& value) -> void
+        { get_method("append", "(LExampleFixture$Player;)V")->call(value); }
+        auto live_players() const -> std::vector<std::unique_ptr<player>>
+        { return get_field("live_players")->get().to_vector(); }
+        auto clear_live_players() -> void
+        { get_method("clear_live_players", "()V")->call(); }
+        static auto collect() -> void
+        { static_members::get_method("collect", "()V")->call(); }
+        static auto throughput_loop(std::int32_t count) -> std::int64_t
+        { return static_members::get_method("throughput_loop", "(I)J")->call(count); }
+        static auto unrelated_loop(std::int32_t count) -> std::int64_t
+        { return static_members::get_method("unrelated_loop", "(I)J")->call(count); }
         static auto get_total() -> std::int32_t
         { return static_members::get_field("total")->get(); }
         static auto thread_name() -> std::string
