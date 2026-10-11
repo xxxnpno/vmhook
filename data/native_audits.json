@@ -82,7 +82,15 @@
         "interpreter_entry_table": 9337312,
         "field_enable_guards10": 6397504,
         "field_special_exit10": 6401232,
-        "frame_oops_interpreted": 2697552
+        "frame_oops_interpreted": 2697552,
+        "heap_ensure_g1": 1892720,
+        "heap_iterate_g1": 2756688,
+        "monitor_lock_construct_bool": 6241776,
+        "monitor_lock_destroy": 6241936,
+        "heap_lock": 9440552,
+        "heap_lock_enter": 5366592,
+        "root_keepalive_g1": 2906512,
+        "loaded_class_walk": 1773008
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -815,6 +823,37 @@
             "vtable_do_oop_wide": 1,
             "vtable_count": 2
           }
+        },
+        "ObjectClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_object": 0,
+            "vtable_count": 1
+          }
+        },
+        "ObjectLocker": {
+          "size": 32,
+          "members": {
+            "_thread": 0,
+            "_obj": 8,
+            "_lock": 16,
+            "_dolock": 24
+          },
+          "enums": {
+            "storage_size__thread": 8,
+            "storage_size__obj": 8,
+            "storage_size__lock": 8,
+            "storage_size__dolock": 1
+          }
+        },
+        "KlassClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_klass": 0,
+            "vtable_count": 1
+          }
         }
       },
       "code_prefixes": {
@@ -884,7 +923,14 @@
         "interpreter_entry_table": "00000000000000000000000000000000",
         "field_enable_guards10": "48895c2408574883ec20488b81280100",
         "field_special_exit10": "48895c240848896c2410488974241857",
-        "frame_oops_interpreted": "48895c24185556574154415541564157488d6c24e04881ec20010000488b05cd"
+        "frame_oops_interpreted": "48895c24185556574154415541564157488d6c24e04881ec20010000488b05cd",
+        "heap_ensure_g1": "48895c240848896c2410488974241848897c242041564883ec20488b1d070875",
+        "heap_iterate_g1": "4883ec48488d05ed434a004889542430488d5424204881c128010000c6442428",
+        "monitor_lock_construct_bool": "48895c240848897424184889542410574883ec2048c7410800000000498bf0488bda448849184c890148895108488bf9",
+        "monitor_lock_destroy": "4883ec2880791800747148895c2430488b5908488974243848897c24204885db7403488b1b488b31488b3b488b411048",
+        "heap_lock_enter": "4889742418574883ec20488bfa488bf1e88bfcffff85c00f85e8000000488b07488bcfff501884c074278b0524763e0083f802751c488b46084885c07513c646300148897e08488b7424404883c4205fc3488bd7488bcee8b4fcffff85c00f85a1000000488b07488bcfff5020488bd784c00f8485000000488d4c243048895c2438e85980bcff488bd7488bcee81ef8ffff488b5c2430c783500200000b000000833de4313e00017509803d6e2e3d00007418803d662e3d00007407e89f6e0100eb08488bcbe8558abcff8b0583753e0085c0740a488b4c2430e801000800c7835002000006000000488b5c243848897e08488b7424404883c4205fc3488bcee8abf7ffff48897e08488b7424404883c4205fc3",
+        "root_keepalive_g1": "40574883ec20803dab91650000488bf90f848b0000008b151817660065488b04255800000048895c2430488b04d0bb08000000488b1c03488bcb488b03ff502084c0741f488d8bf002000080791000744b488bd7488b5c24304883c4205fe90d262c00488b1dfeb363004885db7408488bcbe8898a2500803d5a91650000740f488d0d41916500488bd7e8e1252c004885db7408488bcbe8b48d2500488b5c24304883c4205fc3",
+        "loaded_class_walk": "488974241841564883ec20488b35d6d773004c8bf14885f6746f48895c243048897c2438488b5e184885db7408488bcbe88bd63600488b7e304885ff742b66908b470885c0780b7e1480bf6a01000001720b498b06488bd7498bceff10488bbf880000004885ff75d74885db7408488bcbe89ad93600488b76584885f675a5488b7c2438488b5c2430488b7424404883c420415ec3"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -914,7 +960,11 @@
           "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
           "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
           "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body.",
-          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace."
+          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace.",
+          "Heap iteration: exact RTTI vtables and VM_HeapIterateOperation machine calls prove the G1 parsability/iteration entries and ObjectClosure slot0 ABI. PRODUCT ObjectClosure is 8 bytes with no state. Captured oops are written into preallocated caller HandleArea roots before safepoint completion. Iterator sees allocated objects, including unreclaimed unreachable objects.",
+          "ObjectLocker monitor ABI: exact constructor stores Thread at0, Handle root-slot pointer at8, boolean doLock at24 and passes BasicLock at16 to ordinary ObjectSynchronizer::slow_enter following biased-lock handling. Tagged ObjectLocker/BasicLock source and destructor machine reads prove the32-byte stack-only layout. The VM destructor balances real Java monitor release; this does not call JNI or JVMTI APIs.",
+          "Heap iteration caller protocol: acquire the actual Heap_lock Monitor with safepoint-aware Monitor::lock(Thread*) before submitting the VM operation, as tagged jvmtiTagMap.cpp does. Distinct from lock_without_safepoint_check. G1SATBCardTableModRefBS::enqueue(oop) takes one decoded oop in RCX, tests SATB active state, obtains current Thread via calibrated TLS, dispatches JavaThread per-thread queue or VMThread shared SATB queue guarded by Shared_SATB_Q_lock without safepoint checks, and publishes via PtrQueue::enqueue_known_active. Exact 167-byte control-flow fingerprint and tagged9/10 source prove this signature and VMThread support.",
+          "Loaded class inventory: CLDG loaded_classes_do(KlassClosure*) verified against unique loaded-state/array-filter CFG, original GetLoadedClasses call site, exact ClassLoaderDataGraph head, klass/CLD next offsets, and slot0 Klass* callback. VMHook calls this internal traversal, never the JNI/JVMTI entry point. G1 decoded mirror enqueue preserves keepalive before publishing caller HandleArea roots at safepoint."
         ],
         "source_hashes": {
           "9-javaCalls.cpp": "974c9324fd5af15c2e743010e2e40a28f308464ae22d7941f3fb42a8048a8706",
@@ -958,7 +1008,20 @@
           "intrinsic/9/exact9-vmSymbols.hpp": "e6251dc9f5f077f323a9b386235e3b38c23dbe7365575e48b400d7902b4e0c32",
           "deallocate/9/utilities/growableArray.hpp": "782d7e8c28d1724e41fdef3c567e255d5c5c4ec3012d104a2d79825adfd68af9",
           "deallocate/9/classfile/classLoaderData.hpp": "d3a857ef01cbc6b3b539951f342bdd5a9eb6fc8e9c812c43ecff1c8abfe4ff25",
-          "deallocate/9/classfile/classLoaderData.cpp": "2446688f51ad65f1118d76effe74a4f062d5004a9eb5fb6825dad483cd291ea1"
+          "deallocate/9/classfile/classLoaderData.cpp": "2446688f51ad65f1118d76effe74a4f062d5004a9eb5fb6825dad483cd291ea1",
+          "heap/9/memory/iterator.hpp": "61a9df5436017759629b97d038a55588365b357fd21fc824f4716e102fa1d4c5",
+          "heap/9/gc/shared/collectedHeap.cpp": "68f72f9bec204c8227fa3333632170ddf5668de285bb27f10edda0ee59c808e7",
+          "heap/9/gc/g1/g1CollectedHeap.cpp": "8fe2b0a4b25cdfd2b18cb068e47bab15928d9c6e8a6aa6b302fadbd80ebded3c",
+          "heap/9/gc/g1/heapRegion.cpp": "31302a30b62b37314a8fcbc43e2d9e734b7c030684960be6443f35b4e4987a09",
+          "heap/9/prims/jvmtiTagMap.cpp": "f991ed3a829bc0f15eca442230e4b161a7558e6bd10cc898df16c2a6ea94bd7b",
+          "monitor/9/runtime/synchronizer.hpp": "79b09cf9b30de93a792911c3c8c7ef5b6059354439e11b798184925ded16673b",
+          "monitor/9/runtime/synchronizer.cpp": "4f79556f026c8db8815ef6c6f200514b762ea730a0fda4d4a657832d18f751b3",
+          "monitor/9/runtime/basicLock.hpp": "6016ae5fbb1d140c4588ca46af16f288edcb9fe5e347c2739d2c219b64d1b2ca",
+          "heap-rooting/exact9-mutex.cpp": "ac90fecb6077f681505828366727bccadcfc8876b3397542c6ac9adc56b804c4",
+          "heap-rooting/exact9-g1SATBCardTableModRefBS.cpp": "8b695b4047696b1185b5e4e01ca43d1ab58ee689ca7db7029cb7d839ea93e9f1",
+          "heap-rooting/exact9-jvmtiTagMap.cpp": "f991ed3a829bc0f15eca442230e4b161a7558e6bd10cc898df16c2a6ea94bd7b",
+          "class-inventory/9/classfile/classLoaderData.cpp": "2446688f51ad65f1118d76effe74a4f062d5004a9eb5fb6825dad483cd291ea1",
+          "hotspot/src/share/vm/memory/iterator.hpp": "61a9df5436017759629b97d038a55588365b357fd21fc824f4716e102fa1d4c5"
         },
         "observation_entrypoints": {
           "vm_execute": {
@@ -1221,6 +1284,36 @@
               "storage_size": 8,
               "proof": "The scanner first loads full-width FP from [RCX+32], then Method from FP-24; the same frame is used for BCI, monitors, mirror and expression-stack scanning."
             }
+          },
+          "ObjectLocker": {
+            "_thread": {
+              "rva": 6241814,
+              "bytes": "4c8901",
+              "offset": 0,
+              "storage_size": 8,
+              "proof": "Constructor stores the current Thread* from R8 at this+0."
+            },
+            "_obj": {
+              "rva": 6241817,
+              "bytes": "48895108",
+              "offset": 8,
+              "storage_size": 8,
+              "proof": "Constructor stores the by-value Handle (one root-slot pointer in RDX) at this+8."
+            },
+            "_lock": {
+              "rva": 6241890,
+              "bytes": "488d57104c8bc6488bcb",
+              "offset": 16,
+              "storage_size": 8,
+              "proof": "Constructor passes this+16 as BasicLock* in RDX to ObjectSynchronizer::slow_enter after its biased fast-path check. Tagged BasicLock contains one native-width displaced mark word; exact destructor/exit code reads that 8-byte slot."
+            },
+            "_dolock": {
+              "rva": 6241810,
+              "bytes": "44884918",
+              "offset": 24,
+              "storage_size": 1,
+              "proof": "Constructor stores boolean doLock from R9B at this+24. Tagged StackObj is empty, so four fields with maximum alignment8 prove the complete32-byte PRODUCT layout."
+            }
           }
         },
         "data_layout_proofs": {
@@ -1248,6 +1341,14 @@
               "rva": 6281290,
               "bytes": "48890597a12e00",
               "target_rva": 9337320
+            }
+          ],
+          "heap_lock": [
+            {
+              "rva": 5373073,
+              "bytes": "48893d90103e00",
+              "target_rva": 9440552,
+              "proof": "Exact initialization sequence passes the Heap_lock string as Monitor constructor name then publishes the resulting Monitor* in this 8-byte RIP-relative global."
             }
           ]
         },
@@ -1397,6 +1498,28 @@
               },
               "proof": "Frame mirror is a full-width oop slot at FP-32. The scanner passes that slot in RDX and OopClosure in RCX, then calls [closure_vptr+8], proving the wide overload is slot1. Tagged PRODUCT OopClosure/Closure have no virtual destructor or diagnostic base; OopClosure declares exactly the wide and narrow do_oop virtuals."
             }
+          ],
+          "ObjectClosure": [
+            {
+              "rva": 3156323,
+              "bytes": "488b06488bd3488bceff10",
+              "enums": {
+                "vtable_do_object": 0,
+                "vtable_count": 1
+              },
+              "proof": "Exact HeapRegion RTTI vtable leads to its object_iterate slot14. The function passes the oop in RDX and ObjectClosure in RCX, calls [closure_vptr+0]. Tagged PRODUCT Closure is empty; ObjectClosure has only do_object(oop), no virtual destructor or inherited abort state."
+            }
+          ],
+          "KlassClosure": [
+            {
+              "rva": 1773099,
+              "bytes": "ff10",
+              "enums": {
+                "vtable_do_klass": 0,
+                "vtable_count": 1
+              },
+              "notes": "Exact loaded-state/array-filter CLDG traversal invokes KlassClosure::do_klass(Klass*) through first vtable slot; exact tagged Closure has no data or virtual destructor, KlassClosure adds one pure virtual method, sizeof8."
+            }
           ]
         },
         "function_reference_proofs": {
@@ -1425,7 +1548,46 @@
               "target_rva": 2697552,
               "proof": "frame::oops_do tests is_interpreted_frame and passes RCX=this,RDX=OopClosure,R8=RegisterMap,R9b=query_oop_map_cache to the exact scanner; no CLDClosure argument. The body matches the tagged source: Method/BCI, monitors, native temporary oop, mirror, invoke arguments, mask_for/compute_one_oop_map, then iterate_oop."
             }
+          ],
+          "heap_lock_enter": [
+            {
+              "rva": 5366909,
+              "bytes": "e9befeffff",
+              "target_rva": 5366592,
+              "proof": "Monitor::lock() obtains Thread::current() through the existing calibrated TLS slot then tail-jumps to Monitor::lock(Thread*). The target CFG contains Thread::is_Java_thread(), VM-to-blocked and blocked-to-VM state transitions, and monitor ownership publication."
+            }
+          ],
+          "loaded_class_walk": [
+            {
+              "rva": 4339700,
+              "bytes": "e8d7d5d8ff",
+              "target_rva": 1773008
+            }
           ]
+        },
+        "heap_iteration_proof": {
+          "heap_type": "G1CollectedHeap",
+          "heap_vtable_rva": 7620360,
+          "prepare_slot": 22,
+          "walk_slot": 38,
+          "vm_operation_doit_rva": 4394576,
+          "prepare_call_rva": 4394604,
+          "walk_call_rva": 4394647,
+          "region_closure_vtable_rva": 7623752,
+          "region_closure_lea_rva": 2756692,
+          "region_callback_rva": 2738224,
+          "heap_region_vtable_rva": 7700872,
+          "heap_region_iterate_slot": 14,
+          "heap_region_iterate_rva": 3156256,
+          "source_notes": "The exact VM_HeapIterateOperation::doit loads Universe::_collectedHeap, sets EDX=0, invokes heap ensure_parsability(false), then invokes object_iterate(ObjectClosure*). G1 object_iterate constructs the RTTI-identified IterateObjectClosureRegionClosure; its callback invokes HeapRegion object_iterate at offset0x70, whose callback above proves ObjectClosure slot0."
+        },
+        "heap_lock_initialization_proof": {
+          "name_rva": 7853544,
+          "reference_rva": 5373046,
+          "reference_bytes": "4c8d056bd92500",
+          "publication_rva": 5373073,
+          "publication_bytes": "48893d90103e00",
+          "target_rva": 9440552
         }
       }
     },
@@ -1510,7 +1672,15 @@
         "bytecode_lengths": 9586800,
         "class_loader_data_head": 9606128,
         "interpreter_entry_table": 9577632,
-        "frame_oops_interpreted": 2796992
+        "frame_oops_interpreted": 2796992,
+        "heap_ensure_g1": 1972816,
+        "heap_iterate_g1": 2852368,
+        "monitor_lock_construct_bool": 6337216,
+        "monitor_lock_destroy": 6337376,
+        "heap_lock": 9682688,
+        "heap_lock_enter": 5432912,
+        "root_keepalive_g1": 3079680,
+        "loaded_class_walk": 1837248
       },
       "capabilities": {
         "new_attaching_factory": false,
@@ -2239,6 +2409,37 @@
             "vtable_do_oop_wide": 1,
             "vtable_count": 2
           }
+        },
+        "ObjectClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_object": 0,
+            "vtable_count": 1
+          }
+        },
+        "ObjectLocker": {
+          "size": 32,
+          "members": {
+            "_thread": 0,
+            "_obj": 8,
+            "_lock": 16,
+            "_dolock": 24
+          },
+          "enums": {
+            "storage_size__thread": 8,
+            "storage_size__obj": 8,
+            "storage_size__lock": 8,
+            "storage_size__dolock": 1
+          }
+        },
+        "KlassClosure": {
+          "size": 8,
+          "members": {},
+          "enums": {
+            "vtable_do_klass": 0,
+            "vtable_count": 1
+          }
         }
       },
       "code_prefixes": {
@@ -2308,7 +2509,14 @@
         "bytecode_lengths": "00000000000000000000000000000000",
         "class_loader_data_head": "0000000000000000",
         "interpreter_entry_table": "00000000000000000000000000000000",
-        "frame_oops_interpreted": "4c8bdc554156498d6ba84881ec48010000488b05882265004833c44889451844"
+        "frame_oops_interpreted": "4c8bdc554156498d6ba84881ec48010000488b05882265004833c44889451844",
+        "heap_ensure_g1": "48896c2410488974241848897c242041564883ec500fb669108b05ad0b78000f",
+        "heap_iterate_g1": "4883ec48488d054d444b004889542430488d5424204881c1e8020000c6442428",
+        "monitor_lock_construct_bool": "48895c240848897424184889542410574883ec2048c7410800000000498bf0488bda448849184c890148895108488bf9",
+        "monitor_lock_destroy": "80791800742a488b41084885c0750f4c8b01488d5110488bc8e982250000488b004c8b01488d5110488bc8e970250000",
+        "heap_lock_enter": "48895c2408574883ec20488bda488bf9e8bbfbffff85c00f85a3000000488b03488bcbff501884c074278b059c26410083f802751c488b47084885c07513c647300148895f08488b5c24304883c4205fc3488bd3488bcfe844fcffff85c07560488b03488bcbff5020488bd384c07448488d8be0010000e8e4d7d7ffba06000000488bcb448d4204e813bcbcff488bd3488bcfe838f7ffffba0a000000488bcb448d42fce8f7bbbcff48895f08488b5c24304883c4205fc3488bcfe810f7ffff48895f08488b5c24304883c4205fc3",
+        "root_keepalive_g1": "40574883ec20803dfb9f660000488bf90f848b0000008b150028670065488b04255800000048895c2430488b04d0bb08000000488b1c03488bcb488b03ff502084c0741f488d8b1803000080791000744b488bd7488b5c24304883c4205fe99da42a00488b1d56c164004885db7408488bcbe8d9e82300803daa9f660000740f488d0d919f6600488bd7e871a42a004885db7408488bcbe8d4eb2300488b5c24304883c4205fc3",
+        "loaded_class_walk": "4889742410574883ec20488b351f8b7600488bf94885f6744e48895c24306690488b5e384885db74300f1f80000000008b430885c0780b7e1480bb6201000001720b488b07488bd3488bcfff10488b9b880000004885db75d7488b76704885f675be488b5c2430488b7424384883c4205fc3"
       },
       "provenance": {
         "kind": "exact DLL control-flow/source audit",
@@ -2338,7 +2546,11 @@
           "BasicType return selectors are the explicit integer enum assignments from the exact tagged globalDefinitions.hpp, whose source hash is recorded; _result_type is the independently audited one-byte BasicType cell.",
           "Anonymous Klass predicate reads uint16 InstanceKlass::_misc_flags@274 and mask32, proved by exported VMStruct plus exact constructor ORcx0x20/storeword and tagged source. Hidden Klass is absent in these9/10 images.",
           "ClassLoaderData::_deallocate_list and GrowableArray<Metadata*> size32/length0-width4/data24-width8 are independently proven by exact tagged declarations plus identified add_to_deallocate_list construction/append and free_deallocate_list reverse traversal. The latter filename and ShouldNotReachHere source-line argument identify the exact native body.",
-          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace."
+          "Callback VM-to-Java return uses the already audited generic ThreadStateTransition::transition_and_fence(thread,6,8): tagged source requires this variant when the call-stub SEH handler cannot be reached reliably. Preserve the original destructor reguard and exact special-exit mask; Java9 external/deopt, Java10 external/trace.",
+          "Heap iteration: exact RTTI vtables and VM_HeapIterateOperation machine calls prove the G1 parsability/iteration entries and ObjectClosure slot0 ABI. PRODUCT ObjectClosure is 8 bytes with no state. Captured oops are written into preallocated caller HandleArea roots before safepoint completion. Iterator sees allocated objects, including unreclaimed unreachable objects.",
+          "ObjectLocker monitor ABI: exact constructor stores Thread at0, Handle root-slot pointer at8, boolean doLock at24 and passes BasicLock at16 to ordinary ObjectSynchronizer::slow_enter following biased-lock handling. Tagged ObjectLocker/BasicLock source and destructor machine reads prove the32-byte stack-only layout. The VM destructor balances real Java monitor release; this does not call JNI or JVMTI APIs.",
+          "Heap iteration caller protocol: acquire the actual Heap_lock Monitor with safepoint-aware Monitor::lock(Thread*) before submitting the VM operation, as tagged jvmtiTagMap.cpp does. Distinct from lock_without_safepoint_check. G1SATBCardTableModRefBS::enqueue(oop) takes one decoded oop in RCX, tests SATB active state, obtains current Thread via calibrated TLS, dispatches JavaThread per-thread queue or VMThread shared SATB queue guarded by Shared_SATB_Q_lock without safepoint checks, and publishes via PtrQueue::enqueue_known_active. Exact 167-byte control-flow fingerprint and tagged9/10 source prove this signature and VMThread support.",
+          "Loaded class inventory: CLDG loaded_classes_do(KlassClosure*) verified against unique loaded-state/array-filter CFG, original GetLoadedClasses call site, exact ClassLoaderDataGraph head, klass/CLD next offsets, and slot0 Klass* callback. VMHook calls this internal traversal, never the JNI/JVMTI entry point. G1 decoded mirror enqueue preserves keepalive before publishing caller HandleArea roots at safepoint."
         ],
         "source_hashes": {
           "10-handles.cpp": "42c41ba4b1387e23cf36dbda4162e6accbd23581690a7e8ac67202b476e9bc5f",
@@ -2383,7 +2595,20 @@
           "intrinsic/10/exact10-abstractInterpreter.hpp": "a47d0352ea165e602d71bbc0e9cf1c88782458a9e9463875f6d76bfbdb673ab9",
           "deallocate/10/utilities/growableArray.hpp": "ef87744831f9c6ee53c5a29d8ceaf1651823a263d13bb1b6ada3c5a738f9c150",
           "deallocate/10/classfile/classLoaderData.hpp": "0f9bf6c64f6ab0f2247dd4729d5b22364086d60b8a0517456850a417a9c15e7b",
-          "deallocate/10/classfile/classLoaderData.cpp": "1a29d8ace762a2c8dd8556adf7d44f26dfc794316602b134ef21a05b8e9ec286"
+          "deallocate/10/classfile/classLoaderData.cpp": "1a29d8ace762a2c8dd8556adf7d44f26dfc794316602b134ef21a05b8e9ec286",
+          "heap/10/memory/iterator.hpp": "d28705d8009afe8ae888d773ba3fb8a6c17fb7fa2940de975aa502153202880a",
+          "heap/10/gc/shared/collectedHeap.cpp": "9f152a79c034a111307cb73d6ce7701ee357eab2527938260d0f71a789215e9d",
+          "heap/10/gc/g1/g1CollectedHeap.cpp": "335377787897ec229ff1a134a0fc9ff6113be951fe271b95484e67b7c88c6719",
+          "heap/10/gc/g1/heapRegion.cpp": "210bfe728085c41ad61fc5f4521b8cb4819f9bf77645efe3e9376848092d064e",
+          "heap/10/prims/jvmtiTagMap.cpp": "7af5d7bd4094e5966734ea2b00b13dd0bb16918d3765851cbe25373503a19dd3",
+          "monitor/10/runtime/synchronizer.hpp": "cd76ce1d2847cc390e7872b0973d8b02efe066b1e5da972eb44e59c437f80235",
+          "monitor/10/runtime/synchronizer.cpp": "7a554d862a614ae452d589f80a798ff06776e3fcb3df8b428419248d4e520cdd",
+          "monitor/10/runtime/basicLock.hpp": "6016ae5fbb1d140c4588ca46af16f288edcb9fe5e347c2739d2c219b64d1b2ca",
+          "heap-rooting/exact10-mutex.cpp": "7eeb2eecbfefa58f4ea6dcc7f3a7cff56bd9a0c13485c1e4e7770bf56e1d2aec",
+          "heap-rooting/exact10-g1SATBCardTableModRefBS.cpp": "61b960102ae71848e8e245f1642d4be18332342a4e5c3f88c594434eb9bd68ff",
+          "heap-rooting/exact10-jvmtiTagMap.cpp": "7af5d7bd4094e5966734ea2b00b13dd0bb16918d3765851cbe25373503a19dd3",
+          "class-inventory/10/classfile/classLoaderData.cpp": "1a29d8ace762a2c8dd8556adf7d44f26dfc794316602b134ef21a05b8e9ec286",
+          "src/hotspot/share/memory/iterator.hpp": "d28705d8009afe8ae888d773ba3fb8a6c17fb7fa2940de975aa502153202880a"
         },
         "observation_entrypoints": {
           "vm_execute": {
@@ -2656,6 +2881,36 @@
               "storage_size": 8,
               "proof": "The scanner first loads full-width FP from [RCX+32], then Method from FP-24; the same frame is used for BCI, monitors, mirror and expression-stack scanning."
             }
+          },
+          "ObjectLocker": {
+            "_thread": {
+              "rva": 6337254,
+              "bytes": "4c8901",
+              "offset": 0,
+              "storage_size": 8,
+              "proof": "Constructor stores the current Thread* from R8 at this+0."
+            },
+            "_obj": {
+              "rva": 6337257,
+              "bytes": "48895108",
+              "offset": 8,
+              "storage_size": 8,
+              "proof": "Constructor stores the by-value Handle (one root-slot pointer in RDX) at this+8."
+            },
+            "_lock": {
+              "rva": 6337330,
+              "bytes": "488d57104c8bc6488bcb",
+              "offset": 16,
+              "storage_size": 8,
+              "proof": "Constructor passes this+16 as BasicLock* in RDX to ObjectSynchronizer::slow_enter after its biased fast-path check. Tagged BasicLock contains one native-width displaced mark word; exact destructor/exit code reads that 8-byte slot."
+            },
+            "_dolock": {
+              "rva": 6337250,
+              "bytes": "44884918",
+              "offset": 24,
+              "storage_size": 1,
+              "proof": "Constructor stores boolean doLock from R9B at this+24. Tagged StackObj is empty, so four fields with maximum alignment8 prove the complete32-byte PRODUCT layout."
+            }
           }
         },
         "data_layout_proofs": {
@@ -2683,6 +2938,14 @@
               "rva": 6389387,
               "bytes": "48890516a63000",
               "target_rva": 9577640
+            }
+          ],
+          "heap_lock": [
+            {
+              "rva": 5439140,
+              "bytes": "48893d55c04000",
+              "target_rva": 9682688,
+              "proof": "Exact initialization sequence passes the Heap_lock string as Monitor constructor name then publishes the resulting Monitor* in this 8-byte RIP-relative global."
             }
           ]
         },
@@ -2832,6 +3095,28 @@
               },
               "proof": "Frame mirror is a full-width oop slot at FP-32. The scanner passes that slot in RDX and OopClosure in RCX, then calls [closure_vptr+8], proving the wide overload is slot1. Tagged PRODUCT OopClosure/Closure have no virtual destructor or diagnostic base; OopClosure declares exactly the wide and narrow do_oop virtuals."
             }
+          ],
+          "ObjectClosure": [
+            {
+              "rva": 3338243,
+              "bytes": "488b06488bd3488bceff10",
+              "enums": {
+                "vtable_do_object": 0,
+                "vtable_count": 1
+              },
+              "proof": "Exact HeapRegion RTTI vtable leads to its object_iterate slot14. The function passes the oop in RDX and ObjectClosure in RCX, calls [closure_vptr+0]. Tagged PRODUCT Closure is empty; ObjectClosure has only do_object(oop), no virtual destructor or inherited abort state."
+            }
+          ],
+          "KlassClosure": [
+            {
+              "rva": 1837323,
+              "bytes": "ff10",
+              "enums": {
+                "vtable_do_klass": 0,
+                "vtable_count": 1
+              },
+              "notes": "Exact loaded-state/array-filter CLDG traversal invokes KlassClosure::do_klass(Klass*) through first vtable slot; exact tagged Closure has no data or virtual destructor, KlassClosure adds one pure virtual method, sizeof8."
+            }
           ]
         },
         "function_reference_proofs": {
@@ -2842,7 +3127,46 @@
               "target_rva": 2796992,
               "proof": "frame::oops_do tests is_interpreted_frame and passes RCX=this,RDX=OopClosure,R8=RegisterMap,R9b=query_oop_map_cache to the exact scanner; no CLDClosure argument. The body matches the tagged source: Method/BCI, monitors, native temporary oop, mirror, invoke arguments, mask_for/compute_one_oop_map, then iterate_oop."
             }
+          ],
+          "heap_lock_enter": [
+            {
+              "rva": 5433149,
+              "bytes": "e90effffff",
+              "target_rva": 5432912,
+              "proof": "Monitor::lock() obtains Thread::current() through the existing calibrated TLS slot then tail-jumps to Monitor::lock(Thread*). The target CFG contains Thread::is_Java_thread(), VM-to-blocked and blocked-to-VM state transitions, and monitor ownership publication."
+            }
+          ],
+          "loaded_class_walk": [
+            {
+              "rva": 4382005,
+              "bytes": "e8862bd9ff",
+              "target_rva": 1837248
+            }
           ]
+        },
+        "heap_iteration_proof": {
+          "heap_type": "G1CollectedHeap",
+          "heap_vtable_rva": 7782144,
+          "prepare_slot": 23,
+          "walk_slot": 40,
+          "vm_operation_doit_rva": 4435792,
+          "prepare_call_rva": 4435820,
+          "walk_call_rva": 4435863,
+          "region_closure_vtable_rva": 7785064,
+          "region_closure_lea_rva": 2852372,
+          "region_callback_rva": 2836080,
+          "heap_region_vtable_rva": 7857160,
+          "heap_region_iterate_slot": 14,
+          "heap_region_iterate_rva": 3338176,
+          "source_notes": "The exact VM_HeapIterateOperation::doit loads Universe::_collectedHeap, sets EDX=0, invokes heap ensure_parsability(false), then invokes object_iterate(ObjectClosure*). G1 object_iterate constructs the RTTI-identified IterateObjectClosureRegionClosure; its callback invokes HeapRegion object_iterate at offset0x70, whose callback above proves ObjectClosure slot0."
+        },
+        "heap_lock_initialization_proof": {
+          "name_rva": 8029344,
+          "reference_rva": 5439113,
+          "reference_bytes": "4c8d0510862700",
+          "publication_rva": 5439140,
+          "publication_bytes": "48893d55c04000",
+          "target_rva": 9682688
         }
       }
     }
@@ -2872,6 +3196,113 @@
         "javaFrameAnchor_x86.hpp declares _saved_rbp_address as a volatile intptr_t**; clear() clears it and copy() preserves it.",
         "frame_x86.cpp sender_for_entry_frame() uses saved_rbp_address() to update the saved-link register map when the address is non-null.",
         "macroAssembler_x86.cpp reset_last_Java_frame() clears saved_rbp_address together with the last Java SP, FP and PC."
+      ]
+    },
+    {
+      "identity": {
+        "guid": "e442ae1e-2a33-fb96-991b-ae4f84049fe5",
+        "age": 1,
+        "machine": 34404,
+        "image_size": 13025280,
+        "pe_timestamp": 807086503,
+        "sha256": "6b9a2354b41134986d61d1f8ff0f9614e3a6b7e235469b7e9260fe7a1d9bb84a",
+        "java_feature": 17
+      },
+      "source_repository": "https://github.com/adoptium/jdk17u",
+      "source_commit": "79597447bd94",
+      "source_sha256": {
+        "src/hotspot/share/gc/shared/satbMarkQueue.cpp": "0c5a2ac222a171ac14a944d7ebc068ab0f2ae677743e1664a3bcd74be608028f",
+        "src/hotspot/share/gc/g1/g1ConcurrentMark.cpp": "fd40cfcd0965c40646b465d2da4a1ce413ed206977ff4ee62eaea970ea877eec",
+        "src/hotspot/share/gc/g1/g1BarrierSet.cpp": "bc871137f682ced241c787b1876998115785b3da91cbd716bcb16f9966613c66",
+        "src/hotspot/share/runtime/thread.cpp": "6507c363b6a2701af8d3a8e22575d447204e3243a1f18f38dd89f859250f2229",
+        "src/hotspot/share/runtime/thread.hpp": "53e22e00d0f3f10be47fa152d31e2542bed3245c9a17355e1514c9a227477b38",
+        "src/hotspot/share/runtime/vmThread.hpp": "dc48c9d0ca18316570e7789f4ea424f7b3e20b1f2bd4fd56067a717ddaebd887",
+        "src/hotspot/share/runtime/nonJavaThread.cpp": "379f3021614afbd6165ba3084ef629a22ae8f9e2c9c775a6e4056eb13acab33f",
+        "src/hotspot/share/runtime/nonJavaThread.hpp": "005ebb00ec8df7d7466aa7bfcccc301e53c214fbf2b1af05027eeb7331f01864"
+      },
+      "subject": "G1 VMThread SATB queue creation, activation and partial-buffer remark drain",
+      "source_facts": [
+        "Thread::Thread invokes BarrierSet::on_thread_create after barrier-set initialization; G1BarrierSet::on_thread_create allocates G1ThreadLocalData for all Thread objects.",
+        "VMThread derives from NamedThread, which derives from NonJavaThread. Thread::call_run invokes NonJavaThread::pre_run before VMThread::run, registering the VMThread in NonJavaThread::Iterator.",
+        "SATBMarkQueueSet::set_active_all_threads updates each queue through Threads::threads_do, whose non-Java iteration includes the registered VMThread.",
+        "G1RemarkThreadsClosure::do_thread flushes the SATB queue before any JavaThread-only work. Java 17 remark calls Threads::threads_do; Java 21/27 remark calls Threads::possibly_parallel_threads_do, which includes NonJavaThread::Iterator.",
+        "Therefore even a partial VMThread SATB buffer, including a single mirror newly published by a VM operation, is transferred for completed-buffer marking at remark. Full-buffer overflow is not required."
+      ],
+      "limitations": [
+        "This exact tagged-source chain proves VMThread support; ordinary System.gc tests alone do not demonstrate an active concurrent marking phase.",
+        "The general heap iterator must independently prove object liveness around post-remark cleanup; CLDG lookup uses the matching internal live-holder traversal."
+      ]
+    },
+    {
+      "identity": {
+        "guid": "bf39a5d1-44b0-9d94-33ed-ab5d25845be7",
+        "age": 1,
+        "machine": 34404,
+        "image_size": 14295040,
+        "pe_timestamp": 3619660896,
+        "sha256": "3df13bd73c7dbeef26693cef664b4ede84649720f7a12f0203215a65656d25f4",
+        "java_feature": 21
+      },
+      "source_repository": "https://github.com/adoptium/jdk21u",
+      "source_commit": "1c417fbfc2f7",
+      "source_sha256": {
+        "src/hotspot/share/gc/shared/satbMarkQueue.cpp": "1de0d2047d65d010819f744c8f671d1371c6786ee33c66c18ff76295b882e64a",
+        "src/hotspot/share/gc/g1/g1ConcurrentMark.cpp": "29512bdd179e72401f0382971d721e3d87f1d42129c9c7b7516ee035122e83bb",
+        "src/hotspot/share/gc/g1/g1BarrierSet.cpp": "442594b2aadffd3604330eb70dcea8cc186afd2c536f739496a92ab99e22f8b0",
+        "src/hotspot/share/runtime/thread.cpp": "29dda956e5683d6464961b7c68dd6960f8dd78f98f33b9c8215764484a3ade1f",
+        "src/hotspot/share/runtime/thread.hpp": "6b1039f533c4d332e07d3c117a8142a7a66bbb879d1bf90164277bc97dd32850",
+        "src/hotspot/share/runtime/vmThread.hpp": "b7a088c4fcd7089f3f39bd0b19eb68aa608b1a61ad5b9c152f80515c4fdd98ed",
+        "src/hotspot/share/runtime/nonJavaThread.cpp": "33bf181028eac84b493bc37860bd990f95c15432a2a4385812d85fd5a6b4e26a",
+        "src/hotspot/share/runtime/nonJavaThread.hpp": "f0a1fccf0ecd1e9a30d50472165dd8eafee69e0183aa771b0de8ca8a39b64aa0",
+        "src/hotspot/share/runtime/threads.cpp": "c65536ca884012a75d2f6f31141f2461c355675602ad36012d1072df90f5221a"
+      },
+      "subject": "G1 VMThread SATB queue creation, activation and partial-buffer remark drain",
+      "source_facts": [
+        "Thread::Thread invokes BarrierSet::on_thread_create after barrier-set initialization; G1BarrierSet::on_thread_create allocates G1ThreadLocalData for all Thread objects.",
+        "VMThread derives from NamedThread, which derives from NonJavaThread. Thread::call_run invokes NonJavaThread::pre_run before VMThread::run, registering the VMThread in NonJavaThread::Iterator.",
+        "SATBMarkQueueSet::set_active_all_threads updates each queue through Threads::threads_do, whose non-Java iteration includes the registered VMThread.",
+        "G1RemarkThreadsClosure::do_thread flushes the SATB queue before any JavaThread-only work. Java 17 remark calls Threads::threads_do; Java 21/27 remark calls Threads::possibly_parallel_threads_do, which includes NonJavaThread::Iterator.",
+        "Therefore even a partial VMThread SATB buffer, including a single mirror newly published by a VM operation, is transferred for completed-buffer marking at remark. Full-buffer overflow is not required."
+      ],
+      "limitations": [
+        "This exact tagged-source chain proves VMThread support; ordinary System.gc tests alone do not demonstrate an active concurrent marking phase.",
+        "The general heap iterator must independently prove object liveness around post-remark cleanup; CLDG lookup uses the matching internal live-holder traversal."
+      ]
+    },
+    {
+      "identity": {
+        "guid": "ce07d576-734b-eb55-0a57-b420424be891",
+        "age": 1,
+        "machine": 34404,
+        "image_size": 15519744,
+        "pe_timestamp": 4183519753,
+        "sha256": "eae6c00b80f738a9ea0ebf6dc2a0110ea93438b23290ec1d4d140ed981f1960b",
+        "java_feature": 27
+      },
+      "source_repository": "https://github.com/adoptium/jdk",
+      "source_commit": "efe86855fd73",
+      "source_sha256": {
+        "src/hotspot/share/gc/shared/satbMarkQueue.cpp": "8710a2780db1d47ed7f2eb26a5b1b137078f55210f70aa1d53a90e470324e704",
+        "src/hotspot/share/gc/g1/g1ConcurrentMark.cpp": "2d45516f2a2a42639310191dbe5d234d73c333ba4d3aed10c02a68f999760e5c",
+        "src/hotspot/share/gc/g1/g1BarrierSet.cpp": "c7adec279661523ec9f9b72d5b8f8c222e4b659ae6b4c0764a2ee5a371f1b764",
+        "src/hotspot/share/runtime/thread.cpp": "273d45e8c1440dd08a4a0fb1de54a17b51ab54fcab277f58dc6c60a2e78cfd9c",
+        "src/hotspot/share/runtime/thread.hpp": "a0434660049c706b1303d0e640084cb56882cbe0c169a3d47a4b52d0b51c79ad",
+        "src/hotspot/share/runtime/vmThread.hpp": "0a02b92c1523e225f963c441bdc4bca78f4e17d8909e6f1e6e6a3844117f4b56",
+        "src/hotspot/share/runtime/nonJavaThread.cpp": "757f5a2fd785da676afa9bc5bb8a4b3307b1b6c6eff70b4d1993b527853a40aa",
+        "src/hotspot/share/runtime/nonJavaThread.hpp": "7645bc2db6b1bad43b3cb0b0538162455a80e6d2e7a92c49aeb7082f5ac10e4d",
+        "src/hotspot/share/runtime/threads.cpp": "92fe2072df5ca12a013218d52f4b83ddf09fdfc4fc321cfd982ddf669f7cfc73"
+      },
+      "subject": "G1 VMThread SATB queue creation, activation and partial-buffer remark drain",
+      "source_facts": [
+        "Thread::Thread invokes BarrierSet::on_thread_create after barrier-set initialization; G1BarrierSet::on_thread_create allocates G1ThreadLocalData for all Thread objects.",
+        "VMThread derives from NamedThread, which derives from NonJavaThread. Thread::call_run invokes NonJavaThread::pre_run before VMThread::run, registering the VMThread in NonJavaThread::Iterator.",
+        "SATBMarkQueueSet::set_active_all_threads updates each queue through Threads::threads_do, whose non-Java iteration includes the registered VMThread.",
+        "G1RemarkThreadsClosure::do_thread flushes the SATB queue before any JavaThread-only work. Java 17 remark calls Threads::threads_do; Java 21/27 remark calls Threads::possibly_parallel_threads_do, which includes NonJavaThread::Iterator.",
+        "Therefore even a partial VMThread SATB buffer, including a single mirror newly published by a VM operation, is transferred for completed-buffer marking at remark. Full-buffer overflow is not required."
+      ],
+      "limitations": [
+        "This exact tagged-source chain proves VMThread support; ordinary System.gc tests alone do not demonstrate an active concurrent marking phase.",
+        "The general heap iterator must independently prove object liveness around post-remark cleanup; CLDG lookup uses the matching internal live-holder traversal."
       ]
     }
   ]

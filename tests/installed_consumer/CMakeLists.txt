@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.28)
+project(vmhook_installed_consumer LANGUAGES CXX)
+
+option(VMHOOK_CONSUMER_MODULE "Import the installed C++26 module" OFF)
+if(VMHOOK_CONSUMER_MODULE)
+    find_package(vmhook CONFIG REQUIRED COMPONENTS module)
+    set(_vmhook_interface vmhook::module)
+else()
+    find_package(vmhook CONFIG REQUIRED COMPONENTS header)
+    set(_vmhook_interface vmhook::vmhook)
+endif()
+
+if(NOT EXISTS "${vmhook_java_helper_source}")
+    message(FATAL_ERROR "The installed package is missing its ordinary Java callback helper source.")
+endif()
+
+add_executable(vmhook_installed_consumer main.cpp second.cpp)
+target_link_libraries(vmhook_installed_consumer PRIVATE ${_vmhook_interface})
+target_compile_options(vmhook_installed_consumer PRIVATE -Wall -Wextra -Werror)
+target_link_options(vmhook_installed_consumer PRIVATE -static)
+if(VMHOOK_CONSUMER_MODULE)
+    target_compile_definitions(vmhook_installed_consumer PRIVATE VMHOOK_CONSUMER_MODULE)
+endif()
+
+enable_testing()
+if(NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR)
+    add_test(NAME vmhook.installed_consumer COMMAND vmhook_installed_consumer)
+endif()

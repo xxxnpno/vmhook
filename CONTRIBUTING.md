@@ -47,7 +47,9 @@ features, including static reflection.
   Java null. Keep copied primitive/string values distinct from Java references.
   Allocation helpers also return owning wrappers and report backend/root
   failures explicitly; preserve their actual allocator/context restrictions.
-  Reference field stores require Epsilon until a write-barrier backend exists.
+  Metadata-bound reference stores must use the verified collector-aware field
+  backend; raw reference-memory stores remain Epsilon-only. Preserve volatile,
+  final and atomic semantics rather than relying on Windows x64 ordering.
 - Convert collections through their Java interface operations. Do not infer a
   map implementation from a field named `table` or a list from `get(int)`.
   Keep snapshot arrays and entries rooted across calls, resolve moved objects
@@ -124,3 +126,19 @@ Describe the concrete behavior that changes and include the checks actually
 run. State live JVM limitations precisely. Avoid benchmark figures without a
 reproducible workload, toolchain, and environment. Use the private reporting
 process in [SECURITY.md](SECURITY.md) for memory safety vulnerabilities.
+
+
+## Distribution changes
+
+Keep package versions aligned with `version_string` in the canonical module.
+CMake reads that version directly; `vcpkg.json` is checked by the source-package
+tool. Verify installation from an independent copied project using
+`tools/verify_installed_package.py` for both interfaces. Module CMIs are rebuilt
+for each consumer compiler/options/configuration; do not publish them as
+portable release assets. See [packaging](docs/packaging.md).
+
+The compiled [standalone examples](examples/README.md) keep the first payload
+small. Add meaningful live checks when an example promises new behavior.
+Benchmark claims need the actual workload and execution metadata described in
+[benchmarks](docs/benchmarks.md). Preserve the existing license unless the
+copyright holder explicitly chooses new terms.

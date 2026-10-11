@@ -9,6 +9,7 @@ same flags and publishes a mapper that consumers can use from any directory.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -44,13 +45,15 @@ def discover_std(compiler: str, flags: list[str], cwd: Path) -> Path:
 
 
 def prepare_standard_overlay(standard: Path, output: Path, compiler: str, flags: list[str]) -> Path | None:
-    """Preserve libstdc++'s shared_ptr tag COMDAT when imported through GCC.
+    """Preserve libstdc++ ABI linkage in affected GNU Windows C++26 builds.
 
-    GCC 16's Windows importer emits this function-local constexpr as a strong
-    symbol. Filesystem and future then fail to link with the compiler's own
-    static library. An inline class member has the required COMDAT linkage;
-    its explicit assembler name preserves the existing libstdc++ ABI. Only a
-    build-directory copy is changed, never the installed compiler headers.
+    The shared_ptr tag needs COMDAT linkage after module import. GNU 16's
+    constexpr exception copy/move constructors also need the same gnu_inline
+    annotation already used by their other constructors; otherwise the C2
+    alias collides with the compiler's own static runtime at -O0. Only exact
+    recognized layouts are changed, in a build-directory overlay. The variant
+    error table has the same local-static import linkage defect as the tag;
+    its exact ABI symbol and four diagnostic strings are preserved.
     """
     header = standard.parent / "shared_ptr_base.h"
     if not header.is_file():
@@ -69,22 +72,81 @@ def prepare_standard_overlay(standard: Path, output: Path, compiler: str, flags:
     {
       return reinterpret_cast<const type_info&>(__tag);
     }"""
-    if before not in original and not re.search(
-            r"alignas\s*\(\s*type_info\s*\)\s*static\s+constexpr\s+char\s+__tag", original):
-        (output / "stdlib-overlay/bits/shared_ptr_base.h").unlink(missing_ok=True)
-        return None
-    if original.count(before) != 1:
-        raise ValueError("unrecognized libstdc++ shared_ptr tag layout; review the GCC module workaround")
+    overlays: dict[str, str] = {}
+    if before in original:
+        if original.count(before) != 1:
+            raise ValueError("unrecognized libstdc++ shared_ptr tag layout; review the GNU workaround")
+        overlays["bits/shared_ptr_base.h"] = original.replace(before, after)
+    elif re.search(r"alignas\s*\(\s*type_info\s*\)\s*static\s+constexpr\s+char\s+__tag", original):
+        raise ValueError("unrecognized libstdc++ shared_ptr tag layout; review the GNU workaround")
+
     configuration = run([compiler, *flags, "-dM", "-E", "-x", "c++",
                          "-include", "bits/c++config.h", "-"], output, True, "")
     macros = dict(re.findall(r"^#define\s+(\w+)\s+([^\n]+)", configuration, re.MULTILINE))
-    if macros.get("_GLIBCXX_INLINE_VERSION") != "0" or "_WIN64" not in macros or "__x86_64__" not in macros:
-        raise ValueError("the shared_ptr ABI workaround requires unversioned libstdc++ on Windows x64")
+    exceptions = standard.parent / "stdexcept_except.h"
+    if macros.get("__GNUC__") == "16" and exceptions.is_file():
+        original_exceptions = exceptions.read_text(encoding="utf-8")
+        constructors = (
+            "constexpr logic_error(logic_error&& __arg) noexcept = default;",
+            "constexpr logic_error(const logic_error&) noexcept = default;",
+            "constexpr runtime_error(runtime_error&&) noexcept = default;",
+            "constexpr runtime_error(const runtime_error&) noexcept = default;",
+        )
+        matches = [declaration for declaration in constructors if declaration in original_exceptions]
+        if matches:
+            if len(matches) != 4 or any(original_exceptions.count(declaration) != 1 for declaration in matches):
+                raise ValueError("unrecognized GNU 16 constexpr exception layout; review the ABI workaround")
+            for declaration in matches:
+                original_exceptions = original_exceptions.replace(declaration,
+                    "[[__gnu__::__gnu_inline__]] " + declaration.replace("constexpr ", "constexpr inline "))
+            overlays["bits/stdexcept_except.h"] = original_exceptions
+    variant_header = standard.parent.parent / "variant"
+    if macros.get("__GNUC__") == "16" and variant_header.is_file():
+        variant = variant_header.read_text(encoding="utf-8")
+        local_table = """      [[maybe_unused]] static constexpr const char* __reasons[] = {
+\t"std::get: wrong index for variant",
+\t"std::get: variant is valueless",
+\t"std::visit: variant is valueless",
+\t"std::visit<R>: variant is valueless",
+      };"""
+        friend_declaration = """    friend _GLIBCXX_CONSTEXPR_BAD_VARIANT_ACCESS void
+    __throw_bad_variant_access([[maybe_unused]] unsigned __n)"""
+        if "static constexpr const char* __reasons[]" in variant:
+            if variant.count(local_table) != 1 or variant.count(friend_declaration) != 1:
+                raise ValueError("unrecognized GNU 16 variant reason table; review the module ABI workaround")
+            inline_table = local_table.replace("[[maybe_unused]] static constexpr", "static inline constexpr")
+            inline_table = inline_table.replace("__reasons[] =", '__reasons[]\n      __asm__("_ZZSt26__throw_bad_variant_accessjE9__reasons") =')
+            variant = variant.replace(local_table + "\n", "")
+            overlays["variant"] = variant.replace(friend_declaration,
+                inline_table + "\n\n" + friend_declaration)
+    format_header = standard.parent.parent / "format"
+    if macros.get("__GNUC__") == "16" and format_header.is_file():
+        formatting = format_header.read_text(encoding="utf-8")
+        declarations = (
+            "      static constexpr char32_t __replace = U'\\uFFFD';",
+            "      static constexpr _Str_view __replace_rep = []",
+        )
+        if any(declaration in formatting for declaration in declarations):
+            if any(formatting.count(declaration) != 1 for declaration in declarations):
+                raise ValueError("unrecognized GNU 16 format replacement table; review the module workaround")
+            # Both values are used only during this function call. The view
+            # still refers to the same static string literals; removing its
+            # local-static storage avoids duplicate imported instantiations.
+            for declaration in declarations:
+                formatting = formatting.replace(declaration, declaration.replace("static constexpr", "constexpr"))
+            overlays["format"] = formatting
+    if overlays and (macros.get("_GLIBCXX_INLINE_VERSION") != "0"
+                     or "_WIN64" not in macros or "__x86_64__" not in macros):
+        raise ValueError("the GNU ABI workarounds require unversioned libstdc++ on Windows x64")
     overlay = output / "stdlib-overlay"
-    copied = overlay / "bits/shared_ptr_base.h"
-    copied.parent.mkdir(parents=True, exist_ok=True)
-    copied.write_text(original.replace(before, after), encoding="utf-8", newline="\n")
-    return overlay
+    for name in ("bits/shared_ptr_base.h", "bits/stdexcept_except.h", "variant", "format"):
+        copied = overlay / name
+        if name in overlays:
+            copied.parent.mkdir(parents=True, exist_ok=True)
+            copied.write_text(overlays[name], encoding="utf-8", newline="\n")
+        else:
+            copied.unlink(missing_ok=True)
+    return overlay if overlays else None
 
 
 def build(args: argparse.Namespace) -> None:
@@ -142,6 +204,34 @@ def build(args: argparse.Namespace) -> None:
                       "-fmodule-mapper=" + mapper.as_posix()]
     if standard_overlay:
         consumer_flags.append("-I" + standard_overlay.as_posix())
+    manifest = {
+        "schema": 1,
+        "compiler": {
+            "path": args.compiler,
+            "file_sha256": hashlib.sha256(Path(args.compiler).read_bytes()).hexdigest()
+                if Path(args.compiler).is_file() else None,
+            "version": run([args.compiler, "-dumpfullversion"], output, True),
+            "target": run([args.compiler, "-dumpmachine"], output, True),
+        },
+        "compile_options": args.flag,
+        "consumer_flags": consumer_flags,
+        "source_sha256": {
+            str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in (module, bridge, platform, standard)
+        },
+        "artifact_sha256": {
+            path.relative_to(output).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(set(mappings.values()) | {archive})
+        },
+        "stdlib_overlay": standard_overlay is not None,
+        "stdlib_overlay_sha256": {
+            path.relative_to(standard_overlay).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(path for path in standard_overlay.rglob("*") if path.is_file())
+        } if standard_overlay else {},
+        "scope": "Compiler/configuration-specific local build; no runtime compatibility claim",
+    }
+    (output / "build-info.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Built {archive}\nConsumer flags: {subprocess.list2cmdline(consumer_flags)}")
 
 

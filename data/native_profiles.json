@@ -739,6 +739,47 @@
     ],
     "frame_oops_interpreted_small1": [
       "??$oops_interpreted_do@V?$SmallRegisterMapType@$00@@@frame@@QEBAXPEAVOopClosure@@PEBV?$SmallRegisterMapType@$00@@_N@Z"
+    ],
+    "heap_ensure_g1": [
+      "?ensure_parsability@CollectedHeap@@UEAAX_N@Z"
+    ],
+    "heap_ensure_parallel": [
+      "?ensure_parsability@ParallelScavengeHeap@@UEAAX_N@Z"
+    ],
+    "heap_iterate_g1": [
+      "?object_iterate@G1CollectedHeap@@UEAAXPEAVObjectClosure@@@Z"
+    ],
+    "heap_iterate_parallel": [
+      "?object_iterate@ParallelScavengeHeap@@UEAAXPEAVObjectClosure@@@Z"
+    ],
+    "monitor_lock_construct": [
+      "??0ObjectLocker@@QEAA@VHandle@@PEAVJavaThread@@@Z",
+      "??0ObjectLocker@@QEAA@VHandle@@PEAVThread@@@Z"
+    ],
+    "monitor_lock_construct_bool": [
+      "??0ObjectLocker@@QEAA@VHandle@@PEAVThread@@_N@Z"
+    ],
+    "monitor_lock_destroy": [
+      "??1ObjectLocker@@QEAA@XZ"
+    ],
+    "interpreter_remove_activation": [
+      "?_remove_activation_entry@TemplateInterpreter@@1PEAEEA"
+    ],
+    "heap_lock": [
+      "?Heap_lock@@3PEAVMonitor@@EA"
+    ],
+    "heap_lock_enter": [
+      "?lock@Mutex@@QEAAXPEAVThread@@@Z",
+      "?lock@Monitor@@QEAAXPEAVThread@@@Z"
+    ],
+    "root_keepalive_g1": [
+      "?enqueue_preloaded@G1BarrierSet@@SAXPEAVoopDesc@@@Z",
+      "?enqueue@G1BarrierSet@@SAXPEAVoopDesc@@@Z",
+      "?enqueue@G1SATBCardTableModRefBS@@SAXPEAVoopDesc@@@Z"
+    ],
+    "loaded_class_walk": [
+      "?loaded_classes_do_keepalive@ClassLoaderDataGraph@@SAXPEAVKlassClosure@@@Z",
+      "?loaded_classes_do@ClassLoaderDataGraph@@SAXPEAVKlassClosure@@@Z"
     ]
   },
   "profile_types": [
@@ -834,7 +875,10 @@
     "AbstractInterpreter::MethodKind",
     "InstanceKlass::<unnamed-enum-_misc_rewritten>",
     "frame",
-    "OopClosure"
+    "OopClosure",
+    "ObjectClosure",
+    "ObjectLocker",
+    "KlassClosure"
   ],
   "required_fields": {
     "JavaThread": [
@@ -856,7 +900,8 @@
       "_suspend_flags",
       "_special_runtime_exit_condition",
       "_vm_result",
-      "_vm_result_oop"
+      "_vm_result_oop",
+      "_vthread"
     ],
     "Thread": [
       "_active_handles",
@@ -1057,6 +1102,11 @@
       "_pc",
       "_fp",
       "_on_heap"
+    ],
+    "ObjectLocker": [
+      "_thread",
+      "_obj",
+      "_lock"
     ]
   },
   "required_enums": {
@@ -1248,7 +1298,8 @@
       "storage_size__stack_size",
       "storage_size__threadObj",
       "storage_size__thread_state",
-      "storage_size__tlab"
+      "storage_size__tlab",
+      "storage_size__vthread"
     ],
     "SafepointMechanism::ThreadData": [
       "storage_size__polling_word"
@@ -1359,7 +1410,9 @@
       "deallocate_list_length_width",
       "frame_scan_legacy_cld_arg",
       "frame_scan_small_maps",
-      "frame_stack_slots_relative"
+      "frame_stack_slots_relative",
+      "normal_exit_jfr_clear_offset",
+      "normal_exit_jfr_clear_width"
     ],
     "Thread::SuspendFlags": [
       "_external_suspend",
@@ -1491,6 +1544,19 @@
     "OopClosure": [
       "vtable_do_oop_wide",
       "vtable_count"
+    ],
+    "ObjectClosure": [
+      "vtable_count",
+      "vtable_do_object"
+    ],
+    "ObjectLocker": [
+      "storage_size__thread",
+      "storage_size__obj",
+      "storage_size__lock"
+    ],
+    "KlassClosure": [
+      "vtable_do_klass",
+      "vtable_count"
     ]
   },
   "alias_kinds": {
@@ -1539,7 +1605,9 @@
     "interpreter_throw_exception": "data",
     "bytecode_lengths": "data",
     "class_loader_data_head": "data",
-    "interpreter_entry_table": "data"
+    "interpreter_entry_table": "data",
+    "interpreter_remove_activation": "data",
+    "heap_lock": "data"
   },
   "derived_profile_facts": {
     "ObservationABI": {
@@ -1568,7 +1636,9 @@
         "deallocate_list_length_width": "Exact length storage width in bytes from TPI or independently audited9/10 machine loads/stores.",
         "frame_scan_legacy_cld_arg": "1 when the exact PDB signature takes OopClosure*,CLDClosure*,RegisterMap*,bool;0 for the four-machine-argument scanner. Stripped9/10 verified at exact caller and scanner bytes.",
         "frame_scan_small_maps": "1 when all three RegisterMap/SmallRegisterMapType<0>/<1> template instantiations are present in the matching PDB;0 for the ordinary scanner.",
-        "frame_stack_slots_relative": "1 when the exact PDB-named interpreter_frame_monitor_end getter unconditionally adds FP to the signed monitor-top slot multiplied by8;0 for absolute or heap-frame-only conditional conversion. Applies to physical monitor-end and nonzero last_sp slots; heap frames are excluded by the runtime."
+        "frame_stack_slots_relative": "1 when the exact PDB-named interpreter_frame_monitor_end getter unconditionally adds FP to the signed monitor-top slot multiplied by8;0 for absolute or heap-frame-only conditional conversion. Applies to physical monitor-end and nonzero last_sp slots; heap frames are excluded by the runtime.",
+        "normal_exit_jfr_clear_offset": "On Java25\u201327, exact matching PDB JavaThread::_jfr_thread_local aggregate offset plus JfrThreadLocal::_sampling_critical_section byte offset; validates generated normal-exit tail store after LEAVE.",
+        "normal_exit_jfr_clear_width": "On Java25\u201327, exact PDB storage width of JfrThreadLocal::_sampling_critical_section; runtime requires one-byte Boolean storage."
       }
     }
   },
@@ -1626,6 +1696,14 @@
       "element_size": 8,
       "length_enum": "AbstractInterpreter::MethodKind::number_of_method_entries",
       "value": "inline normal/synchronized/intrinsic entry address array"
+    },
+    "interpreter_remove_activation": {
+      "storage_size": 8,
+      "value": "address interpreter activation removal codelet"
+    },
+    "heap_lock": {
+      "storage_size": 8,
+      "value": "Monitor*; allocation serialization held on caller before heap-walk VM operation"
     }
   }
 }

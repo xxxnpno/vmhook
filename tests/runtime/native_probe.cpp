@@ -315,6 +315,53 @@ namespace
         return true;
     }
 
+    #include "field_memory_cases.hpp"
+    #include "monitor_cases.hpp"
+
+    auto check_heap_iteration() -> bool
+    {
+        const auto snapshot = vmhook::get_instances<native_fixture>();
+        if (snapshot.size() < 3 || !vmhook::get_instances<native_fixture>(0).empty()) { return false; }
+        std::vector<std::int32_t> values;
+        for (const auto& object : snapshot)
+        {
+            if (!object || !object->get_instance()) { return false; }
+            // Java code collects after the VM iterator has returned. Every
+            // remaining snapshot object must follow relocation through its root.
+            values.push_back(object->add(std::int32_t{}));
+        }
+        for (const auto wanted : {10, 20, 41})
+        { if (std::ranges::find(values, wanted) == values.end()) { return false; } }
+        // Race repeated count/capture VM operations against the fixture's
+        // ordinary allocation slow paths. A safepoint without caller Heap_lock
+        // can observe an allocated Eden interval before its header is written.
+        for (std::size_t attempt{}; attempt < 32; ++attempt)
+        {
+            const auto held = vmhook::get_instances<native_fixture>(16);
+            if (held.size() < 3) { return false; }
+            if (attempt % 8 == 0) { native_fixture::collect(); }
+            for (const auto& object : held)
+            {
+                if (!object || !object->get_instance()) { return false; }
+                (void)object->add(std::int32_t{});
+            }
+            std::this_thread::yield();
+        }
+        std::size_t callbacks{};
+        if (vmhook::for_each_instance<native_fixture>([&](std::unique_ptr<native_fixture> object)
+            { if (object && object->get_instance()) { ++callbacks; } }, 1) != 1 || callbacks != 1)
+        { return false; }
+        callbacks = 0;
+        auto* const target = vmhook::find_class("NativeFixture");
+        const auto count = vmhook::for_each_instance_of(target, [&](std::unique_ptr<vmhook::any_object> object)
+        {
+            if (!object || !object->get_instance()) { return; }
+            (void)static_cast<std::int32_t>(object->get_field("value")->get());
+            ++callbacks;
+        });
+        return count >= 3 && count == callbacks;
+    }
+
     auto check_object_contract(const std::unique_ptr<native_fixture>& first,
                                const std::unique_ptr<native_fixture>& second) -> bool
     {
@@ -349,18 +396,12 @@ namespace
             || string_result.as_string() != unicode_text())
         { return false; }
 
-        // The unique_ptr setter still respects the collector barrier gate.
-        // Moving collectors must refuse it without changing the Java field;
-        // a separately configured Epsilon run may test the supported store.
-        if (vmhook::detail::reference_stores_supported())
-        {
-            second->child_object(java_null);
-            const auto stored_null = second->child_object();
-            if (!stored_null || stored_null->get_instance()) { return false; }
-            second->child_object(first);
-        }
-        else if (!conversion_refused([&] { second->child_object(java_null); }))
-        { return false; }
+        // The rooted accessor executes the VM's real collector barriers.
+        // Java null and non-null references must work with ordinary GC defaults.
+        second->child_object(java_null);
+        const auto stored_null = second->child_object();
+        if (!stored_null || stored_null->get_instance()) { return false; }
+        second->child_object(first);
         if (!conversion_refused([&] { second->child_object(forged_type); })) { return false; }
         const auto after_store = second->child_object();
         if (!after_store || !after_store->get_instance() || after_store->value() != 10)
@@ -383,7 +424,7 @@ namespace
             || !conversion_refused([]
                 { const std::unique_ptr<native_fixture> invalid = native_fixture::collect(); (void)invalid; }))
         { return false; }
-        const auto thrown = native_fixture::static_members::get_method("failObject")->call();
+        const auto thrown = native_fixture::static_members::get_method("failObject")->try_call();
         if (!thrown.was_invoked() || !thrown.threw()
             || !conversion_refused([&]
                 { const std::unique_ptr<native_fixture> invalid = thrown; (void)invalid; }))
@@ -426,6 +467,22 @@ namespace
                 runtime.has_field("Arena", "_size_in_bytes")
                     ? vmhook::detail::private_native::load<std::size_t>(area, runtime.off("Arena", "_size_in_bytes"))
                     : std::size_t{}};
+    }
+
+    auto check_lossless_utf16() -> bool
+    {
+        const std::u16string text{char16_t{0}, char16_t{0x80}, char16_t{0xd800}, u'A',
+            char16_t{0xdc00}, char16_t{0xd83d}, char16_t{0xde00}};
+        auto original = vmhook::new_string<java_string>(std::u16string_view{text});
+        const auto result = native_fixture::static_members::get_method("echo", "(Ljava/lang/String;)Ljava/lang/String;")->call(original);
+        if (result.as_utf16() != text
+            || result.as_string() != vmhook::detail::utf16_to_utf8(text)) { return false; }
+        // Java null cannot silently become an empty native String.
+        const auto nullable = native_fixture::static_members::get_method("echo", "(Ljava/lang/String;)Ljava/lang/String;")->call(
+            std::make_unique<java_string>(nullptr));
+        try { (void)nullable.as_string(); }
+        catch (const vmhook::exception& error) { return error.code() == vmhook::error_code::null_reference; }
+        return false;
     }
 
     auto check_root_growth() -> bool
@@ -502,10 +559,12 @@ namespace
                 conversion_refused([] { (void)vmhook::make_unique<native_fixture>(true); })
                 && conversion_refused([] { (void)vmhook::make_unique<native_fixture>(std::int32_t{-100}); })))
             { return false; }
-            output << "object_stores="
-                   << (vmhook::detail::reference_stores_supported()
-                       ? "epsilon_supported" : "moving_gc_refused") << '\n';
+            output << "object_stores=collector_barrier_accessor" << '\n';
             if (!passed(output, "object_contract", check_object_contract(first, second))) { return false; }
+            if (!passed(output, "field_memory", check_field_memory(first, second))) { return false; }
+            if (!passed(output, "heap_iteration", check_heap_iteration())) { return false; }
+            if (!passed(output, "monitor_locks", check_monitor_locks(context, output))) { return false; }
+            output << "monitor_backend=" << (vmhook::monitor_locks_supported() ? "vm_object_locker" : "refused_profile") << '\n';
 
             const auto virtual_call = base_method(*first, "virtualValue");
             const auto private_call = base_method(*first, "privateValue");
@@ -538,13 +597,27 @@ namespace
                 && floating.was_invoked() && !floating.threw()
                 && static_cast<double>(floating) == 3.75)) { return false; }
             if (!passed(output, "strings", echo.was_invoked() && !echo.threw()
-                && echo.as_string() == unicode_text() && first->text() == unicode_text()))
+                && echo.as_string() == unicode_text() && first->text() == unicode_text()
+                && check_lossless_utf16()))
             { return false; }
             if (!passed(output, "root_growth", check_root_growth())) { return false; }
 
-            const auto thrown = native_fixture::static_members::get_method("fail", "()V")->call();
+            const auto thrown = native_fixture::static_members::get_method("fail", "()V")->try_call();
             const auto after_exception = native_fixture::plain(40);
+            const auto throwable = thrown.get_throwable();
+            const auto copied_error = thrown.error();
+            bool checked_throw{};
+            try { native_fixture::static_members::get_method("fail", "()V")->call(); }
+            catch (const vmhook::exception& error)
+            {
+                checked_throw = error.code() == vmhook::error_code::java_exception
+                    && error.exception_class() == "java/lang/IllegalStateException"
+                    && error.get_throwable()->get_method("getMessage")->call().as_string()
+                        == "expected native-call exception";
+            }
             if (!passed(output, "java_exception", thrown.was_invoked() && thrown.threw()
+                && checked_throw && copied_error && copied_error->has_throwable()
+                && throwable->get_method("getMessage")->call().as_string() == "expected native-call exception"
                 && thrown.exception_class == "java/lang/IllegalStateException"
                 && after_exception.was_invoked() && !after_exception.threw()
                 && static_cast<std::int32_t>(after_exception) == 41)) { return false; }
@@ -589,7 +662,7 @@ namespace
                 try
                 {
                     const auto method = first->get_method("add", "(I)I");
-                    refused = !method || !method->call(std::int32_t{1}).was_invoked();
+                    refused = !method || !method->try_call(std::int32_t{1}).was_invoked();
                 }
                 catch (const vmhook::exception&) { refused = true; }
                 foreign_safe = other.valid() && conversion_refused([&] { (void)first->get_instance(); })
@@ -599,7 +672,7 @@ namespace
                     && virtual_call->raw_method() == nullptr
                     && virtual_call->get_compressed_oop() == 0
                     && !static_call->is_static()
-                    && refused && (!field || static_cast<std::int32_t>(field->get()) == 0)
+                    && refused && (!field || field->try_get().status() == vmhook::error_code::refused)
                     && static_holder.get()->get_instance() != nullptr;
             });
             foreign.join();
@@ -657,7 +730,7 @@ namespace
             && !escaped_players[1]->get_instance() && escaped_players[2]
             && conversion_refused([&] { (void)escaped_players[0]->get_instance(); })
             && conversion_refused([&] { (void)escaped_players[2]->get_instance(); })
-            && (!escaped_field || static_cast<std::int32_t>(escaped_field->get()) == 0));
+            && (!escaped_field || escaped_field->try_get().status() == vmhook::error_code::refused));
     }
 
     auto check_repeated_attachment() -> bool
@@ -716,7 +789,7 @@ namespace
                 && vmhook::register_class<collection_player_view>("NativeFixture$PlayerView")
                 && vmhook::register_class<collection_key>("NativeFixture$Key");
             if (!passed(output, "metadata", metadata)) { return 2; }
-            const auto refused = native_fixture::plain(1);
+            const auto refused = native_fixture::static_members::get_method("plain", "(I)I")->try_call(std::int32_t{1});
             if (!passed(output, "native_refusal", !refused.was_invoked())) { return 3; }
             if (!check_context(output)) { return 4; }
             if (!passed(output, "repeated_attach", check_repeated_attachment())) { return 5; }

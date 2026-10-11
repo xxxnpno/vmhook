@@ -47,6 +47,13 @@ loaded. Check `valid()` or its boolean conversion and inspect `error()` on
 failure. The optional constructor argument sets the Java thread's name; the
 default includes its Windows thread ID. VMHook registers it as a daemon thread,
 so its presence does not keep the JVM alive after application threads finish.
+An allocation failure in C++ name, context or session bookkeeping throws
+`std::bad_alloc`. Partial construction releases the attachment before the
+exception reaches the caller; the same OS thread can retry. Unsupported VM
+profiles and VM attachment refusals remain invalid contexts with an `error()`.
+Private-runtime initialization has a separate cached failure: a C++ allocation
+error while reading its profile or PDB is rethrown on later checked operations,
+and is never reported as an unsupported JVM. See [runtime diagnostics](runtime-diagnostics.md).
 
 Each wrapper operation enters VM state for the necessary work and returns to
 native state afterward. Normal C++ waits and sleeps therefore let HotSpot
@@ -81,6 +88,10 @@ Temporary internal handles are released after each operation; surviving results
 are promoted into the context's roots. Released root slots can be reused, so a
 long-running stream of temporary method results does not require an ever-growing
 live root set.
+The older `ref`, `borrowed::pin()` and static `root` reference helpers also
+propagate C++ allocation failures as `std::bad_alloc`, including allocations
+during navigation. Their documented empty or expired states still describe
+missing paths and unavailable lifetimes; they do not represent C++ exhaustion.
 
 These references require their owning context and OS thread. Another context
 on another thread cannot use them, even if it belongs to the same JVM. Closing
@@ -122,8 +133,11 @@ For a rooted wrapper, `get_instance()` throws `vmhook::exception` when the
 context has closed or the wrong thread attempts to resolve it. A null instance
 therefore describes a genuine Java-null reference, not an expired object.
 The returned address remains a temporary snapshot subject to moving GC.
-Reference field stores still require Epsilon; passing an owning pointer does
-not supply the missing write barrier for another collector.
+Metadata-bound reference field stores execute the verified Java Unsafe store
+methods, which publish through the collector's own barriers. Raw reference
+memory writes retain their Epsilon-only gate. Volatile fields and supported
+compare/exchange operations use the VM's memory semantics; final writes are
+refused.
 
 The allocation helpers `new_object<wrapper>`, `new_array<wrapper>` and
 `new_string<wrapper>` also return `std::unique_ptr<wrapper>`, defaulting to
@@ -253,10 +267,10 @@ compressed oops. ZGC, Shenandoah and other concurrent relocating collectors
 are refused: their colored references and access barriers require separate
 support. A matching PDB does not bypass the collector checks.
 
-Primitive field stores use the normal primitive access path. Public **reference
-field stores require Epsilon** until VMHook has the corresponding write-barrier
-backend. Java methods and constructors still perform their own ordinary VM
-barriers; this limitation concerns a direct C++ reference-field store.
+Metadata-bound primitive/reference fields use checked plain, volatile and
+supported atomic access. Reference publication delegates to the verified Java
+Unsafe methods and their collector barriers; raw reference-memory stores remain
+Epsilon-only. Java calls and constructors use their normal VM barriers.
 Typed wrapper references currently require verified compressed oops.
 
 Native-context and method-callback object and String allocation uses VM
@@ -266,9 +280,9 @@ narrower TLAB/layout requirements.
 
 Classes must already be loaded; native calls and construction perform class
 initialization when required. Method hook registration additionally requires
-an already-linked declaring class and does not initialize it. Name-only lookup
-can choose the wrong copy when
-multiple class loaders define the same name. Concurrent JVM shutdown, arbitrary
+an already-linked declaring class and does not initialize it. Ambiguous name-only lookup refuses independent definitions. Bind a wrapper
+through an already-rooted anchor for exact defining-loader identity; its retained
+mirror also protects its cached generation and existing proxies. Concurrent JVM shutdown, arbitrary
 class unloading of externally cached metadata, other JVM implementations and
 all vendor/collector combinations are outside the verified scope.
 

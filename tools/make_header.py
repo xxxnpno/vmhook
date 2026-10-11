@@ -145,7 +145,7 @@ def replace_function(source: str, signature: str, replacement: str) -> str:
 
 
 TYPE_NAME = """        template<typename type>
-        inline auto type_name() noexcept -> std::string
+        inline auto type_name() -> std::string
         {
             const std::string_view signature{ std::source_location::current().function_name() };
             constexpr std::string_view prefix{ "type = " };
@@ -233,7 +233,7 @@ def generate(module_path: Path, platform_header_path: Path) -> str:
             raise ValueError(f"vmhook.ixx must import {name} exactly once")
     module = strip_module_declarations(module, "vmhook")
     module = replace_function(module,
-        r"^[ \t]*template\s*<\s*typename\s+type\s*>\s*inline\s+auto\s+type_name\s*\(\s*\)\s*noexcept\s*->\s*std::string",
+        r"^[ \t]*template\s*<\s*typename\s+type\s*>\s*inline\s+auto\s+type_name\s*\(\s*\)\s*(?:noexcept\s*)?->\s*std::string",
         TYPE_NAME)
     module = replace_function(module,
         r"^[ \t]*template\s*<\s*typename\s+wrapper_type\s*>\s*consteval\s+auto\s+annotated_class_name\s*\(\s*\)\s*noexcept\s*->\s*std::string_view",

@@ -42,6 +42,30 @@ public class NativeFixture extends NativeBase implements NativeOverride {
     public String text;
     public NativeFixture child;
     public NativeFixture nullable;
+    public final int immutable_value = 31337;
+    public final NativeFixture immutable_child = this;
+    public volatile boolean memory_boolean;
+    public volatile byte memory_byte;
+    public volatile short memory_short;
+    public volatile char memory_char;
+    public volatile int memory_int;
+    public volatile long memory_long;
+    public volatile float memory_float;
+    public volatile double memory_double;
+    public volatile NativeFixture memory_object;
+    public static volatile NativeFixture memory_static_object;
+    public static int memory_payload;
+    public static volatile int memory_command;
+    public static volatile int memory_reply;
+    public static NativeFixture monitor_object;
+    public static volatile int monitor_request;
+    public static volatile int monitor_attempting;
+    public static volatile int monitor_acquired;
+    public static volatile int monitor_inside;
+    public static volatile int monitor_release;
+    public static volatile int monitor_seen;
+
+    public boolean monitor_held() { return Thread.holdsLock(this); }
 
     public NativeFixture() {
         value = 41;
@@ -295,6 +319,7 @@ public class NativeFixture extends NativeBase implements NativeOverride {
 
     public static void main(String[] arguments) throws Exception {
         holder = new NativeFixture();
+        monitor_object = new NativeFixture();
         collectionCases = new CollectionCases();
         Class.forName("NativeFixture$Lazy", false, NativeFixture.class.getClassLoader());
         Class.forName("java.lang.IllegalStateException");
@@ -304,6 +329,30 @@ public class NativeFixture extends NativeBase implements NativeOverride {
         Object[] live = new Object[16];
         int iteration = 0;
         while (true) {
+            // The DLL publishes payload before its volatile command; Java
+            // acquires that command, then publishes a reply in the other direction.
+            if (memory_command == 1) {
+                memory_reply = memory_payload == 0x12345678 ? 1 : -1;
+                memory_payload = 0x23456789;
+                memory_command = 2;
+            }
+            if (monitor_request == 1) {
+                monitor_attempting = 1;
+                synchronized (monitor_object) {
+                    monitor_seen = monitor_object.value;
+                    monitor_object.value += 1;
+                }
+                monitor_acquired = 1;
+                monitor_request = 0;
+            } else if (monitor_request == 2) {
+                synchronized (monitor_object) {
+                    monitor_inside = 1;
+                    while (monitor_release == 0) { Thread.yield(); }
+                    monitor_object.value = 9001;
+                }
+                monitor_inside = 0;
+                monitor_request = 0;
+            }
             live[iteration++ % live.length] = new byte[1024 * 1024];
             if (iteration % 10 == 0) { System.gc(); ++gcEpoch; }
             Thread.sleep(20);
