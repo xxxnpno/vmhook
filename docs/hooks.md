@@ -26,6 +26,14 @@ counted. Argument writes already made by that callback are not rolled back.
 These callbacks observe method **entry**. `return_value::set()` chooses an early
 return; it does not report the original body's result or its duration.
 
+`control.throw_exception(throwable)` forwards an allocated, rooted
+`std::unique_ptr<vmhook::any_object>` containing a non-null Java `Throwable`.
+It skips the original body and uses the genuine interpreter exception
+continuation, so Java catches and `finally` blocks see the same object.
+The pending exception takes precedence over an early return. Unrelated objects,
+Java null and calls outside the active method callback are refused. Nested Java
+calls and GC preserve the outer synchronized entry's monitor unwind flag.
+
 Same-observer recursion is suppressed by default. Other observers can still
 observe a nested invocation. `hook_recursion::allow` permits explicit recursion
 with a maximum C++ dispatch depth of 64. `call_without_hooks(callable)` suppresses

@@ -9,6 +9,7 @@ import vmhook.windows;
 
 static_assert(sizeof(void*) == 8, "VMHook requires Windows x64.");
 
+export namespace vmhook { class any_object; }
 export namespace vmhook::hotspot { struct method; struct klass; }
 export namespace vmhook::detail::jit_backend
 {
@@ -97,6 +98,7 @@ export namespace vmhook::detail
     inline auto resolve_callback_oop_snapshot(void*) noexcept -> void*;
     inline auto set_callback_reference(hotspot::return_slot*, const native_backend::root&) noexcept -> bool;
     inline auto set_callback_reference_snapshot(hotspot::return_slot*, void*) noexcept -> bool;
+    inline auto ensure_bootstrap_class(std::string_view, bool) -> std::pair<hotspot::klass*, native_backend::root>;
     template<typename value_type>
     consteval auto hook_write_argument_supported() noexcept -> bool;
 }
@@ -685,6 +687,11 @@ export namespace vmhook
             requires (std::is_base_of_v<vmhook::object_base, wrapper_type>
                       && !std::is_const_v<wrapper_type> && !std::is_volatile_v<wrapper_type>)
         auto set(const std::unique_ptr<wrapper_type>& value) -> void;
+
+        // Delivers this same Java Throwable through the interpreter's genuine
+        // exception continuation. Valid only in this active method callback.
+        // A null Java reference, empty owner or unrelated Java object is refused.
+        auto throw_exception(const std::unique_ptr<vmhook::any_object>& throwable) -> void;
 
         auto cancel() noexcept
             -> void
@@ -9113,13 +9120,14 @@ export namespace vmhook
                 std::shared_ptr<void> pin{};
                 std::uint16_t access_flags{};
                 bool duplicate{};
+                std::exception_ptr allocation_failure{};
             } lookup{ &registered_name, method_name, method_signature };
             const bool looked_up{ vmhook::detail::jit_backend::with_vm_state([](void* const opaque) noexcept
             {
                 auto& request{ *static_cast<metadata_lookup*>(opaque) };
                 try
                 {
-                    auto* const klass{ vmhook::find_class(*request.class_name) };
+                    auto* const klass{ vmhook::detail::registered_class_klass<wrapper_type>() };
                     vmhook::hotspot::method** methods{}; std::int32_t count{};
                     if (!klass || !vmhook::detail::jit_backend::holder_linked(klass)
                         || !vmhook::hotspot::safe_klass_methods(klass, methods, count)) { return; }
@@ -9139,8 +9147,10 @@ export namespace vmhook
                     request.pin = vmhook::detail::retain_hook_klass(klass);
                     if (!request.pin) { request.method = nullptr; }
                 }
+                catch (const std::bad_alloc&) { request.method = nullptr; request.allocation_failure = std::current_exception(); }
                 catch (...) { request.method = nullptr; }
             }, &lookup) };
+            if (lookup.allocation_failure) { std::rethrow_exception(lookup.allocation_failure); }
             if (lookup.duplicate) { throw vmhook::exception{ "Overloaded method: pass its JVM descriptor to hook()." }; }
             if (!looked_up || !lookup.method || !lookup.pin)
             { throw vmhook::exception{ "Java method is unavailable or unsupported; native, abstract and constructor hooks are refused." }; }
@@ -9271,6 +9281,7 @@ export namespace vmhook
             vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
             return observer_id;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (const std::exception& exception)
         {
             ::vmhook::detail::log_line("{} hook('{}'): {}", vmhook::error_tag, method_name, exception.what());
@@ -20811,6 +20822,42 @@ export namespace vmhook
             { throw vmhook::exception{ std::format("Java object is not an instance of '{}'", class_name) }; }
         }
 
+        inline auto raise_callback_exception(hotspot::return_slot* const slot,
+            hotspot::frame* const frame, const std::unique_ptr<vmhook::any_object>& throwable) -> void
+        {
+            if (!slot || !frame || frame != hotspot::current_interpreter_frame
+                || !callback_backend::current || !throwable)
+            { throw vmhook::exception{ "A Java exception requires the active method callback and an allocated wrapper owner." }; }
+            native_backend::operation access{};
+            if (!access)
+            { throw vmhook::exception{ "The Java exception requires its own rooted callback context." }; }
+            const auto root{ throwable->get_native_root() };
+            if (!root || !root->valid() || !root->resolve_under_vm())
+            { throw vmhook::exception{ "A Java exception requires a retained non-null Throwable reference." }; }
+            const auto [throwable_class, class_root]{ ensure_bootstrap_class("java/lang/Throwable", false) };
+            if (!throwable_class || !class_root || !container_class_assignable(
+                    vmhook::klass_from_oop(root->resolve_under_vm()), throwable_class))
+            { throw vmhook::exception{ "The Java exception is not a bootstrap Throwable instance." }; }
+            auto* const context{ native_backend::current_context_lifetime() };
+            auto& runtime{ private_native::rt() };
+            if (!context || runtime.current_thread() != context->thread
+                || private_native::thread_state(context->thread) != 6)
+            { throw vmhook::exception{ "A Java exception requires this callback's VM state." }; }
+            const auto pending_offset{ runtime.off("JavaThread", "_pending_exception") };
+            const auto file_offset{ runtime.off("ThreadShadow", "_exception_file") };
+            const auto line_offset{ runtime.off("ThreadShadow", "_exception_line") };
+            if (private_native::load<void*>(context->thread, pending_offset))
+            { throw vmhook::exception{ "The callback already has a pending Java exception." }; }
+            // ThreadShadow's pending exception is a VM-scanned oop. Publish it
+            // in VM state before session HandleArea roots retire. No Java call
+            // or safepoint occurs between resolving this ticket and the store.
+            private_native::store(context->thread, pending_offset, root->resolve_under_vm());
+            private_native::store(context->thread, file_offset, "VMHook method callback");
+            private_native::store(context->thread, line_offset, std::int32_t{ 0 });
+            slot->cancel = true;
+            slot->retval = 0;
+        }
+
         template<typename... argument_types>
         [[nodiscard]] inline auto call_container_method(const native_backend::root& root,
             const std::string_view name, const std::string_view signature,
@@ -20989,6 +21036,9 @@ export namespace vmhook
     inline auto hotspot::method_args::operator[](const std::size_t index) const
         -> std::unique_ptr<vmhook::any_object>
     { return this->as<vmhook::any_object>(index); }
+
+    inline auto return_value::throw_exception(const std::unique_ptr<vmhook::any_object>& throwable) -> void
+    { vmhook::detail::raise_callback_exception(this->return_slot, this->stack_frame, throwable); }
 
     /* Java Collection wrappers use the public toArray contract. Snapshot order
        and concurrent-mutation semantics are those of the Java implementation.
