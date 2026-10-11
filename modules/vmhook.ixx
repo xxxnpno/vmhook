@@ -35,6 +35,9 @@ export namespace vmhook::detail
     inline auto finish_class_hooks(vmhook::hotspot::klass*, bool) noexcept -> void;
     inline auto fail_class_hook_preparation(void*) noexcept -> void;
     inline auto class_event_notification_active() noexcept -> bool;
+    inline auto disable_deferred_hooks() noexcept -> void;
+    inline auto reclaim_class_observers() noexcept -> bool;
+    inline auto reclaim_deferred_hook_captures() noexcept -> bool;
 }
 
 export namespace vmhook
@@ -6252,6 +6255,8 @@ export namespace vmhook
             vmhook::method_hook_id id{};
             vmhook::hook_options options{};
             std::atomic<bool> enabled{ true };
+            std::atomic<std::size_t> active{};
+            std::atomic<std::uint64_t> calls{}, failures{}, suppressed_recursions{};
         };
         struct hooked_method
         {
@@ -6292,17 +6297,22 @@ export namespace vmhook
         inline thread_local std::size_t suppress_method_observers{};
         struct method_observer_guard final
         {
-            const method_observer_control* observer{};
+            method_observer_control* observer{};
             method_observer_guard* previous{};
             inline static thread_local method_observer_guard* current{};
-            explicit method_observer_guard(const method_observer_control* next) noexcept
+            explicit method_observer_guard(method_observer_control* next) noexcept
                 : observer{ next }, previous{ current }
             {
                 current = this; ++current_method_observer_depth;
                 g_active_hook_callbacks.fetch_add(1, std::memory_order_acq_rel);
+                if (this->observer)
+                {
+                    this->observer->active.fetch_add(1, std::memory_order_seq_cst);
+                }
             }
             ~method_observer_guard()
             {
+                if (this->observer) { this->observer->active.fetch_sub(1, std::memory_order_seq_cst); }
                 g_active_hook_callbacks.fetch_sub(1, std::memory_order_acq_rel);
                 --current_method_observer_depth; current = this->previous;
             }
@@ -6373,19 +6383,27 @@ export namespace vmhook
             {
                 if (g_shutdown_requested.load(std::memory_order_acquire) || slot->cancel) { break; }
                 if (entry.method != method || entry.const_method_identity != identity || !entry.detour) { continue; }
-                if (entry.observer && !entry.observer->enabled.load(std::memory_order_acquire)) { continue; }
                 // Even explicitly recursive observers have a finite C++ depth.
                 if (current_method_observer_depth >= 64
                     || (entry.observer && entry.observer->options.recursion == vmhook::hook_recursion::suppress_same_observer
                         && method_observer_guard::active(entry.observer.get())))
-                { g_suppressed_hook_recursions.fetch_add(1, std::memory_order_relaxed); continue; }
+                {
+                    g_suppressed_hook_recursions.fetch_add(1, std::memory_order_relaxed);
+                    if (entry.observer) { entry.observer->suppressed_recursions.fetch_add(1, std::memory_order_relaxed); }
+                    continue;
+                }
                 const method_observer_guard entered{ entry.observer.get() };
+                // Count an entered reader before checking enablement. A removal
+                // can therefore distinguish it from a future disabled entry.
+                if (entry.observer && !entry.observer->enabled.load(std::memory_order_seq_cst)) { continue; }
+                if (entry.observer) { entry.observer->calls.fetch_add(1, std::memory_order_relaxed); }
                 try { (*entry.detour)(frame, thread, slot); }
                 catch (...)
                 {
                     // An unsuccessful callback cannot leave a forced return.
                     slot->cancel = false; slot->retval = 0;
                     g_hook_callback_failures.fetch_add(1, std::memory_order_relaxed);
+                    if (entry.observer) { entry.observer->failures.fetch_add(1, std::memory_order_relaxed); }
                 }
             }
         }
@@ -9384,7 +9402,7 @@ export namespace vmhook
 
             auto wrapper_detour = [detour = std::forward<decltype(user_detour)>(user_detour), argument_slots]
                 (vmhook::hotspot::frame* const frame_pointer, vmhook::hotspot::java_thread*,
-                 vmhook::hotspot::return_slot* const slot)
+                 vmhook::hotspot::return_slot* const slot) mutable
             {
                 vmhook::return_value retval{ slot, frame_pointer };
                 [&]<std::size_t... indexes>(std::index_sequence<indexes...>)
@@ -9554,7 +9572,7 @@ export namespace vmhook
             std::erase_if(next->methods, [id](const auto& entry) { return entry.observer && entry.observer->id == id; });
             hotspot::g_hook_dispatch_snapshots.reserve(hotspot::g_hook_dispatch_snapshots.size() + 1);
             retired.reserve(hotspot::g_hook_dispatch_snapshots.size() + 1);
-            found->observer->enabled.store(false, std::memory_order_release);
+            found->observer->enabled.store(false, std::memory_order_seq_cst);
             removed_callback = std::move(found->detour);
             const auto* const method{ found->method };
             if (std::any_of(hotspot::g_hooked_methods.begin(), hotspot::g_hooked_methods.end(),
@@ -9565,6 +9583,41 @@ export namespace vmhook
             return true;
         }
         catch (...) { return false; }
+    }
+
+    struct method_hook_stats final
+    {
+        method_hook_id id{};
+        bool enabled{};
+        std::size_t active_callbacks{};
+        std::uint64_t calls{}, failures{}, suppressed_recursions{};
+    };
+    // Metadata is retained through shutdown. Removed observer IDs may disappear
+    // once another observer replaces the dormant physical method registration.
+    [[nodiscard]] inline auto observer_stats(const method_hook_id id) noexcept -> std::optional<method_hook_stats>
+    {
+        const auto sample = [](const hotspot::method_observer_control& node) noexcept -> method_hook_stats
+        {
+            return { node.id, node.enabled.load(std::memory_order_acquire), node.active.load(std::memory_order_acquire),
+                node.calls.load(std::memory_order_relaxed), node.failures.load(std::memory_order_relaxed),
+                node.suppressed_recursions.load(std::memory_order_relaxed) };
+        };
+        if (hotspot::current_method_observer_depth != 0 || hotspot::in_java_detour() || detail::class_event_notification_active())
+        {
+            const hotspot::hook_dispatch_reader reader{};
+            if (!reader.snapshot) { return std::nullopt; }
+            for (const auto& entry : reader.snapshot->methods)
+            { if (entry.observer && entry.observer->id == id) { return sample(*entry.observer); } }
+            return std::nullopt;
+        }
+        try
+        {
+            std::lock_guard lock{ hotspot::g_hooked_methods_mutex };
+            for (const auto& entry : hotspot::g_hooked_methods)
+            { if (entry.observer && entry.observer->id == id) { return sample(*entry.observer); } }
+        }
+        catch (...) {}
+        return std::nullopt;
     }
 
     // Release disabled observer captures on a native administrator, outside
@@ -9616,7 +9669,7 @@ export namespace vmhook
         std::size_t active_observers{}, retained_method_policies{}, physical_stubs{};
         std::size_t retained_snapshots{}, dispatch_readers{}, active_callbacks{};
         std::uint64_t callback_failures{}, suppressed_recursions{};
-        bool shutdown_requested{};
+        bool shutdown_requested{}, registry_sizes_available{};
         // Published code can remain on a Java return stack after callbacks drain.
         bool dll_must_remain_loaded{ true };
     };
@@ -9631,6 +9684,7 @@ export namespace vmhook
                 && !detail::class_event_notification_active())
             {
             std::lock_guard lock{ hotspot::g_hooked_methods_mutex };
+            result.registry_sizes_available = true;
             for (std::size_t i{}; i < hotspot::g_hooked_methods.size(); ++i)
             {
                 const auto& entry{ hotspot::g_hooked_methods[i] };
@@ -9695,6 +9749,7 @@ export namespace vmhook
     inline auto shutdown_hooks() noexcept -> void
     {
         vmhook::hotspot::g_shutdown_requested.store(true, std::memory_order_release);
+        vmhook::detail::disable_deferred_hooks();
         // Callback-side shutdown disables method dispatch without taking locks
         // or starting a safepoint. A native owner completes removal later.
         if (vmhook::hotspot::in_java_detour() || vmhook::detail::class_event_notification_active()) { return; }
@@ -9738,6 +9793,8 @@ export namespace vmhook
                 retired_snapshots.clear();
                 vmhook::detail::flush_hook_roots();
                 vmhook::detail::reset_watcher_latches();
+                (void)vmhook::detail::reclaim_class_observers();
+                (void)vmhook::detail::reclaim_deferred_hook_captures();
             }
         }
         catch (...) {}
@@ -22068,7 +22125,127 @@ export namespace vmhook
         vmhook::oop_t defining_loader_oop{};
         std::string_view internal_name{};
         class_load_phase phase{};
+        // Notification identity, not a retained Klass or class-loader handle.
+        std::uint64_t event_id{};
     };
+
+    // Plain copied data is safe after the VM callback returns. The event ID
+    // identifies a notification; it deliberately cannot be used to dereference
+    // metadata, infer class-loader identity or bind a wrapper.
+    struct class_load_snapshot final
+    {
+        std::uint64_t event_id{};
+        std::string internal_name{};
+        class_load_phase phase{};
+        bool bootstrap_loader{};
+    };
+    [[nodiscard]] inline auto copy_class_event(const class_load_event& event) -> class_load_snapshot
+    {
+        return { event.event_id, std::string{ event.internal_name }, event.phase, event.defining_loader_oop == nullptr };
+    }
+
+    // Fixed data for allocation-free callback capture. Long names are copied
+    // with an explicit truncation flag; they cannot masquerade as exact names.
+    struct class_load_record final
+    {
+        std::uint64_t event_id{};
+        class_load_phase phase{};
+        bool bootstrap_loader{}, truncated{};
+        std::uint16_t name_length{};
+        std::array<char, 1024> internal_name{};
+        [[nodiscard]] auto name() const noexcept -> std::string_view
+        { return { this->internal_name.data(), this->name_length }; }
+    };
+    [[nodiscard]] inline auto record_class_event(const class_load_event& event) noexcept -> class_load_record
+    {
+        class_load_record record{};
+        record.event_id = event.event_id; record.phase = event.phase;
+        record.bootstrap_loader = event.defining_loader_oop == nullptr;
+        const auto length{ std::min(event.internal_name.size(), record.internal_name.size()) };
+        record.name_length = static_cast<std::uint16_t>(length);
+        record.truncated = length != event.internal_name.size();
+        if (length) { std::memcpy(record.internal_name.data(), event.internal_name.data(), length); }
+        return record;
+    }
+
+    // A bounded MPMC transport for copied telemetry, independent of Java calls.
+    // Producers allocate nothing and never acquire a mutex. Full or repeatedly
+    // contended writes are dropped and counted; a slow exporter cannot block a
+    // Java callback. Owning Java wrappers belong in an explicit root transfer,
+    // never in this raw-data queue.
+    template<class event_type>
+        requires std::is_trivially_copyable_v<event_type> && std::is_nothrow_copy_assignable_v<event_type>
+    class bounded_event_queue final
+    {
+        struct slot final
+        {
+            std::atomic<std::size_t> sequence{};
+            event_type value{};
+        };
+        std::unique_ptr<slot[]> slots_{};
+        const std::size_t capacity_{};
+        alignas(64) std::atomic<std::size_t> write_position_{};
+        alignas(64) std::atomic<std::size_t> read_position_{};
+        std::atomic<std::uint64_t> pushed_{}, popped_{}, dropped_{};
+    public:
+        explicit bounded_event_queue(const std::size_t capacity = 256) : capacity_{ capacity }
+        {
+            if (capacity < 2 || capacity > (std::size_t{ 1 } << 20) || (capacity & (capacity - 1)) != 0)
+            { throw std::invalid_argument{ "An event queue capacity must be a power of two between 2 and 1048576." }; }
+            this->slots_ = std::make_unique<slot[]>(capacity);
+            for (std::size_t i{}; i < capacity; ++i) { this->slots_[i].sequence.store(i, std::memory_order_relaxed); }
+        }
+        bounded_event_queue(const bounded_event_queue&) = delete;
+        auto operator=(const bounded_event_queue&) -> bounded_event_queue& = delete;
+        [[nodiscard]] auto try_push(const event_type& event) noexcept -> bool
+        {
+            auto position{ this->write_position_.load(std::memory_order_relaxed) };
+            for (unsigned attempt{}; attempt < 64; ++attempt)
+            {
+                auto& entry{ this->slots_[position & (this->capacity_ - 1)] };
+                const auto sequence{ entry.sequence.load(std::memory_order_acquire) };
+                const auto difference{ static_cast<std::intptr_t>(sequence - position) };
+                if (difference == 0)
+                {
+                    if (!this->write_position_.compare_exchange_weak(position, position + 1, std::memory_order_relaxed)) { continue; }
+                    entry.value = event;
+                    entry.sequence.store(position + 1, std::memory_order_release);
+                    this->pushed_.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+                if (difference < 0) { break; }
+                position = this->write_position_.load(std::memory_order_relaxed);
+            }
+            this->dropped_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        [[nodiscard]] auto try_pop(event_type& event) noexcept -> bool
+        {
+            auto position{ this->read_position_.load(std::memory_order_relaxed) };
+            for (unsigned attempt{}; attempt < 64; ++attempt)
+            {
+                auto& entry{ this->slots_[position & (this->capacity_ - 1)] };
+                const auto sequence{ entry.sequence.load(std::memory_order_acquire) };
+                const auto difference{ static_cast<std::intptr_t>(sequence - (position + 1)) };
+                if (difference == 0)
+                {
+                    if (!this->read_position_.compare_exchange_weak(position, position + 1, std::memory_order_relaxed)) { continue; }
+                    event = entry.value;
+                    entry.sequence.store(position + this->capacity_, std::memory_order_release);
+                    this->popped_.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+                if (difference < 0) { return false; }
+                position = this->read_position_.load(std::memory_order_relaxed);
+            }
+            return false;
+        }
+        [[nodiscard]] auto capacity() const noexcept -> std::size_t { return this->capacity_; }
+        [[nodiscard]] auto pushed() const noexcept -> std::uint64_t { return this->pushed_.load(std::memory_order_relaxed); }
+        [[nodiscard]] auto popped() const noexcept -> std::uint64_t { return this->popped_.load(std::memory_order_relaxed); }
+        [[nodiscard]] auto dropped() const noexcept -> std::uint64_t { return this->dropped_.load(std::memory_order_relaxed); }
+    };
+    using class_event_queue = bounded_event_queue<class_load_record>;
 
     namespace detail
     {
@@ -22078,6 +22255,8 @@ export namespace vmhook
         inline auto disable_class_observers() noexcept -> void;
         inline auto class_event_notification_active() noexcept -> bool;
         inline auto ensure_class_events_installed() noexcept -> bool;
+        inline auto reclaim_class_observers() noexcept -> bool;
+        inline auto class_observers_idle() noexcept -> bool;
     }
 
     // Persistent, synchronous native notification; discarding the returned ID
@@ -22112,6 +22291,202 @@ export namespace vmhook
         return detail::erase_class_observer(id);
     }
 
+    // Keep the transport alive while notifications can enter it. Explicit
+    // remove_class_observer() stops publication; reclaim_class_observers()
+    // releases its captured shared owner from a native administrator.
+    inline auto on_class_loaded(std::shared_ptr<class_event_queue> events) -> class_observer_id
+    {
+        if (!events) { throw std::invalid_argument{ "A class event queue cannot be empty." }; }
+        return detail::add_class_observer([events = std::move(events)](const class_load_event& event)
+        { (void)events->try_push(record_class_event(event)); });
+    }
+    inline auto reclaim_class_observers() noexcept -> bool { return detail::reclaim_class_observers(); }
+    [[nodiscard]] inline auto class_observers_idle() noexcept -> bool { return detail::class_observers_idle(); }
+
+
+    using deferred_hook_id = std::uint64_t;
+    enum class deferred_hook_state : std::uint8_t
+    { waiting_for_class, installing, installed, failed, cancelled };
+    struct deferred_hook_info final
+    {
+        deferred_hook_id id{};
+        method_hook_id installed_hook{};
+        deferred_hook_state state{};
+        std::uint64_t attempts{};
+    };
+    namespace detail
+    {
+        struct deferred_hook_attempt final { method_hook_id id{}; bool class_bound{}; };
+        struct deferred_hook_node final
+        {
+            deferred_hook_id id{};
+            class_observer_id class_observer{};
+            std::string class_name{};
+            std::function<deferred_hook_attempt()> install{};
+            deferred_hook_node* previous{};
+            std::atomic<bool> enabled{ true }, pending{ true }, busy{};
+            std::atomic<method_hook_id> installed_hook{};
+            std::atomic<deferred_hook_state> state{ deferred_hook_state::waiting_for_class };
+            std::atomic<std::uint64_t> attempts{};
+        };
+        inline std::atomic<deferred_hook_node*> deferred_hook_head{};
+        inline std::mutex deferred_hook_setup_mutex{};
+        inline std::vector<std::unique_ptr<deferred_hook_node>> deferred_hook_nodes{};
+        inline deferred_hook_id next_deferred_hook_id{ 1 };
+        inline auto deferred_hook_native_owner() noexcept -> bool
+        {
+            return !hotspot::in_java_detour() && !class_event_notification_active()
+                && static_cast<bool>(native_backend::active_context_lifetime());
+        }
+    }
+
+    // A definition callback only marks readiness. The user's native owner
+    // calls process_pending_hooks() after the class can be linked; all lookup,
+    // roots, deoptimization and code patching happen outside the VM callback.
+    // Ordinary Java calls on native workers never depend on this mechanism.
+    template<class wrapper_type, class callback_type>
+        requires detail::hook_callback_supported_v<callback_type>
+    inline auto hook_when_loaded(std::string_view class_name, std::string_view method_name,
+        std::string_view descriptor, callback_type&& callback, hook_options options = {}) -> deferred_hook_id
+    {
+        if (!detail::deferred_hook_native_owner())
+        { throw vmhook::exception{ "Deferred hook registration requires a native_thread_context outside VM callbacks." }; }
+        if (class_name.empty() || method_name.empty())
+        { throw std::invalid_argument{ "A deferred hook requires its class and method name." }; }
+        auto node{ std::make_unique<detail::deferred_hook_node>() };
+        node->class_name = std::string{ class_name };
+        node->install = [name = node->class_name, method = std::string{ method_name }, signature = std::string{ descriptor },
+                         detour = std::forward<callback_type>(callback), options]() mutable -> detail::deferred_hook_attempt
+        {
+            if (!vmhook::register_class<wrapper_type>(name)) { return {}; }
+            return { vmhook::add_hook<wrapper_type>(method, signature, detour, options), true };
+        };
+        std::lock_guard lock{ detail::deferred_hook_setup_mutex };
+        node->id = detail::next_deferred_hook_id++;
+        if (!node->id) { throw vmhook::exception{ "Deferred hook IDs exhausted." }; }
+        auto* const pointer{ node.get() };
+        // The resident node is prepared before observer publication. Failed
+        // subscription never publishes a pointer whose storage can disappear.
+        detail::deferred_hook_nodes.reserve(detail::deferred_hook_nodes.size() + 1);
+        node->class_observer = vmhook::on_class_loaded([pointer](const class_load_event& event)
+        {
+            if (pointer->enabled.load(std::memory_order_seq_cst) && event.internal_name == pointer->class_name)
+            { pointer->pending.store(true, std::memory_order_release); }
+        });
+        if (!node->class_observer) { return 0; }
+        node->previous = detail::deferred_hook_head.load(std::memory_order_relaxed);
+        detail::deferred_hook_nodes.push_back(std::move(node));
+        detail::deferred_hook_head.store(pointer, std::memory_order_release);
+        return pointer->id;
+    }
+    template<class wrapper_type, class callback_type>
+        requires detail::hook_callback_supported_v<callback_type>
+    inline auto hook_when_loaded(std::string_view class_name, std::string_view method_name,
+        callback_type&& callback, hook_options options = {}) -> deferred_hook_id
+    {
+        return hook_when_loaded<wrapper_type>(class_name, method_name, std::string_view{},
+            std::forward<callback_type>(callback), options);
+    }
+    // Returns successful installs. A class can have been defined but remain
+    // unlinked at the first attempt; retry_deferred_hook() schedules another
+    // native attempt without blocking the loading thread or inventing a pump.
+    inline auto process_pending_hooks(const std::size_t maximum = 64) -> std::size_t
+    {
+        if (!detail::deferred_hook_native_owner())
+        { throw vmhook::exception{ "Process deferred hooks on a native_thread_context outside VM callbacks." }; }
+        std::size_t installed{}, processed{};
+        for (auto* node{ detail::deferred_hook_head.load(std::memory_order_acquire) }; node && processed < maximum; node = node->previous)
+        {
+            if (!node->enabled.load(std::memory_order_seq_cst) || node->installed_hook.load(std::memory_order_seq_cst)
+                || !node->pending.exchange(false, std::memory_order_acq_rel)) { continue; }
+            if (node->busy.exchange(true, std::memory_order_seq_cst)) { node->pending.store(true, std::memory_order_release); continue; }
+            if (!node->enabled.load(std::memory_order_seq_cst)) { node->busy.store(false, std::memory_order_seq_cst); continue; }
+            ++processed; node->attempts.fetch_add(1, std::memory_order_relaxed);
+            node->state.store(deferred_hook_state::installing, std::memory_order_release);
+            detail::deferred_hook_attempt result{};
+            try { result = node->install(); }
+            catch (...) { result.class_bound = true; }
+            node->installed_hook.store(result.id, std::memory_order_seq_cst);
+            if (!node->enabled.load(std::memory_order_seq_cst))
+            {
+                if (result.id) { (void)remove_hook(result.id); }
+                node->state.store(deferred_hook_state::cancelled, std::memory_order_release);
+            }
+            else
+            {
+                node->state.store(result.id ? deferred_hook_state::installed
+                    : result.class_bound ? deferred_hook_state::failed : deferred_hook_state::waiting_for_class,
+                    std::memory_order_release);
+                if (result.id) { ++installed; }
+            }
+            node->busy.store(false, std::memory_order_seq_cst);
+        }
+        return installed;
+    }
+    inline auto retry_deferred_hook(const deferred_hook_id id) noexcept -> bool
+    {
+        for (auto* node{ detail::deferred_hook_head.load(std::memory_order_acquire) }; node; node = node->previous)
+        {
+            if (node->id == id && node->enabled.load(std::memory_order_seq_cst)
+                && !node->installed_hook.load(std::memory_order_seq_cst))
+            { node->pending.store(true, std::memory_order_release); return true; }
+        }
+        return false;
+    }
+    [[nodiscard]] inline auto deferred_hook_status(const deferred_hook_id id) noexcept -> std::optional<deferred_hook_info>
+    {
+        for (auto* node{ detail::deferred_hook_head.load(std::memory_order_acquire) }; node; node = node->previous)
+        {
+            if (node->id == id)
+            {
+                return deferred_hook_info{ id, node->installed_hook.load(std::memory_order_seq_cst),
+                    node->enabled.load(std::memory_order_seq_cst) ? node->state.load(std::memory_order_acquire) : deferred_hook_state::cancelled,
+                    node->attempts.load(std::memory_order_relaxed) };
+            }
+        }
+        return std::nullopt;
+    }
+    inline auto remove_deferred_hook(const deferred_hook_id id) noexcept -> bool
+    {
+        for (auto* node{ detail::deferred_hook_head.load(std::memory_order_acquire) }; node; node = node->previous)
+        {
+            if (node->id != id || !node->enabled.exchange(false, std::memory_order_seq_cst)) { continue; }
+            node->state.store(deferred_hook_state::cancelled, std::memory_order_release);
+            (void)remove_class_observer(node->class_observer);
+            if (const auto hook{ node->installed_hook.load(std::memory_order_seq_cst) }) { (void)remove_hook(hook); }
+            return true;
+        }
+        return false;
+    }
+    namespace detail
+    {
+        inline auto disable_deferred_hooks() noexcept -> void
+        {
+            for (auto* node{ deferred_hook_head.load(std::memory_order_acquire) }; node; node = node->previous)
+            {
+                node->enabled.store(false, std::memory_order_seq_cst);
+                node->state.store(deferred_hook_state::cancelled, std::memory_order_release);
+            }
+        }
+    }
+    inline auto reclaim_deferred_hooks() noexcept -> bool
+    {
+        if (!detail::deferred_hook_native_owner()) { return false; }
+        try
+        {
+            std::vector<std::function<detail::deferred_hook_attempt()>> captures{};
+            std::lock_guard lock{ detail::deferred_hook_setup_mutex };
+            captures.reserve(detail::deferred_hook_nodes.size());
+            for (auto& node : detail::deferred_hook_nodes)
+            {
+                if (!node->enabled.load(std::memory_order_seq_cst) && !node->busy.load(std::memory_order_seq_cst) && node->install)
+                { captures.push_back(std::move(node->install)); }
+            }
+            return true;
+        }
+        catch (...) { return false; }
+    }
+
     /*
         @brief Registry that owns the exception callbacks installed by
                on_exception.
@@ -22135,14 +22510,46 @@ export namespace vmhook
         };
     }
 
+    namespace detail
+    {
+        inline auto reclaim_deferred_hook_captures() noexcept -> bool { return vmhook::reclaim_deferred_hooks(); }
+    }
+
+    struct throwable_stack_trace_event final
+    {
+        std::unique_ptr<vmhook::any_object> throwable{};
+        std::string internal_name{};
+    };
+    // Exact event: entry to Throwable.fillInStackTrace(), including explicit
+    // refreshes. This neither reports every construction nor observes throws,
+    // rethrows or catches. The returned ID is persistent until remove_hook().
+    template<class callback_type>
+        requires std::is_invocable_v<callback_type&, const throwable_stack_trace_event&>
+    inline auto on_throwable_stack_trace(callback_type&& callback) -> method_hook_id
+    {
+        if (detail::registered_class_name<detail::throwable_wrapper>().empty()
+            && !vmhook::register_class<detail::throwable_wrapper>("java/lang/Throwable")) { return 0; }
+        return add_hook<detail::throwable_wrapper>("fillInStackTrace", "()Ljava/lang/Throwable;",
+            [observe = std::forward<callback_type>(callback)](return_value&, const std::unique_ptr<detail::throwable_wrapper>& self) mutable
+            {
+                throwable_stack_trace_event event{};
+                event.throwable = std::make_unique<vmhook::any_object>(self->get_instance());
+                if (auto* const klass{ vmhook::klass_from_oop(event.throwable->get_instance()) })
+                { if (auto* const name{ klass->get_name() }) { event.internal_name = name->to_string(); } }
+                if (event.internal_name.empty()) { event.internal_name = "java/lang/Throwable"; }
+                std::invoke(observe, static_cast<const throwable_stack_trace_event&>(event));
+            });
+    }
+
     /*
-        @brief Registers a callback fired whenever a `java.lang.Throwable`
-               (or any subclass) is constructed.
+        @brief Compatibility observer for Throwable.fillInStackTrace() calls.
+        @warning This is not a throw/catch event or a complete construction
+                 event. Explicit stack-trace refreshes also notify. Prefer
+                 on_throwable_stack_trace() for the precise persistent API.
         @details
         Installs an interpreter hook on
         `java.lang.Throwable::fillInStackTrace()Ljava/lang/Throwable;`,
-        which every public Throwable constructor calls before
-        returning.  When the hook fires we read the dynamic klass off
+        which ordinary writable-stack-trace constructors generally call.  When the hook fires we read the dynamic klass off
         the receiver oop's narrow-klass header and dispatch the
         callback with the fully-qualified internal class name (`/`-
         separated).
@@ -22152,7 +22559,7 @@ export namespace vmhook
         Throwable whose constructor goes through `fillInStackTrace`.
         It misses:
           - exceptions constructed with `writableStackTrace=false`
-            (the 4-bool protected constructor with that flag set),
+            (the protected constructor's writableStackTrace flag),
           - subclasses that override `fillInStackTrace` to a no-op
             for performance (rare; some preallocated VM errors do
             this).
@@ -26065,9 +26472,13 @@ public:
         class_observer_id id{};
         callback_node* previous{};
         std::atomic_bool enabled{true};
+        std::atomic<std::size_t> active{};
+        std::atomic<std::uint64_t> calls{}, failures{};
     };
 private:
     inline static std::atomic<callback_node*> callbacks_{};
+    inline static std::atomic<std::size_t> active_notifications_{};
+    inline static std::atomic<std::uint64_t> next_event_id_{1};
     inline static std::mutex setup_mutex_{};
     inline static std::vector<std::unique_ptr<callback_node>> retained_callbacks_{};
     inline static std::array<native_entry_hook,4> hooks_{};
@@ -26110,14 +26521,21 @@ private:
         if(selected_profile_->feature<10)loader=read<void*>(cld,cld_loader_offset_);
         else {auto* const slot=read<void**>(cld,cld_loader_offset_);loader=slot?*slot:nullptr;}
         const event value{static_cast<vmhook::hotspot::klass*>(klass),static_cast<vmhook::hotspot::class_loader_data*>(cld),loader,
-                          {static_cast<const char*>(symbol)+symbol_body_,length},point};
+                          {static_cast<const char*>(symbol)+symbol_body_,length},point,
+                          next_event_id_.fetch_add(1,std::memory_order_relaxed)};
         ++callback_depth_;
+        active_notifications_.fetch_add(1,std::memory_order_seq_cst);
         // No registry mutex, shared_ptr lock, allocation, snapshot copy or VM call.
         // Nodes remain resident; stop merely disables one atomic flag.
         for(auto* node=callbacks_.load(std::memory_order_acquire);node;node=node->previous) {
-            if(!node->enabled.load(std::memory_order_acquire))continue;
-            try{node->callback(value);}catch(...){}
+            node->active.fetch_add(1,std::memory_order_seq_cst);
+            if(node->enabled.load(std::memory_order_seq_cst)) {
+                node->calls.fetch_add(1,std::memory_order_relaxed);
+                try{node->callback(value);}catch(...){node->failures.fetch_add(1,std::memory_order_relaxed);}
+            }
+            node->active.fetch_sub(1,std::memory_order_seq_cst);
         }
+        active_notifications_.fetch_sub(1,std::memory_order_seq_cst);
         --callback_depth_;
     }
     static auto instance_define(void* klass,void* loader,void* thread) -> void {
@@ -26283,14 +26701,29 @@ public:
     }
     static auto remove(class_observer_id id) noexcept -> bool {
         for(auto* node=callbacks_.load(std::memory_order_acquire);node;node=node->previous) {
-            if(node->id==id)return node->enabled.exchange(false,std::memory_order_acq_rel);
+            if(node->id==id)return node->enabled.exchange(false,std::memory_order_seq_cst);
         }
         return false;
     }
     static auto remove_all() noexcept -> void {
         for(auto* node=callbacks_.load(std::memory_order_acquire);node;node=node->previous)
-            node->enabled.store(false,std::memory_order_release);
+            node->enabled.store(false,std::memory_order_seq_cst);
     }
+    static auto reclaim() noexcept -> bool {
+        if(callback_depth_ || vmhook::hotspot::in_java_detour())return false;
+        try {
+            std::vector<std::function<void(const event&)>> captures;
+            std::lock_guard lock{setup_mutex_};
+            captures.reserve(retained_callbacks_.size());
+            for(auto& node:retained_callbacks_) {
+                if(!node->enabled.load(std::memory_order_seq_cst)
+                   && node->active.load(std::memory_order_seq_cst)==0 && node->callback)
+                    captures.push_back(std::move(node->callback));
+            }
+            return true;
+        } catch(...) {return false;}
+    }
+    static auto idle() noexcept -> bool {return active_notifications_.load(std::memory_order_seq_cst)==0;}
     static auto archive_capacity_exceeded() noexcept -> bool {return archive_table_full_.load(std::memory_order_acquire);}
     static auto notifying() noexcept -> bool {return callback_depth_!=0;}
 };
@@ -26309,6 +26742,8 @@ export namespace vmhook::detail {
     inline auto ensure_class_events_installed() noexcept -> bool {
         try{return class_events::observer::ensure_installed();}catch(...){return false;}
     }
+    inline auto reclaim_class_observers() noexcept -> bool {return class_events::observer::reclaim();}
+    inline auto class_observers_idle() noexcept -> bool {return class_events::observer::idle();}
 }
 
 // Synchronous static getstatic/putstatic interception. Code and registry readers

@@ -129,5 +129,31 @@ int main()
           "retired captures are destroyed outside registry locks after readers drain");
     check(vmhook::hook_resources().dll_must_remain_loaded,
           "callback quiescence never authorizes unloading published executable code");
+
+    snapshot.methods.clear();
+    std::atomic<bool> self_removed{}, reclaim_refused{};
+    add(9, [&](auto*, auto*, auto*)
+    {
+        self_removed.store(vmhook::remove_hook(9));
+        reclaim_refused.store(!vmhook::reclaim_hook_callbacks());
+        const auto own = vmhook::observer_stats(9);
+        check(own && own->calls == 1 && own->active_callbacks == 1 && !own->enabled,
+              "per-observer counters remain readable inside a callback without registry locks");
+    });
+    {
+        std::lock_guard lock{vmhook::hotspot::g_hooked_methods_mutex};
+        vmhook::hotspot::g_hooked_methods = snapshot.methods;
+        auto published = std::make_unique<vmhook::hotspot::hook_dispatch_snapshot>(std::move(snapshot));
+        vmhook::hotspot::publish_hook_dispatch_locked(std::move(published));
+        std::thread self_removing([&]
+        {
+            vmhook::hotspot::hook_dispatch_reader reader;
+            vmhook::hotspot::return_slot own_slot{};
+            vmhook::hotspot::dispatch_method_observers(*reader.snapshot, method, identity, nullptr, nullptr, &own_slot);
+        });
+        self_removing.join();
+    }
+    check(self_removed.load() && reclaim_refused.load() && vmhook::reclaim_hook_callbacks(),
+          "callback removal never waits for an administrator's installation mutex");
     return failures ? 1 : 0;
 }
