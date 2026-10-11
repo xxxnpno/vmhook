@@ -13293,6 +13293,7 @@ export namespace vmhook::detail::callback_backend
         borrowed_context* previous_callback_{};
         nb::root outgoing_{};
         vmhook::hotspot::return_slot* outgoing_slot_{};
+        void* outgoing_reference_slot_{};
         std::vector<std::pair<void*, nb::root>> snapshots_{};
         bool entered_{};
         bool published_{};
@@ -13306,7 +13307,7 @@ export namespace vmhook::detail::callback_backend
                 if (pn::thread_state(this->thread_) != 6) { std::terminate(); }
                 // This thread root remains scanned during the VM-to-Java
                 // transition after the callback session's roots are retired.
-                void* const result{ this->outgoing_slot_
+                void* const result{ (this->outgoing_slot_ || this->outgoing_reference_slot_)
                     ? this->outgoing_ ? this->outgoing_->resolve_under_vm() : nullptr
                     : this->old_result_ ? pn::detail::resolve_root(this->old_result_)
                         : pn::load<void*>(this->thread_, this->result_offset_) };
@@ -13330,6 +13331,15 @@ export namespace vmhook::detail::callback_backend
                 {
                     void* const relocated{ pn::load<void*>(this->thread_, this->result_offset_) };
                     std::memcpy(&this->outgoing_slot_->retval, &relocated, sizeof(relocated));
+                    pn::store<void*>(this->thread_, this->result_offset_, pn::detail::resolve_root(this->old_result_));
+                }
+                else if (this->outgoing_reference_slot_)
+                {
+                    // Field continuations perform no safepoint-capable call
+                    // between this transfer and pushing the real Java operand
+                    // slot. The next dispatch uses the original bytecode map.
+                    void* const relocated{ pn::load<void*>(this->thread_, this->result_offset_) };
+                    std::memcpy(this->outgoing_reference_slot_, &relocated, sizeof relocated);
                     pn::store<void*>(this->thread_, this->result_offset_, pn::detail::resolve_root(this->old_result_));
                 }
                 // HandleMark performs arena rollback and unlinks itself. The
@@ -13447,6 +13457,13 @@ export namespace vmhook::detail::callback_backend
                 return true;
             }
             catch (...) { return false; }
+        }
+        auto reference_transport(nb::root outgoing, void* const slot) noexcept -> bool
+        {
+            if (!slot || this->outgoing_slot_ || (outgoing && !outgoing->valid())) { return false; }
+            this->outgoing_ = std::move(outgoing);
+            this->outgoing_reference_slot_ = slot;
+            return true;
         }
     };
 }
@@ -22183,6 +22200,35 @@ export namespace vmhook
         auto prevent() noexcept -> void { this->prevented_ = true; }
     };
 
+    template<class wrapper_type>
+        requires vmhook::detail::is_java_object_pointer_v<std::unique_ptr<wrapper_type>>
+    class field_access<std::unique_ptr<wrapper_type>>
+    {
+        friend struct detail::field_event_transport;
+        bool write_{};
+        std::unique_ptr<wrapper_type> value_{};
+        bool prevented_{};
+        bool replaced_{};
+        explicit field_access(const bool write, std::unique_ptr<wrapper_type> value)
+            : write_{write}, value_{std::move(value)} {}
+    public:
+        [[nodiscard]] auto is_read() const noexcept -> bool { return !this->write_; }
+        [[nodiscard]] auto is_write() const noexcept -> bool { return this->write_; }
+        [[nodiscard]] auto value() const noexcept -> const std::unique_ptr<wrapper_type>& { return this->value_; }
+        auto set(const std::unique_ptr<wrapper_type>& value) -> void
+        {
+            vmhook::detail::require_object_argument(value);
+            vmhook::detail::native_backend::operation access{};
+            if (!access) { throw vmhook::exception{"Reference field replacement requires a rooted VM operation"}; }
+            auto root{value->get_native_root()};
+            if (!root && value->get_instance()) { root = vmhook::detail::native_backend::retain_oop(value->get_instance()); }
+            if (value->get_instance() && !root) { throw vmhook::exception{"Reference field replacement could not be retained"}; }
+            this->value_ = vmhook::detail::materialize_object<wrapper_type>(0, root);
+            this->replaced_ = true;
+        }
+        auto prevent() noexcept -> void { this->prevented_ = true; }
+    };
+
     namespace detail
     {
         template<class wrapper_type, typename field_type, typename callback_type>
@@ -22204,7 +22250,16 @@ export namespace vmhook
         const auto id{ detail::install_field_hook<wrapper_type, field_type>(field_name,
             [callback = std::move(on_change)](field_access<field_type>& event) mutable
             {
-                if (event.is_write()) { callback(field_type{}, event.value()); }
+                if (event.is_write())
+                {
+                    if constexpr (vmhook::detail::is_java_object_pointer_v<field_type>)
+                    {
+                        using value_wrapper = typename vmhook::detail::is_unique_ptr<field_type>::value_type_t;
+                        const auto previous{std::make_unique<value_wrapper>(nullptr)};
+                        callback(previous, event.value());
+                    }
+                    else { callback(field_type{}, event.value()); }
+                }
             }) };
         if (!id) { return {}; }
         block->on_stop = [id]() noexcept { detail::remove_field_hook_id(id); };
@@ -27407,6 +27462,9 @@ export namespace vmhook::detail::field_backend
         char descriptor{};
         std::uint64_t bits{};
         action result{action::allow};
+        void* incoming_slot{};
+        hotspot::klass* holder{};
+        std::string_view signature{};
     };
     struct scratch_frame
     {
@@ -27433,6 +27491,7 @@ export namespace vmhook::detail::field_backend
         hotspot::klass* holder{};
         std::uint32_t offset{};
         char descriptor{};
+        std::string signature{};
         std::type_index wrapper{typeid(void)};
         std::string name{};
         std::shared_ptr<void> metadata_root{};
@@ -27522,6 +27581,9 @@ export namespace vmhook::detail::field_backend
         const auto descriptor=(*selected)->descriptor;
         invocation call{selected,&selected_view,{current->write,descriptor}};
         auto* java_sp=reinterpret_cast<std::byte*>(scratch)+sizeof(*scratch);
+        call.event.incoming_slot = current->write ? java_sp : nullptr;
+        call.event.holder = (*selected)->holder;
+        call.event.signature = (*selected)->signature;
         if(current->write) { std::memcpy(&call.event.bits,java_sp,sizeof(call.event.bits)); }
         const hotspot::detour_java_anchor_t anchor{java_sp,frame,current->patch,true};
         if(vmhook::detail::execute_borrowed_callback(static_cast<hotspot::java_thread*>(thread),
@@ -27575,7 +27637,7 @@ export namespace vmhook::detail::field_backend
         if(current.write)
         {
             code.emit({0x48,0x83,0x3c,0x24,0x03}); const auto unchanged=code.branch({0x0f,0x85});
-            // Primitive replacement occupies the existing Java stack slot. The
+            // Replacement occupies the existing Java stack slot. The
             // original field template applies truncation and collector barriers.
             code.emit({0x48,0x8b,0x44,0x24,0x08,0x48,0x89,0x84,0x24,0xc8,0,0,0});
             code.emit({0x48,0xc7,0x04,0x24,0,0,0,0}); code.label(unchanged);
@@ -27891,6 +27953,43 @@ export namespace vmhook::detail
         template<typename value_type,typename callback_type>
         static auto deliver(callback_type& callback,field_backend::packet& packet) -> void
         {
+            if constexpr(vmhook::detail::is_java_object_pointer_v<value_type>)
+            {
+                using wrapper_type = typename vmhook::detail::is_unique_ptr<value_type>::value_type_t;
+                value_type incoming{};
+                {
+                    native_backend::operation access{};
+                    if (!access) { throw vmhook::exception{"Reference field event requires a rooted VM operation"}; }
+                    void* object{};
+                    if (packet.write)
+                    {
+                        if (!packet.incoming_slot) { throw vmhook::exception{"Reference field write has no Java operand slot"}; }
+                        std::memcpy(&object, packet.incoming_slot, sizeof object);
+                    }
+                    auto root{object ? native_backend::retain_oop(object) : native_backend::root{}};
+                    if (object && !root) { throw vmhook::exception{"Reference field input could not be retained"}; }
+                    incoming = materialize_object<wrapper_type>(0, root);
+                }
+                field_access<value_type> event{packet.write,std::move(incoming)};
+                callback(event);
+                packet.result = packet.write
+                    ? event.prevented_ ? field_backend::action::skip_write
+                        : event.replaced_ ? field_backend::action::replace_write : field_backend::action::allow
+                    : event.prevented_ || event.replaced_ ? field_backend::action::read_result : field_backend::action::allow;
+                if (packet.result == field_backend::action::read_result || packet.result == field_backend::action::replace_write)
+                {
+                    native_backend::operation access{};
+                    if (!access) { throw vmhook::exception{"Reference field output requires a rooted VM operation"}; }
+                    auto root{event.replaced_ ? event.value_->get_native_root() : native_backend::root{}};
+                    void* const value{root ? root->resolve_under_vm() : nullptr};
+                    require_reference_argument(value, packet.signature, packet.holder);
+                    auto* const context{callback_backend::current};
+                    if (!context || !context->reference_transport(std::move(root), &packet.bits))
+                    { throw vmhook::exception{"Reference field output transport is unavailable"}; }
+                }
+            }
+            else
+            {
             value_type incoming{};
             if(packet.write)
             {
@@ -27918,13 +28017,15 @@ export namespace vmhook::detail
                 }
                 else { std::memcpy(&packet.bits,&result,sizeof result); }
             }
+            }
         }
     };
     template<class wrapper_type,typename field_type,typename callback_type>
     inline auto install_field_hook(std::string_view name,callback_type callback) -> std::uint64_t
     {
-        if constexpr(!std::is_arithmetic_v<field_type>
-            ||(sizeof(field_type)!=1&&sizeof(field_type)!=2&&sizeof(field_type)!=4&&sizeof(field_type)!=8)
+        if constexpr((!vmhook::detail::is_java_object_pointer_v<field_type>
+            && (!std::is_arithmetic_v<field_type>
+                ||(sizeof(field_type)!=1&&sizeof(field_type)!=2&&sizeof(field_type)!=4&&sizeof(field_type)!=8)))
             ||!std::is_same_v<field_type,std::remove_cvref_t<field_type>>)
         { return 0; }
         else
@@ -27951,14 +28052,14 @@ export namespace vmhook::detail
                 {
                     native_backend::operation access{};
                     if(!access) { return 0; }
-                    const auto class_name=registered_class_name<wrapper_type>();
-                    auto* klass=vmhook::find_class(class_name);
+                    auto* klass=registered_class_klass<wrapper_type>();
                     if(!klass) { return 0; }
                     const auto field=vmhook::find_field(klass,name);
                     if(!field||!field->is_static||field->signature!=jvm_descriptor_for_arg<field_type>()) { return 0; }
                     added->holder=field->declaring_klass?field->declaring_klass:klass;
                     added->offset=field->offset;
                     added->descriptor=field->signature.front();
+                    added->signature=field->signature;
                     added->metadata_root=retain_hook_klass(added->holder);
                     if(!added->metadata_root) { return 0; }
                 }
@@ -27999,8 +28100,9 @@ export namespace vmhook
     // and inlined accessors after the JIT installation transaction. Compile-time
     // constants, reflection, Unsafe and VM-native accesses have no such bytecode.
     // Callback runs synchronously on the executing JavaThread, in native state;
-    // Java wrappers may reenter with a temporary rooted context. References are
-    // rejected until their replacement/collector protocol is implemented.
+    // Java wrappers may reenter with a temporary rooted context. Reference
+    // events use unique_ptr wrappers and transfer replacements through the
+    // VM-scanned thread result across the callback's return transition.
     template<class wrapper_type,typename field_type,typename callback_type>
     inline auto hook_field(std::string_view name,callback_type callback) -> bool
     { return detail::install_field_hook<wrapper_type,field_type>(name,std::move(callback))!=0; }
