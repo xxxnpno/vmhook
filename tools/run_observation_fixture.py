@@ -8,7 +8,6 @@ The opt-in heap liveness gate case adds its documented test-only JVM flag.
 
 import argparse
 import hashlib
-import json
 import os
 from pathlib import Path
 import queue
@@ -18,6 +17,10 @@ import sys
 import tempfile
 import threading
 import time
+
+# Keep provenance consistent with the independent owned-JVM fixture runners.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests" / "runtime"))
+from runtime_evidence import runtime_evidence
 
 
 CHECKS = {
@@ -191,14 +194,10 @@ def report_failure(args, mode, directory, result, pid, error, process_alive=Fals
                       if "=" in line)
         for key, value in values.items():
             print(f"{mode}.{key}={value}", flush=True)
-    if args.evidence:
-        args.evidence.parent.mkdir(parents=True, exist_ok=True)
-        args.evidence.write_text(json.dumps({"native_windows": os.name == "nt",
-                                            "runtime_init_fault": args.runtime_init_fault,
-                                            "heap_liveness_class_unloading_disabled": args.heap_liveness_class_unloading_disabled,
-                                            "java": str(args.java), "failed_mode": mode,
-                                            "passed": False, "error": str(error),
-                                            "partial_checks": values}, indent=2) + "\n")
+    args.evidence_report.update({"failed_mode": mode,
+                                 "runtime_init_fault": args.runtime_init_fault,
+                                 "heap_liveness_class_unloading_disabled": args.heap_liveness_class_unloading_disabled,
+                                 "partial_checks": values})
     if os.environ.get("GITHUB_ACTIONS") == "true":
         message = f"Observation {mode}: {error}; last native checks: {values}"
         escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -254,7 +253,7 @@ def execute_mode(args, mode, directory):
                   if mode == "heap_liveness" and args.heap_liveness_class_unloading_disabled else [])
     command = prefix + [str(args.java), *java_flags, "-cp", windows_path(directory), FIXTURES[mode]]
     process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True)
+                               stderr=subprocess.STDOUT, text=True, cwd=directory)
     output = queue.Queue()
     captured = []
 
@@ -345,6 +344,8 @@ def execute_mode(args, mode, directory):
                 break
             captured.append(line)
             print(f"{mode}: {line}", flush=True)
+        args.evidence_report["java_output"].extend(captured)
+        args.evidence_report["failed_java_arguments"] = [*java_flags, "-cp", "<compiled owned fixture>", FIXTURES[mode]]
         report_failure(args, mode, directory, result, pid, error, process.poll() is None)
         raise
     finally:
@@ -431,22 +432,51 @@ def main():
             print(f"heap_concurrent skipped: Java {feature} has no active-mark diagnostic witness", flush=True)
     source = Path(__file__).resolve().parents[1] / "tests" / "runtime"
     results = []
+    evidence = runtime_evidence(args.evidence, "observation fixtures", args.emulator)
+    evidence.report.update({"java": str(args.java), "probe": str(args.probe.resolve()),
+                            "probe_sha256": digests, "results": results})
+    # Every successful mode records its actual arguments in results below.
+    del evidence.report["java_arguments"]
+    args.evidence_report = evidence.report
     with tempfile.TemporaryDirectory(prefix="vmhook-observation-") as temporary:
         directory = Path(temporary)
-        target = str(directory) if os.name == "nt" else "Z:" + str(directory).replace("/", "\\")
-        fixture_names = dict.fromkeys(FIXTURES[mode] for mode in modes)
-        sources = [str(source / (name + ".java")) for name in fixture_names]
-        subprocess.run(prefix + [str(args.javac), "-d", target, *sources], check=True, timeout=90)
-        for mode in modes:
-            results.append(execute_mode(args, mode, directory))
-    if any(checksum(Path(path)) != digest for path, digest in digests.items()):
-        raise RuntimeError("probe DLL changed while its fixtures were running")
-    if args.evidence:
-        args.evidence.parent.mkdir(parents=True, exist_ok=True)
-        args.evidence.write_text(json.dumps({"native_windows": os.name == "nt",
-                                            "java": str(args.java), "probe": str(args.probe.resolve()),
-                                            "probe_sha256": digests, "results": results}, indent=2) + "\n")
-    return 0
+        passed = False
+        failure = None
+        try:
+            evidence.add_runtime(str(args.java), str(args.javac), args.injector, args.probe)
+            evidence.add_input("observation_runner", Path(__file__))
+            evidence.add_input("evidence_helper", source / "runtime_evidence.py")
+            for mode in modes:
+                attribute = OPTIONAL_PROBES.get(mode)
+                if attribute:
+                    evidence.add_input(mode + "_probe", getattr(args, attribute))
+            target = str(directory) if os.name == "nt" else "Z:" + str(directory).replace("/", "\\")
+            fixture_names = dict.fromkeys(FIXTURES[mode] for mode in modes)
+            sources = [source / (name + ".java") for name in fixture_names]
+            for fixture in sources:
+                evidence.add_input(fixture.stem + "_source", fixture)
+            compilation = subprocess.run(prefix + [str(args.javac), "-d", target, *map(str, sources)],
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                         text=True, timeout=90)
+            evidence.report["java_compiler_output"] = compilation.stdout
+            if compilation.stdout:
+                print(compilation.stdout, end="", flush=True)
+            compilation.check_returncode()
+            evidence.add_classes(directory)
+            for mode in modes:
+                result = execute_mode(args, mode, directory)
+                results.append(result)
+                evidence.report["java_output"].extend(result["java_output"])
+            if any(checksum(Path(path)) != digest for path, digest in digests.items()):
+                raise RuntimeError("probe DLL changed while its fixtures were running")
+            passed = True
+            return 0
+        except Exception as error:
+            failure = error
+            raise
+        finally:
+            evidence.finish(passed, failure, directory)
+
 
 
 if __name__ == "__main__":
