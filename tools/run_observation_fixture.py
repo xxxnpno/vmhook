@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Verify public method, field and class hooks in a JVM started without VM flags.
+"""Verify public runtime operations using an ordinary JVM launch by default.
 
 The harness only injects its own Java subprocess. Native Windows is the default;
 --emulator permits separate Windows ABI checks through a local Wine wrapper.
+The opt-in heap liveness gate case adds its documented test-only JVM flag.
 """
 
 import argparse
@@ -62,6 +63,8 @@ CHECKS = {
                      "failure_cleanup", "runtime_init_complete"],
     "monitor_fault": ["monitor_cpp_allocation", "monitor_pending_cleanup",
                       "monitor_fault_balance", "monitor_fault_retry", "native_complete"],
+    "heap_liveness": ["heap_liveness", "native_complete"],
+    "heap_concurrent": ["heap_concurrent_ready", "mark_completed", "heap_concurrent", "native_complete"],
     "method_exit": ["context", "registration", "observers", "original_results_and_monitors",
                     "all_primitive_bits", "reference_kind_only", "empty_void_original",
                     "exception_has_no_normal_exit", "resident_stubs", "composition",
@@ -95,6 +98,8 @@ FIXTURES = {
     "class_inventory": "LifetimeFixture",
     "runtime_init": "ExecutorFixture",
     "monitor_fault": "NativeFixture",
+    "heap_liveness": "NativeFixture",
+    "heap_concurrent": "HeapConcurrentFixture",
     "method_exit": "MethodExitFixture",
     "event_stream": "EventStreamFixture",
     "management": "ManagementFixture",
@@ -111,6 +116,8 @@ OPTIONAL_PROBES = {
     "class_inventory": "class_inventory_probe",
     "runtime_init": "runtime_init_probe",
     "monitor_fault": "monitor_fault_probe",
+    "heap_liveness": "heap_liveness_probe",
+    "heap_concurrent": "heap_concurrent_probe",
     "method_exit": "method_exit_probe",
     "event_stream": "event_stream_probe",
     "management": "management_probe",
@@ -127,6 +134,8 @@ TERMINAL_CHECK = {
     "class_inventory": "inventory_complete",
     "runtime_init": "runtime_init_complete",
     "monitor_fault": "native_complete",
+    "heap_liveness": "native_complete",
+    "heap_concurrent": "native_complete",
     "method_exit": "method_exit_proof",
 }
 
@@ -147,6 +156,7 @@ def report_failure(args, mode, directory, result, pid, error, process_alive=Fals
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
         args.evidence.write_text(json.dumps({"native_windows": os.name == "nt",
                                             "runtime_init_fault": args.runtime_init_fault,
+                                            "heap_liveness_class_unloading_disabled": args.heap_liveness_class_unloading_disabled,
                                             "java": str(args.java), "failed_mode": mode,
                                             "passed": False, "error": str(error),
                                             "partial_checks": values}, indent=2) + "\n")
@@ -195,11 +205,14 @@ def execute_mode(args, mode, directory):
                        VMHOOK_EVENT_STREAM_REPORT=windows_path(result),
                        VMHOOK_TEST_RESULT=windows_path(result),
                        VMHOOK_RUNTIME_INIT_FAULT=args.runtime_init_fault,
+                       VMHOOK_TEST_HEAP_REFUSAL="1" if args.heap_liveness_expect_refusal else "0",
                        VMHOOK_MANAGEMENT_REPORT=windows_path(result),
                        VMHOOK_CALLBACK_THROW_REPORT=windows_path(result),
                        VMHOOK_METHOD_EXIT_REPORT=windows_path(result),
                        VMHOOK_VIRTUAL_THREAD_REPORT=windows_path(result))
-    command = prefix + [str(args.java), "-cp", windows_path(directory), FIXTURES[mode]]
+    java_flags = (["-XX:-ClassUnloadingWithConcurrentMark"]
+                  if mode == "heap_liveness" and args.heap_liveness_class_unloading_disabled else [])
+    command = prefix + [str(args.java), *java_flags, "-cp", windows_path(directory), FIXTURES[mode]]
     process = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True)
     output = queue.Queue()
@@ -269,10 +282,18 @@ def execute_mode(args, mode, directory):
             gc = values.get("gc_observed", "")
             if not gc.isdecimal() or int(gc) == 0:
                 failed.append("gc_observed")
+        if mode == "heap_concurrent":
+            captures = values.get("satb_active_captures", "")
+            rooted = values.get("rooted_captures", "")
+            if not captures.isdecimal() or int(captures) < 1:
+                failed.append("satb_active_captures")
+            if rooted != "64":
+                failed.append("rooted_captures")
         if failed:
             raise RuntimeError("failed " + mode + " checks: " + ", ".join(sorted(set(failed))))
         return {"mode": mode, "checks": values, "java_output": captured,
                 "runtime_init_fault": args.runtime_init_fault if mode == "runtime_init" else None,
+                "java_arguments": [*java_flags, "-cp", "<compiled owned fixture>", FIXTURES[mode]],
                 "seconds": round(time.monotonic() - started, 3)}
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         if process.poll() is not None:
@@ -329,6 +350,8 @@ def main():
     parser.add_argument("--runtime-init-fault", default="path",
                         choices=["path", "profile", "diagnostic", "persistent_path", "unsupported", "builtin"],
                         help="select the fresh-runtime fault case; runtime_init mode only")
+    parser.add_argument("--heap-liveness-class-unloading-disabled", action="store_true",
+                        help="test-only heap_liveness launch with class unloading disabled; ordinary modes keep default JVM arguments")
     args = parser.parse_args()
     if os.name != "nt" and not args.emulator:
         parser.error("native Windows is required unless --emulator is specified")
@@ -346,13 +369,26 @@ def main():
     prefix = [str(args.emulator)] if args.emulator else []
     modes = [mode for mode in FIXTURES if mode not in OPTIONAL_PROBES
              or getattr(args, OPTIONAL_PROBES[mode])] if args.mode == "all" else [args.mode]
-    if "virtual_thread" in modes:
+    args.heap_liveness_expect_refusal = False
+    if args.heap_liveness_class_unloading_disabled:
+        if args.mode != "heap_liveness":
+            parser.error("the test-only class-unloading option requires --mode heap_liveness")
         feature = java_feature(args.java, prefix)
-        if feature < 21:
+        if feature < 9:
+            parser.error("the class-unloading gate case requires Java 9 or newer")
+        args.heap_liveness_expect_refusal = feature <= 16
+    if "virtual_thread" in modes or "heap_concurrent" in modes:
+        feature = java_feature(args.java, prefix)
+        if "virtual_thread" in modes and feature < 21:
             if args.mode == "virtual_thread":
                 parser.error("virtual_thread requires Java 21 or newer without preview arguments")
             modes.remove("virtual_thread")
             print(f"virtual_thread skipped: Java {feature} is below the stable Java 21 API", flush=True)
+        if "heap_concurrent" in modes and feature not in (21, 27):
+            if args.mode == "heap_concurrent":
+                parser.error("heap_concurrent requires the exact shipped Java 21 or 27 diagnostic image")
+            modes.remove("heap_concurrent")
+            print(f"heap_concurrent skipped: Java {feature} has no active-mark diagnostic witness", flush=True)
     source = Path(__file__).resolve().parents[1] / "tests" / "runtime"
     results = []
     with tempfile.TemporaryDirectory(prefix="vmhook-observation-") as temporary:

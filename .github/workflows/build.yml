@@ -215,6 +215,8 @@ jobs:
             method_exit_probe: vmhook_method_exit_probe.dll
             runtime_init_probe: vmhook_runtime_init_probe.dll
             monitor_fault_probe: vmhook_monitor_fault_probe.dll
+            heap_liveness_probe: vmhook_heap_liveness_probe.dll
+            heap_concurrent_probe: vmhook_heap_concurrent_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
             observation_probe: vmhook_module_observation_probe.dll
@@ -233,6 +235,8 @@ jobs:
             method_exit_probe: vmhook_module_method_exit_probe.dll
             runtime_init_probe: vmhook_module_runtime_init_probe.dll
             monitor_fault_probe: vmhook_module_monitor_fault_probe.dll
+            heap_liveness_probe: vmhook_module_heap_liveness_probe.dll
+            heap_concurrent_probe: vmhook_module_heap_concurrent_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -310,7 +314,21 @@ jobs:
           --method-exit-probe runtime-binaries/${{ matrix.method_exit_probe }}
           --runtime-init-probe runtime-binaries/${{ matrix.runtime_init_probe }}
           --monitor-fault-probe runtime-binaries/${{ matrix.monitor_fault_probe }}
+          --heap-liveness-probe runtime-binaries/${{ matrix.heap_liveness_probe }}
+          --heap-concurrent-probe runtime-binaries/${{ matrix.heap_concurrent_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
+      - name: Verify the heap liveness gate with class unloading disabled
+        if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[9,16,17,21,27]'), matrix.java) }}
+        shell: pwsh
+        run: >-
+          python tools/run_observation_fixture.py
+          --java "$env:JAVA_HOME/bin/java.exe"
+          --javac "$env:JAVA_HOME/bin/javac.exe"
+          --injector runtime-binaries/vmhook_test_injector.exe
+          --probe runtime-binaries/${{ matrix.observation_probe }}
+          --heap-liveness-probe runtime-binaries/${{ matrix.heap_liveness_probe }}
+          --mode heap_liveness --heap-liveness-class-unloading-disabled
+          --evidence heap-liveness-gate-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify fresh-runtime faults and unavailable backends
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[8,21,27]'), matrix.java) }}
         shell: pwsh
@@ -380,6 +398,7 @@ jobs:
           name: observation-${{ matrix.java }}-${{ matrix.toolchain }}
           path: |
             native-threads-${{ matrix.java }}-${{ matrix.toolchain }}.json
+            heap-liveness-gate-${{ matrix.java }}-${{ matrix.toolchain }}.json
             runtime-init-${{ matrix.java }}-${{ matrix.toolchain }}-*.json
             observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
             callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-*.json
