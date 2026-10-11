@@ -1093,7 +1093,10 @@ export namespace vmhook
     inline auto read_java_string(void* string_oop)
         -> std::string;
 
-    inline auto make_java_string(std::string_view value) noexcept
+    inline auto read_java_string_utf16(void* string_oop) -> std::u16string;
+    inline auto make_java_string_utf16(std::u16string_view value) -> void*;
+
+    inline auto make_java_string(std::string_view value)
         -> void*;
 
     inline auto decode_array_oop(std::uint32_t compressed)
@@ -9493,81 +9496,83 @@ export namespace vmhook
             }
         }
 
-        /*
-            @brief Decodes a UTF-8 byte string into a vector of UTF-16 code units.
-            @details
-            Extracted from make_java_string's original inline decoder so every
-            caller shares ONE source of truth for the byte->char-unit conversion.
-            Malformed sequences yield U+FFFD; astral code points (>= U+10000) become a
-            surrogate pair.
-
-            This decodes the FULL input — it does NOT truncate.  A previous version
-            capped the result at 4096 code units, which made make_java_string SILENTLY
-            produce a SHORTER String for any input over the cap (a 5000-char input
-            yielded a 4096-char String that did NOT equal the original, with no error
-            — robustness bug #9).  The length decision belongs entirely to the
-            caller, so this decode stays lossless at any input size.
-
-            Complexity: O(N).  Exception safety: noexcept-equivalent (only std::vector
-            growth, which the caller treats as fatal-on-throw via the noexcept callers).
-
-            @param value  UTF-8 input text.
-            @return  UTF-16 code units (LE in-memory), one per BMP char and two per
-                     astral code point — the complete decode, never truncated.
-        */
+        /* Standard UTF-8: malformed bytes are replaced individually with U+FFFD.
+           Every continuation, shortest form and Unicode scalar range is checked.
+           Allocation failures propagate as std::bad_alloc. */
         inline auto utf8_to_utf16(const std::string_view value)
             -> std::vector<std::uint16_t>
         {
             std::vector<std::uint16_t> units;
             units.reserve(value.size());
-            for (std::size_t i{ 0 }; i < value.size(); )
+            for (std::size_t position{}; position < value.size(); )
             {
-                const std::uint8_t b0{ static_cast<std::uint8_t>(value[i]) };
-                std::uint32_t cp{ 0xFFFDu }; // U+FFFD replacement for malformed input
-                std::size_t adv{ 1 };
-                if (b0 < 0x80u)
+                const auto lead{ static_cast<std::uint8_t>(value[position]) };
+                std::uint32_t scalar{ 0xfffdu };
+                std::size_t count{ 1 };
+                const std::size_t width{ lead < 0x80u ? 1u : lead >= 0xc2u && lead <= 0xdfu ? 2u
+                    : lead >= 0xe0u && lead <= 0xefu ? 3u : lead >= 0xf0u && lead <= 0xf4u ? 4u : 0u };
+                if (width == 1) { scalar = lead; }
+                else if (width && width <= value.size() - position)
                 {
-                    cp = b0;
+                    std::uint32_t decoded{ lead & (0x7fu >> width) };
+                    bool valid{ true };
+                    for (std::size_t index{ 1 }; index < width; ++index)
+                    {
+                        const auto byte{ static_cast<std::uint8_t>(value[position + index]) };
+                        if ((byte & 0xc0u) != 0x80u) { valid = false; break; }
+                        decoded = (decoded << 6) | (byte & 0x3fu);
+                    }
+                    const std::uint32_t minimum{ width == 2 ? 0x80u : width == 3 ? 0x800u : 0x10000u };
+                    if (valid && decoded >= minimum && decoded <= 0x10ffffu
+                        && !(decoded >= 0xd800u && decoded <= 0xdfffu))
+                    { scalar = decoded; count = width; }
                 }
-                else if ((b0 & 0xE0u) == 0xC0u && (i + 1) < value.size())
+                if (scalar >= 0x10000u)
                 {
-                    cp = ((b0 & 0x1Fu) << 6)
-                       |  (static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu);
-                    adv = 2;
+                    scalar -= 0x10000u;
+                    units.push_back(static_cast<std::uint16_t>(0xd800u + (scalar >> 10)));
+                    units.push_back(static_cast<std::uint16_t>(0xdc00u + (scalar & 0x3ffu)));
                 }
-                else if ((b0 & 0xF0u) == 0xE0u && (i + 2) < value.size())
-                {
-                    cp = ((b0 & 0x0Fu) << 12)
-                       | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 6)
-                       |  (static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu);
-                    adv = 3;
-                }
-                else if ((b0 & 0xF8u) == 0xF0u && (i + 3) < value.size())
-                {
-                    cp = ((b0 & 0x07u) << 18)
-                       | ((static_cast<std::uint8_t>(value[i + 1]) & 0x3Fu) << 12)
-                       | ((static_cast<std::uint8_t>(value[i + 2]) & 0x3Fu) << 6)
-                       |  (static_cast<std::uint8_t>(value[i + 3]) & 0x3Fu);
-                    adv = 4;
-                }
+                else { units.push_back(static_cast<std::uint16_t>(scalar)); }
+                position += count;
+            }
+            return units;
+        }
 
-                if (cp >= 0x10000u)
+        /* Java Strings may contain isolated UTF-16 surrogates. UTF-8 replaces
+           those with U+FFFD; read_java_string_utf16 preserves every code unit. */
+        inline auto utf16_to_utf8(const std::u16string_view text) -> std::string
+        {
+            std::string result;
+            result.reserve(text.size());
+            for (std::size_t position{}; position < text.size(); ++position)
+            {
+                std::uint32_t scalar{ text[position] };
+                if (scalar >= 0xd800u && scalar <= 0xdbffu && position + 1 < text.size()
+                    && text[position + 1] >= 0xdc00u && text[position + 1] <= 0xdfffu)
+                { scalar = 0x10000u + ((scalar - 0xd800u) << 10) + (text[++position] - 0xdc00u); }
+                else if (scalar >= 0xd800u && scalar <= 0xdfffu) { scalar = 0xfffdu; }
+                if (scalar < 0x80u) { result.push_back(static_cast<char>(scalar)); }
+                else if (scalar < 0x800u)
                 {
-                    cp -= 0x10000u;
-                    units.push_back(static_cast<std::uint16_t>(0xD800u + (cp >> 10)));
-                    units.push_back(static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu)));
+                    result.push_back(static_cast<char>(0xc0u | (scalar >> 6)));
+                    result.push_back(static_cast<char>(0x80u | (scalar & 0x3fu)));
+                }
+                else if (scalar < 0x10000u)
+                {
+                    result.push_back(static_cast<char>(0xe0u | (scalar >> 12)));
+                    result.push_back(static_cast<char>(0x80u | ((scalar >> 6) & 0x3fu)));
+                    result.push_back(static_cast<char>(0x80u | (scalar & 0x3fu)));
                 }
                 else
                 {
-                    units.push_back(static_cast<std::uint16_t>(cp));
+                    result.push_back(static_cast<char>(0xf0u | (scalar >> 18)));
+                    result.push_back(static_cast<char>(0x80u | ((scalar >> 12) & 0x3fu)));
+                    result.push_back(static_cast<char>(0x80u | ((scalar >> 6) & 0x3fu)));
+                    result.push_back(static_cast<char>(0x80u | (scalar & 0x3fu)));
                 }
-                i += adv;
             }
-
-            // No truncation here: return the complete decode.  Capping would
-            // silently shorten the String the caller asked for; any length policy
-            // belongs to make_java_string, which sees units.size().
-            return units;
+            return result;
         }
 
         /*
@@ -12470,17 +12475,13 @@ export namespace vmhook::detail::native_backend
         catch (...) { return {}; }
     }
 
-    inline auto make_string(const std::string_view value) noexcept -> root
+    inline auto make_string_utf16(const std::u16string_view text) -> root
     {
         operation access{};
         const auto context{ active_context_lifetime() };
         if (!access || !context) { return {}; }
         try
         {
-            const auto units{ vmhook::detail::utf8_to_utf16(value) };
-            std::u16string text{};
-            text.reserve(units.size());
-            for (const auto unit : units) { text.push_back(static_cast<char16_t>(unit)); }
             auto* const klass{ vmhook::find_class("java/lang/String") };
             auto result{ reserve_result_root(klass) };
             if (!result) { return {}; }
@@ -12493,7 +12494,17 @@ export namespace vmhook::detail::native_backend
             }
             return result;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (...) { return {}; }
+    }
+
+    inline auto make_string(const std::string_view value) -> root
+    {
+        const auto units{ vmhook::detail::utf8_to_utf16(value) };
+        std::u16string text;
+        text.reserve(units.size());
+        for (const auto unit : units) { text.push_back(static_cast<char16_t>(unit)); }
+        return make_string_utf16(text);
     }
 
     struct native_call_result final
@@ -13834,29 +13845,13 @@ export namespace vmhook
     }
 
     /*
-        @brief Allocates a new java.lang.String OOP from a UTF-8 string_view.
-        @details
-        In a native_thread_context, uses HotSpot's collector-aware String allocator
-        and keeps its result rooted for the context's lifetime. In a validated
-        detour, decodes UTF-8 to UTF-16 and constructs compact byte[] strings
-        (Latin1 or UTF16 coder) or Java 8 char[] strings in the executing TLAB.
-
-        LENGTH HANDLING (no silent truncation): the decode is lossless and the TLAB
-        build path runs at ANY length, so the returned String EQUALS the complete
-        input.  (Previously the decode was capped at 4096 code units, so a 5000-char
-        input silently produced a 4096-char String that did not equal the original;
-        robustness bug #9.)  Longer inputs simply need a larger TLAB allocation and
-        are therefore likelier to fail outright — there is no slow path to fall back
-        on, so a null return is the failure mode, never a shortened String.  Note
-        that read_java_string still reads back at most 4096 chars via its fixed body
-        buffer, so the native readback of a long String is a separate, documented
-        limit — the Java-visible String itself is complete.
-
-        Complexity: O(N) where N = length of value.
-        Exception safety: noexcept — returns nullptr on any allocation failure.
-
-        @param value  UTF-8 text to encode as a Java String; any length.
-        @return  Raw java.lang.String OOP, or nullptr on failure.
+        Allocates a Java String through the active native allocator or the
+        executing detour's TLAB. UTF-16 accepts every Java code unit, including
+        isolated surrogates. UTF-8 uses standard scalar decoding with one U+FFFD
+        per malformed input byte. Inputs are never silently truncated.
+        VM allocation refusal returns nullptr; C++ bad_alloc propagates.
+        Raw addresses require an existing VM lifetime context; public new_string
+        returns the owning wrapper instead.
     */
     namespace detail
     {
@@ -13889,14 +13884,14 @@ export namespace vmhook
         }
     }
 
-    inline auto make_java_string(const std::string_view value) noexcept
+    inline auto make_java_string_utf16(const std::u16string_view value)
         -> void*
     {
         vmhook::detail::native_backend::operation native_operation{};
         if (vmhook::detail::native_backend::active())
         {
             if (!native_operation) { return nullptr; }
-            const auto rooted{ vmhook::detail::native_backend::make_string(value) };
+            const auto rooted{ vmhook::detail::native_backend::make_string_utf16(value) };
             return rooted ? rooted->resolve_under_vm() : nullptr;
         }
         vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
@@ -13919,7 +13914,7 @@ export namespace vmhook
         // UTF-8 BYTES straight into a LATIN1 byte[] / char[], which conflated
         // byte count with char count and corrupted every non-ASCII string —
         // e.g. "é" (0xC3 0xA9) turned into the two chars U+00C3 U+00A9.
-        const std::vector<std::uint16_t> units{ vmhook::detail::utf8_to_utf16(value) };
+        const std::u16string_view units{ value };
         const auto maximum_units{ static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)())
             / (compact_string ? 2u : 1u) };
         if (units.size() > maximum_units) { return nullptr; }
@@ -14054,6 +14049,15 @@ export namespace vmhook
         return nullptr;
     }
 
+    inline auto make_java_string(const std::string_view value) -> void*
+    {
+        const auto units{ vmhook::detail::utf8_to_utf16(value) };
+        std::u16string text;
+        text.reserve(units.size());
+        for (const auto unit : units) { text.push_back(static_cast<char16_t>(unit)); }
+        return vmhook::make_java_string_utf16(text);
+    }
+
     // --- Array element access -------------------------------------------------
 
     /*
@@ -14074,10 +14078,8 @@ export namespace vmhook
 
         Clamping every oop-derived count to `min(count, k_max_safe_container_elems)`
         (and treating <0 as 0) before BOTH the reserve and the loop fixes both:
-        the reserve can never throw (16M * the largest element this header
-        reserves — a unique_ptr / pair / char — stays a few hundred MB at most,
-        which standard allocators satisfy or fail gracefully WITHOUT length_error)
-        and the loop is bounded.  16,777,216 is far above any realistic
+        the loop is bounded and reservations cannot overflow. Bounded allocations
+        can still throw std::bad_alloc; a size cap does not make allocation noexcept.  16,777,216 is far above any realistic
         introspected container, so an honest container of N <= cap elements reads
         EXACTLY as before — only a degenerate/corrupted count is ever truncated.
 
@@ -14485,10 +14487,10 @@ export namespace vmhook
             /*
                 @brief The field value as a std::string, unambiguously.
             */
-            auto as_string() const noexcept -> std::string
+            auto as_string() const -> std::string
             {
                 vmhook::detail::native_backend::operation access{};
-                return std::visit([this](const auto& v) noexcept
+                return std::visit([this](const auto& v)
                     -> std::string
                     {
                         using stored_type = std::remove_cvref_t<decltype(v)>;
@@ -15130,7 +15132,7 @@ export namespace vmhook
             not independently rooted; adjacency of allocation and store is not a GC safety proof.
             @return True only when construction and the reference store succeed.
         */
-        auto store_string(const std::string_view value) const noexcept
+        auto store_string(const std::string_view value) const
             -> bool
         {
             // Length-counted UTF-16: a std::string is standard UTF-8, so an
@@ -16236,10 +16238,10 @@ export namespace vmhook
             /*
                 @brief The result as a std::string, unambiguously.
             */
-            auto as_string() const noexcept -> std::string
+            auto as_string() const -> std::string
             {
                 vmhook::detail::native_backend::operation access{};
-                return std::visit([this](const auto& v) noexcept
+                return std::visit([this](const auto& v)
                     -> std::string
                     {
                         using stored_type = std::remove_cvref_t<decltype(v)>;
@@ -20412,253 +20414,60 @@ export namespace vmhook
         @note Windows memory reads report accessibility failures; they do not
         validate object lifetime, prevent VM mutation, or register a GC root.
     */
-    inline auto read_java_string(void* const string_oop)
-        -> std::string
+    inline auto read_java_string_utf16(void* const string_oop) -> std::u16string
     {
+        if (!string_oop)
+        { throw vmhook::exception{ "A Java null String cannot be copied to a C++ string" }; }
         if (!vmhook::detail::reference_reads_supported()
-            || vmhook::detail::reference_storage_width() != sizeof(std::uint32_t))
+            || vmhook::detail::reference_storage_width() != sizeof(std::uint32_t)
+            || !vmhook::hotspot::is_valid_pointer(string_oop))
+        { throw vmhook::exception{ "Java String decoding requires a valid reference and verified narrow oops" }; }
+        auto* const klass{ vmhook::find_class("java/lang/String") };
+        if (!klass || vmhook::klass_from_oop(string_oop) != klass)
+        { throw vmhook::exception{ "Java String decoding requires a java.lang.String instance" }; }
+        const auto value_field{ klass->find_field("value") };
+        if (!value_field) { throw vmhook::exception{ "Java String backing storage metadata is unavailable" }; }
+        std::uint32_t narrow{};
+        if (!vmhook::os::safe_read(&narrow, static_cast<const std::uint8_t*>(string_oop)
+                + value_field->offset, sizeof(narrow)) || !narrow)
+        { throw vmhook::exception{ "Java String backing storage is missing or unreadable" }; }
+        auto* const array{ static_cast<const std::uint8_t*>(vmhook::hotspot::decode_oop_pointer(narrow)) };
+        const auto layout{ vmhook::detail::array_layout(vmhook::klass_from_oop(const_cast<std::uint8_t*>(array))) };
+        std::int32_t length{};
+        if (!array || !layout || !vmhook::os::safe_read(&length, array + layout->length_offset, sizeof(length))
+            || length < 0 || length > 2 * vmhook::read_java_string_max_units)
+        { throw vmhook::exception{ "Java String backing array length is invalid or unreadable" }; }
+        const auto coder_field{ klass->find_field("coder") };
+        std::uint8_t coder{};
+        if (coder_field && (!vmhook::os::safe_read(&coder, static_cast<const std::uint8_t*>(string_oop)
+                + coder_field->offset, sizeof(coder)) || coder > 1))
+        { throw vmhook::exception{ "Java String compact coder is invalid or unreadable" }; }
+        if ((coder_field && layout->element_width != 1) || (!coder_field && layout->element_width != 2)
+            || (coder_field && coder == 1 && length % 2 != 0))
+        { throw vmhook::exception{ "Java String backing array geometry does not match its coder" }; }
+        const std::size_t count{ static_cast<std::size_t>(coder_field && coder == 1 ? length / 2 : length) };
+        if (count > static_cast<std::size_t>(vmhook::read_java_string_max_units))
+        { throw vmhook::exception{ "Java String exceeds the checked copy limit" }; }
+        std::u16string result(count, char16_t{});
+        if (count == 0) { return result; }
+        if (!coder_field || coder == 1)
         {
-            return {};
-        }
-        if (!string_oop || !vmhook::hotspot::is_valid_pointer(string_oop))
-        {
-            ::vmhook::detail::log_line("{} read_java_string(): string_oop is null or invalid (0x{:016X}).",
-                       vmhook::warning_tag, reinterpret_cast<std::uintptr_t>(string_oop));
-            return {};
-        }
-
-        vmhook::hotspot::klass* const string_klass{ vmhook::find_class("java/lang/String") };
-        if (!string_klass)
-        {
-            ::vmhook::detail::log_line("{} read_java_string(): find_class('java/lang/String') returned null - "
-                       "very early bootstrap, or the VMStructs class lookup failed.",
-                       vmhook::error_tag);
-            return {};
-        }
-
-        // Read JVM memory through the Windows memory API and stop on unreadable data.
-        // A successful read does not establish object lifetime or a coherent VM snapshot.
-        const auto value_field{ string_klass->find_field("value") };
-        if (!value_field)
-        {
-            ::vmhook::detail::log_line("{} read_java_string(): java.lang.String has no 'value' field - "
-                       "VMStructs field walk failed.",
-                       vmhook::error_tag);
-            return {};
-        }
-
-        std::uint32_t arr_compressed{ 0 };
-        if (!vmhook::os::safe_read(&arr_compressed,
-                                   reinterpret_cast<const std::uint8_t*>(string_oop) + value_field->offset,
-                                   sizeof(arr_compressed)))
-        {
-            // The String OOP's `value` slot is not currently mapped (e.g. the
-            // String was GC-relocated out from under its old address).  Degrade
-            // to "" exactly like every other failure path here.
-            return {};
-        }
-
-        if (!arr_compressed)
-        {
-            // Backing-array compressed pointer is 0 - this is the legitimate
-            // state for a freshly-allocated (uninitialised) String OOP.  Don't
-            // log here to avoid spamming the common case.
-            return {};
-        }
-
-        void* const arr_oop{ vmhook::hotspot::decode_oop_pointer(arr_compressed) };
-        if (!arr_oop || !vmhook::hotspot::is_valid_pointer(arr_oop))
-        {
-            ::vmhook::detail::log_line("{} read_java_string(): backing array OOP is invalid after decompression "
-                       "(compressed=0x{:08X}, decoded=0x{:016X}).",
-                       vmhook::warning_tag, arr_compressed,
-                       reinterpret_cast<std::uintptr_t>(arr_oop));
-            return {};
-        }
-
-        // Read the arrayOop length (+12) through safe_read for the same reason:
-        // the backing array can itself be relocated/unmapped, and
-        // is_valid_pointer(arr_oop) only passed the heuristic, not a
-        // mapped-memory check.
-        const auto* const arr{ reinterpret_cast<const std::uint8_t*>(arr_oop) };
-        std::int32_t length{ 0 };
-        const auto array_layout{ vmhook::detail::array_layout(vmhook::klass_from_oop(const_cast<std::uint8_t*>(arr))) };
-        if (!array_layout) { return {}; }
-        if (!vmhook::os::safe_read(&length, arr + array_layout->length_offset, sizeof(length)))
-        {
-            return {};
-        }
-
-        // Coarse sanity on the RAW array length (element count for char[] /
-        // byte count for byte[]) before we trust it for any arithmetic.  A
-        // length <= 0 is the empty string or a corrupt header; an absurdly large
-        // one is corruption.  The PRECISE, layout-aware ceiling is applied to the
-        // decoded CHARACTER count just below (k_max_string_units), so this coarse
-        // bound only has to reject a wildly negative/oversized raw value cheaply.
-        // The widest layout (JDK 9+ UTF16 byte[]) stores 2 bytes per char, so the
-        // raw length may legitimately be up to 2 * k_max_string_units.
-        //
-        // The fix for robustness bug #29: the old guard was `length > 4096`, which
-        // made any String longer than the cap decode to "" (the doc even claimed
-        // it "truncated").  We now read the String IN FULL up to a much larger,
-        // CHARACTER-based ceiling that is identical across all three layouts.
-        if (length <= 0 || length > 2 * read_java_string_max_units)
-        {
-            ::vmhook::detail::log_line("{} read_java_string(): array length {} out of range (must be "
-                       "1..{}) - either an empty string or the array header is corrupt.",
-                       vmhook::warning_tag, length, 2 * read_java_string_max_units);
-            return {};
-        }
-
-        const bool has_coder{ string_klass->find_field("coder").has_value() };
-
-        // Resolve the coder (JDK 9+) BEFORE touching the body so we know how many
-        // body bytes the layout occupies, then copy exactly that span into a
-        // heap buffer (sized to the validated body length) through safe_read.  The
-        // decode below reads from this mapped-into-process copy (`data`) instead
-        // of dereferencing the heap array directly — so a relocated/unmapped body
-        // can never fault the decode loops, and a normally-mapped String yields
-        // byte-identical bytes.
-        std::uint8_t coder{ 0 };
-        if (has_coder)
-        {
-            const auto coder_field{ string_klass->find_field("coder") };
-            if (!coder_field
-                || !vmhook::os::safe_read(&coder,
-                                          reinterpret_cast<const std::uint8_t*>(string_oop) + coder_field->offset,
-                                          sizeof(coder)))
-            {
-                return {};
-            }
-        }
-
-        // Decoded CHARACTER count for this layout:
-        //   * JDK 8 char[] (no coder):     `length` IS the char count.
-        //   * JDK 9+ LATIN1 (coder == 0):  one byte per char -> `length` chars.
-        //   * JDK 9+ UTF16  (coder != 0):  two bytes per char -> length / 2 chars
-        //                                  (a well-formed UTF16 byte[] is even).
-        const std::int32_t char_count{ (has_coder && coder != 0) ? length / 2 : length };
-
-        // The REAL ceiling, applied UNIFORMLY to the character count — so a
-        // LATIN1, a UTF16, and a JDK 8 char[] String of the same logical length
-        // all read back identically (this also fixes the old asymmetric ceiling
-        // that capped UTF-16 at HALF the LATIN1 limit, robustness bug #29 part 2).
-        // A char_count of 0 happens for a UTF16 byte[] of length 0/1 — treat the
-        // empty/degenerate case as "" just like length 0.
-        if (char_count <= 0 || char_count > read_java_string_max_units)
-        {
-            ::vmhook::detail::log_line("{} read_java_string(): decoded character count {} out of range "
-                       "(must be 1..{}) - the backing array length is corrupt.",
-                       vmhook::warning_tag, char_count, read_java_string_max_units);
-            return {};
-        }
-
-        // Number of body bytes this String occupies for its layout: the JDK 8
-        // char[] (no coder) stores 2 bytes per char, while both JDK 9+ byte[]
-        // layouts (LATIN1 and UTF16) make `length` the byte count directly.
-        // char_count <= read_java_string_max_units and the widest case is
-        // 2 * char_count, both well within int32 (the cap is far below INT32_MAX).
-        const std::int32_t body_bytes{ has_coder ? length : length * 2 };
-
-        // Copy EXACTLY body_bytes from the heap array body (+16) into a local heap
-        // buffer through a single all-or-nothing safe_read.  The buffer is sized
-        // to the validated body length — never larger — so the read can never walk
-        // past the array, and a corrupt length only ever drives a bounded
-        // allocation that is freed immediately if the read fails.  Replaces the
-        // old fixed 8192-byte stack buffer (the structural cause of the 4096-char
-        // cap).  std::vector<std::uint16_t> guarantees 2-byte alignment for the
-        // UTF-16 reinterpret_cast below, and (body_bytes + 1) / 2 rounds up so the
-        // last odd byte of a (malformed) odd-length body still has backing store.
-        std::vector<std::uint16_t> body_storage(
-            static_cast<std::size_t>((body_bytes + 1) / 2), std::uint16_t{ 0 });
-        auto* const body_buffer{ reinterpret_cast<std::uint8_t*>(body_storage.data()) };
-        if (!vmhook::os::safe_read(body_buffer, arr + array_layout->body_offset, static_cast<std::size_t>(body_bytes)))
-        {
-            // The backing array body is not fully mapped (relocated String) —
-            // degrade to "" rather than faulting the decode below.
-            return {};
-        }
-
-        const std::uint8_t* const data{ body_buffer };
-
-        // Append a Unicode code point to `out` as standard UTF-8 (1-4 bytes).
-        // Replaces the previous lossy "non-ASCII -> '?'" substitution that
-        // silently corrupted every string containing any char >= 0x80 (and the
-        // LATIN1 path that copied raw 0x80-0xFF bytes as if they were UTF-8).
-        const auto append_utf8 = [](std::string& out, std::uint32_t cp) -> void
-        {
-            if (cp < 0x80u)
-            {
-                out += static_cast<char>(cp);
-            }
-            else if (cp < 0x800u)
-            {
-                out += static_cast<char>(0xC0u | (cp >> 6));
-                out += static_cast<char>(0x80u | (cp & 0x3Fu));
-            }
-            else if (cp < 0x10000u)
-            {
-                out += static_cast<char>(0xE0u | (cp >> 12));
-                out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
-                out += static_cast<char>(0x80u | (cp & 0x3Fu));
-            }
-            else
-            {
-                out += static_cast<char>(0xF0u | (cp >> 18));
-                out += static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu));
-                out += static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu));
-                out += static_cast<char>(0x80u | (cp & 0x3Fu));
-            }
-        };
-
-        // Decode `count` native-endian UTF-16 code units (combining surrogate
-        // pairs into astral code points) and append them to `out` as UTF-8.
-        const auto utf16_to_utf8 = [&append_utf8](std::string& out,
-                                                  const std::uint16_t* const chars,
-                                                  const std::int32_t count) -> void
-        {
-            for (std::int32_t i{ 0 }; i < count; ++i)
-            {
-                std::uint32_t cp{ chars[i] };
-                if (cp >= 0xD800u && cp <= 0xDBFFu && (i + 1) < count)
-                {
-                    const std::uint16_t low{ chars[i + 1] };
-                    if (low >= 0xDC00u && low <= 0xDFFFu)
-                    {
-                        cp = 0x10000u + ((cp - 0xD800u) << 10) + (low - 0xDC00u);
-                        ++i;
-                    }
-                }
-                append_utf8(out, cp);
-            }
-        };
-
-        // char_count is the validated decoded length for whichever layout we are
-        // on (computed once, above).  Reserve at least that many output bytes —
-        // UTF-8 emits >= 1 byte per code unit — and decode EXACTLY char_count
-        // units from the in-process body copy (never past the validated length).
-        std::string result;
-        result.reserve(static_cast<std::size_t>(char_count));
-        if (!has_coder)
-        {
-            // JDK 8: backing char[] is always UTF-16; char_count == array length.
-            utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), char_count);
-        }
-        else if (coder == 0)
-        {
-            // JDK 9+ LATIN1: one byte per char, each a code point in 0..255.
-            // UTF-8-encode each (so 0xE9 'é' -> C3 A9, not a raw invalid byte).
-            for (std::int32_t i{ 0 }; i < char_count; ++i)
-            {
-                append_utf8(result, data[i]);
-            }
+            if (!vmhook::os::safe_read(result.data(), array + layout->body_offset, count * sizeof(char16_t)))
+            { throw vmhook::exception{ "Java String UTF-16 storage is unreadable" }; }
         }
         else
         {
-            // JDK 9+ UTF16: char_count == array byte length / 2.
-            utf16_to_utf8(result, reinterpret_cast<const std::uint16_t*>(data), char_count);
+            std::vector<std::uint8_t> bytes(count);
+            if (!vmhook::os::safe_read(bytes.data(), array + layout->body_offset, count))
+            { throw vmhook::exception{ "Java String Latin1 storage is unreadable" }; }
+            for (std::size_t index{}; index < count; ++index) { result[index] = static_cast<char16_t>(bytes[index]); }
         }
         return result;
+    }
+
+    inline auto read_java_string(void* const string_oop) -> std::string
+    {
+        return vmhook::detail::utf16_to_utf8(vmhook::read_java_string_utf16(string_oop));
     }
 
     /*
@@ -24025,6 +23834,19 @@ namespace hotspot
         if (!access)
         { throw vmhook::exception{ "Java String allocation requires a native-thread or callback context" }; }
         const auto root{ vmhook::detail::native_backend::make_string(value) };
+        if (!root) { throw vmhook::exception{ "Java String allocation failed" }; }
+        return vmhook::detail::materialize_object<wrapper_type>(0, root);
+    }
+
+    template<typename wrapper_type = vmhook::any_object>
+        requires vmhook::detail::is_java_object_pointer_v<std::unique_ptr<wrapper_type>>
+    [[nodiscard]] inline auto new_string(const std::u16string_view value)
+        -> std::unique_ptr<wrapper_type>
+    {
+        vmhook::detail::native_backend::operation access{};
+        if (!access)
+        { throw vmhook::exception{ "Java String allocation requires a native-thread or callback context" }; }
+        const auto root{ vmhook::detail::native_backend::make_string_utf16(value) };
         if (!root) { throw vmhook::exception{ "Java String allocation failed" }; }
         return vmhook::detail::materialize_object<wrapper_type>(0, root);
     }
