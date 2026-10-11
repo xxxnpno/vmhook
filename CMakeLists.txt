@@ -103,6 +103,8 @@ include(CTest)
 if(BUILD_TESTING)
     add_subdirectory(tests)
     if(Python3_Interpreter_FOUND)
+        add_test(NAME vmhook.wrapper_generator
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/wrapper_generator.py")
         add_test(NAME vmhook.source_contract
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/check_source.py")
     endif()
@@ -116,9 +118,11 @@ install(FILES include/vmhook/detail/windows.hpp DESTINATION "${CMAKE_INSTALL_DAT
 install(FILES tools/build_module.py tools/make_header.py DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/tools")
 install(FILES tools/private_profiles.py tools/build_private_profiles.py
     DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/tools")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/inspect_runtime.py")
-    install(FILES tools/inspect_runtime.py DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/tools")
-endif()
+foreach(_vmhook_optional_tool IN ITEMS inspect_runtime.py generate_wrappers.py)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/${_vmhook_optional_tool}")
+        install(FILES "tools/${_vmhook_optional_tool}" DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/tools")
+    endif()
+endforeach()
 install(FILES data/native_profiles.json data/native_audits.json
     DESTINATION "${CMAKE_INSTALL_DATADIR}/vmhook/data")
 install(TARGETS vmhook EXPORT vmhookTargets)
