@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 
+from runtime_evidence import runtime_evidence, read_results
+
 REQUIRED = ('reference_install',)
 
 
@@ -26,6 +28,7 @@ def main() -> int:
     parser.add_argument('--injector', type=Path, required=True)
     parser.add_argument('--probe', type=Path, required=True)
     parser.add_argument('--wine', type=Path, help='supplemental Wine runner on a non-Windows host')
+    parser.add_argument('--evidence', type=Path, help='write copied hashes, checks and failure diagnostics as JSON')
     args = parser.parse_args()
     if os.name != 'nt' and not args.wine:
         parser.error('use native Windows or explicitly supply --wine for a supplemental check')
@@ -41,20 +44,38 @@ def main() -> int:
         destination = directory / 'result.txt'
         control = directory / 'control'
         fixture = Path(__file__).with_name('ReferenceFieldFixture.java')
-        subprocess.run(prefix + [args.javac, '-d', windows_path(directory), windows_path(fixture)],
-                       check=True, timeout=90)
-        environment = dict(os.environ, VMHOOK_TEST_RESULT=windows_path(destination), VMHOOK_REFERENCE_CONTROL=windows_path(control))
-        process = subprocess.Popen(prefix + [args.java, '-cp', windows_path(directory), 'ReferenceFieldFixture'],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, env=environment)
+        evidence = runtime_evidence(args.evidence, 'ReferenceFieldFixture', args.wine)
         lines: queue.Queue[str] = queue.Queue()
+        process = None
+        reader = None
+        passed = False
+        failure = None
+
+        def capture(line: str) -> None:
+            evidence.report['java_output'].append(line)
+            print(line, flush=True)
 
         def read_output() -> None:
             for line in process.stdout:
                 lines.put(line.rstrip())
 
-        threading.Thread(target=read_output, daemon=True).start()
         try:
+            evidence.add_input('fixture_source', fixture)
+            evidence.add_runtime(args.java, args.javac, args.injector, args.probe)
+            compilation = subprocess.run(prefix + [args.javac, '-d', windows_path(directory), windows_path(fixture)],
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+            evidence.report['java_compiler_output'] = compilation.stdout
+            if compilation.stdout:
+                print(compilation.stdout, end='', flush=True)
+            compilation.check_returncode()
+            evidence.add_classes(directory)
+            environment = dict(os.environ, VMHOOK_TEST_RESULT=windows_path(destination),
+                               VMHOOK_REFERENCE_CONTROL=windows_path(control))
+            process = subprocess.Popen(prefix + [args.java, '-cp', windows_path(directory), 'ReferenceFieldFixture'],
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, env=environment, cwd=directory)
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
             deadline = time.monotonic() + 60
             pid = None
             while time.monotonic() < deadline:
@@ -64,13 +85,14 @@ def main() -> int:
                     if process.poll() is not None:
                         raise RuntimeError('Java exited before fixture readiness')
                     continue
-                print(line, flush=True)
+                capture(line)
                 if line.startswith('PID='):
                     pid = line[4:]
-                if line == 'READY' and pid:
+                if line == 'READY' and pid and pid.isdecimal():
                     break
             else:
-                raise RuntimeError('Interop fixture readiness timeout')
+                raise RuntimeError('Reference field fixture readiness timeout')
+            evidence.report['windows_pid'] = int(pid)
             subprocess.run(prefix + [str(args.injector.resolve()), pid, windows_path(args.probe)],
                            check=True, timeout=30)
             values: dict[str, str] = {}
@@ -79,30 +101,45 @@ def main() -> int:
             while time.monotonic() < deadline:
                 while not lines.empty():
                     line = lines.get_nowait()
-                    print(line, flush=True)
+                    capture(line)
                     java_verified = java_verified or line == 'REFERENCE_FIELDS=pass'
                 if destination.is_file():
-                    values = dict(line.split('=', 1) for line in destination.read_text().splitlines()
-                                  if '=' in line)
-                    if java_verified or 'exception' in values:
+                    values = read_results(destination)
+                    if java_verified or 'exception' in values or 'fail' in values.values():
                         break
                 if process.poll() is not None:
-                    raise RuntimeError('Java exited during the interop probe')
+                    raise RuntimeError('Java exited during the reference field probe')
                 time.sleep(0.1)
             for key, value in values.items():
                 print(f'{key}={value}', flush=True)
             missing = [key for key in REQUIRED if values.get(key) != 'pass']
-            if missing or 'exception' in values or not java_verified:
+            failed = [key for key, value in values.items() if value in ('fail', 'timeout')]
+            if missing or failed or 'exception' in values or not java_verified:
                 raise RuntimeError('Reference field checks failed: ' + ', '.join(missing)
+                                   + ('; ' + ', '.join(failed) if failed else '')
+                                   + ('; Java REFERENCE_FIELDS proof missing' if not java_verified else '')
                                    + ('; ' + values['exception'] if 'exception' in values else ''))
+            evidence.verify_probe(args.probe)
+            passed = True
             return 0
+        except Exception as error:
+            failure = error
+            raise
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if reader is not None:
+                reader.join(timeout=1)
+            while not lines.empty():
+                capture(lines.get_nowait())
+            evidence.report['checks'] = read_results(destination)
+            evidence.report['java_reference_fields_verified'] = 'REFERENCE_FIELDS=pass' in evidence.report['java_output']
+            evidence.finish(passed, failure, directory)
 
 
 if __name__ == '__main__':

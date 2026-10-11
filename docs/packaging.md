@@ -99,6 +99,13 @@ installed module in Debug with a changed common compiler definition.
 This consumer verifies packaging, linking and ownership without a JVM;
 the separate [standalone examples](../examples/README.md) verify live Java use.
 
+The independent interface and reference-field runtime runners accept
+`--evidence result.json`. Windows CI retains their copied checks, Java output,
+compiled-class hashes and exact DLL, injector, launcher and JVM image hashes.
+Compilation and runtime failures also produce a report, including any fatal
+JVM diagnostics. An explicit Wine reference-field run is labelled supplemental
+and never counted as native Windows evidence.
+
 ## Source archives and licensing
 
 On a clean, committed revision:

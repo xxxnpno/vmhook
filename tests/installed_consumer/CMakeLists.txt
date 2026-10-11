@@ -10,6 +10,10 @@ else()
     set(_vmhook_interface vmhook::vmhook)
 endif()
 
+if(NOT EXISTS "${vmhook_java_helper_source}")
+    message(FATAL_ERROR "The installed package is missing its ordinary Java callback helper source.")
+endif()
+
 add_executable(vmhook_installed_consumer main.cpp second.cpp)
 target_link_libraries(vmhook_installed_consumer PRIVATE ${_vmhook_interface})
 target_compile_options(vmhook_installed_consumer PRIVATE -Wall -Wextra -Werror)

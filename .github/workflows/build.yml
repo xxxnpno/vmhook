@@ -253,6 +253,7 @@ jobs:
           --javac "$env:JAVA_HOME/bin/javac.exe"
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.interface_probe }}
+          --evidence interface-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify assembly reference-field hooks under moving GC
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
@@ -262,6 +263,7 @@ jobs:
           --javac "$env:JAVA_HOME/bin/javac.exe"
           --injector runtime-binaries/vmhook_test_injector.exe
           --probe runtime-binaries/${{ matrix.reference_field_probe }}
+          --evidence reference-fields-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify method hooks, field stubs, class notifications and rooted callbacks
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' }}
         shell: pwsh
@@ -329,6 +331,8 @@ jobs:
             callback-repeat-${{ matrix.java }}-${{ matrix.toolchain }}-*.json
             examples-${{ matrix.java }}-${{ matrix.toolchain }}.json
             benchmark-${{ matrix.java }}-${{ matrix.toolchain }}.json
+            interface-${{ matrix.java }}-${{ matrix.toolchain }}.json
+            reference-fields-${{ matrix.java }}-${{ matrix.toolchain }}.json
           if-no-files-found: ignore
           retention-days: 7
 

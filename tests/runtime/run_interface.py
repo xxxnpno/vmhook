@@ -15,6 +15,8 @@ import tempfile
 import threading
 import time
 
+from runtime_evidence import runtime_evidence, read_results
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -22,6 +24,7 @@ def main() -> int:
     parser.add_argument('--javac', default='javac')
     parser.add_argument('--injector', type=Path, required=True)
     parser.add_argument('--probe', type=Path, required=True)
+    parser.add_argument('--evidence', type=Path, help='write copied hashes, checks and failure diagnostics as JSON')
     args = parser.parse_args()
     if os.name != 'nt':
         parser.error('this runtime harness requires native Windows')
@@ -30,18 +33,38 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix='vmhook-interface-') as temporary:
         directory = Path(temporary)
         result = directory / 'result.txt'
-        subprocess.run([args.javac, '-d', str(directory), str(helper), str(source)], check=True)
-        process = subprocess.Popen([args.java, '-cp', str(directory), 'interface_fixture'],
-                                   env=dict(os.environ, VMHOOK_INTERFACE_RESULT=str(result)),
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        evidence = runtime_evidence(args.evidence, 'interface_fixture')
+        process = None
+        reader = None
+        passed = False
+        failure = None
         output = queue.Queue()
+
+        def capture(line):
+            evidence.report['java_output'].append(line)
+            print(line, flush=True)
 
         def read_output():
             for line in process.stdout:
                 output.put(line.rstrip())
 
-        threading.Thread(target=read_output, daemon=True).start()
         try:
+            evidence.add_input('fixture_source', source)
+            evidence.add_input('java_callback_helper', helper)
+            evidence.add_runtime(args.java, args.javac, args.injector, args.probe)
+            compilation = subprocess.run([args.javac, '-d', str(directory), str(helper), str(source)],
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=90)
+            evidence.report['java_compiler_output'] = compilation.stdout
+            if compilation.stdout:
+                print(compilation.stdout, end='', flush=True)
+            compilation.check_returncode()
+            evidence.add_classes(directory)
+            process = subprocess.Popen([args.java, '-cp', str(directory), 'interface_fixture'],
+                                       env=dict(os.environ, VMHOOK_INTERFACE_RESULT=str(result)),
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                       cwd=directory)
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
             deadline = time.monotonic() + 45
             while time.monotonic() < deadline:
                 if process.poll() is not None:
@@ -50,19 +73,19 @@ def main() -> int:
                     line = output.get(timeout=0.25)
                 except queue.Empty:
                     continue
-                print(line, flush=True)
+                capture(line)
                 if line == 'READY':
                     break
             else:
                 raise RuntimeError('Java interface fixture did not become ready')
+            evidence.report['windows_pid'] = process.pid
             subprocess.run([str(args.injector.resolve()), str(process.pid),
                             str(args.probe.resolve())], check=True, timeout=15)
             values = {}
             deadline = time.monotonic() + 150
             while time.monotonic() < deadline:
                 if result.is_file():
-                    values = dict(line.split('=', 1) for line in result.read_text().splitlines()
-                                  if '=' in line)
+                    values = read_results(result)
                     if ('interface_proof' in values or 'exception' in values
                             or any(value in ('fail', 'timeout') for value in values.values())):
                         break
@@ -79,14 +102,26 @@ def main() -> int:
                        if value in ('fail', 'timeout') or key == 'exception']
             if failed:
                 raise RuntimeError('failed checks: ' + ', '.join(sorted(set(failed))))
+            evidence.verify_probe(args.probe)
+            passed = True
             return 0
+        except Exception as error:
+            failure = error
+            raise
         finally:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if reader is not None:
+                reader.join(timeout=1)
+            while not output.empty():
+                capture(output.get_nowait())
+            evidence.report['checks'] = read_results(result)
+            evidence.finish(passed, failure, directory)
 
 
 if __name__ == '__main__':

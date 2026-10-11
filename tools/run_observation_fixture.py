@@ -65,6 +65,7 @@ CHECKS = {
                          "recursive_observer", "suppressed_reentry", "same_thread_suppression",
                          "remove_recursive", "callback_side_removal", "native_reclamation",
                          "disabled_resources", "shutdown_original_body", "shutdown_resources",
+                         "resident_return_markers", "remove_object_hook", "resident_markers_after_shutdown",
                          "hook_composition_proof"],
 }
 
