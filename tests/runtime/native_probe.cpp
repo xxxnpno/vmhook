@@ -33,6 +33,50 @@ namespace
         { return static_members::get_method("initializedOn", "()Ljava/lang/String;")->call(); }
     };
 
+    class collection_player : public vmhook::object<collection_player>
+    {
+    public:
+        using vmhook::object<collection_player>::object;
+        auto id() const -> std::int32_t { return get_field("id")->get(); }
+    };
+
+    class collection_player_view : public vmhook::object<collection_player_view>
+    {
+    public:
+        using vmhook::object<collection_player_view>::object;
+        auto id() const -> std::int32_t { return get_method("id", "()I")->call(); }
+    };
+
+    class collection_key : public vmhook::object<collection_key>
+    {
+    public:
+        using vmhook::object<collection_key>::object;
+        auto id() const -> std::int32_t { return get_field("id")->get(); }
+    };
+
+    class unregistered_player : public vmhook::object<unregistered_player>
+    {
+    public:
+        using vmhook::object<unregistered_player>::object;
+    };
+
+    using players = std::vector<std::unique_ptr<collection_player>>;
+    using player_entries = std::vector<std::pair<std::unique_ptr<collection_key>,
+                                                std::unique_ptr<collection_player>>>;
+    using collection_conversion = decltype(std::declval<vmhook::field_proxy::value_t>().to_vector());
+
+    class collection_cases : public vmhook::object<collection_cases>
+    {
+    public:
+        using vmhook::object<collection_cases>::object;
+        auto inferred_players() const -> players
+        { return get_field("arrayList")->get().to_vector(); }
+        auto inferred_entries() const -> player_entries
+        { return get_field("linkedHashMap")->get().to_vector(); }
+        auto inferred_entries_named() const -> player_entries
+        { return get_field("linkedHashMap")->get().to_entries(); }
+    };
+
     vmhook::root<native_fixture> static_holder{"NativeFixture", "holder"};
 
     auto unicode_text() -> const std::string&
@@ -49,6 +93,200 @@ namespace
         output << label << '=' << (correct ? "pass" : "fail") << '\n';
         output.flush();
         return correct;
+    }
+
+    template<typename function_type>
+    auto conversion_refused(function_type&& function) -> bool
+    {
+        try { function(); }
+        catch (const vmhook::exception&) { return true; }
+        return false;
+    }
+
+    template<typename player_type>
+    auto player_ids(const std::vector<std::unique_ptr<player_type>>& values)
+        -> std::vector<std::int32_t>
+    {
+        std::vector<std::int32_t> result;
+        result.reserve(values.size());
+        for (const auto& value : values)
+        {
+            if (value && !value->get_instance()) { return {}; }
+            result.push_back(value ? value->id() : -1);
+        }
+        return result;
+    }
+
+    auto entry_ids(const player_entries& values)
+        -> std::vector<std::pair<std::int32_t, std::int32_t>>
+    {
+        std::vector<std::pair<std::int32_t, std::int32_t>> result;
+        result.reserve(values.size());
+        for (const auto& [key, value] : values)
+        {
+            if ((key && !key->get_instance()) || (value && !value->get_instance())) { return {}; }
+            result.emplace_back(key ? key->id() : -1, value ? value->id() : -1);
+        }
+        return result;
+    }
+
+    template<typename wrapper_type>
+    auto tagged_players(const collection_cases& cases, const std::string_view name) -> players
+    {
+        const std::unique_ptr<wrapper_type> wrapper = cases.get_field(name)->get();
+        if (!wrapper) { throw vmhook::exception{"Missing collection fixture"}; }
+        return wrapper->template to_vector<collection_player>();
+    }
+
+    template<typename wrapper_type>
+    auto tagged_entries(const collection_cases& cases, const std::string_view name) -> player_entries
+    {
+        const std::unique_ptr<wrapper_type> wrapper = cases.get_field(name)->get();
+        if (!wrapper) { throw vmhook::exception{"Missing map fixture"}; }
+        return wrapper->template to_vector<collection_key, collection_player>();
+    }
+
+    auto check_collections(std::ostream& output,
+                           std::optional<collection_conversion>& escaped_conversion,
+                           players& escaped_players) -> bool
+    {
+        const std::unique_ptr<collection_cases> cases =
+            native_fixture::static_members::get_field("collectionCases")->get();
+        if (!cases || !cases->get_instance()) { return false; }
+        const auto expect = [&](const std::string_view name, const bool correct)
+        {
+            if (!correct) { output << "collection_case=" << name << '\n'; output.flush(); }
+            return correct;
+        };
+        const std::vector<std::int32_t> array_order{1, -1, 2, 3};
+        const std::vector<std::int32_t> deque_order{3, 1, 2};
+        const std::vector<std::pair<std::int32_t, std::int32_t>> map_order{{2, 20}, {-1, 30}, {1, -1}};
+        if (!expect("inferred_field", player_ids(cases->inferred_players()) == array_order
+            && entry_ids(cases->inferred_entries()) == map_order
+            && entry_ids(cases->inferred_entries_named()) == map_order)) { return false; }
+        const std::unique_ptr<vmhook::array_list> inferred_list = cases->get_field("arrayList")->get();
+        const players inferred_wrapper = inferred_list->to_vector();
+        if (!expect("inferred_collection_wrapper", player_ids(inferred_wrapper) == array_order)) { return false; }
+        if (!expect("array_list", player_ids(tagged_players<vmhook::array_list>(*cases, "arrayList")) == array_order)
+            || !expect("linked_list", player_ids(tagged_players<vmhook::linked_list>(*cases, "linkedList"))
+                == std::vector<std::int32_t>{3, 1, -1})
+            || !expect("linked_hash_set", player_ids(tagged_players<vmhook::linked_hash_set>(*cases, "linkedHashSet"))
+                == std::vector<std::int32_t>{2, 1, -1})
+            || !expect("tree_set", player_ids(tagged_players<vmhook::tree_set>(*cases, "treeSet"))
+                == std::vector<std::int32_t>{1, 2, 3})
+            || !expect("array_deque", player_ids(tagged_players<vmhook::array_deque>(*cases, "arrayDeque")) == deque_order)
+            || !expect("queue", player_ids(tagged_players<vmhook::queue>(*cases, "arrayDeque")) == deque_order)
+            || !expect("deque", player_ids(tagged_players<vmhook::deque>(*cases, "arrayDeque")) == deque_order))
+        { return false; }
+        auto set_ids = player_ids(tagged_players<vmhook::hash_set>(*cases, "hashSet"));
+        std::ranges::sort(set_ids);
+        if (!expect("hash_set", set_ids == std::vector<std::int32_t>{-1, 1, 2})) { return false; }
+
+        for (const auto name : {"unmodifiableCollection", "unmodifiableList"})
+        {
+            const players values = cases->get_field(name)->get().to_vector();
+            if (!expect(name, player_ids(values) == array_order)) { return false; }
+        }
+        const players custom = cases->get_field("customCollection")->get().to_vector<collection_player>();
+        const players array = cases->get_field("objectArray")->get().to_vector();
+        const players array_as_object = cases->get_field("objectArrayAsObject")->get()
+            .to_vector<collection_player>();
+        const players returned_array_as_object = native_fixture::static_members::get_method(
+            "temporaryArrayAsObject", "()Ljava/lang/Object;")->call().to_vector<collection_player>();
+        const std::vector<std::unique_ptr<collection_player_view>> interfaces =
+            cases->get_field("arrayList")->get().to_vector();
+        if (!expect("custom_collection", player_ids(custom) == std::vector<std::int32_t>{2, -1, 1}
+                && static_cast<std::int32_t>(cases->get_field("customArrayCalls")->get()) > 0)
+            || !expect("object_array", player_ids(array) == std::vector<std::int32_t>{3, -1, 1})
+            || !expect("array_object_descriptor", player_ids(array_as_object) == std::vector<std::int32_t>{3, -1, 1}
+                && player_ids(returned_array_as_object) == std::vector<std::int32_t>{83, -1, 84})
+            || !expect("interface_and_subclass", player_ids(interfaces) == array_order)) { return false; }
+
+        const std::unique_ptr<vmhook::linked_hash_map> ordered = cases->get_field("linkedHashMap")->get();
+        const player_entries inferred_map = ordered->to_vector();
+        const player_entries inferred_named = ordered->to_entries();
+        const player_entries explicit_named = ordered->to_entries<collection_key, collection_player>();
+        const player_entries explicit_field = cases->get_field("linkedHashMap")->get()
+            .to_vector<collection_key, collection_player>();
+        const player_entries explicit_field_named = cases->get_field("linkedHashMap")->get()
+            .to_entries<collection_key, collection_player>();
+        if (!expect("linked_hash_map", entry_ids(tagged_entries<vmhook::linked_hash_map>(*cases, "linkedHashMap")) == map_order
+            && entry_ids(inferred_map) == map_order && entry_ids(inferred_named) == map_order
+            && entry_ids(explicit_named) == map_order && entry_ids(explicit_field) == map_order
+            && entry_ids(explicit_field_named) == map_order)
+            || !expect("tree_map", entry_ids(tagged_entries<vmhook::tree_map>(*cases, "treeMap"))
+                == std::vector<std::pair<std::int32_t, std::int32_t>>{{1, -1}, {2, 20}})) { return false; }
+        auto hash_ids = entry_ids(tagged_entries<vmhook::hash_map>(*cases, "hashMap"));
+        auto concurrent_ids = entry_ids(tagged_entries<vmhook::concurrent_hash_map>(*cases, "concurrentHashMap"));
+        auto identity_ids = entry_ids(tagged_entries<vmhook::map>(*cases, "identityHashMap"));
+        std::ranges::sort(hash_ids);
+        std::ranges::sort(concurrent_ids);
+        std::ranges::sort(identity_ids);
+        if (!expect("hash_map", hash_ids == std::vector<std::pair<std::int32_t, std::int32_t>>{{-1, 30}, {1, -1}, {2, 20}})
+            || !expect("concurrent_hash_map", concurrent_ids
+                == std::vector<std::pair<std::int32_t, std::int32_t>>{{8, 80}, {9, 90}})
+            || !expect("identity_hash_map", identity_ids
+                == std::vector<std::pair<std::int32_t, std::int32_t>>{{7, 70}, {7, 71}})
+            || !expect("unmodifiable_map", entry_ids(tagged_entries<vmhook::map>(*cases, "unmodifiableMap")) == map_order))
+        { return false; }
+
+        const players null_values = cases->get_field("nullCollection")->get().to_vector();
+        const players empty_values = cases->get_field("emptyCollection")->get().to_vector();
+        const player_entries null_entries = cases->get_field("nullMap")->get().to_entries();
+        const player_entries empty_entries = cases->get_field("emptyMap")->get().to_vector();
+        const players null_return = native_fixture::static_members::get_method("nullCollection",
+            "()Ljava/util/Collection;")->call().to_vector();
+        if (!expect("null_and_empty", null_values.empty() && empty_values.empty()
+            && null_entries.empty() && empty_entries.empty() && null_return.empty())) { return false; }
+
+        for (const auto name : {"primitive", "primitiveArray", "nestedArray", "plainObject", "mixedCollection", "linkedHashMap"})
+        {
+            if (!expect(name, conversion_refused([&]
+                { const players values = cases->get_field(name)->get().to_vector(); (void)values; }))) { return false; }
+        }
+        for (const auto name : {"wrongKeyMap", "wrongValueMap", "arrayList"})
+        {
+            if (!expect(name, conversion_refused([&]
+                { const player_entries values = cases->get_field(name)->get().to_entries(); (void)values; }))) { return false; }
+        }
+        if (!expect("unregistered_wrapper", conversion_refused([&]
+                { (void)cases->get_field("arrayList")->get().to_vector<unregistered_player>(); }))
+            || !expect("registered_wrong_wrapper", conversion_refused([&]
+                { (void)cases->get_field("arrayList")->get().to_vector<collection_key>(); }))
+            || !expect("void_result", conversion_refused([]
+                { const players values = native_fixture::collect().to_vector(); (void)values; }))
+            || !expect("primitive_result", conversion_refused([]
+                { const players values = native_fixture::plain(40).to_vector(); (void)values; }))
+            || !expect("java_to_array_exception", conversion_refused([&]
+                { const players values = cases->get_field("throwingCollection")->get().to_vector(); (void)values; })))
+        { return false; }
+        const auto after_exception = native_fixture::plain(40);
+        if (!expect("exception_consumed", after_exception.was_invoked() && !after_exception.threw()
+            && static_cast<std::int32_t>(after_exception) == 41)) { return false; }
+
+        auto deferred = native_fixture::static_members::get_method("temporaryCollection",
+            "()Ljava/util/Collection;")->call().to_vector();
+        auto deferred_map = native_fixture::static_members::get_method("temporaryMap",
+            "()Ljava/util/Map;")->call().to_entries();
+        native_fixture::collect();
+        escaped_players = deferred;
+        const player_entries temporary_entries = deferred_map;
+        native_fixture::collect();
+        if (!expect("deferred_gc_roots", player_ids(escaped_players) == std::vector<std::int32_t>{81, -1, 82}
+            && entry_ids(temporary_entries) == std::vector<std::pair<std::int32_t, std::int32_t>>{{91, 910}, {-1, -1}}))
+        { return false; }
+        std::atomic<bool> foreign_safe{};
+        std::thread foreign([&]
+        {
+            vmhook::native_thread_context other{thread_name()};
+            foreign_safe = other.valid()
+                && conversion_refused([&] { const players values = deferred; (void)values; })
+                && conversion_refused([&] { const player_entries values = deferred_map; (void)values; });
+        });
+        foreign.join();
+        if (!expect("foreign_adapter", foreign_safe.load())) { return false; }
+        escaped_conversion.emplace(cases->get_field("customCollection")->get().to_vector());
+        return true;
     }
 
     auto base_method(const native_fixture& receiver, const std::string_view name,
@@ -134,6 +372,8 @@ namespace
         std::optional<vmhook::field_proxy> escaped_field;
         std::optional<vmhook::method_proxy> escaped_method;
         vmhook::method_proxy::value_t escaped_value;
+        std::optional<collection_conversion> escaped_collection;
+        players escaped_players;
         {
             const auto physical_thread = ::GetCurrentThreadId();
             const std::string name{thread_name()};
@@ -180,7 +420,10 @@ namespace
             const auto wide = native_fixture::static_members::get_method("wide", "(JDI)J")->call(
                 std::int64_t{0x1122334455667788LL}, 42.25, std::int32_t{-7});
             const auto floating = native_fixture::static_members::get_method("floating", "(FD)D")->call(1.25f, 2.5);
+            const bool collections = check_collections(output, escaped_collection, escaped_players);
+            passed(output, "collections", collections);
             if (!passed(output, "invocation", result.was_invoked() && !result.threw()
+                && collections
                 && first->add(5) == 16 && wide.was_invoked() && !wide.threw()
                 && static_cast<std::int64_t>(wide) == 0x1122334455667788LL
                 && floating.was_invoked() && !floating.threw()
@@ -290,6 +533,11 @@ namespace
             && escaped_method && escaped_method->raw_method() == nullptr
             && escaped_method->get_compressed_oop() == 0
             && escaped_value.template to_borrowed<native_fixture>().resolve() == nullptr
+            && escaped_collection && conversion_refused([&]
+                { const players values = *escaped_collection; (void)values; })
+            && escaped_players.size() == 3 && escaped_players[0] && !escaped_players[1]
+            && escaped_players[2] && escaped_players[0]->get_instance() == nullptr
+            && escaped_players[2]->get_instance() == nullptr
             && (!escaped_field || static_cast<std::int32_t>(escaped_field->get()) == 0));
     }
 
@@ -340,7 +588,11 @@ namespace
         try
         {
             const bool metadata = vmhook::register_class<native_fixture>("NativeFixture")
-                && vmhook::register_class<lazy_fixture>("NativeFixture$Lazy");
+                && vmhook::register_class<lazy_fixture>("NativeFixture$Lazy")
+                && vmhook::register_class<collection_cases>("NativeFixture$CollectionCases")
+                && vmhook::register_class<collection_player>("NativeFixture$Player")
+                && vmhook::register_class<collection_player_view>("NativeFixture$PlayerView")
+                && vmhook::register_class<collection_key>("NativeFixture$Key");
             if (!passed(output, "metadata", metadata)) { return 2; }
             const auto refused = native_fixture::plain(1);
             if (!passed(output, "native_refusal", !refused.was_invoked())) { return 3; }

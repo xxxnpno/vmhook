@@ -99,6 +99,31 @@ GC and nested Java calls while the callback runs, but expire when it returns.
 They do not acquire the lifetime of a separately attached worker context.
 Neither route protects arbitrary raw objects captured before its roots existed.
 
+## Collection conversion lifetime
+
+The collection mini wrappers and reference field/method results support
+`to_vector()` with a declared `std::vector<std::unique_ptr<wrapper>>`
+destination. Maps support vectors of key/value wrapper pairs, also spelled
+`to_entries()`. Explicit template arguments materialize a vector immediately;
+an untyped `auto` destination instead stores a deferred conversion value.
+That value owns its source and shared root ticket, so destroying the original
+C++ result does not invalidate it. Materialization observes the collection at
+conversion time, not at the earlier `to_vector()` call.
+
+Collection conversion requires a valid native context or a method/field
+callback's temporary context. It uses Java's `Collection.toArray()` or
+`Map.entrySet().toArray()`, retaining the resulting reference array. Map
+entries, keys and values stay rooted across subsequent Java calls, and their
+addresses are resolved again after possible collection. Returned wrappers
+retain the same context-bound protection. They cannot cross threads or remain
+usable after context closure.
+
+Java null source references become empty vectors; null elements, keys and
+values remain `nullptr`. Invalid shapes, incompatible registered wrapper
+types, unavailable roots and failed calls are reported by `vmhook::exception`.
+Java decides encounter order and concurrent-mutation behavior; conversion
+does not add locking or establish an atomic snapshot of a mutable collection.
+
 ## Java calls inside a hook callback
 
 A method or static-field callback does not need to construct a
@@ -234,15 +259,22 @@ followed by another call, roots surviving idle GC, rejection on the wrong thread
 and after closure, bounded root-slot growth, repeated and concurrent attachment,
 and calls after the target method has actually compiled. It verifies that no
 hook was installed.
+The collection suite also checks ArrayList, LinkedList, ordered sets and queues,
+unmodifiable/custom collections, object arrays (including an Object-typed
+field/result), map order/nulls, identity and concurrent maps, interface and
+subclass elements, failed native result handoffs, incompatible types, deferred
+roots during GC, foreign threads and expired contexts. `collections=pass` is
+required separately by the harness and also conditions `invocation`.
 
-The current receiver-bound snake_case API's frozen public probes passed
+At [commit 35898be](https://github.com/xxxnpno/vmhook/commit/35898bec80f0a17c6e00c2ff69379d19c241e957), the receiver-bound snake_case API's frozen public probes passed
 **400/400 strict assertions on each interface**, across all 20 Java majors 8–27 under **Wine 10.0**: MinGW-w64
 G++ 14.2 for the C++23 header and Windows G++ 16.2 for the C++26 module.
-The matrices record unchanged current source and DLL hashes for the manifest's
+Those historical matrices record unchanged source and DLL hashes for the manifest's
 exact images and default collectors, including receiver-bound instance calls
 and qualified static lookups. Two simultaneously retained sets of field and
 method proxies remain bound to distinct Java objects. Static-only lookup
 refuses instance members, and missing-member results remain observable.
+These runs predate the target-inferred collection conversion path.
 
 Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
 
@@ -302,3 +334,5 @@ Useful upstream starting points are:
 - [Java 8 attachment and TLS implementation](https://github.com/adoptium/jdk8u/blob/1358e1b273e2/hotspot/src/share/vm/prims/jni.cpp)
 - [Windows x64 calling convention](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention)
 - [Compact object headers](https://openjdk.org/jeps/534)
+- [Java 8 Collection snapshot contract](https://github.com/openjdk/jdk8u/blob/8fd60ce581a797dc26c2d34da7cbd33b25e5b939/jdk/src/share/classes/java/util/Collection.java)
+- [Java 8 Map entry-view contract](https://github.com/openjdk/jdk8u/blob/c6b9c1ec9161a924cbdffa85753f4974241f3572/jdk/src/share/classes/java/util/Map.java)

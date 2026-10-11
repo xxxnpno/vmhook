@@ -35,6 +35,12 @@ features, including static reflection.
   explicit receiver argument. Class-bound lookup uses the same names under
   `static_members`; a static wrapper function uses that qualifier explicitly.
 - Hooks persist until explicitly removed. Do not add scoped hook handles.
+- Convert collections through their Java interface operations. Do not infer a
+  map implementation from a field named `table` or a list from `get(int)`.
+  Keep snapshot arrays and entries rooted across calls, resolve moved objects
+  again, preserve nulls and encounter order, and check registered element types.
+  Verify target-inferred vector returns in both public interfaces and live
+  collection variants on Java 8–27.
 - Keep preprocessor directives out of every `.ixx` file. Import the standard
   library and use the SDK header unit for Windows declarations.
 - Preserve C++23/module behavior parity. Reflection can improve compile-time

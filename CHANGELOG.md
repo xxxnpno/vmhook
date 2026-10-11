@@ -69,6 +69,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   inside a wrapper, or qualify them with the wrapper class externally.
   Checked lookup arrows report missing members through `vmhook::exception`.
   Java class/member strings and external ABI names retain their exact spelling.
+- Collection and map conversions use Java `Collection.toArray()` and
+  `Map.entrySet().toArray()` rather than guessed private node layouts. Common
+  list, set, queue and map wrappers share this path, preserving Java encounter
+  order and null elements. A declared vector return type supplies wrapper
+  types for `to_vector()`; explicit templates remain available for `auto`
+  locals. Source snapshots and returned wrappers retain native-context roots;
+  invalid contexts, incompatible elements and failed calls are reported.
 - Native-context construction uses HotSpot's collector-aware allocator,
   initializes an already-loaded concrete class and invokes its real constructor.
   String arguments use the private VM String allocator, including Java 27's

@@ -1068,6 +1068,25 @@ export namespace vmhook
     class linked_list;
     class map;
     class hash_map;
+    class array_list;
+    class hash_set;
+    class linked_hash_set;
+    class tree_set;
+    class linked_hash_map;
+    class tree_map;
+    class queue;
+    class deque;
+    class array_deque;
+    class concurrent_hash_map;
+
+    namespace detail
+    {
+        template<typename wrapper_type>
+        concept container_wrapper = std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+            && std::is_base_of_v<vmhook::object_base, wrapper_type>
+            && std::is_constructible_v<wrapper_type, void*>;
+        template<typename source_type, bool entries_only = false> class vector_conversion;
+    }
 
     // Anchored-reference model (definitions live in the "Anchored references"
     // section near the end of the file, after gc_epoch() - which resolve() needs
@@ -14672,32 +14691,19 @@ export namespace vmhook
                 return std::holds_alternative<std::uint32_t>(data);
             }
 
-            /*
-                @brief Converts a reference-type field into a vector of unique_ptr wrappers.
-                @details
-                Interprets the stored compressed OOP as a Java object array, decodes each
-                element, and constructs a std::unique_ptr<element_type> wrapper for each.
-                Defined out-of-line after array helpers are available.
-
-                Complexity: O(N) where N = array length.
-            */
-            template<typename element_type>
+            /* The destination of a deferred conversion supplies the wrapper
+               types. Explicit template arguments materialize eagerly for auto
+               locals. Non-null sources require their originating VM root. */
+            auto to_vector() const -> vmhook::detail::vector_conversion<value_t>;
+            auto to_entries() const -> vmhook::detail::vector_conversion<value_t, true>;
+            template<vmhook::detail::container_wrapper element_type>
+            auto to_vector() const -> std::vector<std::unique_ptr<element_type>>;
+            template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
             auto to_vector() const
-                -> std::vector<std::unique_ptr<element_type>>;
-
-            /*
-                @brief Converts a reference-type field into a vector of key/value pairs.
-                @details
-                Interprets the stored compressed OOP as a java.util.Map, decodes it via
-                vmhook::map, and walks its entries.  Each entry is returned as a pair of
-                std::unique_ptr<key_type> / std::unique_ptr<value_type> wrappers.
-                Defined out-of-line after vmhook::map is complete.
-
-                Complexity: O(N) where N = map size.
-            */
-            template<typename key_type, typename value_type>
+                -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>;
+            template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
             auto to_entries() const
-                -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>;
+                -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>;
 
             /*
                 @brief Converts a reference field value to an epoch-checked non-owning borrow.
@@ -14783,7 +14789,7 @@ export namespace vmhook
             {
                 ::vmhook::detail::log_line("{} field_proxy::get(): typed reference reads require verified narrow oops.",
                                           vmhook::error_tag);
-                return value_t{ std::uint32_t{}, this->signature_text };
+                return value_t{ std::int32_t{}, this->signature_text };
             }
             // Read the static mirror again instead of retaining its previously observed address.
             // This narrows staleness but does not synchronize with GC or class unloading.
@@ -14865,13 +14871,14 @@ export namespace vmhook
 
             // Reference or array type - store compressed OOP
             std::uint32_t value{};
-            vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value));
+            if (!vmhook::os::safe_read_fast(&value, read_pointer, sizeof(value)))
+            { return value_t{ std::int32_t{}, this->signature_text }; }
             value_t result{ value, this->signature_text };
             if (access)
             {
                 result.native_root = vmhook::detail::native_backend::retain_oop(
                     vmhook::hotspot::decode_oop_pointer(value));
-                if (value != 0 && !result.native_root) { result.data = std::uint32_t{}; }
+                if (value != 0 && !result.native_root) { result.data = std::int32_t{}; }
             }
             return result;
         }
@@ -16361,6 +16368,12 @@ export namespace vmhook
             }
 
             bool invoked{ false };
+            // Distinguishes an actual null reference result from void or failure.
+            bool reference_result{ false };
+            bool reference_array_result{ false };
+            bool primitive_array_result{ false };
+            // A callee may run successfully while result-root bookkeeping fails.
+            bool result_failed{ false };
             // Internal constructor handoff; borrowed immediately, never a GC root.
             void* receiver_address{ nullptr };
 
@@ -16371,6 +16384,8 @@ export namespace vmhook
             {
                 value_t result{ std::forward<stored_type>(value) };
                 result.invoked = true;
+                result.reference_result = std::is_same_v<std::remove_cvref_t<stored_type>, std::uint32_t>
+                    || std::is_same_v<std::remove_cvref_t<stored_type>, std::string>;
                 result.receiver_address = receiver;
                 return result;
             }
@@ -16381,8 +16396,23 @@ export namespace vmhook
                 vmhook::detail::native_backend::operation access{};
                 value_t result{ std::uint32_t{} };
                 result.invoked = true;
+                result.reference_result = true;
                 result.native_root = std::move(object);
                 result.native_receiver_root = std::move(receiver);
+                return result;
+            }
+
+            // Native reference handoff preserves invocation and bookkeeping
+            // status even when no object ticket could be promoted.
+            static auto completed_native_reference(
+                const vmhook::detail::native_backend::native_call_result& called) -> value_t
+            {
+                auto result{ completed_reference(called.object, called.receiver) };
+                result.invoked = called.invoked;
+                result.exception_thrown = called.threw;
+                result.exception_class = called.exception_class;
+                result.result_failed = !called.error.empty()
+                    || (!called.threw && called.bits != 0 && !called.object);
                 return result;
             }
 
@@ -16625,6 +16655,20 @@ export namespace vmhook
                     }
                 , data);
             }
+
+            /* The destination of a deferred conversion supplies the wrapper
+               types. Explicit template arguments materialize eagerly for auto
+               locals. Non-null sources require their originating VM root. */
+            auto to_vector() const -> vmhook::detail::vector_conversion<value_t>;
+            auto to_entries() const -> vmhook::detail::vector_conversion<value_t, true>;
+            template<vmhook::detail::container_wrapper element_type>
+            auto to_vector() const -> std::vector<std::unique_ptr<element_type>>;
+            template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+            auto to_vector() const
+                -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>;
+            template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+            auto to_entries() const
+                -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>;
 
             /*
                 @brief Converts an object call result to an epoch-checked non-owning borrow.
@@ -17524,14 +17568,23 @@ export namespace vmhook
                 void* const result_oop{ reinterpret_cast<void*>(result_holder) };
                 if (!result_oop)
                 {
-                    return value_t::completed(std::monostate{}, receiver_after);
+                    auto result{ value_t::completed(std::monostate{}, receiver_after) };
+                    result.reference_result = true;
+                    result.reference_array_result = ret_char == '[';
+                    result.primitive_array_result = ret_char == '[' && rparen + 2 < sig.size()
+                        && sig[rparen + 2] != 'L' && sig[rparen + 2] != '[';
+                    return result;
                 }
                 if (rparen != std::string_view::npos
                     && sig.substr(rparen + 1) == "Ljava/lang/String;")
                 {
                     return value_t::completed(vmhook::read_java_string(result_oop), receiver_after);
                 }
-                return value_t::completed(vmhook::hotspot::encode_oop_pointer(result_oop), receiver_after);
+                auto result{ value_t::completed(vmhook::hotspot::encode_oop_pointer(result_oop), receiver_after) };
+                result.reference_array_result = ret_char == '[';
+                result.primitive_array_result = ret_char == '[' && rparen + 2 < sig.size()
+                    && sig[rparen + 2] != 'L' && sig[rparen + 2] != '[';
+                return result;
             }
             }
         }
@@ -18166,9 +18219,9 @@ export namespace vmhook
             }
             case 'L':
             case '[':
+                converted = value_t::completed_native_reference(result);
                 if (!result.threw && result.object)
                 {
-                    converted = value_t::completed_reference(result.object, result.receiver);
                     if (signature.substr(close + 1) == "Ljava/lang/String;")
                     { converted.data = vmhook::read_java_string(result.object->resolve_under_vm()); }
                 }
@@ -18176,6 +18229,11 @@ export namespace vmhook
             default: break;
             }
             converted.invoked = result.invoked;
+            converted.reference_result = type == 'L' || type == '[';
+            converted.reference_array_result = type == '[';
+            converted.primitive_array_result = type == '[' && close + 2 < signature.size()
+                && signature[close + 2] != 'L' && signature[close + 2] != '[';
+            converted.result_failed = converted.result_failed || !result.error.empty();
             converted.receiver_address = receiver;
             converted.native_receiver_root = result.receiver;
             converted.exception_thrown = result.threw;
@@ -18509,7 +18567,7 @@ export namespace vmhook
                     if (auto* const cp{ cm->get_constants() };
                         cp && vmhook::hotspot::is_valid_pointer(cp))
                     {
-                        static const auto* const pool_holder_entry{
+                        const auto* const pool_holder_entry{
                             vmhook::hotspot::iterate_struct_entries("ConstantPool", "_pool_holder") };
                         if (pool_holder_entry)
                         {
@@ -20055,1223 +20113,550 @@ export namespace vmhook
 
     namespace detail
     {
-        template<typename wrapper_type>
-        auto wrap_retained_object(void* const oop) -> std::unique_ptr<wrapper_type>
+        /* The destination supplies the C++ wrapper types. Owning the source
+           preserves its root when the field/call temporary has been destroyed. */
+        template<typename source_type, bool entries_only>
+        class vector_conversion final
         {
-            auto result{ vmhook::detail::wrap_object<wrapper_type>(oop) };
-            if (result && oop && vmhook::detail::native_backend::active())
+            source_type source_;
+            bool valid_{ true };
+            auto require_source() const -> void
             {
-                auto root{ vmhook::detail::native_backend::retain_oop(oop) };
-                if (!root) { return vmhook::detail::wrap_object<wrapper_type>(nullptr); }
-                result->set_native_root(std::move(root));
+                if (!this->valid_)
+                { throw vmhook::exception{ "Cannot materialize a moved-from collection conversion" }; }
             }
+        public:
+            explicit vector_conversion(source_type source)
+                : source_{ std::move(source) } {}
+            vector_conversion(const vector_conversion&) = default;
+            auto operator=(const vector_conversion&) -> vector_conversion& = default;
+            vector_conversion(vector_conversion&& other)
+                noexcept(std::is_nothrow_move_constructible_v<source_type>)
+                : source_{ std::move(other.source_) }, valid_{ std::exchange(other.valid_, false) } {}
+            auto operator=(vector_conversion&& other)
+                noexcept(std::is_nothrow_move_assignable_v<source_type>) -> vector_conversion&
+            {
+                if (this != &other)
+                {
+                    this->source_ = std::move(other.source_);
+                    this->valid_ = std::exchange(other.valid_, false);
+                }
+                return *this;
+            }
+
+            template<container_wrapper element_type>
+                requires (!entries_only && requires(const source_type& source)
+                {
+                    { source.template to_vector<element_type>() }
+                        -> std::same_as<std::vector<std::unique_ptr<element_type>>>;
+                })
+            operator std::vector<std::unique_ptr<element_type>>() const
+            { this->require_source(); return this->source_.template to_vector<element_type>(); }
+
+            template<container_wrapper key_type, container_wrapper mapped_type>
+                requires requires(const source_type& source)
+                {
+                    { source.template to_entries<key_type, mapped_type>() }
+                        -> std::same_as<std::vector<std::pair<std::unique_ptr<key_type>,
+                                                             std::unique_ptr<mapped_type>>>>;
+                }
+            operator std::vector<std::pair<std::unique_ptr<key_type>,
+                                           std::unique_ptr<mapped_type>>>() const
+            { this->require_source(); return this->source_.template to_entries<key_type, mapped_type>(); }
+        };
+
+        [[nodiscard]] inline auto container_class_assignable(
+            vmhook::hotspot::klass* runtime_class, vmhook::hotspot::klass* const expected_class) -> bool
+        {
+            if (!expected_class || !vmhook::hotspot::is_valid_pointer(expected_class)) { return false; }
+            const auto* const layout_entry{
+                vmhook::hotspot::iterate_struct_entries("Klass", "_layout_helper") };
+            const auto* const secondary_entry{
+                vmhook::hotspot::iterate_struct_entries("Klass", "_secondary_supers") };
+            for (std::size_t depth{}; runtime_class && depth < 256; ++depth)
+            {
+                if (!vmhook::hotspot::is_valid_pointer(runtime_class)) { return false; }
+                if (runtime_class == expected_class) { return true; }
+                // This Klass metadata also covers interfaces and array covariance.
+                if (secondary_entry)
+                {
+                    const auto* const array{ static_cast<const std::byte*>(vmhook::hotspot::safe_read_pointer(
+                        reinterpret_cast<const std::byte*>(runtime_class) + secondary_entry->offset)) };
+                    std::int32_t count{};
+                    if (array)
+                    {
+                        if (!vmhook::os::safe_read(&count, array, sizeof(count)) || count < 0 || count > 65535)
+                        { return false; }
+                        for (std::int32_t index{}; index < count; ++index)
+                        {
+                            vmhook::hotspot::klass* secondary_class{};
+                            if (!vmhook::os::safe_read(&secondary_class,
+                                    array + 8 + static_cast<std::size_t>(index) * sizeof(secondary_class),
+                                    sizeof(secondary_class))) { return false; }
+                            if (secondary_class == expected_class) { return true; }
+                        }
+                    }
+                }
+                std::int32_t layout{};
+                if (!layout_entry || !vmhook::os::safe_read(&layout,
+                        reinterpret_cast<const std::byte*>(runtime_class) + layout_entry->offset, sizeof(layout)))
+                { return false; }
+                // Negative layout is ArrayKlass; zero is an interface InstanceKlass.
+                if (layout >= 0)
+                {
+                    std::int32_t interface_count{};
+                    auto* const interfaces{ runtime_class->get_interfaces_ptr(interface_count) };
+                    for (std::int32_t index{}; interfaces && index < interface_count; ++index)
+                    {
+                        vmhook::hotspot::klass* interface_class{};
+                        if (!vmhook::os::safe_read(&interface_class, interfaces + index, sizeof(interface_class)))
+                        { return false; }
+                        if (interface_class == expected_class) { return true; }
+                    }
+                }
+                runtime_class = runtime_class->get_super();
+            }
+            return false;
+        }
+
+        [[nodiscard]] inline auto container_address(const native_backend::root& root) -> void*
+        {
+            if (!root || !root->valid())
+            { throw vmhook::exception{ "Collection reference belongs to a closed or different thread context" }; }
+            void* const address{ root->resolve_under_vm() };
+            if (!address || !vmhook::hotspot::is_valid_pointer(address))
+            { throw vmhook::exception{ "Collection reference cannot be resolved under the current VM operation" }; }
+            return address;
+        }
+
+        [[nodiscard]] inline auto retain_container_address(void* const address) -> native_backend::root
+        {
+            if (!address) { return {}; }
+            if (!vmhook::hotspot::is_valid_pointer(address))
+            { throw vmhook::exception{ "Invalid Java reference in collection conversion" }; }
+            auto root{ native_backend::retain_oop(address) };
+            if (!root)
+            { throw vmhook::exception{ "Cannot retain a Java reference for collection conversion" }; }
+            return root;
+        }
+
+        [[nodiscard]] inline auto container_source_root(const vmhook::object_base& source)
+            -> native_backend::root
+        {
+            auto root{ source.get_native_root() };
+            if (root) { (void)container_address(root); return root; }
+            if (!source.get_instance()) { return {}; }
+            throw vmhook::exception{ "Non-null collection conversion requires a retained Java reference" };
+        }
+
+        [[nodiscard]] inline auto container_value_root(const std::uint32_t compressed,
+            const native_backend::root& existing) -> native_backend::root
+        {
+            if (existing) { (void)container_address(existing); return existing; }
+            if (compressed == 0) { return {}; }
+            throw vmhook::exception{ "Non-null collection conversion requires its originating Java root" };
+        }
+
+        inline auto require_container_contract(const native_backend::root& root,
+            const std::string_view class_name) -> void
+        {
+            auto* const expected_class{ vmhook::find_class(class_name) };
+            if (!expected_class || !container_class_assignable(
+                    vmhook::klass_from_oop(container_address(root)), expected_class))
+            { throw vmhook::exception{ std::format("Java object is not an instance of '{}'", class_name) }; }
+        }
+
+        [[nodiscard]] inline auto call_container_method(const native_backend::root& root,
+            const std::string_view name, const std::string_view signature) -> vmhook::method_proxy::value_t
+        {
+            vmhook::any_object source{ container_address(root) };
+            source.set_native_root(root);
+            const auto method{ source.get_method(name, signature) };
+            if (!method)
+            { throw vmhook::exception{ std::format("Java collection method '{}{}' is unavailable", name, signature) }; }
+            auto result{ method->call() };
+            if (!result.was_invoked() || result.threw() || result.result_failed)
+            { throw vmhook::exception{ std::format("Java collection method '{}{}' failed{}{}", name, signature,
+                result.threw() ? ": " : "", result.exception_class) }; }
             return result;
+        }
+
+        [[nodiscard]] inline auto container_result_root(const vmhook::method_proxy::value_t& value)
+            -> native_backend::root
+        {
+            if (!value.was_invoked() || value.threw() || value.result_failed || !value.reference_result)
+            { throw vmhook::exception{ "Collection conversion requires a successful Java reference result" }; }
+            if (value.native_root) { (void)container_address(value.native_root); return value.native_root; }
+            if (std::holds_alternative<std::uint32_t>(value.data))
+            { return container_value_root(std::get<std::uint32_t>(value.data), {}); }
+            if (std::holds_alternative<std::monostate>(value.data)) { return {}; }
+            { throw vmhook::exception{ "Collection conversion requires an object or reference array" }; }
+        }
+
+        [[nodiscard]] inline auto container_array_length(const native_backend::root& root) -> std::int32_t
+        {
+            void* const array{ container_address(root) };
+            const auto layout{ vmhook::detail::array_layout(vmhook::klass_from_oop(array)) };
+            if (!layout || !layout->reference_elements || layout->element_width != sizeof(std::uint32_t)
+                || !vmhook::detail::reference_reads_supported()
+                || vmhook::detail::reference_storage_width() != sizeof(std::uint32_t))
+            { throw vmhook::exception{ "Collection conversion requires a supported Java reference array" }; }
+            std::int32_t count{};
+            if (!vmhook::os::safe_read(&count, static_cast<const std::byte*>(array) + layout->length_offset,
+                                      sizeof(count)) || count < 0
+                || static_cast<std::size_t>(count) > vmhook::k_max_safe_container_elems)
+            { throw vmhook::exception{ "Java collection snapshot length is unreadable or exceeds the supported limit" }; }
+            return count;
+        }
+
+        [[nodiscard]] inline auto container_array_element(const native_backend::root& root,
+            const std::int32_t index) -> native_backend::root
+        {
+            // Re-resolve the snapshot after any previous getKey/getValue call.
+            void* const array{ container_address(root) };
+            const auto layout{ vmhook::detail::array_layout(vmhook::klass_from_oop(array)) };
+            const auto count{ container_array_length(root) };
+            if (!layout || index < 0 || index >= count)
+            { throw vmhook::exception{ "Java collection snapshot index is invalid" }; }
+            std::uint32_t compressed{};
+            if (!vmhook::os::safe_read(&compressed, static_cast<const std::byte*>(array) + layout->body_offset
+                    + static_cast<std::size_t>(index) * layout->element_width, sizeof(compressed)))
+            { throw vmhook::exception{ "Java collection snapshot element is unreadable" }; }
+            return retain_container_address(vmhook::hotspot::decode_oop_pointer(compressed));
+        }
+
+        template<container_wrapper wrapper_type>
+        [[nodiscard]] auto wrap_container_element(const native_backend::root& root)
+            -> std::unique_ptr<wrapper_type>
+        {
+            if (!root) { return nullptr; }
+            void* const address{ container_address(root) };
+            if constexpr (!std::is_same_v<wrapper_type, vmhook::any_object>)
+            {
+                std::string expected_name{ vmhook::detail::registered_class_name<wrapper_type>() };
+                if (expected_name.empty())
+                {
+                    if constexpr (requires { std::string_view{ wrapper_type::java_contract }; })
+                    { expected_name = wrapper_type::java_contract; }
+                }
+                if (expected_name.empty())
+                { throw vmhook::exception{ "Collection element wrapper is not registered with a Java class" }; }
+                auto* const expected_class{ vmhook::find_class(expected_name) };
+                if (!expected_class || !container_class_assignable(vmhook::klass_from_oop(address), expected_class))
+                { throw vmhook::exception{ std::format("Collection element does not match wrapper class '{}'", expected_name) }; }
+            }
+            auto result{ std::make_unique<wrapper_type>(address) };
+            result->set_native_root(root);
+            return result;
+        }
+
+        template<container_wrapper element_type>
+        [[nodiscard]] auto container_array_vector(const native_backend::root& snapshot)
+            -> std::vector<std::unique_ptr<element_type>>
+        {
+            const auto count{ container_array_length(snapshot) };
+            std::vector<std::unique_ptr<element_type>> result;
+            result.reserve(static_cast<std::size_t>(count));
+            for (std::int32_t index{}; index < count; ++index)
+            { result.push_back(wrap_container_element<element_type>(container_array_element(snapshot, index))); }
+            return result;
+        }
+
+        [[nodiscard]] inline auto collection_snapshot(const native_backend::root& source) -> native_backend::root
+        {
+            require_container_contract(source, "java/util/Collection");
+            auto snapshot{ container_result_root(call_container_method(source, "toArray", "()[Ljava/lang/Object;")) };
+            if (!snapshot) { throw vmhook::exception{ "Collection.toArray returned null" }; }
+            (void)container_array_length(snapshot);
+            return snapshot;
         }
     }
 
-    // Forward declarations of the templated walk helpers used by
-    // collection::to_vector below.  The bodies live further down in this
-    // header (after the wrapper classes) so they can be reused by every
-    // wrapper that inherits from collection.  Declaring them up here lets
-    // GCC's first-phase lookup find the qualified names inside the
-    // templated collection::to_vector body.
-    template<typename element_type, typename out_t>
-    inline auto linked_list_walk_items(void* list_oop, std::int32_t size, out_t& out) -> void;
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto hash_map_walk_entries(void* map_oop, out_t& out) -> void;
-    template<typename element_type, typename out_t>
-    inline auto hash_map_walk_keys(void* map_oop, out_t& out) -> void;
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto tree_map_walk_entries(void* map_oop, out_t& out) -> void;
-    template<typename element_type, typename out_t>
-    inline auto tree_map_walk_keys(void* map_oop, out_t& out) -> void;
-
-    /*
-        @brief C++ wrapper for java.util.Collection objects.
-
-        Uses the live OOP's klass pointer (read from its object header) to
-        resolve fields and methods, so no register_class<T>() call is needed
-        and it works with any concrete Collection implementation
-        (ArrayList, LinkedList, HashSet, etc.).
-
-        Typical usage (from a hook detour where you received a List OOP):
-
-            collection col{ list_oop };
-            std::int32_t n = col.size();
-    */
+    /* Java Collection wrappers use the public toArray contract. Snapshot order
+       and concurrent-mutation semantics are those of the Java implementation.
+       Returned unique_ptrs own C++ wrappers; their Java roots belong to the
+       current native-thread or validated callback context. */
     class collection : public vmhook::oop_reflective_base
     {
     public:
-        /*
-            @brief Wraps a decoded OOP that refers to any java.util.Collection implementation.
-            @details
-            The oop must be a fully decoded 64-bit heap pointer (not a compressed OOP).
-            The constructor does not validate the pointer; pass nullptr for a null-safe
-            collection that returns empty/zero for all operations.
-
-            Exception safety: noexcept.
-            @param oop  Decoded OOP of the Java Collection object, or nullptr.
-        */
-        explicit collection(vmhook::oop_t oop) noexcept
-            : vmhook::oop_reflective_base{ oop }
-        {
-        }
-
-        /*
-            @brief Wraps the Java collection behind a lifetime-checked handle.
-            @details
-            Phase-3 intercept: the way to build a collection wrapper WITHOUT the
-            caller ever spelling a raw address.  The borrow is resolved once,
-            here, so an already-expired handle produces a null-safe (empty)
-            wrapper rather than one bound to an address known to be stale.
-
-            The wrapper itself still holds a plain address afterwards - it is a
-            view over one object for the duration of a call, exactly like the
-            oop_t constructor.  Resolving at construction is what makes the
-            EXPIRED case fail closed instead of silently walking a moved object.
-
-            Declared as a member template so it can name vmhook::borrowed, which
-            is only complete much later in this header; the body is instantiated
-            at the call site, by which point it is.
-
-            Exception safety: noexcept.
-            @param handle  Borrow of the Java object, possibly empty or expired.
-        */
+        inline static constexpr std::string_view java_contract{ "java/util/Collection" };
+        explicit collection(vmhook::oop_t oop = nullptr) noexcept : vmhook::oop_reflective_base{ oop } {}
         template<typename wrapper_type>
         explicit collection(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::oop_reflective_base{ handle.resolve() }
+        { this->set_native_root(handle.get_native_root()); }
+
+        auto size() const -> std::int32_t
         {
-            this->set_native_root(handle.get_native_root());
+            vmhook::detail::native_backend::operation access{};
+            const auto source{ vmhook::detail::container_source_root(*this) };
+            if (!source) { return 0; }
+            if (!access) { throw vmhook::exception{ "Collection access requires a native-thread or rooted callback context" }; }
+            vmhook::detail::require_container_contract(source, "java/util/Collection");
+            const auto result{ vmhook::detail::call_container_method(source, "size", "()I") };
+            if (!std::holds_alternative<std::int32_t>(result.data))
+            { throw vmhook::exception{ "Collection.size returned an invalid value" }; }
+            return std::get<std::int32_t>(result.data);
         }
+        auto is_empty() const -> bool { return this->size() == 0; }
 
-        // oop_klass() / get_field_by_oop_klass() / get_method_by_oop_klass()
-        // are inherited (protected) from vmhook::oop_reflective_base.
-
-        /*
-            @brief Returns the number of elements via the Java size() method.
-            Resolves through the concrete class's virtual dispatch table,
-            so it works for ArrayList, LinkedList, HashSet, etc.
-        */
-        auto size() const noexcept -> std::int32_t
-        {
-            const auto proxy{ get_method_by_oop_klass("size") };
-            if (!proxy)
-            {
-                return 0;
-            }
-            return proxy->call();
-        }
-
-        /*
-            @brief Returns true if the collection contains no elements.
-            @details
-            Delegates to size(); returns true when size() == 0.
-
-            Complexity: O(1) if size() is O(1) for the underlying implementation.
-            Exception safety: noexcept.
-        */
-        auto is_empty() const noexcept -> bool
-        {
-            return size() == 0;
-        }
-
-        /*
-            @brief Converts this java.util.Collection to a std::vector<std::unique_ptr<element_type>>.
-            @details
-            Picks the right fast path by probing the live OOP for the field
-            shape of each known container, in order of specificity:
-
-              1. ArrayList     ("elementData" + "size")  → direct array walk
-              2. LinkedList    ("first" + "size")        → Node first->next chain
-              3. HashSet       ("map")                   → walk backing HashMap.table keys
-              4. TreeSet       ("m")                     → walk backing TreeMap.root keys
-              5. Generic       (size() + get(int))       → only valid for List impls
-
-            The cascade is field-presence based, so it picks the right path
-            from the runtime klass without needing the caller to know which
-            wrapper type (collection / list / linked_list / set) to construct.
-            That means `field_proxy::get().to_vector<T>()` does the right
-            thing for ArrayList, LinkedList, HashSet, LinkedHashSet, TreeSet,
-            and any other Collection whose layout matches one of these.
-
-            Null Java elements become nullptr entries in the returned vector.
-
-            Complexity: O(N) where N = collection size.
-            Exception safety: does not throw; returns an empty vector on any failure.
-
-            @tparam element_type  C++ wrapper whose constructor accepts vmhook::oop_t.
-            @return  Vector of unique_ptr<element_type>; nullptr slots for null elements.
-        */
-        template<typename element_type>
+        template<vmhook::detail::container_wrapper element_type>
         auto to_vector() const -> std::vector<std::unique_ptr<element_type>>
         {
             vmhook::detail::native_backend::operation access{};
-            (void)this->get_instance();
-            std::vector<std::unique_ptr<element_type>> result;
-
-            if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
-            {
-                return result;
-            }
-
-            //  ArrayList fast path
-            const auto size_opt{ get_field_by_oop_klass("size") };
-            const auto data_opt{ get_field_by_oop_klass("elementData") };
-
-            if (size_opt && data_opt)
-            {
-                const std::int32_t n{ size_opt->get() };
-                if (n <= 0)
-                {
-                    return result;
-                }
-
-                const std::uint32_t compressed_array{ static_cast<std::uint32_t>(data_opt->get()) };
-                void* const array_oop{ vmhook::decode_array_oop(compressed_array) };
-                if (array_oop && vmhook::hotspot::is_valid_pointer(array_oop))
-                {
-                    // n is the Java `size` field read from heap memory; a
-                    // stale/corrupted list oop can report an absurd value, so
-                    // clamp it for BOTH the reserve and the loop (the per-element
-                    // get_array_element read is already bounds-clamped, but the
-                    // loop COUNT and the reserve are not).  Honest lists (n <= cap)
-                    // are unaffected.
-                    const std::int32_t safe_n{ vmhook::clamp_safe_container_count(n) };
-                    result.reserve(static_cast<std::size_t>(safe_n));
-                    for (std::int32_t index{ 0 }; index < safe_n; ++index)
-                    {
-                        const std::uint32_t compressed_element{ vmhook::get_array_element<std::uint32_t>(array_oop, index) };
-                        void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed_element) };
-                        if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
-                        {
-                            result.push_back(vmhook::detail::wrap_retained_object<element_type>(element_oop));
-                        }
-                        else
-                        {
-                            result.push_back(nullptr);
-                        }
-                    }
-                    return result;
-                }
-            }
-
-            //  LinkedList fast path — walks the first->next Node chain.
-            const auto first_opt{ get_field_by_oop_klass("first") };
-            if (first_opt && size_opt)
-            {
-                const std::int32_t n{ size_opt->get() };
-                if (n > 0)
-                {
-                    vmhook::linked_list_walk_items<element_type>(this->instance, n, result);
-                }
-                return result;
-            }
-
-            //  HashSet / LinkedHashSet fast path — elements live as keys in
-            //  the backing HashMap held in field "map".
-            if (const auto map_field{ get_field_by_oop_klass("map") })
-            {
-                const std::uint32_t map_compressed{ static_cast<std::uint32_t>(map_field->get()) };
-                void* const map_oop{ vmhook::hotspot::decode_oop_pointer(map_compressed) };
-                if (map_oop && vmhook::hotspot::is_valid_pointer(map_oop))
-                {
-                    vmhook::hash_map_walk_keys<element_type>(map_oop, result);
-                }
-                return result;
-            }
-
-            //  "m"-backed Set fast path — elements live as keys in a backing
-            //  map held in field "m".  Two distinct JDK shapes share this field
-            //  name, so we must NOT assume TreeMap from the name alone:
-            //    * TreeSet                          -> m is a TreeMap (red-black,
-            //                                          has a "root" field).
-            //    * Collections.newSetFromMap(map)   -> Collections$SetFromMap.m
-            //                                          is whatever Map was passed,
-            //                                          commonly a HashMap (has a
-            //                                          "table" field, NO "root").
-            //  Routing on the field name alone sent a HashMap-backed SetFromMap
-            //  into the tree walk, which finds no "root" and silently returns 0
-            //  of N elements.  Instead inspect the ACTUAL backing map's klass and
-            //  pick the walker that matches its real layout: "root" => tree walk,
-            //  else "table" => hash walk.  A real TreeSet still resolves "root"
-            //  first, so its behaviour is unchanged.
-            if (const auto tree_field{ get_field_by_oop_klass("m") })
-            {
-                const std::uint32_t tree_compressed{ static_cast<std::uint32_t>(tree_field->get()) };
-                void* const map_oop{ vmhook::hotspot::decode_oop_pointer(tree_compressed) };
-                if (map_oop && vmhook::hotspot::is_valid_pointer(map_oop))
-                {
-                    vmhook::hotspot::klass* const backing_klass{ vmhook::klass_from_oop(map_oop) };
-                    if (backing_klass && vmhook::find_field(backing_klass, "root"))
-                    {
-                        // TreeMap-shaped backing -> in-order red-black walk.
-                        vmhook::tree_map_walk_keys<element_type>(map_oop, result);
-                    }
-                    else if (backing_klass && vmhook::find_field(backing_klass, "table"))
-                    {
-                        // HashMap-shaped backing (e.g. newSetFromMap(new HashMap))
-                        // -> bucket/Node.next key walk.
-                        vmhook::hash_map_walk_keys<element_type>(map_oop, result);
-                    }
-                    else
-                    {
-                        // Unknown backing shape: fall back to the tree walk, which
-                        // null-guards a missing "root" and returns empty — keeping
-                        // the prior behaviour for any non-Tree/non-Hash backing.
-                        vmhook::tree_map_walk_keys<element_type>(map_oop, result);
-                    }
-                }
-                return result;
-            }
-
-            //  Generic fallback — only valid for List impls (Set has no get(int)).
-            const std::int32_t n{ size() };
-            if (n <= 0)
-            {
-                return result;
-            }
-
-            const auto get_method_opt{ get_method_by_oop_klass("get") };
-            if (!get_method_opt)
-            {
-                return result;
-            }
-
-            // n is the collection's live size(); clamp it so a corrupt/absurd
-            // size cannot make this reserve over-allocate or the loop call the
-            // Java get(int) gate billions of times.  Honest lists (n <= cap) read
-            // exactly as before.
-            const std::int32_t safe_n{ vmhook::clamp_safe_container_count(n) };
-            result.reserve(static_cast<std::size_t>(safe_n));
-            for (std::int32_t index{ 0 }; index < safe_n; ++index)
-            {
-                const auto element_value{ get_method_opt->call<std::uint32_t>(index) };
-                void* const element_oop{ vmhook::hotspot::decode_oop_pointer(element_value) };
-                if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
-                {
-                    result.push_back(vmhook::detail::wrap_retained_object<element_type>(element_oop));
-                }
-                else
-                {
-                    result.push_back(nullptr);
-                }
-            }
-
-            return result;
+            const auto source{ vmhook::detail::container_source_root(*this) };
+            if (!source) { return {}; }
+            if (!access) { throw vmhook::exception{ "Collection conversion requires a native-thread or rooted callback context" }; }
+            return vmhook::detail::container_array_vector<element_type>(vmhook::detail::collection_snapshot(source));
         }
+        auto to_vector() const -> vmhook::detail::vector_conversion<collection>
+        { return vmhook::detail::vector_conversion<collection>{ *this }; }
     };
 
-    /*
-        @brief C++ wrapper for java.util.List objects.
-
-        Type-tag for fields you know are Lists.  All container dispatch
-        already happens inside collection::to_vector<T>() (ArrayList,
-        LinkedList, HashSet, TreeSet fast paths plus the get(int)
-        fallback), so this class only exists so callers can express
-        intent — e.g. taking `const std::unique_ptr<vmhook::list>&` as a
-        hook detour parameter.
-
-        Usage:
-            // Java: public List<Widget> items;
-            auto vec = get_field("items")->get().to_vector<widget>();
-            // vec is std::vector<std::unique_ptr<widget>>
-    */
     class list : public vmhook::collection
     {
     public:
-        explicit list(vmhook::oop_t oop) noexcept
-            : vmhook::collection{ oop }
-        {
-        }
-
-        /*
-            @brief Wraps the Java object behind a lifetime-checked handle.
-            @details See vmhook::collection's borrow constructor - same contract:
-            resolved once at construction, empty/expired yields a null-safe
-            wrapper.  Exception safety: noexcept.
-        */
-        template<typename wrapper_type>
-        explicit list(const vmhook::borrowed<wrapper_type>& handle) noexcept
-            : vmhook::collection{ handle.resolve() }
-        {
-            this->set_native_root(handle.get_native_root());
-        }
+        using collection::collection;
+        inline static constexpr std::string_view java_contract{ "java/util/List" };
     };
-
-    /*
-        @brief C++ wrapper for java.util.Set objects.
-
-        Type-tag, same role as vmhook::list.  HashSet / LinkedHashSet /
-        TreeSet fast paths are already part of collection::to_vector, so
-        a Set field reached through `field_proxy::get().to_vector<T>()`
-        already takes the right path.
-
-        Usage:
-            // Java: public Set<Widget> items;
-            auto vec = get_field("items")->get().to_vector<widget>();
-    */
-    class set : public vmhook::collection
+    class array_list : public vmhook::list
     {
     public:
-        explicit set(vmhook::oop_t oop) noexcept
-            : vmhook::collection{ oop }
-        {
-        }
-
-        /*
-            @brief Wraps the Java object behind a lifetime-checked handle.
-            @details See vmhook::collection's borrow constructor - same contract:
-            resolved once at construction, empty/expired yields a null-safe
-            wrapper.  Exception safety: noexcept.
-        */
-        template<typename wrapper_type>
-        explicit set(const vmhook::borrowed<wrapper_type>& handle) noexcept
-            : vmhook::collection{ handle.resolve() }
-        {
-            this->set_native_root(handle.get_native_root());
-        }
+        using list::list;
+        inline static constexpr std::string_view java_contract{ "java/util/ArrayList" };
     };
-
-    /*
-        @brief C++ wrapper for java.util.LinkedList objects.
-
-        Type-tag, same role as vmhook::list.  The Node first->next walk
-        lives in collection::to_vector, so `get().to_vector<T>()` runs
-        in O(N) regardless of which wrapper the field signature happens
-        to bind to.
-
-        Usage:
-            // Java: public LinkedList<Widget> chain;
-            auto vec = get_field("chain")->get().to_vector<widget>();
-    */
     class linked_list : public vmhook::list
     {
     public:
-        explicit linked_list(vmhook::oop_t oop) noexcept
-            : vmhook::list{ oop }
-        {
-        }
-
-        /*
-            @brief Wraps the Java object behind a lifetime-checked handle.
-            @details See vmhook::collection's borrow constructor - same contract:
-            resolved once at construction, empty/expired yields a null-safe
-            wrapper.  Exception safety: noexcept.
-        */
-        template<typename wrapper_type>
-        explicit linked_list(const vmhook::borrowed<wrapper_type>& handle) noexcept
-            : vmhook::list{ handle.resolve() }
-        {
-            this->set_native_root(handle.get_native_root());
-        }
+        using list::list;
+        inline static constexpr std::string_view java_contract{ "java/util/LinkedList" };
+    };
+    class set : public vmhook::collection
+    {
+    public:
+        using collection::collection;
+        inline static constexpr std::string_view java_contract{ "java/util/Set" };
+    };
+    class hash_set : public vmhook::set
+    {
+    public:
+        using set::set;
+        inline static constexpr std::string_view java_contract{ "java/util/HashSet" };
+    };
+    class linked_hash_set : public vmhook::hash_set
+    {
+    public:
+        using hash_set::hash_set;
+        inline static constexpr std::string_view java_contract{ "java/util/LinkedHashSet" };
+    };
+    class tree_set : public vmhook::set
+    {
+    public:
+        using set::set;
+        inline static constexpr std::string_view java_contract{ "java/util/TreeSet" };
+    };
+    class queue : public vmhook::collection
+    {
+    public:
+        using collection::collection;
+        inline static constexpr std::string_view java_contract{ "java/util/Queue" };
+    };
+    class deque : public vmhook::queue
+    {
+    public:
+        using queue::queue;
+        inline static constexpr std::string_view java_contract{ "java/util/Deque" };
+    };
+    class array_deque : public vmhook::deque
+    {
+    public:
+        using deque::deque;
+        inline static constexpr std::string_view java_contract{ "java/util/ArrayDeque" };
     };
 
-    /*
-        @brief C++ wrapper for java.util.Map objects.
-
-        Generic base for Map implementations.  Provides size()/is_empty() via
-        virtual dispatch on the Java side and a to_entries<K,V>() that tries
-        the HashMap "table" fast path and the TreeMap "root" red-black walk
-        before giving up.  Works for HashMap, LinkedHashMap, TreeMap and the
-        Set wrappers that delegate to them.
-
-        Usage (from a hook detour where you received a Map OOP):
-
-            map m{ map_oop };
-            auto entries = m.to_entries<key_wrapper, value_wrapper>();
-    */
+    /* Map traversal preserves Java encounter order. Entry values are observed
+       through getKey/getValue; concurrent changes retain the Java map's own
+       semantics and are not an atomic snapshot of every key/value pair. */
     class map : public vmhook::oop_reflective_base
     {
     public:
-        /*
-            @brief Wraps a decoded OOP that refers to any java.util.Map implementation.
-            @param oop  Decoded OOP of the Java Map object, or nullptr.
-        */
-        explicit map(vmhook::oop_t oop) noexcept
-            : vmhook::oop_reflective_base{ oop }
-        {
-        }
-
-        /*
-            @brief Wraps the Java object behind a lifetime-checked handle.
-            @details See vmhook::collection's borrow constructor - same contract:
-            resolved once at construction, empty/expired yields a null-safe
-            wrapper.  Exception safety: noexcept.
-        */
+        inline static constexpr std::string_view java_contract{ "java/util/Map" };
+        explicit map(vmhook::oop_t oop = nullptr) noexcept : vmhook::oop_reflective_base{ oop } {}
         template<typename wrapper_type>
         explicit map(const vmhook::borrowed<wrapper_type>& handle) noexcept
             : vmhook::oop_reflective_base{ handle.resolve() }
-        {
-            this->set_native_root(handle.get_native_root());
-        }
+        { this->set_native_root(handle.get_native_root()); }
 
-        // oop_klass() / get_field_by_oop_klass() / get_method_by_oop_klass()
-        // are inherited (protected) from vmhook::oop_reflective_base — the same
-        // single implementation collection uses.  (Map is not a Collection in
-        // Java, but both wrappers need identical live-OOP klass reflection.)
-
-        /*
-            @brief Returns the number of entries via the Java size() method.
-        */
-        auto size() const noexcept -> std::int32_t
-        {
-            const auto proxy{ get_method_by_oop_klass("size") };
-            if (!proxy)
-            {
-                // Fall back to the "size" field, present on every JDK Map impl.
-                if (const auto size_field{ get_field_by_oop_klass("size") })
-                {
-                    return size_field->get();
-                }
-                return 0;
-            }
-            return proxy->call();
-        }
-
-        /*
-            @brief Returns true if the map contains no entries.
-        */
-        auto is_empty() const noexcept -> bool
-        {
-            return size() == 0;
-        }
-
-        /*
-            @brief Converts this java.util.Map to a vector of unique_ptr pairs.
-            @details
-            Tries the HashMap "table" Node[] walk first (covers HashMap and
-            LinkedHashMap), then the TreeMap "root" red-black walk (covers
-            TreeMap), and finally returns an empty vector if neither layout
-            is present.  Iterator-based fallback would require multiple Java
-            call-gate dispatches per entry; leave that to callers that opt in.
-
-            Null keys/values become nullptr entries in the returned pairs.
-
-            @tparam key_type    C++ wrapper for the Map key.
-            @tparam value_type  C++ wrapper for the Map value.
-        */
-        template<typename key_type, typename value_type>
-        auto to_entries() const
-            -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>
+        auto size() const -> std::int32_t
         {
             vmhook::detail::native_backend::operation access{};
-            (void)this->get_instance();
-            std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>> result;
-            if (!instance || !vmhook::hotspot::is_valid_pointer(instance))
-            {
-                return result;
-            }
+            const auto source{ vmhook::detail::container_source_root(*this) };
+            if (!source) { return 0; }
+            if (!access) { throw vmhook::exception{ "Map access requires a native-thread or rooted callback context" }; }
+            vmhook::detail::require_container_contract(source, "java/util/Map");
+            const auto result{ vmhook::detail::call_container_method(source, "size", "()I") };
+            if (!std::holds_alternative<std::int32_t>(result.data))
+            { throw vmhook::exception{ "Map.size returned an invalid value" }; }
+            return std::get<std::int32_t>(result.data);
+        }
+        auto is_empty() const -> bool { return this->size() == 0; }
 
-            // HashMap / LinkedHashMap fast path
-            if (get_field_by_oop_klass("table"))
+        template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+        auto to_entries() const
+            -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
+        {
+            vmhook::detail::native_backend::operation access{};
+            const auto source{ vmhook::detail::container_source_root(*this) };
+            if (!source) { return {}; }
+            if (!access) { throw vmhook::exception{ "Map conversion requires a native-thread or rooted callback context" }; }
+            vmhook::detail::require_container_contract(source, "java/util/Map");
+            const auto entries{ vmhook::detail::container_result_root(
+                vmhook::detail::call_container_method(source, "entrySet", "()Ljava/util/Set;")) };
+            if (!entries) { throw vmhook::exception{ "Map.entrySet returned null" }; }
+            const auto snapshot{ vmhook::detail::collection_snapshot(entries) };
+            const auto count{ vmhook::detail::container_array_length(snapshot) };
+            std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>> result;
+            result.reserve(static_cast<std::size_t>(count));
+            for (std::int32_t index{}; index < count; ++index)
             {
-                vmhook::hash_map_walk_entries<key_type, value_type>(instance, result);
-                return result;
+                const auto entry{ vmhook::detail::container_array_element(snapshot, index) };
+                if (!entry) { throw vmhook::exception{ "Map.entrySet contained a null entry" }; }
+                vmhook::detail::require_container_contract(entry, "java/util/Map$Entry");
+                const auto key{ vmhook::detail::container_result_root(
+                    vmhook::detail::call_container_method(entry, "getKey", "()Ljava/lang/Object;")) };
+                const auto mapped{ vmhook::detail::container_result_root(
+                    vmhook::detail::call_container_method(entry, "getValue", "()Ljava/lang/Object;")) };
+                result.emplace_back(vmhook::detail::wrap_container_element<key_type>(key),
+                                    vmhook::detail::wrap_container_element<mapped_type>(mapped));
             }
-
-            // TreeMap fast path
-            if (get_field_by_oop_klass("root"))
-            {
-                vmhook::tree_map_walk_entries<key_type, value_type>(instance, result);
-                return result;
-            }
-
             return result;
         }
+        template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+        auto to_vector() const
+            -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
+        { return this->to_entries<key_type, mapped_type>(); }
+        auto to_vector() const -> vmhook::detail::vector_conversion<map>
+        { return vmhook::detail::vector_conversion<map>{ *this }; }
+        auto to_entries() const -> vmhook::detail::vector_conversion<map, true>
+        { return vmhook::detail::vector_conversion<map, true>{ *this }; }
     };
 
-    /*
-        @brief C++ wrapper for java.util.HashMap objects.
-
-        Type-tag, same role as vmhook::list.  All entry-walking logic
-        already lives in vmhook::map::to_entries (HashMap "table" path
-        then TreeMap "root" path), so `get_field("foo")->get()
-        .to_entries<K, V>()` already does the right thing.  This class
-        exists so callers can declare intent — e.g. a detour parameter
-        of type `const std::unique_ptr<vmhook::hash_map>&`.  Covers
-        LinkedHashMap by inheritance (LinkedHashMap reuses
-        HashMap.table; only the iteration order differs, via
-        Node.before / Node.after).
-    */
     class hash_map : public vmhook::map
     {
     public:
-        explicit hash_map(vmhook::oop_t oop) noexcept
-            : vmhook::map{ oop }
-        {
-        }
-
-        /*
-            @brief Wraps the Java object behind a lifetime-checked handle.
-            @details See vmhook::collection's borrow constructor - same contract:
-            resolved once at construction, empty/expired yields a null-safe
-            wrapper.  Exception safety: noexcept.
-        */
-        template<typename wrapper_type>
-        explicit hash_map(const vmhook::borrowed<wrapper_type>& handle) noexcept
-            : vmhook::map{ handle.resolve() }
-        {
-            this->set_native_root(handle.get_native_root());
-        }
+        using map::map;
+        inline static constexpr std::string_view java_contract{ "java/util/HashMap" };
+    };
+    class linked_hash_map : public vmhook::hash_map
+    {
+    public:
+        using hash_map::hash_map;
+        inline static constexpr std::string_view java_contract{ "java/util/LinkedHashMap" };
+    };
+    class tree_map : public vmhook::map
+    {
+    public:
+        using map::map;
+        inline static constexpr std::string_view java_contract{ "java/util/TreeMap" };
+    };
+    class concurrent_hash_map : public vmhook::map
+    {
+    public:
+        using map::map;
+        inline static constexpr std::string_view java_contract{ "java/util/concurrent/ConcurrentHashMap" };
     };
 
-    // --- Collection / Map / Set walk helpers --------------------------------
-    //
-    // Templated free helpers used by the wrappers above.  Defined out-of-line
-    // so they can reference vmhook::map (complete by this point) and so the
-    // collection / set / map wrappers can all reuse the same traversal code
-    // without depending on each other's identity.
-
-    /*
-        @brief Reads a 4-byte narrow-oop field at `holder_oop + offset`.
-    */
-    inline auto read_compressed_oop_at(const void* const holder_oop,
-                                       const std::size_t offset) noexcept
-        -> std::uint32_t
+    /* Fault-safe narrow-oop read retained for anchored-reference path walks.
+       Readability alone does not provide object lifetime or a VM snapshot. */
+    inline auto read_compressed_oop_at_safe(const void* const holder_oop,
+                                            const std::size_t offset) noexcept -> std::uint32_t
     {
         std::uint32_t compressed{};
-        std::memcpy(&compressed,
-                    reinterpret_cast<const std::uint8_t*>(holder_oop) + offset,
-                    sizeof(compressed));
+        (void)vmhook::os::safe_read_fast(&compressed,
+            reinterpret_cast<const std::uint8_t*>(holder_oop) + offset, sizeof(compressed));
         return compressed;
     }
 
-    /*
-        @brief Fault-safe twin of read_compressed_oop_at for collection node walks.
-        @note Windows memory reads report accessibility failures; they do not
-        validate object lifetime, prevent VM mutation, or register a GC root.
-    */
-    inline auto read_compressed_oop_at_safe(const void* const holder_oop,
-                                            const std::size_t offset) noexcept
-        -> std::uint32_t
+    template<vmhook::detail::container_wrapper element_type>
+    auto field_proxy::value_t::to_vector() const -> std::vector<std::unique_ptr<element_type>>
     {
-        std::uint32_t compressed{ 0 };
-        if (!vmhook::os::safe_read_fast(
-                &compressed,
-                reinterpret_cast<const std::uint8_t*>(holder_oop) + offset,
-                sizeof(compressed)))
-        {
-            compressed = 0;
-        }
-        return compressed;
-    }
-
-    /*
-        @brief Walks a LinkedList's first->next Node chain and appends items.
-        @details
-        Reads the Node klass once per node (HotSpot guarantees every node
-        in a single list shares the same concrete klass), then offsets into
-        each node by the cached "item" and "next" field offsets.  The `size`
-        argument bounds the walk so a corrupt or concurrently-mutated chain
-        cannot loop forever; null `item`s become nullptr entries in `out`.
-    */
-    template<typename element_type, typename out_t>
-    inline auto linked_list_walk_items(void* const list_oop, const std::int32_t size, out_t& out) -> void
-    {
-        if (!list_oop || !vmhook::hotspot::is_valid_pointer(list_oop) || size <= 0)
-        {
-            return;
-        }
-        vmhook::hotspot::klass* const list_klass{ vmhook::klass_from_oop(list_oop) };
-        if (!list_klass)
-        {
-            return;
-        }
-        const auto first_entry{ vmhook::find_field(list_klass, "first") };
-        if (!first_entry)
-        {
-            return;
-        }
-        // memcpy (not *reinterpret_cast<uint32_t*>) — strict-aliasing-safe read
-        // of the narrow oop; see read_compressed_oop_at.  is_valid_pointer above
-        // already proved list_oop's page is mapped.
-        const std::uint32_t first_compressed{
-            vmhook::read_compressed_oop_at(list_oop, first_entry->offset) };
-        void* node_oop{ vmhook::hotspot::decode_oop_pointer(first_compressed) };
-
-        // `size` is the caller's Java `size` field — clamp it so a corrupt/absurd
-        // value cannot make the reserve over-allocate (the chain guards below
-        // already stop the walk at the real end of the list, so honest lists are
-        // unaffected: a real list of <= cap nodes reserves and walks identically).
-        const std::int32_t safe_size{ vmhook::clamp_safe_container_count(size) };
-        out.reserve(static_cast<std::size_t>(safe_size));
-        for (std::int32_t i{ 0 };
-             i < safe_size && node_oop && vmhook::hotspot::is_valid_pointer(node_oop);
-             ++i)
-        {
-            vmhook::hotspot::klass* const node_klass{ vmhook::klass_from_oop(node_oop) };
-            if (!node_klass)
-            {
-                break;
-            }
-            const auto item_entry{ vmhook::find_field(node_klass, "item") };
-            const auto next_entry{ vmhook::find_field(node_klass, "next") };
-            if (!item_entry || !next_entry)
-            {
-                break;
-            }
-            // memcpy read (strict-aliasing-safe; node_oop validated by the loop
-            // guard above) — see read_compressed_oop_at.
-            const std::uint32_t item_compressed{
-                vmhook::read_compressed_oop_at(node_oop, item_entry->offset) };
-            void* const item_oop{ vmhook::hotspot::decode_oop_pointer(item_compressed) };
-            if (item_oop && vmhook::hotspot::is_valid_pointer(item_oop))
-            {
-                out.push_back(vmhook::detail::wrap_retained_object<element_type>(item_oop));
-            }
-            else
-            {
-                out.push_back(nullptr);
-            }
-
-
-            const std::uint32_t next_compressed{
-                vmhook::read_compressed_oop_at(node_oop, next_entry->offset) };
-            node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
-        }
-    }
-
-    /*
-        @brief Walks a HashMap's "table" Node[] and appends entries to `out`.
-        @details
-        Each bucket holds either nullptr, a HashMap$Node, or a HashMap$TreeNode
-        (when a bucket has been treeified for collision resistance).  Both
-        Node and TreeNode expose the same `key` / `value` / `next` fields, so
-        following `next` from the bucket head visits every entry in the bucket
-        regardless of which form it took.
-    */
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto hash_map_walk_entries(void* const map_oop, out_t& out) -> void
-    {
-        if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop))
-        {
-            return;
-        }
-        vmhook::hotspot::klass* const map_klass{ vmhook::klass_from_oop(map_oop) };
-        if (!map_klass)
-        {
-            return;
-        }
-        const auto table_entry{ vmhook::find_field(map_klass, "table") };
-        if (!table_entry)
-        {
-            return;
-        }
-        // Read JVM memory through the Windows memory API and stop on unreadable data.
-        // A successful read does not establish object lifetime or a coherent VM snapshot.
-        const std::uint32_t table_compressed{
-            vmhook::read_compressed_oop_at_safe(map_oop, table_entry->offset) };
-        void* const table_oop{ vmhook::decode_array_oop(table_compressed) };
-        if (!table_oop || !vmhook::hotspot::is_valid_pointer(table_oop))
-        {
-            return;
-        }
-
-        // bucket_count is array_length(table_oop), read from the table's header
-        // (+12).  A stale/corrupted table oop can report an absurd capacity, so
-        // clamp the OUTER bucket loop (the inner per-bucket chain is already
-        // guarded below).  A real HashMap table (power-of-two capacity <= cap)
-        // walks identically.
-        const std::int32_t bucket_count{ vmhook::clamp_safe_container_count(vmhook::array_length(table_oop)) };
-        for (std::int32_t bucket{ 0 }; bucket < bucket_count; ++bucket)
-        {
-            const std::uint32_t head_compressed{
-                vmhook::get_array_element<std::uint32_t>(table_oop, bucket) };
-            void* node_oop{ vmhook::hotspot::decode_oop_pointer(head_compressed) };
-
-            // Bound the per-bucket walk to defend against corrupt chains;
-            // 1<<20 is far above any sane bucket length.
-            for (std::int32_t guard{ 0 };
-                 node_oop && vmhook::hotspot::is_valid_pointer(node_oop) && guard < (1 << 20);
-                 ++guard)
-            {
-                vmhook::hotspot::klass* const node_klass{ vmhook::klass_from_oop(node_oop) };
-                if (!node_klass)
-                {
-                    break;
-                }
-                const auto key_entry  { vmhook::find_field(node_klass, "key") };
-                const auto value_entry{ vmhook::find_field(node_klass, "value") };
-                const auto next_entry { vmhook::find_field(node_klass, "next") };
-                if (!key_entry || !value_entry || !next_entry)
-                {
-                    break;
-                }
-
-                // Read JVM memory through the Windows memory API and stop on unreadable data.
-                // A successful read does not establish object lifetime or a coherent VM snapshot.
-                const std::uint32_t key_compressed{
-                    vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
-                const std::uint32_t value_compressed{
-                    vmhook::read_compressed_oop_at_safe(node_oop, value_entry->offset) };
-
-                void* const key_oop  { vmhook::hotspot::decode_oop_pointer(key_compressed) };
-                void* const value_oop{ vmhook::hotspot::decode_oop_pointer(value_compressed) };
-
-                std::unique_ptr<key_type>   k_ptr;
-                std::unique_ptr<value_type> v_ptr;
-                if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
-                {
-                    k_ptr = vmhook::detail::wrap_retained_object<key_type>(key_oop);
-                }
-                if (value_oop && vmhook::hotspot::is_valid_pointer(value_oop))
-                {
-                    v_ptr = vmhook::detail::wrap_retained_object<value_type>(value_oop);
-                }
-                out.emplace_back(std::move(k_ptr), std::move(v_ptr));
-
-                const std::uint32_t next_compressed{
-                    vmhook::read_compressed_oop_at_safe(node_oop, next_entry->offset) };
-                node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
-            }
-        }
-    }
-
-    /*
-        @brief Walks a HashMap's table and appends each entry's key to `out`.
-        Used by vmhook::set::to_vector for HashSet, whose elements are keys.
-    */
-    template<typename element_type, typename out_t>
-    inline auto hash_map_walk_keys(void* const map_oop, out_t& out) -> void
-    {
-        if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop))
-        {
-            return;
-        }
-        vmhook::hotspot::klass* const map_klass{ vmhook::klass_from_oop(map_oop) };
-        if (!map_klass)
-        {
-            return;
-        }
-        const auto table_entry{ vmhook::find_field(map_klass, "table") };
-        if (!table_entry)
-        {
-            return;
-        }
-        // Read JVM memory through the Windows memory API and stop on unreadable data.
-        // A successful read does not establish object lifetime or a coherent VM snapshot.
-        const std::uint32_t table_compressed{
-            vmhook::read_compressed_oop_at_safe(map_oop, table_entry->offset) };
-        void* const table_oop{ vmhook::decode_array_oop(table_compressed) };
-        if (!table_oop || !vmhook::hotspot::is_valid_pointer(table_oop))
-        {
-            return;
-        }
-
-        // bucket_count is array_length(table_oop); clamp the OUTER bucket loop so
-        // a corrupt table capacity cannot spin it billions of times (the inner
-        // per-bucket chain is already guarded below).  A real HashMap table walks
-        // identically.
-        const std::int32_t bucket_count{ vmhook::clamp_safe_container_count(vmhook::array_length(table_oop)) };
-        for (std::int32_t bucket{ 0 }; bucket < bucket_count; ++bucket)
-        {
-            const std::uint32_t head_compressed{
-                vmhook::get_array_element<std::uint32_t>(table_oop, bucket) };
-            void* node_oop{ vmhook::hotspot::decode_oop_pointer(head_compressed) };
-
-            for (std::int32_t guard{ 0 };
-                 node_oop && vmhook::hotspot::is_valid_pointer(node_oop) && guard < (1 << 20);
-                 ++guard)
-            {
-                vmhook::hotspot::klass* const node_klass{ vmhook::klass_from_oop(node_oop) };
-                if (!node_klass)
-                {
-                    break;
-                }
-                const auto key_entry { vmhook::find_field(node_klass, "key") };
-                const auto next_entry{ vmhook::find_field(node_klass, "next") };
-                if (!key_entry || !next_entry)
-                {
-                    break;
-                }
-                // Read JVM memory through the Windows memory API and stop on unreadable data.
-                // A successful read does not establish object lifetime or a coherent VM snapshot.
-                const std::uint32_t key_compressed{
-                    vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
-                void* const key_oop{ vmhook::hotspot::decode_oop_pointer(key_compressed) };
-                if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
-                {
-                    out.push_back(vmhook::detail::wrap_retained_object<element_type>(key_oop));
-                }
-                else
-                {
-                    out.push_back(nullptr);
-                }
-
-                const std::uint32_t next_compressed{
-                    vmhook::read_compressed_oop_at_safe(node_oop, next_entry->offset) };
-                node_oop = vmhook::hotspot::decode_oop_pointer(next_compressed);
-            }
-        }
-    }
-
-    /*
-        @brief In-order red-black walk of a TreeMap rooted at `map_oop`.
-
-        TreeMap.Entry layout (since Java 1.2, stable across 8/11/17/21):
-          K key; V value; Entry left, right, parent; boolean color.
-
-        Uses an iterative traversal with a small stack so deeply-balanced
-        trees do not blow the C++ stack.  TWO independent caps keep a malformed
-        tree from running away: the OUTER `visited` cap bounds the total number
-        of popped (emitted) nodes, and the INNER left-spine descent carries its
-        OWN `descended` cap so a corrupt `left`-pointer CYCLE cannot push onto
-        the stack without bound (the outer cap is only re-checked AFTER a pop,
-        which a spinning inner loop never reaches — so the inner loop must guard
-        itself).  Both caps use k_max_safe_container_elems, matching the HashMap
-        walker's per-bucket guard.
-    */
-    template<typename key_type, typename value_type, typename out_t>
-    inline auto tree_map_walk_entries(void* const map_oop, out_t& out) -> void
-    {
-        if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop))
-        {
-            return;
-        }
-        vmhook::hotspot::klass* const map_klass{ vmhook::klass_from_oop(map_oop) };
-        if (!map_klass)
-        {
-            return;
-        }
-        const auto root_entry{ vmhook::find_field(map_klass, "root") };
-        if (!root_entry)
-        {
-            return;
-        }
-        // Read JVM memory through the Windows memory API and stop on unreadable data.
-        // A successful read does not establish object lifetime or a coherent VM snapshot.
-        const std::uint32_t root_compressed{
-            vmhook::read_compressed_oop_at_safe(map_oop, root_entry->offset) };
-        void* root_oop{ vmhook::hotspot::decode_oop_pointer(root_compressed) };
-        if (!root_oop || !vmhook::hotspot::is_valid_pointer(root_oop))
-        {
-            return;
-        }
-
-        std::vector<void*> stack;
-        stack.reserve(32);
-        void* node_oop{ root_oop };
-        std::int32_t visited{ 0 };
-
-        // INNER left-spine cap: a corrupt `left`-pointer cycle would push onto
-        // `stack` forever (the outer `visited` cap is only re-checked after a
-        // pop, which a spinning inner descent never reaches).  Bound the descent
-        // by k_max_safe_container_elems, matching the HashMap walker's guard.
-        constexpr std::int32_t k_descend_cap{
-            static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
-        while ((node_oop && vmhook::hotspot::is_valid_pointer(node_oop)) || !stack.empty())
-        {
-            // Walk the left spine first.
-            for (std::int32_t descended{ 0 };
-                 node_oop && vmhook::hotspot::is_valid_pointer(node_oop)
-                     && descended < k_descend_cap;
-                 ++descended)
-            {
-                vmhook::hotspot::klass* const entry_klass{ vmhook::klass_from_oop(node_oop) };
-                if (!entry_klass)
-                {
-                    node_oop = nullptr;
-                    break;
-                }
-                const auto left_entry{ vmhook::find_field(entry_klass, "left") };
-                if (!left_entry)
-                {
-                    node_oop = nullptr;
-                    break;
-                }
-                stack.push_back(node_oop);
-                // Read JVM memory through the Windows memory API and stop on unreadable data.
-                // A successful read does not establish object lifetime or a coherent VM snapshot.
-                const std::uint32_t left_compressed{
-                    vmhook::read_compressed_oop_at_safe(node_oop, left_entry->offset) };
-                node_oop = vmhook::hotspot::decode_oop_pointer(left_compressed);
-            }
-            if (stack.empty())
-            {
-                break;
-            }
-
-            node_oop = stack.back();
-            stack.pop_back();
-
-            vmhook::hotspot::klass* const entry_klass{ vmhook::klass_from_oop(node_oop) };
-            if (!entry_klass)
-            {
-                break;
-            }
-            const auto key_entry  { vmhook::find_field(entry_klass, "key") };
-            const auto value_entry{ vmhook::find_field(entry_klass, "value") };
-            const auto right_entry{ vmhook::find_field(entry_klass, "right") };
-            if (!key_entry || !value_entry || !right_entry)
-            {
-                break;
-            }
-            // Read JVM memory through the Windows memory API and stop on unreadable data.
-            // A successful read does not establish object lifetime or a coherent VM snapshot.
-            const std::uint32_t key_compressed{
-                vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
-            const std::uint32_t value_compressed{
-                vmhook::read_compressed_oop_at_safe(node_oop, value_entry->offset) };
-
-            void* const key_oop  { vmhook::hotspot::decode_oop_pointer(key_compressed) };
-            void* const value_oop{ vmhook::hotspot::decode_oop_pointer(value_compressed) };
-
-            std::unique_ptr<key_type>   k_ptr;
-            std::unique_ptr<value_type> v_ptr;
-            if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
-            {
-                k_ptr = vmhook::detail::wrap_retained_object<key_type>(key_oop);
-            }
-            if (value_oop && vmhook::hotspot::is_valid_pointer(value_oop))
-            {
-                v_ptr = vmhook::detail::wrap_retained_object<value_type>(value_oop);
-            }
-            out.emplace_back(std::move(k_ptr), std::move(v_ptr));
-
-            const std::uint32_t right_compressed{
-                vmhook::read_compressed_oop_at_safe(node_oop, right_entry->offset) };
-            node_oop = vmhook::hotspot::decode_oop_pointer(right_compressed);
-
-            // Safety cap matching the HashMap variant.
-            if (++visited > (1 << 24))
-            {
-                break;
-            }
-        }
-    }
-
-    /*
-        @brief In-order walk of a TreeMap, pushing each entry's key to `out`.
-        Used by vmhook::set::to_vector for TreeSet.
-
-        Carries the same TWO independent run-away caps as tree_map_walk_entries:
-        the OUTER `visited` cap bounds emitted nodes, and the INNER left-spine
-        descent has its own `descended` cap so a corrupt `left`-pointer cycle
-        cannot push onto the stack without bound.
-    */
-    template<typename element_type, typename out_t>
-    inline auto tree_map_walk_keys(void* const map_oop, out_t& out) -> void
-    {
-        if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop))
-        {
-            return;
-        }
-        vmhook::hotspot::klass* const map_klass{ vmhook::klass_from_oop(map_oop) };
-        if (!map_klass)
-        {
-            return;
-        }
-        const auto root_entry{ vmhook::find_field(map_klass, "root") };
-        if (!root_entry)
-        {
-            return;
-        }
-        // Read JVM memory through the Windows memory API and stop on unreadable data.
-        // A successful read does not establish object lifetime or a coherent VM snapshot.
-        const std::uint32_t root_compressed{
-            vmhook::read_compressed_oop_at_safe(map_oop, root_entry->offset) };
-        void* root_oop{ vmhook::hotspot::decode_oop_pointer(root_compressed) };
-        if (!root_oop || !vmhook::hotspot::is_valid_pointer(root_oop))
-        {
-            return;
-        }
-
-        std::vector<void*> stack;
-        stack.reserve(32);
-        void* node_oop{ root_oop };
-        std::int32_t visited{ 0 };
-
-        // INNER left-spine cap (see tree_map_walk_entries): a corrupt `left`
-        // cycle would otherwise push onto `stack` without bound.
-        constexpr std::int32_t k_descend_cap{
-            static_cast<std::int32_t>(vmhook::k_max_safe_container_elems) };
-        while ((node_oop && vmhook::hotspot::is_valid_pointer(node_oop)) || !stack.empty())
-        {
-            for (std::int32_t descended{ 0 };
-                 node_oop && vmhook::hotspot::is_valid_pointer(node_oop)
-                     && descended < k_descend_cap;
-                 ++descended)
-            {
-                vmhook::hotspot::klass* const entry_klass{ vmhook::klass_from_oop(node_oop) };
-                if (!entry_klass)
-                {
-                    node_oop = nullptr;
-                    break;
-                }
-                const auto left_entry{ vmhook::find_field(entry_klass, "left") };
-                if (!left_entry)
-                {
-                    node_oop = nullptr;
-                    break;
-                }
-                stack.push_back(node_oop);
-                // Read JVM memory through the Windows memory API and stop on unreadable data.
-                // A successful read does not establish object lifetime or a coherent VM snapshot.
-                const std::uint32_t left_compressed{
-                    vmhook::read_compressed_oop_at_safe(node_oop, left_entry->offset) };
-                node_oop = vmhook::hotspot::decode_oop_pointer(left_compressed);
-            }
-            if (stack.empty())
-            {
-                break;
-            }
-
-            node_oop = stack.back();
-            stack.pop_back();
-
-            vmhook::hotspot::klass* const entry_klass{ vmhook::klass_from_oop(node_oop) };
-            if (!entry_klass)
-            {
-                break;
-            }
-            const auto key_entry  { vmhook::find_field(entry_klass, "key") };
-            const auto right_entry{ vmhook::find_field(entry_klass, "right") };
-            if (!key_entry || !right_entry)
-            {
-                break;
-            }
-            // Read JVM memory through the Windows memory API and stop on unreadable data.
-            // A successful read does not establish object lifetime or a coherent VM snapshot.
-            const std::uint32_t key_compressed{
-                vmhook::read_compressed_oop_at_safe(node_oop, key_entry->offset) };
-            void* const key_oop{ vmhook::hotspot::decode_oop_pointer(key_compressed) };
-            if (key_oop && vmhook::hotspot::is_valid_pointer(key_oop))
-            {
-                out.push_back(vmhook::detail::wrap_retained_object<element_type>(key_oop));
-            }
-            else
-            {
-                out.push_back(nullptr);
-            }
-
-            const std::uint32_t right_compressed{
-                vmhook::read_compressed_oop_at_safe(node_oop, right_entry->offset) };
-            node_oop = vmhook::hotspot::decode_oop_pointer(right_compressed);
-
-            if (++visited > (1 << 24))
-            {
-                break;
-            }
-        }
-    }
-
-    /*
-        @brief Out-of-line definition of field_proxy::value_t::to_vector<element_type>().
-        @details
-        Reads the stored compressed OOP, decodes it with decode_oop_pointer(), wraps the
-        result in a vmhook::collection, and delegates to collection::to_vector<element_type>().
-        Defined here (after collection is complete) because collection is an incomplete type
-        at the point where value_t is declared.
-
-        Complexity: O(N) where N = collection size.
-        Exception safety: does not throw; returns an empty vector on failure.
-
-        @tparam element_type  C++ wrapper whose constructor accepts vmhook::oop_t.
-        @return  Vector of unique_ptr<element_type>.
-    */
-    template<typename element_type>
-    auto field_proxy::value_t::to_vector() const
-        -> std::vector<std::unique_ptr<element_type>>
-    {
+        if (!this->is_reference() || this->signature.empty()
+            || (this->signature.front() != 'L' && this->signature.front() != '['))
+        { throw vmhook::exception{ "Collection conversion requires a Java object or reference array field" }; }
+        if (this->signature.front() == '[' && (this->signature.size() < 2
+                || (this->signature[1] != 'L' && this->signature[1] != '[')))
+        { throw vmhook::exception{ "Wrapper-vector conversion requires a Java reference array" }; }
         vmhook::detail::native_backend::operation access{};
-        const std::uint32_t compressed_collection{ static_cast<std::uint32_t>(*this) };
-        void* const collection_oop{ this->reference_address(compressed_collection) };
-        if (!collection_oop || !vmhook::hotspot::is_valid_pointer(collection_oop))
-        {
-            ::vmhook::detail::log_line("{} field_proxy::value_t::to_vector<{}>(): underlying collection OOP is "
-                       "null or invalid (compressed=0x{:08X}) - returning empty vector.",
-                       vmhook::warning_tag, vmhook::detail::type_name<element_type>(), compressed_collection);
-            return {};
-        }
-
-        // An OBJECT-ARRAY field ('[L...;' or '[[...') is a raw Java array, NOT a
-        // collection object.  Routing it through vmhook::collection (which probes
-        // the oop's klass as an InstanceKlass for "size"/"elementData"/"first"/...
-        // and finds none on an ObjArrayKlass) silently returns an EMPTY vector —
-        // the documented Object[] entry point was broken.  Walk the array directly
-        // here; only 'L...;' reference fields (ArrayList / HashSet / LinkedList /
-        // ... collection OBJECTS) fall through to collection::to_vector.
-        if (this->signature.size() >= 2u && this->signature.front() == '['
-            && (this->signature[1] == 'L' || this->signature[1] == '['))
-        {
-            std::vector<std::unique_ptr<element_type>> result;
-            // n is array_length() of the backing Object[] header; clamp it for
-            // BOTH the reserve and the loop so a stale/corrupted array oop cannot
-            // over-allocate or over-read (the per-element get_array_element is
-            // already bounds-clamped).  An honest array (n <= cap) is unaffected.
-            const std::int32_t n{ vmhook::clamp_safe_container_count(vmhook::array_length(collection_oop)) };
-            if (n > 0)
-            {
-                result.reserve(static_cast<std::size_t>(n));
-                for (std::int32_t index{ 0 }; index < n; ++index)
-                {
-                    const std::uint32_t compressed_element{
-                        vmhook::get_array_element<std::uint32_t>(collection_oop, index) };
-                    void* const element_oop{ vmhook::hotspot::decode_oop_pointer(compressed_element) };
-                    if (element_oop && vmhook::hotspot::is_valid_pointer(element_oop))
-                    {
-                        auto wrapped{ vmhook::detail::wrap_retained_object<element_type>(element_oop) };
-                        if (access) { wrapped->set_native_root(vmhook::detail::native_backend::retain_oop(element_oop)); }
-                        result.push_back(std::move(wrapped));
-                    }
-                    else
-                    {
-                        result.push_back(nullptr);
-                    }
-                }
-            }
-            return result;
-        }
-
-        vmhook::collection wrapped{ collection_oop };
-        wrapped.set_native_root(this->native_root);
-        auto result{ wrapped.to_vector<element_type>() };
-        if (access)
-        {
-            for (auto& item : result)
-            {
-                if (item) { item->set_native_root(vmhook::detail::native_backend::retain_oop(item->get_instance())); }
-            }
-        }
-        return result;
+        const auto source{ vmhook::detail::container_value_root(std::get<std::uint32_t>(this->data), this->native_root) };
+        if (!source) { return {}; }
+        if (!access) { throw vmhook::exception{ "Collection conversion requires a native-thread or rooted callback context" }; }
+        if (this->signature.front() == '[' || vmhook::detail::array_layout(
+                vmhook::klass_from_oop(vmhook::detail::container_address(source))))
+        { return vmhook::detail::container_array_vector<element_type>(source); }
+        collection wrapped{};
+        wrapped.set_native_root(source);
+        return wrapped.to_vector<element_type>();
     }
-
-    /*
-        @brief Out-of-line definition of field_proxy::value_t::to_entries<K,V>().
-        @details
-        Reads the stored compressed OOP, decodes it, wraps it in a vmhook::map,
-        and delegates to map::to_entries<K,V>().  Defined here so the value_t
-        declaration (which is reached well before map is defined) does not
-        need to see a complete vmhook::map.
-    */
-    template<typename key_type, typename value_type>
+    template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
     auto field_proxy::value_t::to_entries() const
-        -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<value_type>>>
+        -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
     {
+        if (!this->is_reference() || this->signature.empty() || this->signature.front() != 'L')
+        { throw vmhook::exception{ "Map conversion requires a Java object field" }; }
         vmhook::detail::native_backend::operation access{};
-        const std::uint32_t compressed_map{ static_cast<std::uint32_t>(*this) };
-        void* const map_oop{ this->reference_address(compressed_map) };
-        if (!map_oop || !vmhook::hotspot::is_valid_pointer(map_oop))
-        {
-            ::vmhook::detail::log_line("{} field_proxy::value_t::to_entries<{},{}>(): underlying map OOP is null "
-                       "or invalid (compressed=0x{:08X}) - returning empty entries vector.",
-                       vmhook::warning_tag, vmhook::detail::type_name<key_type>(), vmhook::detail::type_name<value_type>(),
-                       compressed_map);
-            return {};
-        }
-        vmhook::map wrapped{ map_oop };
-        wrapped.set_native_root(this->native_root);
-        auto result{ wrapped.to_entries<key_type, value_type>() };
-        if (access)
-        {
-            for (auto& [key, value] : result)
-            {
-                if (key) { key->set_native_root(vmhook::detail::native_backend::retain_oop(key->get_instance())); }
-                if (value) { value->set_native_root(vmhook::detail::native_backend::retain_oop(value->get_instance())); }
-            }
-        }
-        return result;
+        const auto source{ vmhook::detail::container_value_root(std::get<std::uint32_t>(this->data), this->native_root) };
+        if (!source) { return {}; }
+        if (!access) { throw vmhook::exception{ "Map conversion requires a native-thread or rooted callback context" }; }
+        map wrapped{};
+        wrapped.set_native_root(source);
+        return wrapped.to_entries<key_type, mapped_type>();
     }
+    template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+    auto field_proxy::value_t::to_vector() const
+        -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
+    { return this->to_entries<key_type, mapped_type>(); }
+    inline auto field_proxy::value_t::to_vector() const -> vmhook::detail::vector_conversion<value_t>
+    { return vmhook::detail::vector_conversion<value_t>{ *this }; }
+    inline auto field_proxy::value_t::to_entries() const -> vmhook::detail::vector_conversion<value_t, true>
+    { return vmhook::detail::vector_conversion<value_t, true>{ *this }; }
+
+    template<vmhook::detail::container_wrapper element_type>
+    auto method_proxy::value_t::to_vector() const -> std::vector<std::unique_ptr<element_type>>
+    {
+        if (this->primitive_array_result)
+        { throw vmhook::exception{ "Wrapper-vector conversion requires a Java reference array" }; }
+        vmhook::detail::native_backend::operation access{};
+        const auto source{ vmhook::detail::container_result_root(*this) };
+        if (!source) { return {}; }
+        if (!access) { throw vmhook::exception{ "Collection conversion requires a native-thread or rooted callback context" }; }
+        if (vmhook::detail::array_layout(vmhook::klass_from_oop(vmhook::detail::container_address(source))))
+        { return vmhook::detail::container_array_vector<element_type>(source); }
+        collection wrapped{};
+        wrapped.set_native_root(source);
+        return wrapped.to_vector<element_type>();
+    }
+    template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+    auto method_proxy::value_t::to_entries() const
+        -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
+    {
+        if (this->reference_array_result)
+        { throw vmhook::exception{ "Map conversion requires a Java object result" }; }
+        vmhook::detail::native_backend::operation access{};
+        const auto source{ vmhook::detail::container_result_root(*this) };
+        if (!source) { return {}; }
+        if (!access) { throw vmhook::exception{ "Map conversion requires a native-thread or rooted callback context" }; }
+        map wrapped{};
+        wrapped.set_native_root(source);
+        return wrapped.to_entries<key_type, mapped_type>();
+    }
+    template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+    auto method_proxy::value_t::to_vector() const
+        -> std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>
+    { return this->to_entries<key_type, mapped_type>(); }
+    inline auto method_proxy::value_t::to_vector() const -> vmhook::detail::vector_conversion<value_t>
+    { return vmhook::detail::vector_conversion<value_t>{ *this }; }
+    inline auto method_proxy::value_t::to_entries() const -> vmhook::detail::vector_conversion<value_t, true>
+    { return vmhook::detail::vector_conversion<value_t, true>{ *this }; }
 
     // --- Helper: read a Java String OOP to std::string ------------------------
 

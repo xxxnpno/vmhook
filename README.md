@@ -68,7 +68,7 @@ public:
         return static_members::get_method("count")->call();
     }
 
-    static auto total() -> std::int32_t
+    static auto get_total() -> std::int32_t
     {
         return static_members::get_field("total")->get();
     }
@@ -82,6 +82,95 @@ functions have no instance receiver; `static_members` selects class-bound
 lookup explicitly. For an overloaded method, provide its JVM descriptor:
 `get_method("add", "(I)I")` or `static_members::get_method("count", "()I")`.
 C++ identifiers use snake_case; Java class and member names remain unchanged.
+
+Call the static wrapper as `counter::get_total()`. `static_members` is an
+inherited lookup helper, not the wrapper's name or another object to construct.
+CRTP supplies the class identity; an instance function additionally supplies
+its receiver. C++ cannot safely infer that receiver from a static function, so
+the helper qualifier distinguishes the two inside the wrapper.
+
+## Collections and maps
+
+Suppose `example/World.playerEntities` is a Java collection of
+`example/Player` objects. A wrapper can return the C++ vector directly:
+
+```cpp
+class player : public vmhook::object<player>
+{
+public:
+    using vmhook::object<player>::object;
+
+    auto id() const -> std::int32_t
+    {
+        return get_field("id")->get();
+    }
+};
+
+class world : public vmhook::object<world>
+{
+public:
+    using vmhook::object<world>::object;
+
+    auto get_player_entities() const
+        -> std::vector<std::unique_ptr<player>>
+    {
+        return get_field("playerEntities")->get().to_vector();
+    }
+};
+```
+
+Register `player` and `world` with their Java class names during setup, just
+as in the native-thread example below. The declared return type supplies
+`player`; there is no receiver argument or repeated template argument.
+Object-array fields and Java collection method results support the same form.
+
+The mini wrappers include `collection`, `list`, `array_list`, `linked_list`,
+`set`, `hash_set`, `linked_hash_set`, `tree_set`, `queue`, `deque`, `array_deque`,
+`map`, `hash_map`, `linked_hash_map`, `tree_map` and `concurrent_hash_map`.
+They provide `size()`, `is_empty()` and conversion without registering the
+container's concrete implementation. Collections use Java's `toArray()`;
+maps use `entrySet().toArray()`. This also supports implementations such as
+unmodifiable collections and identity maps without reading their private
+node layouts. Encounter order follows the Java operation.
+
+Use a mini wrapper when you also need container operations:
+
+```cpp
+vmhook::list players = get_field("playerEntities")->get();
+const auto count = players.size();
+std::vector<std::unique_ptr<player>> copied = players.to_vector();
+```
+
+For a map, declare a vector of key/value wrapper pairs. For example, a
+`Map<Player, Player>` field named `relationships` can use:
+
+```cpp
+auto get_relationships() const
+    -> std::vector<std::pair<std::unique_ptr<player>, std::unique_ptr<player>>>
+{
+    return get_field("relationships")->get().to_vector();
+}
+```
+
+`to_entries()` has the same map conversion. When using an `auto` local instead
+of a declared destination type, supply the element types to materialize the
+vector immediately:
+
+```cpp
+auto players = get_field("playerEntities")->get().to_vector<player>();
+auto relationships = get_field("relationships")->get().to_vector<player, player>();
+```
+
+Without those template arguments, `auto` stores a deferred conversion value,
+not a `std::vector`. It owns its source value, including its context-bound
+root, and reads the Java collection when converted to the declared vector.
+Use it on the owning thread before that context closes. Actual Java null
+elements, keys and values remain `nullptr`; a null source becomes an empty
+vector. Unsupported shapes, incompatible registered wrapper types, expired
+roots and failed Java calls throw `vmhook::exception`. The returned unique
+pointers own C++ wrappers, while Java manages the objects. Conversion follows
+the Java implementation's concurrent-mutation semantics; it does not promise
+an atomic snapshot of a concurrently modified container.
 
 ## Call Java from the DLL's own thread
 
@@ -108,7 +197,7 @@ auto worker() -> void
     }
 
     const auto value = instance->add(5);
-    const auto total = counter::count();
+    const auto total = counter::get_total();
     std::cout << value << ", total: " << total << '\n';
 }
 ```
@@ -153,7 +242,7 @@ null, or void result:
 
 ```cpp
 const auto result = counter::static_members::get_method("count", "()I")->call();
-if (!result.was_invoked() || result.threw())
+if (!result.was_invoked() || result.threw() || result.result_failed)
 {
     // result.exception_class identifies a reported Java exception.
     throw vmhook::exception{"Counter.count failed"};
@@ -163,7 +252,9 @@ const auto count = static_cast<std::int32_t>(result);
 
 Direct conversion to a primitive returns its default value when invocation is
 refused. A reported Java exception is consumed by the native call backend so
-the next call can proceed. Both instance lookups and `static_members` lookups
+the next call can proceed. `result_failed` reports native result bookkeeping
+failure even when the Java method ran; collection conversion refuses it.
+Both instance lookups and `static_members` lookups
 support boolean checks before using `->`.
 
 `std::string` carries UTF-8 text for a Java String, and
@@ -381,47 +472,26 @@ shutdown or arbitrary unloading of cached metadata.
 [Native-thread documentation](docs/native-threads.md) records the private ABI
 checks, root lifetimes, reproducible runtime tests and exact build scope.
 The [profile manifest](data/native_profiles.json) identifies the built-in images.
-The current receiver-bound snake_case API and frozen probe DLLs passed these
-complete matrices under **Wine 10.0**, with ordinary JVM launches and default
-collectors:
+The [Windows CI workflow](.github/workflows/build.yml) builds both interfaces
+and exercises the exact manifest images across Java 8–27. Direct-native tests
+cover same-thread calls, real constructors, JIT execution, moving GC,
+receiver binding and collection conversions. Collection regressions include
+ordered and unmodifiable containers, identity/concurrent maps, nulls,
+interface and subclass elements, deferred results, invalid types and expired
+contexts.
 
-| Interface | Compiler | Direct native calls, Java 8–27 | JIT/field/class/callback fixtures, Java 8–27 |
-| --- | --- | --- | --- |
-| C++23 header | MinGW-w64 G++ 14.2 | 20/20 JVMs; 400/400 assertions | 80/80 cases; 940/940 assertions |
-| C++26 module | Windows G++ 16.2 | 20/20 JVMs; 400/400 assertions | 80/80 cases; 940/940 assertions |
+The observation fixtures verify actual compilation and inlining before hooks,
+VM deoptimization, all eight primitive field types, class notifications and
+nested callback calls with rooted returns during independent GC. Platform
+thread frames are covered; virtual thread frames remain outside the verified
+scope. Tests launch JVMs normally with their default collectors.
 
-Each observation matrix runs four fixtures per Java major. Its 47 strict
-assertions cover actual compilation and inlining, deoptimization, future
-compilation, all eight primitive field types, new definitions and removal.
-Every callback fixture additionally completes 24 nested calls and rooted
-object returns while independent GC progresses. Its synthetic object return
-cell participates in HotSpot's genuine GC frame scan, preserving the normal
-return epilogue and moving-GC address updates. This covers the tested platform
-thread frames; virtual thread frames remain outside the verified scope.
-Source and DLL hashes are
-checked before and after the run. The G++ 14.2 build passed **8/8 CTest suites**. The combined G++ 16.2 header/module build passed **15/15 CTest suites**.
-
-These fresh builds validate automatic instance receivers and class-bound
-lookups through `static_members`; source and probe hashes identify the tested
-implementation. The native fixture retains proxies for two distinct Java
-objects simultaneously and verifies each stays bound to its own receiver.
-
-Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
-
-The preceding API at [commit 6de00ce](https://github.com/xxxnpno/vmhook/commit/6de00ce0d4dd46b404ff24a4358a00b9d4f5e9d9) passed native Windows CI **53/53 in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38015950857) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38015954009). Each run passed 36 callback stress repetitions; actual GC frame scans visited 628/582 synthetic return slots. These runs predate the receiver-bound snake_case API.
-
-Earlier native Windows CI for [commit 3ce12b5](https://github.com/xxxnpno/vmhook/commit/3ce12b5c5af68c817f375742a1215f8f87e8ad13) passed **53/53 jobs in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38014087119) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38014089850). The 52 Windows jobs cover both builds, all 40 direct-native and observation jobs across Java 8–27, and the 10 interpreter/dispatch jobs. One Ubuntu job reproduces the private profiles. Those runs precede the receiver-bound snake_case API. Each run also passed 36 separate callback stress repetitions across Java 8/9/10/11/15/16 and both interfaces, with 24 nested calls and rooted Java returns plus independent GC per repetition. Actual GC frame scans visited 582 synthetic return slots in the push run and 490 in the PR run; these diagnostic counters are separate from assertion totals. Native CI evidence is retained as strict runtime logs; the packaged probe DLLs and their hashes are from the separate Wine runs.
-
-The older direct-native implementation at
-[commit cdbf2e5](https://github.com/xxxnpno/vmhook/commit/cdbf2e51461283f73c96cf4883f118f3b35ac67c)
-passed two native Windows runs with **53/53 jobs each**:
-[push](https://github.com/xxxnpno/vmhook/actions/runs/37995958477) and
-[PR](https://github.com/xxxnpno/vmhook/actions/runs/37995966320).
-Those runs precede the new JIT/field/class backend. Earlier G++ 16.2 header and
-explicit-PDB matrices remain historical Wine results, detailed in the
-[native-thread guide](docs/native-threads.md#reproduce-the-public-wrapper-tests).
-These finite results concern the exact images and tested collectors, not every
-vendor/collector combination. See [hook fixtures](docs/hooks.md) for reproduction.
+Results for the implementation are recorded in
+[PR #44](https://github.com/xxxnpno/vmhook/pull/44), with the tested commit and
+execution environment identified. Native Windows runs and separate Wine runs
+are distinct evidence. These finite checks concern the exact images and
+tested collectors, not every vendor/collector combination. See
+[hook fixtures](docs/hooks.md) and the native-thread guide for reproduction.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for validation expectations and
 [CHANGELOG.md](CHANGELOG.md) for migration notes.

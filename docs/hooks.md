@@ -278,7 +278,7 @@ during concurrent JVM shutdown.
 
 ## Completed runtime validation
 
-The current receiver-bound snake_case API's frozen probes passed the complete
+At [commit 35898be](https://github.com/xxxnpno/vmhook/commit/35898bec80f0a17c6e00c2ff69379d19c241e957), the receiver-bound snake_case API's frozen probes passed the complete
 Java 8–27 observation matrix under **Wine 10.0**, with no JVM tuning, agent or
 JIT arguments:
 
@@ -295,7 +295,7 @@ genuine GC frame scanner while keeping HotSpot's normal return epilogue.
 Virtual thread frames remain outside this platform-frame validation.
 Both source and probe hashes remain unchanged through their matrices.
 These results cover the manifest's exact images and default collectors.
-The tested callbacks use the receiver-bound API examples from the README.
+The tested callbacks use the receiver-bound API examples from the README. These runs predate the collection conversion redesign.
 
 Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
 
