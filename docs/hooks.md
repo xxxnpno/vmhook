@@ -5,6 +5,11 @@
 recursion policy or per-observer counters. Discarding an ID keeps its observer
 installed. There is no scoped method hook.
 
+C++ allocation failures during hook root and policy preparation propagate as
+`std::bad_alloc`. Field-policy preparation restores compiler flags before
+reporting its captured allocation error to the native caller. VM callbacks
+contain C++ exceptions at their ABI boundary.
+
 ```cpp
 const auto id = vmhook::add_hook<player>("tick", "(I)V",
     [](vmhook::return_value& control,

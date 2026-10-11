@@ -21,6 +21,7 @@ export namespace vmhook::detail::jit_backend
 {
     inline auto at_safepoint(void (*callback)(void*) noexcept, void* opaque) noexcept -> bool;
     inline auto with_vm_state(void (*callback)(void*) noexcept, void* opaque) noexcept -> bool;
+    inline auto with_vm_state_checked(void (*callback)(void*) noexcept, void* opaque) -> bool;
     inline auto return_handler(vmhook::hotspot::method*) noexcept -> void*;
     inline auto throw_handler() noexcept -> void*;
     inline auto pending_exception_slot(void*) noexcept -> void**;
@@ -28,19 +29,21 @@ export namespace vmhook::detail::jit_backend
     inline auto method_is_excluded(vmhook::hotspot::method*) noexcept -> bool;
     inline auto hook_interpreter_entry(vmhook::hotspot::method*) noexcept -> void*;
     inline auto holder_linked(vmhook::hotspot::klass*) noexcept -> bool;
-    inline auto install_method_policy(vmhook::hotspot::method*, bool (*)(void*) noexcept, void*, std::shared_ptr<void>&) noexcept -> bool;
+    inline auto install_method_policy(vmhook::hotspot::method*, bool (*)(void*) noexcept, void*, std::shared_ptr<void>&) -> bool;
     inline auto release_method_policy_at_safepoint(const std::shared_ptr<void>&) noexcept -> void;
-    inline auto acquire_field_interpretation() noexcept -> bool;
+    inline auto acquire_field_interpretation(std::exception_ptr* allocation_failure = nullptr) noexcept -> bool;
     inline auto release_field_interpretation() noexcept -> void;
 }
 export namespace vmhook::detail
 {
     inline auto prepare_hook_roots() noexcept -> bool;
+    inline auto prepare_hook_roots_checked() -> bool;
     inline auto prepare_callback_return_roots() noexcept -> bool;
     inline auto mark_callback_return_root(void*, vmhook::hotspot::method*) noexcept -> bool;
     inline auto callback_return_marker_resources() noexcept -> std::pair<std::size_t, std::size_t>;
     inline auto flush_hook_roots() noexcept -> void;
     inline auto retain_hook_klass(vmhook::hotspot::klass*) noexcept -> std::shared_ptr<void>;
+    inline auto retain_hook_klass_checked(vmhook::hotspot::klass*) -> std::shared_ptr<void>;
     inline auto prepare_class_hooks(vmhook::hotspot::klass*) noexcept -> bool;
     inline auto finish_class_hooks(vmhook::hotspot::klass*, bool) noexcept -> void;
     inline auto fail_class_hook_preparation(void*) noexcept -> void;
@@ -9180,7 +9183,7 @@ export namespace vmhook
             const std::string registered_name{ vmhook::detail::registered_class_name<wrapper_type>() };
             if (registered_name.empty())
             { throw vmhook::exception{ "Register the wrapper class before installing a hook." }; }
-            if (!vmhook::detail::prepare_hook_roots())
+            if (!vmhook::detail::prepare_hook_roots_checked())
             { throw vmhook::exception{ "Persistent hook metadata roots are unavailable." }; }
             struct metadata_lookup final
             {
@@ -9192,7 +9195,7 @@ export namespace vmhook
                 bool duplicate{};
                 std::exception_ptr allocation_failure{};
             } lookup{ &registered_name, method_name, method_signature };
-            const bool looked_up{ vmhook::detail::jit_backend::with_vm_state([](void* const opaque) noexcept
+            const bool looked_up{ vmhook::detail::jit_backend::with_vm_state_checked([](void* const opaque) noexcept
             {
                 auto& request{ *static_cast<metadata_lookup*>(opaque) };
                 try
@@ -9214,7 +9217,7 @@ export namespace vmhook
                     if (!request.method || request.name == "<init>" || request.name == "<clinit>"
                         || !vmhook::os::safe_read(&request.access_flags, request.method->get_access_flags(), sizeof(request.access_flags))
                         || (request.access_flags & (0x0100u | 0x0400u)) != 0) { request.method = nullptr; return; }
-                    request.pin = vmhook::detail::retain_hook_klass(klass);
+                    request.pin = vmhook::detail::retain_hook_klass_checked(klass);
                     if (!request.pin) { request.method = nullptr; }
                 }
                 catch (const std::bad_alloc&) { request.method = nullptr; request.allocation_failure = std::current_exception(); }
@@ -11596,7 +11599,7 @@ export namespace vmhook::detail::jit_backend
                 >= pn::rt().enum_value("InstanceKlass::ClassState", "linked");
         } catch (...) { return false; }
     }
-    inline auto with_vm_state(const safepoint_callback callback, void* const opaque) noexcept -> bool
+    inline auto with_vm_state_checked(const safepoint_callback callback, void* const opaque) -> bool
     {
         if (!callback) { return false; }
         try
@@ -11612,8 +11615,11 @@ export namespace vmhook::detail::jit_backend
             }
             pn::vm_state_guard guard{ thread }; callback(opaque); return true;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (...) { return false; }
     }
+    inline auto with_vm_state(const safepoint_callback callback, void* const opaque) noexcept -> bool
+    { try { return with_vm_state_checked(callback, opaque); } catch (...) { return false; } }
     inline auto return_handler(vmhook::hotspot::method* const method) noexcept -> void*
     {
         const auto& c{ config() };
@@ -12028,7 +12034,7 @@ export namespace vmhook::detail::jit_backend
         resume_compilation(transaction.pause);
     }
     inline auto install_method_policy(vmhook::hotspot::method* const method,
-        bool (*commit)(void*) noexcept, void* const opaque, std::shared_ptr<void>& retained_policy) noexcept -> bool
+        bool (*commit)(void*) noexcept, void* const opaque, std::shared_ptr<void>& retained_policy) -> bool
     {
         try
         {
@@ -12088,6 +12094,7 @@ export namespace vmhook::detail::jit_backend
             }
             return true;
         }
+        catch (const std::bad_alloc&) { throw; }
         catch (...) { return false; }
     }
     inline auto release_method_policy_at_safepoint(const std::shared_ptr<void>& opaque) noexcept -> void
@@ -12231,9 +12238,15 @@ export namespace vmhook::detail::jit_backend
         // can stay loaded indefinitely and must remain eligible.
         return matches(flags.anonymous) || matches(flags.hidden);
     }
+    struct field_policy_collection final
+    {
+        bool okay{true};
+        std::exception_ptr allocation_failure{};
+    };
     inline auto collect_field_policies(void* const opaque) noexcept -> void
     {
-        auto& okay{ *static_cast<bool*>(opaque) };
+        auto& collection{ *static_cast<field_policy_collection*>(opaque) };
+        auto& okay{ collection.okay };
         try
         {
             const auto& c{ config() };
@@ -12254,7 +12267,7 @@ export namespace vmhook::detail::jit_backend
                         {
                             if (!existing->field_metadata_pin)
                             {
-                                if (!pin) { pin = vmhook::detail::retain_hook_klass(klass); }
+                                if (!pin) { pin = vmhook::detail::retain_hook_klass_checked(klass); }
                                 if (!pin) { okay = false; return; }
                                 existing->field_metadata_pin = pin;
                             }
@@ -12265,7 +12278,7 @@ export namespace vmhook::detail::jit_backend
                             else { suppress_accessor_intrinsic(*existing); }
                             existing->reasons.fetch_or(field_reason, std::memory_order_release); continue;
                         }
-                        if (!pin) { pin = vmhook::detail::retain_hook_klass(klass); }
+                        if (!pin) { pin = vmhook::detail::retain_hook_klass_checked(klass); }
                         if (!pin) { okay = false; return; }
                         auto policy{ std::make_unique<method_policy>() };
                         policy->method = method; policy->const_method = pn::load<void*>(method, c.const_method_offset);
@@ -12277,6 +12290,7 @@ export namespace vmhook::detail::jit_backend
                 }
             }
         }
+        catch (const std::bad_alloc&) { okay = false; collection.allocation_failure = std::current_exception(); }
         catch (...) { okay = false; }
     }
     struct field_transaction final
@@ -12370,12 +12384,12 @@ export namespace vmhook::detail::jit_backend
         for (auto* policy{ policies.load(std::memory_order_acquire) }; policy; policy = policy->next)
         { if ((policy->reasons.load() & field_reason) == 0) { policy->field_metadata_pin.reset(); } }
     }
-    inline auto acquire_field_interpretation() noexcept -> bool
+    inline auto acquire_field_interpretation(std::exception_ptr* const allocation_failure) noexcept -> bool
     {
         try
         {
             const auto& c{ config() };
-            if (!c.ready || !lifetime_flags().ready || !vmhook::detail::borrowed_callback_supported() || !vmhook::detail::prepare_hook_roots()
+            if (!c.ready || !lifetime_flags().ready || !vmhook::detail::borrowed_callback_supported() || !vmhook::detail::prepare_hook_roots_checked()
                 || !vmhook::detail::ensure_class_events_installed()) { return false; }
             auto& vm{ pn::rt() }; const auto thread{ vm.current_thread() };
             const bool began_in_vm{ thread && pn::thread_state(thread) == 6 };
@@ -12384,6 +12398,7 @@ export namespace vmhook::detail::jit_backend
             std::lock_guard admin{ administration_mutex };
             if (field_mode.load()) { return true; }
             field_transaction transaction{};
+            field_policy_collection collection{};
             bool okay{ at_safepoint(&pause_for_fields, &transaction) && transaction.paused };
             const auto deadline{ std::chrono::steady_clock::now() + std::chrono::seconds{30} };
             while (okay && !transaction.complete && std::chrono::steady_clock::now() < deadline)
@@ -12391,7 +12406,8 @@ export namespace vmhook::detail::jit_backend
                 // Root tokens, containers and new policy nodes are prepared on
                 // this mutator outside the safepoint while compiler jobs stay
                 // paused. Class-definition guards prepare their own new nodes.
-                okay = with_vm_state(&collect_field_policies, &okay) && okay;
+                collection.okay = okay;
+                okay = with_vm_state(&collect_field_policies, &collection) && collection.okay;
                 compiler_scan scan{};
                 while (okay)
                 {
@@ -12410,8 +12426,11 @@ export namespace vmhook::detail::jit_backend
                 resume_compilation(transaction.pause);
                 release_field_pins();
             }
+            if (allocation_failure) { *allocation_failure = collection.allocation_failure; }
             return okay;
         }
+        catch (const std::bad_alloc&)
+        { if (allocation_failure) { *allocation_failure = std::current_exception(); } return false; }
         catch (...) { return false; }
     }
     inline auto release_field_interpretation() noexcept -> void
@@ -27771,12 +27790,14 @@ export namespace vmhook::detail
     inline auto execute_borrowed_callback(hotspot::java_thread*, hotspot::detour_java_anchor_t,
                                          borrowed_callback, void*) noexcept -> bool;
     inline auto retain_hook_klass(hotspot::klass*) noexcept -> std::shared_ptr<void>;
+    inline auto retain_hook_klass_checked(hotspot::klass*) -> std::shared_ptr<void>;
     inline auto prepare_hook_roots() noexcept -> bool;
+    inline auto prepare_hook_roots_checked() -> bool;
 }
 export namespace vmhook::detail::jit_backend
 {
     inline auto at_safepoint(void (*)(void*) noexcept, void*) noexcept -> bool;
-    inline auto acquire_field_interpretation() noexcept -> bool;
+    inline auto acquire_field_interpretation(std::exception_ptr*) noexcept -> bool;
     inline auto release_field_interpretation() noexcept -> void;
 }
 export namespace vmhook::detail::field_backend
@@ -28220,7 +28241,10 @@ export namespace vmhook::detail::field_backend
         if(!installed) { prepare_sites(); }
         if(first)
         {
-            if(!jit_backend::acquire_field_interpretation()) { return 0; }
+            std::exception_ptr allocation_failure{};
+            const bool acquired{jit_backend::acquire_field_interpretation(&allocation_failure)};
+            if(allocation_failure) { std::rethrow_exception(allocation_failure); }
+            if(!acquired) { return 0; }
             interpretation_owned=true;
         }
         if(!installed)
@@ -28362,7 +28386,7 @@ export namespace vmhook::detail
             {
                 auto* const identity{registered_class_klass(type, original)};
                 if (!identity) { throw vmhook::exception{"Field hook wrapper's exact class is unavailable"}; }
-                auto mirror{retain_hook_klass(identity)};
+                auto mirror{retain_hook_klass_checked(identity)};
                 if (!mirror) { throw vmhook::exception{"Field hook wrapper Class could not be retained"}; }
                 captured = std::make_shared<class_binding>(*original);
                 captured->identity = identity;
@@ -28430,7 +28454,7 @@ export namespace vmhook::detail
                 }
                 auto* caller=private_native::rt().current_thread();
                 if(!caller||private_native::thread_state(caller)!=4) { return 0; }
-                if(!prepare_hook_roots()) { return 0; }
+                if(!prepare_hook_roots_checked()) { return 0; }
                 auto added=std::make_shared<field_backend::binding>();
                 added->wrapper=std::type_index{typeid(wrapper_type)};
                 added->name=name;
@@ -28465,7 +28489,7 @@ export namespace vmhook::detail
                     added->offset=field->offset;
                     added->descriptor=field->signature.front();
                     added->signature=field->signature;
-                    added->metadata_root=retain_hook_klass(added->holder);
+                    added->metadata_root=retain_hook_klass_checked(added->holder);
                     if(!added->metadata_root) { return 0; }
                     if constexpr (vmhook::detail::is_java_object_pointer_v<field_type>)
                     {
@@ -28738,14 +28762,18 @@ inline bool prepare_checked() {
 inline bool prepare() noexcept {
     try { return prepare_checked(); } catch (...) { return false; }
 }
-inline std::shared_ptr<void> retain_klass(vmhook::hotspot::klass* klass) noexcept {
+inline std::shared_ptr<void> retain_klass_checked(vmhook::hotspot::klass* klass) {
     if (!klass) { return {}; }
     try {
         auto* current = pn::rt().current_thread();
         auto* pool = prepared_keeper.load(std::memory_order_acquire);
         if (!pool || !is_java_thread(current) || pn::thread_state(current) != 6) { return {}; }
         return pool->retain(klass->get_java_mirror());
-    } catch (...) { return {}; }
+    } catch (const std::bad_alloc&) { throw; }
+    catch (...) { return {}; }
+}
+inline std::shared_ptr<void> retain_klass(vmhook::hotspot::klass* klass) noexcept {
+    try { return retain_klass_checked(klass); } catch (...) { return {}; }
 }
 inline void drain() noexcept {
     if (auto* pool = prepared_keeper.load(std::memory_order_acquire)) { pool->drain(); }
@@ -28761,8 +28789,14 @@ export namespace vmhook::detail {
     inline auto prepare_hook_roots() noexcept -> bool {
         return persistent_hook_roots::prepare();
     }
+    inline auto prepare_hook_roots_checked() -> bool {
+        return persistent_hook_roots::prepare_checked();
+    }
     inline auto retain_hook_klass(vmhook::hotspot::klass* klass) noexcept -> std::shared_ptr<void> {
         return persistent_hook_roots::retain_klass(klass);
+    }
+    inline auto retain_hook_klass_checked(vmhook::hotspot::klass* klass) -> std::shared_ptr<void> {
+        return persistent_hook_roots::retain_klass_checked(klass);
     }
     inline auto flush_hook_roots() noexcept -> void {
         if (!persistent_hook_roots::prepared_keeper.load(std::memory_order_acquire)) { return; }
