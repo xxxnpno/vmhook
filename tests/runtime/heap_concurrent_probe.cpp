@@ -90,8 +90,9 @@ if (!owner || !owner->get_instance() || owner->value()<0 || owner->value()>=2500
 }
 output << "mark_completed=" << (completed ? "pass" : "fail") << '\n';
 output << "satb_active_captures=" << observed << "\nrooted_captures=" << captured << "\nheap_walks=" << iterations << '\n';
-output << "heap_concurrent=" << (observed>=1 && completed ? "pass" : "fail") << "\nnative_complete=pass\n" << std::flush;
-return observed>=1 && completed ? 0 : 2;
+const bool exact_capture = observed == 1 && captured == 64 && held.size() == 64;
+output << "heap_concurrent=" << (exact_capture && completed ? "pass" : "fail") << "\nnative_complete=pass\n" << std::flush;
+return exact_capture && completed ? 0 : 2;
 } catch(const std::exception& error) { output << "exception=" << error.what() << '\n' << std::flush; return 3; }
 }
 }
