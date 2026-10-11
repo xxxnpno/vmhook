@@ -8,7 +8,12 @@ objects, not a reachability graph: a parsable object awaiting collection can
 still appear. It does not report subclass instances or allocation events.
 
 The verified backend currently covers the pinned Java 8–27 Windows x64 HotSpot
-images with Java 8 Parallel GC and later G1. Other collectors, unidentified
+images with Java 8 Parallel GC and later G1. Java 9–16 G1 additionally requires
+the immutable `ClassUnloadingWithConcurrentMark` launch setting to retain its
+default enabled value: those releases otherwise omit the iterator's dead-object
+filter. VMHook refuses that nondefault configuration instead of returning
+unmarked objects after SATB has stopped. Java 17 and later apply the iterator's
+liveness checks independently of that setting. Other collectors, unidentified
 images and external symbol substitutions are refused. Support is checked
 against exact function signatures and closure layouts; it is not inferred from
 reserved heap addresses.
@@ -26,7 +31,8 @@ object walk. VMHook does not interpret dead G1 blocks using guessed object
 headers: the collector's region iterator retains its mark-bitmap and
 parsable-bottom checks. A first pass counts matches; a second pass fills
 preallocated zeroed HandleArea slots. A bounded result can be truncated at the
-requested limit. Unexpected growth beyond the reserved slots raises an error
+requested limit. Once that bound is full, further collector callbacks skip
+VMHook metadata reads; the collector completes its own full walk. Unexpected growth beyond the reserved slots raises an error
 when the requested limit has not yet been reached.
 
 Publishing a new HandleArea slot is not itself a G1 SATB keepalive barrier.
@@ -64,3 +70,11 @@ rooted refs and borrows, including empty arrays with no elements to inspect.
 Java null still answers false. An unregistered, stale or foreign-context source
 remains an error. `is<vmhook::any_object>()` accepts any non-null rooted Java
 object without requiring an additional registry entry.
+
+`HeapConcurrentFixture` additionally drives ordinary allocation until the
+matching Java 21/27 G1 SATB active flag is observed. Its separate probe checks
+that capture runs with marking active on VMThread and that 64 captured roots
+remain usable after marking completes. The diagnostic flag offsets are
+matching-PDB facts guarded by the full build GUID; they do not select production
+addresses. This runtime witness complements the source proof that remark drains
+partial VMThread SATB queues before the cycle ends.

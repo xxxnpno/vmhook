@@ -29754,6 +29754,40 @@ export namespace vmhook::detail::heap_iteration
         keepalive keep_alive{};
         std::size_t callback_slot{}, callback_slots{}, closure_size{};
     };
+    inline auto legacy_liveness_filter_available() noexcept -> bool
+    {
+        // Java 9–16's region walker filters previous-cycle dead objects only
+        // while this immutable launch flag is enabled. Parsability alone cannot
+        // make those objects live after SATB marking has completed.
+        const auto& table{ vmhook::detail::resolve_jvm_flag_table() };
+        if (!table.resolved || !table.has_type) { return false; }
+        char name[64]{};
+        for (std::size_t index{}; index < table.count; ++index)
+        {
+            if (!vmhook::detail::read_jvm_flag_name(table, index, name, sizeof(name))) { return false; }
+            if (std::strcmp(name, "ClassUnloadingWithConcurrentMark") != 0) { continue; }
+            const auto* const record{ table.base + index * table.stride };
+            if (table.type_is_string)
+            {
+                char type_name[32]{};
+                if (!vmhook::detail::safe_read_c_string(
+                        vmhook::hotspot::safe_read_pointer(record + table.type_offset),
+                        type_name, sizeof(type_name)) || std::strcmp(type_name, "bool") != 0)
+                { return false; }
+            }
+            else
+            {
+                std::int32_t ordinal{ -1 };
+                if (!vmhook::os::safe_read(&ordinal, record + table.type_offset, sizeof(ordinal)) || ordinal != 0)
+                { return false; }
+            }
+            std::uint8_t value{};
+            const auto* const address{ vmhook::hotspot::safe_read_pointer(record + table.addr_offset) };
+            return address && vmhook::os::safe_read(&value, address, sizeof(value)) && value == 1;
+        }
+        return false;
+    }
+
     auto config() noexcept -> const configuration&
     {
         static const configuration value = []() noexcept
@@ -29767,6 +29801,8 @@ export namespace vmhook::detail::heap_iteration
                 const auto collector{ vmhook::vm_capabilities().collector };
                 if (collector != vmhook::gc_collector::g1 && collector != vmhook::gc_collector::parallel)
                 { return result; }
+                if (collector == vmhook::gc_collector::g1 && runtime.profile->java_feature <= 16
+                    && !legacy_liveness_filter_available()) { return result; }
                 result.closure_size = runtime.size("ObjectClosure");
                 const auto slot{ runtime.enum_value("ObjectClosure", "vtable_do_object") };
                 const auto count{ runtime.enum_value("ObjectClosure", "vtable_count") };
@@ -29807,12 +29843,17 @@ export namespace vmhook::detail::heap_iteration
         vmhook::hotspot::klass* target{};
         const nb::root* slots{};
         std::size_t capacity{}, matches{};
+        std::size_t max_matches{ std::numeric_limits<std::size_t>::max() };
         bool executed{};
     };
 
     inline auto do_object(void* const closure, void* const object) noexcept -> void
     {
         auto& payload{ *reinterpret_cast<walk_payload*>(closure) };
+        // The collector still walks every block for its own parsability/liveness
+        // protocol. Once a requested bound is reached, further objects need no
+        // VMHook metadata lookup or additional result root publication.
+        if (payload.matches >= payload.max_matches) { return; }
         if (vmhook::klass_from_oop(object) != payload.target) { return; }
         const auto index{ payload.matches++ };
         if (index < payload.capacity)
@@ -29872,13 +29913,20 @@ export namespace vmhook::detail::heap_iteration
         { throw vmhook::exception{ "Heap snapshots require a standalone native_thread_context" }; }
         const auto& runtime{ config() };
         if (!runtime.ready)
-        { throw vmhook::exception{ "This exact VM profile and collector have no verified heap iterator" }; }
+        {
+            auto& profile{ pn::rt() };
+            if (profile.ready && vmhook::vm_capabilities().collector == vmhook::gc_collector::g1
+                && profile.profile->java_feature <= 16 && !legacy_liveness_filter_available())
+            { throw vmhook::exception{ "This Java 9-16 launch disables the G1 iterator's required dead-object filter" }; }
+            throw vmhook::exception{ "This exact VM profile and collector have no verified heap iterator" };
+        }
         if (!target) { throw vmhook::exception{ "Heap snapshot class could not be resolved" }; }
         const auto metadata{ nb::retain_class(target) };
         if (!metadata) { throw vmhook::exception{ "Heap snapshot class mirror could not be retained" }; }
         walk_payload counted{};
         counted.runtime = &runtime;
         counted.target = target;
+        counted.max_matches = max_visits;
         walk(counted);
         if (counted.matches == 0) { return {}; }
         const auto requested{ std::min(max_visits, counted.matches) };
@@ -29898,6 +29946,7 @@ export namespace vmhook::detail::heap_iteration
         captured.target = target;
         captured.slots = roots.data();
         captured.capacity = roots.size();
+        captured.max_matches = max_visits;
         walk(captured);
         if (captured.matches > roots.size() && roots.size() < max_visits)
         { throw vmhook::exception{ "Class instance count grew beyond the reserved snapshot; retry the heap snapshot" }; }
