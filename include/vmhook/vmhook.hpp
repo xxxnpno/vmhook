@@ -380,11 +380,11 @@ namespace vmhook::detail
         noexcept logging boundary. Disabled logging does not format or allocate;
         its arguments are still evaluated normally by the caller.
     */
-    template<typename... argument_types>
+    template<bool enabled = vmhook::debug_logs, typename... argument_types>
     inline auto log_line(std::format_string<argument_types...> format,
                          argument_types&&... arguments) noexcept -> void
     {
-        if constexpr (vmhook::debug_logs)
+        if constexpr (enabled)
         {
             try { emit_log_line(format_log(format, std::forward<argument_types>(arguments)...)); }
             catch (...) { /* Logging must not escape into the VM or replace a caller's error. */ }
@@ -395,11 +395,11 @@ namespace vmhook::detail
         }
     }
 
-    template<typename... argument_types>
+    template<bool enabled = vmhook::debug_logs, typename... argument_types>
     inline auto log_line_runtime(const std::string_view format,
                                  argument_types&&... arguments) noexcept -> void
     {
-        if constexpr (vmhook::debug_logs)
+        if constexpr (enabled)
         {
             try { emit_log_line(format_log_runtime(format, std::forward<argument_types>(arguments)...)); }
             catch (...) { /* Keep dynamic formatting failures inside the logging boundary. */ }
@@ -2397,15 +2397,30 @@ namespace vmhook
         */
         struct symbol
         {
+            struct prefix_geometry final
+            {
+                static inline std::once_flag initialized{};
+                static inline const vmhook::hotspot::vm_struct_entry_t *length{}, *packed{}, *body{};
+                static auto prepare() -> void
+                {
+                    std::call_once(initialized, []
+                    {
+                        length=vmhook::hotspot::iterate_struct_entries("Symbol", "_length");
+                        packed=vmhook::hotspot::iterate_struct_entries("Symbol", "_length_and_refcount");
+                        body=vmhook::hotspot::iterate_struct_entries("Symbol", "_body");
+                    });
+                }
+            };
             // Metadata geometry checks need only a fixed prefix. Copying those
             // bytes avoids allocating a complete class name in noexcept paths.
             template<std::size_t count>
             auto first_bytes() const noexcept -> std::optional<std::array<std::uint8_t, count>>
             {
                 static_assert(count <= (std::numeric_limits<std::uint16_t>::max)());
-                static const auto* const length_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_length") };
-                static const auto* const packed_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_length_and_refcount") };
-                static const auto* const body_entry{ vmhook::hotspot::iterate_struct_entries("Symbol", "_body") };
+                prefix_geometry::prepare();
+                const auto* const length_entry=prefix_geometry::length;
+                const auto* const packed_entry=prefix_geometry::packed;
+                const auto* const body_entry=prefix_geometry::body;
                 if (!vmhook::hotspot::is_valid_pointer(this) || !body_entry
                     || body_entry->is_static != 0 || (!length_entry && !packed_entry))
                 { return {}; }
@@ -9465,15 +9480,6 @@ namespace vmhook
                 if (lp != rp) { return lp < rp; }
                 return (left.observer ? left.observer->id : 0) < (right.observer ? right.observer->id : 0);
             });
-            if (policy_installed)
-            {
-                std::erase_if(vmhook::hotspot::g_hooked_methods, [found_method](const auto& entry)
-                { return entry.method == found_method && !entry.detour; });
-                vmhook::hotspot::g_hooked_methods.push_back(std::move(method_entry));
-                vmhook::hotspot::publish_hook_dispatch_locked(std::move(next_dispatch));
-                vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
-                return observer_id;
-            }
             const auto existing_stub{ std::find_if(vmhook::hotspot::g_hooked_i2i_entries.begin(),
                 vmhook::hotspot::g_hooked_i2i_entries.end(), [i2i](const auto& entry) { return entry.i2i_entry == i2i; }) };
             std::unique_ptr<vmhook::hotspot::midi2i_hook> prepared_stub{};
@@ -9509,6 +9515,8 @@ namespace vmhook
                     }
                     if (*transaction.stub)
                     { vmhook::hotspot::g_hooked_i2i_entries.push_back({ transaction.i2i, transaction.stub->release() }); }
+                    std::erase_if(vmhook::hotspot::g_hooked_methods, [&transaction](const auto& entry)
+                    { return entry.method == transaction.method->method && !entry.detour; });
                     vmhook::hotspot::g_hooked_methods.push_back(std::move(*transaction.method));
                     vmhook::hotspot::publish_hook_dispatch_locked(std::move(*transaction.dispatch));
                     return true;
@@ -11848,6 +11856,10 @@ namespace vmhook::detail::jit_backend
         std::atomic<unsigned> reasons{};
         method_policy* next{};
         bool excluded{}, intrinsic_owned{}, entry_owned{};
+        // A reason and exclusion can survive an interrupted first transaction.
+        // Only the completed compiler drain/global invalidation proves that
+        // previously compiled or folded callers no longer bypass this method.
+        bool invalidation_complete{};
     };
     // Nodes stay resident so class-definition callbacks need no registry mutex.
     // A zero-reason node owns no live metadata and is ignored by new lookups.
@@ -11955,6 +11967,7 @@ namespace vmhook::detail::jit_backend
     }
     inline auto exclude(method_policy& policy, const bool field_accessor = false) noexcept -> bool
     {
+        policy.invalidation_complete = false;
         const auto& c{ config() };
         auto* const method{ current_policy_method(policy) };
         if (!method) { return false; }
@@ -11980,6 +11993,7 @@ namespace vmhook::detail::jit_backend
     }
     inline auto restore(method_policy& policy) noexcept -> void
     {
+        policy.invalidation_complete = false;
         if (!policy.excluded) { return; }
         const auto& c{ config() };
         auto* const method{ current_policy_method(policy) };
@@ -12153,26 +12167,60 @@ namespace vmhook::detail::jit_backend
         bool (*commit)(void*) noexcept{};
         void* opaque{};
         compilation_pause pause{};
-        bool okay{};
+        bool okay{}, owns_method_reason{};
     };
     inline auto pause_and_exclude(void* const opaque) noexcept -> void
     {
         auto& transaction{ *static_cast<install_transaction*>(opaque) };
         if (!pause_compilation(transaction.pause)) { return; }
-        transaction.okay = transaction.policy->excluded || exclude(*transaction.policy);
+        transaction.okay = (transaction.policy->excluded
+            && method_is_excluded(current_policy_method(*transaction.policy)))
+            || exclude(*transaction.policy);
     }
     inline auto commit_install(void* const opaque) noexcept -> void
     {
         auto& transaction{ *static_cast<install_transaction*>(opaque) };
-        deoptimize_all(); transaction.okay = transaction.commit(transaction.opaque);
-        if (!transaction.okay && (transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(*transaction.policy); }
+        deoptimize_all();
+        transaction.policy->invalidation_complete = true;
+        transaction.okay = transaction.commit(transaction.opaque);
+        if (!transaction.okay && transaction.owns_method_reason
+            && (transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0)
+        { restore(*transaction.policy); }
         resume_compilation(transaction.pause);
     }
     inline auto rollback_install(void* const opaque) noexcept -> void
     {
         auto& transaction{ *static_cast<install_transaction*>(opaque) };
-        if ((transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(*transaction.policy); }
+        if (transaction.owns_method_reason
+            && (transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0)
+        { restore(*transaction.policy); }
         resume_compilation(transaction.pause);
+    }
+    struct existing_policy_install final
+    {
+        method_policy* policy{};
+        vmhook::hotspot::method* method{};
+        bool (*commit)(void*) noexcept{};
+        void* opaque{};
+        bool eligible{}, okay{};
+    };
+    inline auto commit_existing_policy(void* const opaque) noexcept -> void
+    {
+        auto& transaction{*static_cast<existing_policy_install*>(opaque)};
+        const auto& c{config()};
+        // The first successful installation drained preexisting compiler tasks
+        // and globally deoptimized old inlining before publishing this policy.
+        // Its method reason remains live even after all observers are removed.
+        // Additional observers reuse that completed transaction; no new compiler
+        // pause or invalidation is needed while its exact exclusion still holds.
+        transaction.eligible = transaction.policy->invalidation_complete && transaction.policy->excluded
+            && (transaction.policy->reasons.load(std::memory_order_acquire) & method_reason) != 0
+            && transaction.policy->method == transaction.method
+            && current_policy_method(*transaction.policy) == transaction.method
+            && transaction.policy->const_method == pn::load<void*>(transaction.method, c.const_method_offset)
+            && !pn::load<void*>(transaction.method, c.method_code_offset)
+            && method_is_excluded(transaction.method);
+        if (transaction.eligible) { transaction.okay = transaction.commit(transaction.opaque); }
     }
     inline auto install_method_policy(vmhook::hotspot::method* const method,
         bool (*commit)(void*) noexcept, void* const opaque, std::shared_ptr<void>& retained_policy) -> bool
@@ -12207,9 +12255,21 @@ namespace vmhook::detail::jit_backend
             // or flags are changed. An allocation failure cannot leave a live
             // reason pointing at metadata whose installer root is about to end.
             retained_policy = std::shared_ptr<void>{policy, [](void*) noexcept {}};
-            policy->reasons.fetch_or(method_reason, std::memory_order_release);
+            if (existing)
+            {
+                existing_policy_install addition{policy, method, commit, opaque};
+                if (!at_safepoint(&commit_existing_policy, &addition))
+                { retained_policy.reset(); return false; }
+                if (addition.eligible)
+                {
+                    if (!addition.okay) { retained_policy.reset(); }
+                    return addition.okay;
+                }
+            }
+            const auto previous_reasons{policy->reasons.fetch_or(method_reason, std::memory_order_release)};
             if (!existing) { publish_policy(prepared_policy.release()); }
             install_transaction transaction{ policy, commit, opaque };
+            transaction.owns_method_reason = (previous_reasons & method_reason) == 0;
             bool okay{ at_safepoint(&pause_and_exclude, &transaction) && transaction.okay };
             compiler_scan scan{};
             if (okay)
@@ -12242,6 +12302,7 @@ namespace vmhook::detail::jit_backend
     {
         if (!opaque) { return; }
         auto& policy{ *static_cast<method_policy*>(opaque.get()) };
+        policy.invalidation_complete = false;
         if ((policy.reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(policy); }
     }
 
@@ -29656,6 +29717,7 @@ namespace vmhook::detail
     inline auto verified_heap_iteration_available() noexcept -> bool;
     inline auto verified_monitor_locks_available() noexcept -> bool;
     inline auto verified_class_inventory_available() noexcept -> bool;
+    inline auto verified_reference_graph_available() -> bool;
 }
 namespace vmhook
 {
@@ -29667,7 +29729,7 @@ namespace vmhook
         persistent_references, method_entry_hooks, static_primitive_field_hooks,
         class_definition_events, original_method_exit_events, exact_heap_iteration,
         mixed_stack_sampling, virtual_thread_hooks, java_monitors,
-        static_reference_field_hooks, loaded_class_inventory, count
+        static_reference_field_hooks, loaded_class_inventory, rooted_reference_graphs, count
     };
 
     struct feature_support final
@@ -29773,6 +29835,9 @@ namespace vmhook
         set(runtime_feature::loaded_class_inventory,
             detail::verified_class_inventory_available() ? feature_state::conditional : feature_state::unavailable,
             "Verified CLDG keepalive walk at a safepoint; bounded Class roots require a standalone native context");
+        set(runtime_feature::rooted_reference_graphs,
+            detail::verified_reference_graph_available() ? feature_state::conditional : feature_state::unavailable,
+            "Bounded safepoint copies of rooted Java instance fields and array elements; Reference-owned/VM/static slots excluded");
         set(runtime_feature::mixed_stack_sampling, feature_state::unavailable,
             "No verified Windows mixed-stack sampling backend");
         set(runtime_feature::virtual_thread_hooks, feature_state::unavailable,
@@ -31333,3 +31398,435 @@ namespace vmhook::detail
     inline auto verified_class_inventory_available() noexcept -> bool
     { return class_inventory::config().ready; }
 }
+
+// VMHOOK_REFERENCE_GRAPH_BEGIN
+namespace vmhook
+{
+    struct reference_graph_limits final
+    {
+        std::size_t max_nodes{256}, max_edges{2048}, max_classes{256};
+        std::size_t max_depth{16}, max_slots{65536}, max_label_bytes{262144};
+    };
+    enum class reference_node_kind : std::uint8_t { object, object_array, primitive_array };
+    enum class reference_edge_kind : std::uint8_t { instance_field, array_element };
+    enum class reference_edge_state : std::uint8_t
+    { strong, java_null, excluded_reference_field, depth_limit, node_limit, class_limit, label_limit };
+    struct reference_graph_class final { std::size_t id{}; std::string name{}; };
+    struct reference_graph_node final
+    {
+        std::size_t id{}, class_id{}, depth{};
+        reference_node_kind kind{};
+        std::int32_t array_length{-1};
+    };
+    struct reference_graph_edge final
+    {
+        std::size_t from{};
+        std::optional<std::size_t> to{}, declaring_class{};
+        reference_edge_kind kind{};
+        reference_edge_state state{};
+        std::string name{}, signature{};
+        std::size_t field_offset{};
+        std::int32_t array_index{-1};
+    };
+    struct reference_graph final
+    {
+        std::optional<std::size_t> root{};
+        std::vector<reference_graph_class> classes{};
+        std::vector<reference_graph_node> nodes{};
+        std::vector<reference_graph_edge> edges{};
+        reference_graph_limits limits{};
+        bool complete{true};
+        bool node_limit{}, edge_limit{}, class_limit{}, depth_limit{}, slot_limit{}, label_limit{};
+        std::size_t inspected_slots{}, excluded_reference_fields{};
+    };
+}
+namespace vmhook::detail::reference_graph_backend
+{
+    namespace nb = vmhook::detail::native_backend;
+    namespace pn = vmhook::detail::private_native;
+    constexpr auto absent = (std::numeric_limits<std::size_t>::max)();
+    struct coordinates final
+    {
+        const vmhook::hotspot::vm_struct_entry_t *name{}, *super{}, *layout{}, *constants{},
+            *fields{}, *stream{}, *java_count{}, *cp_length{}, *symbol_length{}, *symbol_packed{}, *symbol_body{};
+        std::size_t cp_size{}, reference_width{};
+        bool ready{};
+    };
+    struct coordinate_cache final
+    {
+        static inline std::once_flag initialized{};
+        static inline std::atomic<vmhook::hotspot::klass*> reference_identity{};
+        static inline coordinates value{};
+        static auto get() -> const coordinates&
+        {
+            std::call_once(initialized, []
+            {
+            coordinates c{};
+            auto& runtime{pn::rt()};
+            if (!runtime.ready || runtime.uses_external_symbols() || !vmhook::detail::java_execution_supported()
+                || !vmhook::detail::heap_iteration::config().ready) { return; }
+            const auto slot = [](const char* type, const char* field)
+            { return vmhook::hotspot::iterate_struct_entries(type, field); };
+            c.name=slot("Klass","_name"); c.super=slot("Klass","_super"); c.layout=slot("Klass","_layout_helper");
+            c.constants=slot("InstanceKlass","_constants"); c.fields=slot("InstanceKlass","_fields");
+            c.stream=slot("InstanceKlass","_fieldinfo_stream"); c.java_count=slot("InstanceKlass","_java_fields_count");
+            c.cp_length=slot("ConstantPool","_length"); c.symbol_length=slot("Symbol","_length");
+            c.symbol_packed=slot("Symbol","_length_and_refcount"); c.symbol_body=slot("Symbol","_body");
+            const auto* type=vmhook::hotspot::iterate_type_entries("ConstantPool");
+            c.cp_size=type ? type->size : 0;
+            c.reference_width=vmhook::detail::reference_slot_width();
+            c.ready=c.name && c.super && c.layout && c.constants && c.cp_length && c.symbol_body
+                && (c.symbol_length || c.symbol_packed) && c.cp_size>=16 && c.cp_size<=4096
+                && ((runtime.profile->java_feature>=21 && c.stream)
+                    || (runtime.profile->java_feature<=20 && c.fields && c.java_count))
+                && (c.reference_width==4 || c.reference_width==8);
+            value=c;
+            });
+            return value;
+        }
+    };
+    struct text_range final { std::size_t offset{}, size{}; };
+    struct raw_class final { vmhook::hotspot::klass* address{}; text_range name{}; };
+    struct raw_node final { void* address{}; vmhook::reference_graph_node value{}; };
+    struct raw_edge final { vmhook::reference_graph_edge value{}; text_range name{}, signature{}; };
+    struct payload final
+    {
+        const coordinates* geometry{};
+        void** input{};
+        vmhook::hotspot::klass* reference_class{};
+        vmhook::reference_graph result{};
+        std::vector<raw_class> classes{};
+        std::vector<raw_node> nodes{};
+        std::vector<raw_edge> edges{};
+        std::vector<std::size_t> identities{};
+        std::vector<char> labels{};
+        std::size_t class_count{}, node_count{}, edge_count{}, label_count{};
+        const char* failure{};
+        bool executed{};
+        auto stopped() const noexcept -> bool
+        { return failure || result.edge_limit || result.class_limit || result.slot_limit || result.label_limit; }
+        auto budget(bool& flag) noexcept -> void { flag=true; result.complete=false; }
+        auto fail(const char* message) noexcept -> bool { failure=message; return false; }
+        template<class value_type>
+        auto read(const void* base, std::size_t offset, value_type& value) noexcept -> bool
+        {
+            if (!base || !vmhook::os::safe_read(&value, static_cast<const std::byte*>(base)+offset,sizeof(value)))
+            { return fail("Reference graph metadata or strong slot is unreadable"); }
+            return true;
+        }
+        auto symbol(vmhook::hotspot::symbol* value, text_range& range) noexcept -> bool
+        {
+            std::uint16_t length{};
+            if (geometry->symbol_length)
+            { if (!read(value,geometry->symbol_length->offset,length)) { return false; } }
+            else
+            {
+                std::uint32_t packed{};
+                if (!read(value,geometry->symbol_packed->offset,packed)) { return false; }
+                length=static_cast<std::uint16_t>(packed>>16);
+            }
+            if (length>labels.size()-label_count) { budget(result.label_limit); return false; }
+            range={label_count,length};
+            if (length && !vmhook::os::safe_read(labels.data()+label_count,
+                reinterpret_cast<const std::byte*>(value)+geometry->symbol_body->offset,length))
+            { return fail("Reference graph symbol is unreadable"); }
+            label_count+=length; return true;
+        }
+        auto klass_id(vmhook::hotspot::klass* value) noexcept -> std::size_t
+        {
+            for (std::size_t i{};i<class_count;++i) { if(classes[i].address==value) {return i;} }
+            if(class_count==classes.size()) {budget(result.class_limit);return absent;}
+            vmhook::hotspot::symbol* name{};
+            text_range label{};
+            if(!read(value,geometry->name->offset,name)||!symbol(name,label)) {return absent;}
+            const auto id=class_count++; classes[id]={value,label}; return id;
+        }
+        auto existing_node(void* value) const noexcept -> std::size_t
+        {
+            const auto mask=identities.size()-1;
+            auto position=(reinterpret_cast<std::uintptr_t>(value)>>3)&mask;
+            while(identities[position]!=absent)
+            {
+                const auto id=identities[position];
+                if(nodes[id].address==value) {return id;}
+                position=(position+1)&mask;
+            }
+            return absent;
+        }
+        auto node_id(void* value,std::size_t depth) noexcept -> std::size_t
+        {
+            const auto mask=identities.size()-1;
+            auto position=(reinterpret_cast<std::uintptr_t>(value)>>3)&mask;
+            while(identities[position]!=absent)
+            {
+                const auto id=identities[position];
+                if(nodes[id].address==value) {return id;}
+                position=(position+1)&mask;
+            }
+            if(node_count==nodes.size()) {budget(result.node_limit);return absent;}
+            auto* klass=vmhook::klass_from_oop(value);
+            if(!klass) {fail("Reference graph reached an invalid runtime class");return absent;}
+            const auto class_id=klass_id(klass);
+            if(class_id==absent) {return absent;}
+            const auto id=node_count++;identities[position]=id;
+            nodes[id]={value,{id,class_id,depth,vmhook::reference_node_kind::object,-1}};return id;
+        }
+        auto reference(void* holder,std::size_t offset,void*& value) noexcept -> bool
+        {
+            if(geometry->reference_width==4)
+            {
+                std::uint32_t narrow{};
+                if(!read(holder,offset,narrow)) {return false;}
+                value=narrow ? vmhook::hotspot::decode_oop_pointer(narrow) : nullptr;
+                if(narrow&&!value) {return fail("Reference graph narrow oop cannot be decoded");}
+                return true;
+            }
+            return read(holder,offset,value);
+        }
+        auto edge(std::size_t from,void* holder,std::size_t offset,
+            vmhook::reference_edge_kind kind,std::int32_t index,std::size_t declaring,
+            text_range name,text_range signature,bool excluded) noexcept -> bool
+        {
+            if(edge_count==edges.size()) {budget(result.edge_limit);return false;}
+            auto& edge=edges[edge_count++];
+            edge.value.from=from;edge.value.kind=kind;edge.value.field_offset=offset;
+            edge.value.array_index=index;if(declaring!=absent) {edge.value.declaring_class=declaring;}
+            edge.name=name;edge.signature=signature;
+            if(excluded)
+            {
+                edge.value.state=vmhook::reference_edge_state::excluded_reference_field;
+                ++result.excluded_reference_fields;return true;
+            }
+            // No special Reference-owned slot is loaded, even to classify null.
+            void* value{};
+            if(!reference(holder,offset,value)) {return false;}
+            if(!value) {edge.value.state=vmhook::reference_edge_state::java_null;return true;}
+            const auto existing=existing_node(value);
+            if(existing!=absent)
+            {edge.value.state=vmhook::reference_edge_state::strong;edge.value.to=existing;return true;}
+            const auto next_depth=nodes[from].value.depth+1;
+            if(next_depth>result.limits.max_depth)
+            {
+                edge.value.state=vmhook::reference_edge_state::depth_limit;
+                budget(result.depth_limit);return true;
+            }
+            const auto target=node_id(value,next_depth);
+            if(target==absent)
+            {edge.value.state=result.class_limit?vmhook::reference_edge_state::class_limit
+                    :result.label_limit?vmhook::reference_edge_state::label_limit
+                    :vmhook::reference_edge_state::node_limit;return !stopped();}
+            edge.value.state=vmhook::reference_edge_state::strong;edge.value.to=target;return true;
+        }
+        auto inspect_slot() noexcept -> bool
+        {
+            if(result.inspected_slots==result.limits.max_slots) {budget(result.slot_limit);return false;}
+            ++result.inspected_slots;return true;
+        }
+        auto u5(const void* stream,std::size_t size,std::size_t& cursor,std::uint32_t& value) noexcept -> bool
+        {
+            value=0;
+            for(unsigned i{};i<5;++i)
+            {
+                std::uint8_t byte{};
+                if(cursor>=size||!read(stream,cursor++,byte)||!byte)
+                {return fail("Reference graph field stream is truncated");}
+                value+=static_cast<std::uint32_t>(byte-1)<<(6*i);
+                if(byte<192) {return true;}
+            }
+            return true;
+        }
+        auto field(std::size_t from,vmhook::hotspot::klass* holder,void* cp,std::int32_t cp_count,
+            std::uint32_t name_index,std::uint32_t signature_index,std::uint32_t offset,
+            std::uint32_t flags) noexcept -> bool
+        {
+            if(flags&8) {return true;}
+            if(!name_index||!signature_index||name_index>=static_cast<std::uint32_t>(cp_count)
+                ||signature_index>=static_cast<std::uint32_t>(cp_count))
+            {return fail("Reference graph Java field has invalid constant-pool indices");}
+            vmhook::hotspot::symbol* signature_symbol{};
+            if(!read(cp,geometry->cp_size+signature_index*sizeof(void*),signature_symbol)) {return false;}
+            char descriptor{};
+            if(!read(signature_symbol,geometry->symbol_body->offset,descriptor)) {return false;}
+            if(descriptor!='L'&&descriptor!='[') {return true;}
+            if(offset<8||offset>16777216||offset%geometry->reference_width)
+            {return fail("Reference graph Java reference field has invalid storage geometry");}
+            vmhook::hotspot::symbol* name_symbol{};
+            text_range name{},signature{};
+            if(!read(cp,geometry->cp_size+name_index*sizeof(void*),name_symbol)
+                ||!symbol(name_symbol,name)||!symbol(signature_symbol,signature)) {return false;}
+            const auto declaring=klass_id(holder);
+            if(declaring==absent) {return false;}
+            return edge(from,nodes[from].address,offset,vmhook::reference_edge_kind::instance_field,
+                -1,declaring,name,signature,holder==reference_class);
+        }
+        auto fields(std::size_t from,vmhook::hotspot::klass* holder) noexcept -> bool
+        {
+            void* cp{};std::int32_t cp_count{};
+            if(!read(holder,geometry->constants->offset,cp)||!read(cp,geometry->cp_length->offset,cp_count)
+                ||cp_count<=0||cp_count>65536) {return fail("Reference graph constant pool is invalid");}
+            void* array{};std::int32_t length{};
+            if(geometry->stream)
+            {
+                if(!read(holder,geometry->stream->offset,array)||!read(array,0,length)
+                    ||length<2||length>2097152) {return fail("Reference graph field stream is invalid");}
+                const auto* data=static_cast<const std::byte*>(array)+4;
+                std::size_t cursor{};std::uint32_t java_count{},injected_count{};
+                if(!u5(data,length,cursor,java_count)||!u5(data,length,cursor,injected_count)
+                    ||java_count>65535||injected_count>65535) {return fail("Reference graph field count is invalid");}
+                // Injected records follow Java records. Their non-Java edges are
+                // outside this API, and are never read as instance references.
+                for(std::uint32_t i{};i<java_count;++i)
+                {
+                    if(!inspect_slot()) {return false;}
+                    std::uint32_t name{},signature{},offset{},flags{},field_flags{},ignored{};
+                    if(!u5(data,length,cursor,name)||!u5(data,length,cursor,signature)
+                        ||!u5(data,length,cursor,offset)||!u5(data,length,cursor,flags)
+                        ||!u5(data,length,cursor,field_flags)) {return false;}
+                    for(auto bit:{1u,4u,16u})
+                    {if((field_flags&bit)&&!u5(data,length,cursor,ignored)) {return false;}}
+                    if(field_flags&2u) {return fail("Reference graph Java field unexpectedly marked injected");}
+                    if(!field(from,holder,cp,cp_count,name,signature,offset,flags)) {return false;}
+                }
+                return true;
+            }
+            std::uint16_t java_count{};
+            if(!read(holder,geometry->java_count->offset,java_count)
+                ||!read(holder,geometry->fields->offset,array)||!read(array,0,length)
+                ||length<0||length>524288||std::size_t{java_count}*6>static_cast<std::size_t>(length))
+            {return fail("Reference graph legacy field array is invalid");}
+            for(std::size_t i{};i<java_count;++i)
+            {
+                if(!inspect_slot()) {return false;}
+                std::array<std::uint16_t,6> info{};
+                if(!vmhook::os::safe_read(info.data(),static_cast<const std::byte*>(array)+4+i*12,12))
+                {return fail("Reference graph legacy field record is unreadable");}
+                const auto packed=(std::uint32_t{info[5]}<<16)|info[4];
+                if((packed&3u)!=1u) {return fail("Reference graph legacy field offset is unset");}
+                if(!field(from,holder,cp,cp_count,info[1],info[2],packed>>2,info[0])) {return false;}
+            }
+            return true;
+        }
+        auto walk() noexcept -> void
+        {
+            void* initial{};
+            if(!read(input,0,initial)||!initial) {fail("Reference graph root disappeared");return;}
+            const auto first=node_id(initial,0);
+            if(first==absent) {return;}
+            result.root=first;
+            for(std::size_t from{};from<node_count&&!stopped();++from)
+            {
+                auto& node=nodes[from];auto* klass=classes[node.value.class_id].address;
+                std::int32_t layout{};
+                if(!read(klass,geometry->layout->offset,layout)) {return;}
+                if(layout<0)
+                {
+                    const auto array=vmhook::detail::array_layout(klass);
+                    if(!array||!read(node.address,array->length_offset,node.value.array_length)
+                        ||node.value.array_length<0) {fail("Reference graph array geometry is invalid");return;}
+                    node.value.kind=array->reference_elements?vmhook::reference_node_kind::object_array
+                        :vmhook::reference_node_kind::primitive_array;
+                    if(!array->reference_elements) {continue;}
+                    if(array->element_width!=geometry->reference_width)
+                    {fail("Reference graph array reference width differs from field width");return;}
+                    for(std::int32_t index{};index<node.value.array_length;++index)
+                    {
+                        if(!inspect_slot()||!edge(from,node.address,array->body_offset
+                            +static_cast<std::size_t>(index)*array->element_width,
+                            vmhook::reference_edge_kind::array_element,index,absent,{},{},false)) {return;}
+                    }
+                }
+                else
+                {
+                    for(std::size_t inherited{};klass;++inherited)
+                    {
+                        if(inherited>=256) {fail("Reference graph superclass chain exceeds the verified bound");return;}
+                        if(!fields(from,klass)) {return;}
+                        vmhook::hotspot::klass* next{};
+                        if(!read(klass,geometry->super->offset,next)) {return;}
+                        klass=next;
+                    }
+                }
+            }
+        }
+    };
+    inline auto at_safepoint(void* opaque) noexcept -> void
+    {auto& state=*static_cast<payload*>(opaque);state.walk();state.executed=true;}
+    inline auto validate_limits(const vmhook::reference_graph_limits& limits) -> void
+    {
+        if(!limits.max_nodes||limits.max_nodes>65536||!limits.max_edges||limits.max_edges>262144
+            ||!limits.max_classes||limits.max_classes>8192||limits.max_depth>256
+            ||!limits.max_slots||limits.max_slots>4194304||!limits.max_label_bytes
+            ||limits.max_label_bytes>16777216)
+        {throw vmhook::exception{"Reference graph limits exceed the supported bounded snapshot geometry"};}
+    }
+    inline auto capture(const nb::root& root,const vmhook::reference_graph_limits limits) -> vmhook::reference_graph
+    {
+        validate_limits(limits);
+        nb::operation access{};
+        if(!access||!nb::active()||vmhook::hotspot::in_java_detour())
+        {throw vmhook::exception{"Reference graphs require a standalone native_thread_context"};}
+        if(!root||!root->valid()) {throw vmhook::exception{"Reference graph input must have a live VM-scanned root"};}
+        const auto& geometry=coordinate_cache::get();
+        if(!geometry.ready) {throw vmhook::exception{"This exact VM profile has no verified Java reference graph geometry"};}
+        auto* reference=coordinate_cache::reference_identity.load(std::memory_order_acquire);
+        if(!reference) {reference=vmhook::detail::field_memory_backend::bootstrap_class("java/lang/ref/Reference");}
+        auto reference_root=reference?nb::retain_class(reference):nb::root{};
+        if(!reference_root) {throw vmhook::exception{"Reference graph cannot identify the bootstrap Reference class"};}
+        // Only this well-known bootstrap class is immortal for the audited JVM
+        // lifetime. Application Class identities are never cached here.
+        coordinate_cache::reference_identity.store(reference,std::memory_order_release);
+        // Prewarm the array/codec metadata before the VMThread callback. The
+        // callback only reads and copies into these fixed-capacity C++ buffers.
+        auto* const input_class=vmhook::klass_from_oop(root->resolve_under_vm());
+        (void)vmhook::detail::array_layout(input_class);
+        const auto* const input_name=input_class?input_class->get_name():nullptr;
+        if(!input_name) {throw vmhook::exception{"Reference graph cannot prewarm its runtime class/symbol geometry"};}
+        (void)input_name->first_bytes<2>();
+        (void)vmhook::hotspot::decode_oop_pointer(1);
+        payload state{};state.geometry=&geometry;state.input=root->slot;state.reference_class=reference;
+        state.result.limits=limits;
+        state.classes.resize(limits.max_classes);state.nodes.resize(limits.max_nodes);
+        state.edges.resize(limits.max_edges);state.labels.resize(limits.max_label_bytes);
+        state.identities.assign(std::bit_ceil(limits.max_nodes*2),absent);
+        {
+            vmhook::detail::heap_iteration::allocation_guard lock{vmhook::detail::heap_iteration::config()};
+            if(!vmhook::detail::jit_backend::at_safepoint(&at_safepoint,&state)||!state.executed)
+            {throw vmhook::exception{"The verified reference graph safepoint operation could not run"};}
+        }
+        if(state.failure) {throw vmhook::exception{state.failure};}
+        auto text=[&](text_range range) {return std::string{state.labels.data()+range.offset,range.size};};
+        state.result.classes.reserve(state.class_count);state.result.nodes.reserve(state.node_count);
+        state.result.edges.reserve(state.edge_count);
+        for(std::size_t i{};i<state.class_count;++i) {state.result.classes.push_back({i,text(state.classes[i].name)});}
+        for(std::size_t i{};i<state.node_count;++i) {state.result.nodes.push_back(state.nodes[i].value);}
+        for(std::size_t i{};i<state.edge_count;++i)
+        {
+            auto& edge=state.edges[i];edge.value.name=text(edge.name);edge.value.signature=text(edge.signature);
+            state.result.edges.push_back(std::move(edge.value));
+        }
+        return std::move(state.result);
+    }
+}
+namespace vmhook
+{
+    template<typename wrapper_type>
+    [[nodiscard]] inline auto snapshot_references(const std::unique_ptr<wrapper_type>& object,
+        const reference_graph_limits limits={}) -> reference_graph
+    {
+        static_assert(vmhook::detail::is_java_wrapper_v<wrapper_type>);
+        vmhook::detail::reference_graph_backend::validate_limits(limits);
+        vmhook::detail::native_backend::operation access{};
+        if(!object) {throw vmhook::exception{"A reference graph requires an allocated C++ wrapper"};}
+        if(!access||!vmhook::detail::native_backend::active()||vmhook::hotspot::in_java_detour())
+        {throw vmhook::exception{"Reference graphs require a standalone native_thread_context"};}
+        const auto& owner=static_cast<const vmhook::object_base&>(*object);
+        if(!owner.get_instance()) {reference_graph result{};result.limits=limits;return result;}
+        return vmhook::detail::reference_graph_backend::capture(owner.get_native_root(),limits);
+    }
+}
+namespace vmhook::detail
+{
+    inline auto verified_reference_graph_available() -> bool
+    {return vmhook::detail::reference_graph_backend::coordinate_cache::get().ready;}
+}
+// VMHOOK_REFERENCE_GRAPH_END

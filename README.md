@@ -191,7 +191,10 @@ Multiple observers share one physical stub with defined priority/order and
 recursion policy. `set`, `cancel` and `set_arg` control the return and arguments.
 Installation drains compilation, performs a real VM safepoint deoptimization
 and prevents target compilation/inlining while hooked. It covers already
-compiled and inlined callers and needs no JVM launch flags.
+compiled and inlined callers and needs no JVM launch flags. Additional observers
+reuse the policy only after verifying its completed invalidation and live exclusions
+at a safepoint. [JIT policy and source audit](docs/selective-deoptimization.md)
+explain why a first installation still needs global deoptimization.
 
 `hook_field` uses ASM stubs before interpreter `getstatic`/`putstatic` primitive
 and reference accesses, with replacement and prevention. Object callbacks use
@@ -231,6 +234,12 @@ establish a reachability graph. Unsupported profiles or collectors are refused.
 See [heap snapshots and GC barriers](docs/heap-memory.md) for the locking and
 root-publication protocol.
 
+`snapshot_references(object)` copies a bounded graph of strong instance-field and
+array references, with IDs for cycles and shared objects. Explicit budgets report
+truncation; weak-reference internals are excluded before reading. The result
+contains copied records and does not retain discovered objects. See
+[reference graphs](docs/reference-graphs.md) for the traversal boundaries.
+
 `get_loaded_classes()` takes a bounded safepoint snapshot of rooted `Class`
 wrappers and copied names. Different loaders defining the same name remain
 distinct. See [loaded classes](docs/class-inventory.md) for lifetime and bounds.
@@ -267,7 +276,9 @@ module generates the permanent C++23 header with `tools/make_header.py`.
 
 The [four compiled DLL examples](examples/README.md) provide complete starting
 points. [Benchmarks](docs/benchmarks.md) record executable workloads and measurement
-limits. [CONTRIBUTING.md](CONTRIBUTING.md) describes required validation.
+limits. The [pinned H2 workload](docs/h2-application.md) exercises real JDBC
+transactions over TCP, entirely from the injected C++ native thread.
+[CONTRIBUTING.md](CONTRIBUTING.md) describes required validation.
 
 ## Compatibility and license
 
