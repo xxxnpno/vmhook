@@ -27015,7 +27015,7 @@ export namespace vmhook
         {
             constexpr std::string_view contract{ "java/lang/management/GarbageCollectorMXBean" };
             garbage_collector_snapshot snapshot{};
-            snapshot.name = detail::management_call(collector, contract, "getName", "()Ljava/lang/String;");
+            snapshot.name = static_cast<std::string>(detail::management_call(collector, contract, "getName", "()Ljava/lang/String;"));
             snapshot.valid = detail::management_call(collector, contract, "isValid", "()Z");
             const std::int64_t count{ detail::management_call(collector, contract, "getCollectionCount", "()J") };
             const std::int64_t elapsed{ detail::management_call(collector, contract, "getCollectionTime", "()J") };
@@ -27056,9 +27056,9 @@ export namespace vmhook
             if (!info->get_instance()) { result.push_back(std::move(snapshot)); continue; }
             snapshot.alive = true;
             constexpr std::string_view info_contract{ "java/lang/management/ThreadInfo" };
-            snapshot.name = detail::management_call(info, info_contract, "getThreadName", "()Ljava/lang/String;");
+            snapshot.name = static_cast<std::string>(detail::management_call(info, info_contract, "getThreadName", "()Ljava/lang/String;"));
             const std::unique_ptr<any_object> state{ detail::management_call(info, info_contract, "getThreadState", "()Ljava/lang/Thread$State;") };
-            snapshot.state = detail::management_call(state, "java/lang/Enum", "name", "()Ljava/lang/String;");
+            snapshot.state = static_cast<std::string>(detail::management_call(state, "java/lang/Enum", "name", "()Ljava/lang/String;"));
             snapshot.suspended = detail::management_call(info, info_contract, "isSuspended", "()Z");
             snapshot.in_native = detail::management_call(info, info_contract, "isInNative", "()Z");
             snapshot.blocked_count = detail::management_call(info, info_contract, "getBlockedCount", "()J");
@@ -27079,8 +27079,8 @@ export namespace vmhook
             {
                 constexpr std::string_view frame_contract{ "java/lang/StackTraceElement" };
                 java_stack_frame_snapshot copied{};
-                copied.class_name = detail::management_call(frame, frame_contract, "getClassName", "()Ljava/lang/String;");
-                copied.method_name = detail::management_call(frame, frame_contract, "getMethodName", "()Ljava/lang/String;");
+                copied.class_name = static_cast<std::string>(detail::management_call(frame, frame_contract, "getClassName", "()Ljava/lang/String;"));
+                copied.method_name = static_cast<std::string>(detail::management_call(frame, frame_contract, "getMethodName", "()Ljava/lang/String;"));
                 copied.line_number = detail::management_call(frame, frame_contract, "getLineNumber", "()I");
                 copied.native_method = detail::management_call(frame, frame_contract, "isNativeMethod", "()Z");
                 snapshot.stack.push_back(std::move(copied));
