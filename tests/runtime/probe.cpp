@@ -51,6 +51,7 @@ namespace
 
     struct call_results
     {
+        bool callback_thread{};
         bool invoked{};
         bool count_correct{};
         bool constructed{};
@@ -73,9 +74,16 @@ namespace
 
     auto verify_argument_mutation() -> bool
     {
-        struct check_state { std::atomic<unsigned> checked{}; std::atomic<bool> valid{true}; };
+        vmhook::native_thread_context context{"VMHook-argument-fixture"};
+        if (!context.valid()) { return false; }
+        struct check_state
+        {
+            std::atomic<unsigned> checked{};
+            std::atomic<unsigned> observed{};
+            std::atomic<bool> valid{true};
+        };
         const auto state = std::make_shared<check_state>();
-        const bool installed = vmhook::hook<fixture>("mixed", "(IJIDI[Ljava/lang/Object;)I",
+        const auto installed = vmhook::add_hook<fixture>("mixed", "(IJIDI[Ljava/lang/Object;)I",
             [state](vmhook::return_value& result, const std::unique_ptr<fixture>& self,
                               std::int32_t first, std::int64_t wide, std::int32_t following,
                               double floating, std::int32_t last,
@@ -101,19 +109,39 @@ namespace
                 && std::get<5>(arguments) == -7 && std::get<6>(arguments) == nullptr;
             if (!correct) { state->valid.store(false, std::memory_order_relaxed); }
             state->checked.fetch_add(1, std::memory_order_release);
-        });
-        const bool duplicate_refused = !vmhook::hook<fixture>(
-            "mixed", "(IJIDI[Ljava/lang/Object;)I", [](vmhook::return_value&) {});
+        }, {.priority = 0});
+        const auto observer = vmhook::add_hook<fixture>(
+            "mixed", "(IJIDI[Ljava/lang/Object;)I", [state](vmhook::return_value& result)
+        {
+            const auto arguments = result.frame()->get_arguments<vmhook::oop_t, std::int32_t,
+                std::int64_t, std::int32_t, double, std::int32_t, vmhook::oop_t>();
+            const bool correct = std::get<1>(arguments) == 21
+                && std::get<2>(arguments) == 0x1122334455667788LL
+                && std::get<3>(arguments) == -3 && std::get<4>(arguments) == 42.25
+                && std::get<5>(arguments) == -7 && std::get<6>(arguments) == nullptr;
+            if (!correct) { state->valid.store(false, std::memory_order_relaxed); }
+            state->observed.fetch_add(1, std::memory_order_release);
+        }, {.priority = 1});
         for (int attempt = 0; installed && attempt < 500; ++attempt)
         {
-            if (state->checked.load(std::memory_order_acquire) > 0 && fixture::arguments_mutated()) { break; }
+            if (state->checked.load(std::memory_order_acquire) > 0
+                && state->observed.load(std::memory_order_acquire) > 0
+                && fixture::arguments_mutated()) { break; }
             ::Sleep(10);
         }
-        const bool correct = installed && duplicate_refused
+        const bool correct = installed && observer
             && state->checked.load(std::memory_order_acquire) > 0
+            && state->observed.load(std::memory_order_acquire) > 0
             && state->valid.load(std::memory_order_relaxed) && fixture::arguments_mutated();
         vmhook::shutdown_hooks();
         return correct;
+    }
+
+    auto install_dispatch_hook() -> bool
+    {
+        vmhook::native_thread_context context{"VMHook-dispatch-admin"};
+        return context.valid()
+            && vmhook::hook<fixture>("tick", "()V", [](vmhook::return_value&) {});
     }
 
     auto verify_hook_lifecycle(std::ostream& output) -> void
@@ -159,15 +187,22 @@ namespace
             return 1;
         }
         std::ofstream output{destination};
+        output << std::unitbuf;
         try
         {
-            if (!vmhook::register_class<fixture>("VMHookFixture"))
             {
-                output << "metadata=fail\n";
-                return 2;
+                vmhook::native_thread_context context{"VMHook-metadata-fixture"};
+                if (!context.valid() || !vmhook::register_class<fixture>("VMHookFixture")
+                    || fixture::total() != 41)
+                {
+                    output << "metadata=fail\n";
+                    return 2;
+                }
+                output << "metadata=pass\n";
             }
-            output << "metadata=" << (fixture::total() == 41 ? "pass" : "fail") << '\n';
-            const auto refused = fixture::count_result();
+            // Checked call() throws outside a Java context; try_call() reports
+            // this deliberate refusal without hiding checked-call regressions.
+            const auto refused = fixture::static_members::get_method("count", "()I")->try_call();
             output << "native_refusal="
                    << (!vmhook::can_call_java() && !refused.was_invoked() ? "pass" : "fail") << '\n';
             char mode[32]{};
@@ -177,7 +212,7 @@ namespace
                 output << "baseline=pass\n";
                 return 0;
             }
-            if (!vmhook::hook<fixture>("tick", "()V", [](vmhook::return_value&) {}))
+            if (!install_dispatch_hook())
             {
                 output << "hook=unsupported\n";
                 return 3;
@@ -186,13 +221,14 @@ namespace
             const bool arguments_correct = verify_argument_mutation();
             output << "argument_mutation=" << (arguments_correct ? "pass" : "fail") << '\n';
             if (!arguments_correct
-                || !vmhook::hook<fixture>("tick", "()V", [](vmhook::return_value&) {})) { return 7; }
+                || !install_dispatch_hook()) { return 7; }
+            const auto worker_thread = ::GetCurrentThreadId();
             if (std::string_view{mode} == "hooks")
             {
-                auto future = vmhook::dispatch([]
+                auto future = vmhook::dispatch([worker_thread]
                 {
                     auto nested = vmhook::dispatch([] { return 17; });
-                    return vmhook::can_call_java()
+                    return ::GetCurrentThreadId() != worker_thread && vmhook::can_call_java()
                         && nested.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready
                         && nested.get() == 17;
                 });
@@ -202,9 +238,11 @@ namespace
                 verify_hook_lifecycle(output);
                 return dispatched ? 0 : 4;
             }
-            auto future = vmhook::dispatch([]
+            auto future = vmhook::dispatch([worker_thread]
             {
                 call_results results;
+                results.callback_thread = ::GetCurrentThreadId() != worker_thread
+                    && vmhook::can_call_java();
                 auto count = fixture::count_result();
                 results.invoked = count.was_invoked();
                 if (results.invoked && !count.threw())
@@ -238,14 +276,14 @@ namespace
                 return 4;
             }
             const auto results = future.get();
-            output << "dispatch=pass\ninvocation="
+            output << "dispatch=" << (results.callback_thread ? "pass" : "fail") << "\ninvocation="
                    << (results.invoked ? (results.count_correct ? "pass" : "fail") : "unsupported")
                    << "\nconstruction="
                    << (results.constructed ? (results.construction_correct ? "pass" : "fail") : "unsupported")
                    << "\njava_exception=" << (results.exception_correct ? "pass" : "fail")
                    << "\nstring_read=" << (results.string_correct ? "pass" : "fail")
                    << '\n';
-            if (!results.invoked || !results.count_correct
+            if (!results.callback_thread || !results.invoked || !results.count_correct
                 || !results.constructed || !results.construction_correct
                 || !results.exception_correct || !results.string_correct)
             {
