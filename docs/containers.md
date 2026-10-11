@@ -159,3 +159,26 @@ the position according to Java's `put(byte[])` contract.
 The API exposes copied C++ bytes, not a borrowed pointer to direct storage.
 The retained Java buffer and its Cleaner own direct-memory lifetime. Read-only
 buffers, invalid indices, and insufficient remaining space raise Java failures.
+
+## Inferred arguments
+
+Typed arrays retain their full JVM descriptor: `array<player>` is a Java
+`Player[]`, and `array<array<std::int32_t>>` is `int[][]`. Standard wrappers
+such as `java_string` and `collection` supply their Java contracts without
+registration. Register application wrapper classes before using them as
+arguments, including the leaf of a nested object array.
+
+```cpp
+const auto text = vmhook::new_string<vmhook::java_string>("hello");
+const auto players = vmhook::make_array<player>(2);
+const auto message = vmhook::make_unique<message_wrapper>(text, players);
+```
+
+Name-only method and constructor lookup first selects an exact parameter
+descriptor. When no exact overload exists, Java class identity and assignability
+allow conversions such as `String` to `CharSequence` or `Object`, `Player[]` to
+`Object[]` or `Object`, and `ArrayList` to `Collection`. The unique most-specific
+applicable overload wins. Incomparable overloads require an explicit descriptor.
+An allocated Java-null typed wrapper follows its declared C++ wrapper type for
+this selection. A missing application binding is an error; it is not inferred
+as `Object`. The explicit `any_object` and `borrowed<void>` forms remain opaque.

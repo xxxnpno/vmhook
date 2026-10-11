@@ -9925,7 +9925,9 @@ export namespace vmhook
         [[nodiscard]] inline auto java_wrapper_descriptor() -> std::string
         {
             static_assert(std::is_base_of_v<vmhook::object_base, wrapper_type>);
-            if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+            if constexpr (std::is_same_v<wrapper_type, vmhook::any_object>)
+            { return "Ljava/lang/Object;"; }
+            else if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
             {
                 using element_type = typename wrapper_type::java_element_type;
                 if constexpr (std::is_base_of_v<vmhook::object_base, element_type>)
@@ -10030,6 +10032,8 @@ export namespace vmhook
                 if constexpr (std::is_void_v<wrapper_type>) { return "Ljava/lang/Object;"; }
                 else { return java_wrapper_descriptor<wrapper_type>(); }
             }
+            else if constexpr (vmhook::detail::is_ref_v<clean_t>)
+            { return java_wrapper_descriptor<typename vmhook::detail::is_ref<clean_t>::value_type_t>(); }
             else if constexpr (vmhook::detail::is_unique_ptr_v<clean_t>)
             {
                 using wrapper_type = typename vmhook::detail::is_unique_ptr<clean_t>::value_type_t;
@@ -19100,13 +19104,15 @@ export namespace vmhook
             signature_matches_arguments().  If so, returns this->method directly.
             Otherwise walks the runtime klass hierarchy (obtained from the object header),
             and checks every method with the same name for a matching signature.  Returns
-            the first callable match, or nullptr when no compatible overload exists.
+            an exact descriptor match first. Otherwise verifies reference upcasts
+            against the declaring loader's Class mirrors and selects the unique
+            most-specific parameter list. Incomparable overloads are refused.
 
             This allows a single get_method("foo") result to handle overloaded Java methods
             when the call site provides typed arguments.
 
-            Complexity: O(N * M) where N = number of methods in the class hierarchy,
-                        M = signature parse cost per method.
+            Complexity: O(N * M) for exact lookup; reference fallback may make
+                        O(N^2 * M) ordinary Java Class comparisons.
             Exception safety: rejects unreadable or incompatible metadata; string allocation may propagate std::bad_alloc.
 
             @tparam args_t  C++ argument types from the call<>() invocation.
@@ -26778,7 +26784,9 @@ namespace hotspot
         template<typename wrapper_type>
         inline auto wrapper_class_mirror() -> native_backend::root
         {
-            if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
+            if constexpr (std::is_same_v<wrapper_type, vmhook::any_object>)
+            { return native_backend::retain_class(registered_bootstrap_klass("java/lang/Object")); }
+            else if constexpr (requires { wrapper_type::java_array_wrapper; typename wrapper_type::java_element_type; })
             {
                 if (auto* const loaded{loaded_array_wrapper_class<wrapper_type>()})
                 { return native_backend::retain_class(loaded); }
