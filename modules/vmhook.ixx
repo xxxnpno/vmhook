@@ -25734,3 +25734,120 @@ export namespace vmhook::detail {
     }
 }
 // VMHOOK_PERSISTENT_ROOTS_END
+
+// VMHOOK_RUNTIME_DIAGNOSTICS_BEGIN
+export namespace vmhook
+{
+    enum class feature_state : std::uint8_t { unavailable, conditional, supported };
+
+    enum class runtime_feature : std::uint8_t
+    {
+        native_calls, object_construction, rooted_object_access, reference_field_writes,
+        persistent_references, method_entry_hooks, static_primitive_field_hooks,
+        class_definition_events, original_method_exit_events, exact_heap_iteration,
+        mixed_stack_sampling, virtual_thread_hooks, count
+    };
+
+    struct feature_support final
+    {
+        runtime_feature feature{};
+        feature_state state{ feature_state::unavailable };
+        std::string_view reason{};
+    };
+
+    struct runtime_capability_report final
+    {
+        bool jvm_found{};
+        bool private_abi_verified{};
+        bool external_symbols{};
+        int java_feature{};
+        std::array<unsigned char, 16> codeview_guid{};
+        std::uint32_t codeview_age{}, pe_timestamp{};
+        std::size_t image_size{};
+        gc_collector collector{ gc_collector::unknown };
+        bool gc_flags_resolved{}, compressed_oops{}, compact_object_headers{};
+        std::string_view reason{ "JVM not found" };
+        std::array<feature_support, static_cast<std::size_t>(runtime_feature::count)> features{};
+
+        [[nodiscard]] auto support(const runtime_feature feature) const noexcept -> feature_support
+        {
+            const auto index{ static_cast<std::size_t>(feature) };
+            if (index >= features.size())
+            { return { feature, feature_state::unavailable, "Unknown feature" }; }
+            return features[index];
+        }
+    };
+
+    // Passive preflight. This resolves metadata and private ABI coordinates; it
+    // never attaches a thread, starts the root keeper, or installs a hook.
+    // A conditional feature still needs the stated target-specific validation.
+    [[nodiscard]] inline auto runtime_capabilities() -> runtime_capability_report
+    {
+        runtime_capability_report report{};
+        auto& runtime{ detail::private_native::rt() };
+        report.jvm_found = runtime.base != 0;
+        report.private_abi_verified = runtime.ready;
+        report.external_symbols = runtime.uses_external_symbols();
+        report.image_size = runtime.image_size;
+        report.reason = runtime.reason;
+        if (runtime.profile)
+        {
+            report.java_feature = runtime.profile->java_feature;
+            report.codeview_guid = runtime.profile->guid;
+            report.codeview_age = runtime.profile->age;
+            report.pe_timestamp = runtime.profile->pe_timestamp;
+        }
+        for (std::size_t index{}; index < report.features.size(); ++index)
+        { report.features[index] = { static_cast<runtime_feature>(index), feature_state::unavailable,
+                                    runtime.ready ? "Backend unavailable" : runtime.reason }; }
+        if (!runtime.ready) { return report; }
+        const auto& gc{ vm_capabilities() };
+        report.collector = gc.collector;
+        report.gc_flags_resolved = gc.flags_resolved;
+        report.compressed_oops = gc.compressed_oops;
+        report.compact_object_headers = gc.compact_object_headers;
+        const auto set = [&](runtime_feature feature, feature_state state, std::string_view reason)
+        { report.features[static_cast<std::size_t>(feature)] = { feature, state, reason }; };
+        if (!gc.flags_resolved || !gc.supported)
+        {
+            report.reason = "Collector layout or relocation backend is not verified";
+            for (auto& feature : report.features) { feature.reason = report.reason; }
+            return report;
+        }
+        set(runtime_feature::native_calls, feature_state::supported,
+            "Requires a live native_thread_context on the calling OS thread");
+        set(runtime_feature::object_construction, feature_state::supported,
+            "Private JavaCalls and rooted HotSpot instance allocation");
+        set(runtime_feature::rooted_object_access, feature_state::supported,
+            "Live context-owned roots; foreign and expired roots are refused");
+        set(runtime_feature::reference_field_writes,
+            detail::reference_stores_supported() ? feature_state::supported : feature_state::conditional,
+            "Metadata-bound stores require the collector-aware field backend; raw stores are Epsilon-only");
+        const bool persistent_collector{ report.java_feature == 8
+            ? gc.collector == gc_collector::parallel : gc.collector == gc_collector::g1 };
+        if (!report.external_symbols && persistent_collector)
+        {
+            set(runtime_feature::persistent_references, feature_state::conditional,
+                "Requires successful root-keeper preparation on this exact profile");
+            if (detail::borrowed_callback_supported() && detail::jit_backend::config().ready)
+            {
+                set(runtime_feature::method_entry_hooks, feature_state::conditional,
+                    "Target signature and JIT preparation must pass before publication");
+                set(runtime_feature::static_primitive_field_hooks, feature_state::conditional,
+                    "Interpreter getstatic/putstatic routes only; each field and template is verified");
+                set(runtime_feature::class_definition_events, feature_state::conditional,
+                    "Exact private definition routes; observer preparation must pass");
+            }
+        }
+        set(runtime_feature::original_method_exit_events, feature_state::unavailable,
+            "Entry callbacks and forced returns do not observe an original method exit");
+        set(runtime_feature::exact_heap_iteration, feature_state::unavailable,
+            "Conservative instance scans are not an exact safepoint heap walk");
+        set(runtime_feature::mixed_stack_sampling, feature_state::unavailable,
+            "No verified Windows mixed-stack sampling backend");
+        set(runtime_feature::virtual_thread_hooks, feature_state::unavailable,
+            "Carrier, continuation and virtual-thread root transitions are not verified");
+        return report;
+    }
+}
+// VMHOOK_RUNTIME_DIAGNOSTICS_END
