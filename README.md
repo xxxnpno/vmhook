@@ -220,6 +220,8 @@ G1/Parallel heap iterator at a safepoint. Selected objects are rooted before
 Java resumes; visitors run afterwards in the native context. The snapshot
 contains allocated objects, including objects not yet reclaimed, and does not
 establish a reachability graph. Unsupported profiles or collectors are refused.
+See [heap snapshots and GC barriers](docs/heap-memory.md) for the locking and
+root-publication protocol.
 
 ## Build and install
 

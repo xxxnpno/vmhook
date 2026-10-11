@@ -49,9 +49,11 @@ pending work; deferred installation runs later on the native administrator.
 Retired captures can be reclaimed when readers finish; published stubs and root
 keeper machinery retain their explicit process-lifetime residence contract.
 
-The exact heap iterator reserves root slots before its VM operation. Its object
+The exact heap iterator takes HotSpot's safepoint-aware `Heap_lock` on the native
+caller and reserves root slots before its VM operation. Its object
 visitor performs no Java calls, user callbacks or C++ allocation at the safepoint;
-it publishes selected objects into those slots before the mutators resume. C++
+it applies G1's verified keepalive barrier and publishes selected objects into
+those slots before the mutators resume. C++
 wrapper materialization and user visitors run afterwards. Collection and Java
 management snapshots instead execute ordinary Java methods sequentially; their
 contracts must not be confused with a stop-the-world reachability graph.
