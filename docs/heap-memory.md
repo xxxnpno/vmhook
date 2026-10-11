@@ -119,3 +119,13 @@ Final fields are readable; all setters and CAS operations refuse their
 mutation. A low-level write would bypass Java final-field semantics and could
 contradict an already-folded compiled constant. The library does not promise
 that raw writes invalidate those compiler assumptions.
+
+Direct `set_bool_array` and `set_prim_array` calls require a supported native or
+callback context. They retain the selected array separately from its field
+holder and hold VM state for the full write batch. A Java null array remains a
+no-op; wrong layouts, expired contexts, failed writes and C++ allocation errors
+propagate. The array is updated in place, so a final field's reference is never
+rebound. `set_str_array` additionally roots each newly allocated String and
+refreshes the array address afterward; its raw reference stores remain
+restricted to Epsilon. Use the typed Java array wrapper for collector-aware
+reference element stores on moving collectors.

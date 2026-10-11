@@ -1253,14 +1253,14 @@ export namespace vmhook
     inline auto field_oop(const field_proxy& field)
         -> void*;
 
-    inline auto set_bool_array(const field_proxy& field, const std::vector<bool>& values) noexcept
+    inline auto set_bool_array(const field_proxy& field, const std::vector<bool>& values)
         -> void;
 
     inline auto set_str_array(const field_proxy& field, const std::vector<std::string>& values)
         -> void;
 
     template<typename element_type>
-    inline auto set_prim_array(const field_proxy& field, const std::vector<element_type>& values) noexcept
+    inline auto set_prim_array(const field_proxy& field, const std::vector<element_type>& values)
         -> void;
 
     // --- Compile-time type traits --------------------------------------------
@@ -22311,159 +22311,162 @@ export namespace vmhook
         field.set(value);
     }
 
-    /*
-        @brief Writes a std::vector<bool> into a Java boolean[] field.
-        @details
-        Decodes the field's array OOP via field_oop(), then writes each element
-        as uint8 (0 = false, 1 = true) into the backing boolean[] array.
-        Writes only min(array_length, values.size()) elements.
-
-        Complexity: O(N) where N = written element count.
-        Exception safety: noexcept — returns silently if the OOP is null.
-
-        @param field   A field_proxy whose field holds a boolean[] reference.
-        @param values  Boolean values to write into the array.
-    */
-    inline auto set_bool_array(const vmhook::field_proxy& field, const std::vector<bool>& values) noexcept
-        -> void
+    namespace detail
     {
-        if (field.signature() != "[Z") { return; }
-        void* const array_oop{ vmhook::field_oop(field) };
-        if (!array_oop)
+        // The caller owns a VM operation for the entire batch. The array is a
+        // separate root from its field holder: Java may rebind that field, and
+        // Java allocation in the String helper may safepoint between elements.
+        inline auto array_field_root(const vmhook::field_proxy& field) -> native_backend::root
         {
-            return;
+            const auto value{ field.get() };
+            if (!std::holds_alternative<std::uint32_t>(value.data))
+            { throw vmhook::exception{ "Array helper requires a Java array reference", vmhook::error_code::type_mismatch }; }
+            if (!value.native_root)
+            {
+                if (std::get<std::uint32_t>(value.data) == 0) { return {}; }
+                throw vmhook::exception{ "Array helper could not retain its array" };
+            }
+            if (!value.native_root->valid() || !value.native_root->resolve_under_vm())
+            { throw vmhook::exception{ "Array helper belongs to an expired or different context" }; }
+            return value.native_root;
         }
 
-        const std::int32_t length{ static_cast<std::int32_t>(std::min<std::size_t>(
-            static_cast<std::size_t>(vmhook::array_length(array_oop)), values.size())) };
-        for (std::int32_t index{ 0 }; index < length; ++index)
+        inline auto array_field_layout(void* array, const std::size_t width,
+                                        const bool reference) -> array_layout_t
         {
-            vmhook::set_array_element<std::uint8_t>(array_oop, index, values[static_cast<std::size_t>(index)] ? 1u : 0u);
+            const auto layout{ array_layout(vmhook::klass_from_oop(array)) };
+            if (!layout || layout->reference_elements != reference || layout->element_width != width)
+            { throw vmhook::exception{ "Array helper requires its matching JVM element width", vmhook::error_code::type_mismatch }; }
+            return *layout;
+        }
+
+        inline auto array_field_count(void* array, const array_layout_t& layout,
+                                       const std::size_t values) -> std::int32_t
+        {
+            std::int32_t length{};
+            if (!vmhook::os::safe_read(&length, static_cast<std::byte*>(array)+layout.length_offset,
+                                      sizeof(length)) || length < 0)
+            { throw vmhook::exception{ "Array helper could not read its array length" }; }
+            return static_cast<std::int32_t>(std::min(static_cast<std::size_t>(length), values));
+        }
+
+        template<class value_type>
+        inline auto array_field_write_span(void* array, const array_layout_t& layout,
+                                            const value_type* values, const std::int32_t length) -> void
+        {
+            if (length == 0) { return; }
+            if (layout.element_width != sizeof(value_type)
+                || !vmhook::os::safe_write(static_cast<std::byte*>(array)+layout.body_offset,
+                    values, static_cast<std::size_t>(length)*sizeof(value_type)))
+            { throw vmhook::exception{ "Array helper could not write its elements" }; }
+        }
+
+        template<class value_type>
+        inline auto array_field_write(void* array, const array_layout_t& layout,
+                                       const std::int32_t index, const value_type value) -> void
+        {
+            if (!vmhook::os::safe_write(static_cast<std::byte*>(array)+layout.body_offset
+                    + static_cast<std::size_t>(index)*layout.element_width, &value, sizeof(value)))
+            { throw vmhook::exception{ "Array helper could not write its element" }; }
         }
     }
 
-    /*
-        @brief Writes a std::vector<element_type> into a Java primitive array field.
-        @details
-        Decodes the field's array OOP, then writes each element into the backing Java
-        primitive array.  Special-cases char/uint16 conversion for "[C" (Java char[])
-        fields: narrows each char to uint16 to avoid sign-extension issues.
-        Writes only min(array_length, values.size()) elements.
-
-        Complexity: O(N) where N = written element count.
-        Exception safety: noexcept — returns silently if the OOP is null.
-
-        @tparam element_type  Trivially copyable C++ element type (int, float, etc.).
-        @param field   A field_proxy whose field holds a primitive array reference.
-        @param values  Values to write into the array.
-    */
-    template<typename element_type>
-    inline auto set_prim_array(const vmhook::field_proxy& field, const std::vector<element_type>& values) noexcept
+    /* Direct field-array helpers require a supported native or callback context.
+       Each call roots its selected array and holds VM state across the complete
+       primitive batch. Java null leaves the array unchanged. Only min(length,
+       values.size()) existing elements are written; the field is not rebound.
+       Context, layout, write and C++ allocation failures propagate. */
+    inline auto set_bool_array(const vmhook::field_proxy& field, const std::vector<bool>& values)
         -> void
     {
+        vmhook::detail::native_backend::operation access{};
+        if (!access) { throw vmhook::exception{ "Array helper requires a supported native or callback context" }; }
+        if (field.signature() != "[Z")
+        { throw vmhook::exception{ "Boolean array helper requires a Java boolean[] field", vmhook::error_code::type_mismatch }; }
+        const auto root{ vmhook::detail::array_field_root(field) };
+        if (!root) { return; }
+        void* const array{ root->resolve_under_vm() };
+        const auto layout{ vmhook::detail::array_field_layout(array, sizeof(std::uint8_t), false) };
+        const auto length{ vmhook::detail::array_field_count(array, layout, values.size()) };
+        std::vector<std::uint8_t> packed(static_cast<std::size_t>(length));
+        for (std::int32_t index{}; index < length; ++index)
+        { packed[static_cast<std::size_t>(index)] = values[static_cast<std::size_t>(index)] ? 1 : 0; }
+        vmhook::detail::array_field_write_span(array, layout, packed.data(), length);
+    }
+
+    template<typename element_type>
+    inline auto set_prim_array(const vmhook::field_proxy& field, const std::vector<element_type>& values)
+        -> void
+    {
+        static_assert(std::is_trivially_copyable_v<element_type>);
+        vmhook::detail::native_backend::operation access{};
+        if (!access) { throw vmhook::exception{ "Array helper requires a supported native or callback context" }; }
         const std::string_view signature{ field.signature() };
         if (signature.size() != 2 || signature.front() != '['
-            || vmhook::detail::jvm_primitive_byte_width(signature.substr(1)) == 0) { return; }
-        void* const array_oop{ vmhook::field_oop(field) };
-        if (!array_oop)
+            || vmhook::detail::jvm_primitive_byte_width(signature.substr(1)) == 0)
+        { throw vmhook::exception{ "Primitive array helper requires a Java primitive-array field", vmhook::error_code::type_mismatch }; }
+        const bool widened_character{ std::is_same_v<element_type, char> && signature == "[C" };
+        const auto width{ vmhook::detail::jvm_primitive_byte_width(signature.substr(1)) };
+        if (width != (widened_character ? sizeof(std::uint16_t) : sizeof(element_type)))
+        { throw vmhook::exception{ "Primitive array helper requires its matching JVM element width", vmhook::error_code::type_mismatch }; }
+        const auto root{ vmhook::detail::array_field_root(field) };
+        if (!root) { return; }
+        void* const array{ root->resolve_under_vm() };
+        const auto layout{ vmhook::detail::array_field_layout(array, width, false) };
+        const auto length{ vmhook::detail::array_field_count(array, layout, values.size()) };
+        if constexpr (std::is_same_v<element_type, bool>)
         {
-            return;
+            std::vector<std::uint8_t> packed(static_cast<std::size_t>(length));
+            for (std::int32_t index{}; index < length; ++index)
+            { packed[static_cast<std::size_t>(index)] = values[static_cast<std::size_t>(index)] ? 1 : 0; }
+            vmhook::detail::array_field_write_span(array, layout, packed.data(), length);
         }
-
-        // ELEMENT-WIDTH GUARD (mirrors read_array_value's refusal at 14817 and the
-        // scalar field_proxy::set size-mismatch guard at 15601).  set_array_element
-        // strides the backing array by sizeof(the C++ element), but the array's ACTUAL
-        // element width is fixed by its JVM descriptor ([Z/[B=1, [S/[C=2, [I/[F=4,
-        // [J/[D=8).  A wider C++ element (e.g. an int written into a byte[]) would write
-        // PAST each element into adjacent heap = CORRUPTION; a narrower one mis-strides.
-        // Refuse the write on any mismatch.  The char/"[C" branch below legitimately
-        // writes uint16 (width 2), so it is carved out of this numeric comparison.
-        if constexpr (!std::is_same_v<element_type, char>)
+        else if constexpr (std::is_same_v<element_type, char>)
         {
-            if (signature.size() >= 2 && signature.front() == '[')
+            if (widened_character)
             {
-                const std::size_t field_element_width{
-                    vmhook::detail::jvm_primitive_byte_width(signature.substr(1)) };
-                if (field_element_width != 0 && sizeof(element_type) != field_element_width)
-                {
-                    ::vmhook::detail::log_line("{} set_prim_array: element-width mismatch (C++ element={}B, "
-                               "JVM array element={}B, sig='{}') - refusing the write to avoid "
-                               "corrupting the array data.  Write a std::vector whose element "
-                               "matches the array's primitive width.",
-                               vmhook::error_tag, sizeof(element_type), field_element_width, signature);
-                    return;
-                }
+                std::vector<std::uint16_t> packed(static_cast<std::size_t>(length));
+                for (std::int32_t index{}; index < length; ++index)
+                { packed[static_cast<std::size_t>(index)] = static_cast<unsigned char>(values[static_cast<std::size_t>(index)]); }
+                vmhook::detail::array_field_write_span(array, layout, packed.data(), length);
             }
+            else { vmhook::detail::array_field_write_span(array, layout, values.data(), length); }
         }
-
-        const std::int32_t length{ static_cast<std::int32_t>(std::min<std::size_t>(
-            static_cast<std::size_t>(vmhook::array_length(array_oop)), values.size())) };
-        for (std::int32_t index{ 0 }; index < length; ++index)
-        {
-            const element_type& value{ values[static_cast<std::size_t>(index)] };
-            if constexpr (std::is_same_v<element_type, char>)
-            {
-                if (field.signature() == "[C")
-                {
-                    vmhook::set_array_element<std::uint16_t>(array_oop, index, static_cast<std::uint16_t>(static_cast<unsigned char>(value)));
-                }
-                else
-                {
-                    vmhook::set_array_element<char>(array_oop, index, value);
-                }
-            }
-            else
-            {
-                vmhook::set_array_element<element_type>(array_oop, index, value);
-            }
-        }
+        else { vmhook::detail::array_field_write_span(array, layout, values.data(), length); }
     }
 
-    /*
-        @brief Replaces Java String[] elements with freshly allocated Strings.
-        @details
-        Reuses the existing array, builds an independent String for each input,
-        and stores its reference only on a verified write-barrier-free collector.
-        Existing String objects and their shared backing arrays remain intact.
-        Writes only min(array_length, values.size()) elements.
-
-        Complexity: O(N * S) where N = element count, S = average string length.
-        Exception safety: invalid slots return silently; C++ allocation errors propagate.
-
-        @param field   A field_proxy whose field holds a String[] reference.
-        @param values  New string contents for each slot.
-    */
+    /* String[] raw slot stores remain Epsilon-only: rooting the array does not
+       supply a moving collector's reference-store barrier. Existing strings and
+       their backing arrays are preserved; new strings and the selected array
+       remain rooted across allocation. */
     inline auto set_str_array(const vmhook::field_proxy& field, const std::vector<std::string>& values)
         -> void
     {
-        if (field.signature() != "[Ljava/lang/String;"
-            || !vmhook::detail::reference_stores_supported()) { return; }
-        void* const array_oop{ vmhook::field_oop(field) };
-        if (!array_oop)
+        vmhook::detail::native_backend::operation access{};
+        if (!access) { throw vmhook::exception{ "Array helper requires a supported native or callback context" }; }
+        if (field.signature() != "[Ljava/lang/String;" || !vmhook::detail::reference_stores_supported())
+        { throw vmhook::exception{ "Direct String-array helper requires Epsilon and a Java String[] field" }; }
+        const auto root{ vmhook::detail::array_field_root(field) };
+        if (!root) { return; }
+        auto* array{ root->resolve_under_vm() };
+        const auto layout{ vmhook::detail::array_field_layout(array, vmhook::detail::reference_storage_width(), true) };
+        const auto length{ vmhook::detail::array_field_count(array, layout, values.size()) };
+        for (std::int32_t index{}; index < length; ++index)
         {
-            return;
-        }
-
-        const auto layout{ vmhook::detail::array_layout(vmhook::klass_from_oop(array_oop)) };
-        if (!layout || !layout->reference_elements
-            || layout->element_width != vmhook::detail::reference_storage_width()) { return; }
-        const std::int32_t length{ static_cast<std::int32_t>(std::min<std::size_t>(
-            static_cast<std::size_t>(vmhook::array_length(array_oop)), values.size())) };
-        for (std::int32_t index{ 0 }; index < length; ++index)
-        {
-            void* const string_oop{ vmhook::make_java_string(values[static_cast<std::size_t>(index)]) };
-            if (!string_oop) { return; }
-            if (layout->element_width == sizeof(std::uint32_t))
+            const auto string{ vmhook::detail::native_backend::make_string(values[static_cast<std::size_t>(index)]) };
+            if (!string) { throw vmhook::exception{ "String-array helper could not allocate its element" }; }
+            array = root->resolve_under_vm();
+            auto* const object{ string->resolve_under_vm() };
+            if (!array || !object) { throw vmhook::exception{ "String-array helper lost a retained object" }; }
+            if (layout.element_width == sizeof(std::uint32_t))
             {
-                const std::uint32_t compressed{ vmhook::hotspot::encode_oop_pointer(string_oop) };
-                if (!compressed) { return; }
-                vmhook::set_array_element<std::uint32_t>(array_oop, index, compressed);
+                const auto encoded{ vmhook::hotspot::encode_oop_pointer(object) };
+                if (!encoded) { throw vmhook::exception{ "String-array helper could not encode its element" }; }
+                vmhook::detail::array_field_write(array, layout, index, encoded);
             }
-            else if (layout->element_width == sizeof(void*))
-            {
-                vmhook::set_array_element<void*>(array_oop, index, string_oop);
-            }
-            else { return; }
+            else if (layout.element_width == sizeof(void*))
+            { vmhook::detail::array_field_write(array, layout, index, object); }
+            else { throw vmhook::exception{ "String-array helper reference width is unsupported" }; }
         }
     }
 
