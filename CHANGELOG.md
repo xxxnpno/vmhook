@@ -78,6 +78,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Additional method observers and dormant-policy reuse now validate completed
+  initial compiler drain/deoptimization, exact method identity and live
+  compilation/inlining exclusions at a safepoint before publication. Failed
+  additions preserve earlier observers' policy. Validated reuse retains
+  unrelated and recompiled caller code; first installations still invalidate
+  globally because folded C2 leaves can be absent from method metadata.
+
 - **Breaking Java object ownership contract:** object-valued field getters,
   method returns, `self()` and `root<wrapper>::get()` produce
   `std::unique_ptr<wrapper>`.

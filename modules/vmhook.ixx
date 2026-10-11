@@ -9355,15 +9355,6 @@ export namespace vmhook
                 if (lp != rp) { return lp < rp; }
                 return (left.observer ? left.observer->id : 0) < (right.observer ? right.observer->id : 0);
             });
-            if (policy_installed)
-            {
-                std::erase_if(vmhook::hotspot::g_hooked_methods, [found_method](const auto& entry)
-                { return entry.method == found_method && !entry.detour; });
-                vmhook::hotspot::g_hooked_methods.push_back(std::move(method_entry));
-                vmhook::hotspot::publish_hook_dispatch_locked(std::move(next_dispatch));
-                vmhook::hotspot::collect_hook_dispatch_locked(retired_snapshots);
-                return observer_id;
-            }
             const auto existing_stub{ std::find_if(vmhook::hotspot::g_hooked_i2i_entries.begin(),
                 vmhook::hotspot::g_hooked_i2i_entries.end(), [i2i](const auto& entry) { return entry.i2i_entry == i2i; }) };
             std::unique_ptr<vmhook::hotspot::midi2i_hook> prepared_stub{};
@@ -9399,6 +9390,8 @@ export namespace vmhook
                     }
                     if (*transaction.stub)
                     { vmhook::hotspot::g_hooked_i2i_entries.push_back({ transaction.i2i, transaction.stub->release() }); }
+                    std::erase_if(vmhook::hotspot::g_hooked_methods, [&transaction](const auto& entry)
+                    { return entry.method == transaction.method->method && !entry.detour; });
                     vmhook::hotspot::g_hooked_methods.push_back(std::move(*transaction.method));
                     vmhook::hotspot::publish_hook_dispatch_locked(std::move(*transaction.dispatch));
                     return true;
@@ -11738,6 +11731,10 @@ export namespace vmhook::detail::jit_backend
         std::atomic<unsigned> reasons{};
         method_policy* next{};
         bool excluded{}, intrinsic_owned{}, entry_owned{};
+        // A reason and exclusion can survive an interrupted first transaction.
+        // Only the completed compiler drain/global invalidation proves that
+        // previously compiled or folded callers no longer bypass this method.
+        bool invalidation_complete{};
     };
     // Nodes stay resident so class-definition callbacks need no registry mutex.
     // A zero-reason node owns no live metadata and is ignored by new lookups.
@@ -11845,6 +11842,7 @@ export namespace vmhook::detail::jit_backend
     }
     inline auto exclude(method_policy& policy, const bool field_accessor = false) noexcept -> bool
     {
+        policy.invalidation_complete = false;
         const auto& c{ config() };
         auto* const method{ current_policy_method(policy) };
         if (!method) { return false; }
@@ -11870,6 +11868,7 @@ export namespace vmhook::detail::jit_backend
     }
     inline auto restore(method_policy& policy) noexcept -> void
     {
+        policy.invalidation_complete = false;
         if (!policy.excluded) { return; }
         const auto& c{ config() };
         auto* const method{ current_policy_method(policy) };
@@ -12043,26 +12042,60 @@ export namespace vmhook::detail::jit_backend
         bool (*commit)(void*) noexcept{};
         void* opaque{};
         compilation_pause pause{};
-        bool okay{};
+        bool okay{}, owns_method_reason{};
     };
     inline auto pause_and_exclude(void* const opaque) noexcept -> void
     {
         auto& transaction{ *static_cast<install_transaction*>(opaque) };
         if (!pause_compilation(transaction.pause)) { return; }
-        transaction.okay = transaction.policy->excluded || exclude(*transaction.policy);
+        transaction.okay = (transaction.policy->excluded
+            && method_is_excluded(current_policy_method(*transaction.policy)))
+            || exclude(*transaction.policy);
     }
     inline auto commit_install(void* const opaque) noexcept -> void
     {
         auto& transaction{ *static_cast<install_transaction*>(opaque) };
-        deoptimize_all(); transaction.okay = transaction.commit(transaction.opaque);
-        if (!transaction.okay && (transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(*transaction.policy); }
+        deoptimize_all();
+        transaction.policy->invalidation_complete = true;
+        transaction.okay = transaction.commit(transaction.opaque);
+        if (!transaction.okay && transaction.owns_method_reason
+            && (transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0)
+        { restore(*transaction.policy); }
         resume_compilation(transaction.pause);
     }
     inline auto rollback_install(void* const opaque) noexcept -> void
     {
         auto& transaction{ *static_cast<install_transaction*>(opaque) };
-        if ((transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(*transaction.policy); }
+        if (transaction.owns_method_reason
+            && (transaction.policy->reasons.fetch_and(~method_reason) & ~method_reason) == 0)
+        { restore(*transaction.policy); }
         resume_compilation(transaction.pause);
+    }
+    struct existing_policy_install final
+    {
+        method_policy* policy{};
+        vmhook::hotspot::method* method{};
+        bool (*commit)(void*) noexcept{};
+        void* opaque{};
+        bool eligible{}, okay{};
+    };
+    inline auto commit_existing_policy(void* const opaque) noexcept -> void
+    {
+        auto& transaction{*static_cast<existing_policy_install*>(opaque)};
+        const auto& c{config()};
+        // The first successful installation drained preexisting compiler tasks
+        // and globally deoptimized old inlining before publishing this policy.
+        // Its method reason remains live even after all observers are removed.
+        // Additional observers reuse that completed transaction; no new compiler
+        // pause or invalidation is needed while its exact exclusion still holds.
+        transaction.eligible = transaction.policy->invalidation_complete && transaction.policy->excluded
+            && (transaction.policy->reasons.load(std::memory_order_acquire) & method_reason) != 0
+            && transaction.policy->method == transaction.method
+            && current_policy_method(*transaction.policy) == transaction.method
+            && transaction.policy->const_method == pn::load<void*>(transaction.method, c.const_method_offset)
+            && !pn::load<void*>(transaction.method, c.method_code_offset)
+            && method_is_excluded(transaction.method);
+        if (transaction.eligible) { transaction.okay = transaction.commit(transaction.opaque); }
     }
     inline auto install_method_policy(vmhook::hotspot::method* const method,
         bool (*commit)(void*) noexcept, void* const opaque, std::shared_ptr<void>& retained_policy) -> bool
@@ -12097,9 +12130,21 @@ export namespace vmhook::detail::jit_backend
             // or flags are changed. An allocation failure cannot leave a live
             // reason pointing at metadata whose installer root is about to end.
             retained_policy = std::shared_ptr<void>{policy, [](void*) noexcept {}};
-            policy->reasons.fetch_or(method_reason, std::memory_order_release);
+            if (existing)
+            {
+                existing_policy_install addition{policy, method, commit, opaque};
+                if (!at_safepoint(&commit_existing_policy, &addition))
+                { retained_policy.reset(); return false; }
+                if (addition.eligible)
+                {
+                    if (!addition.okay) { retained_policy.reset(); }
+                    return addition.okay;
+                }
+            }
+            const auto previous_reasons{policy->reasons.fetch_or(method_reason, std::memory_order_release)};
             if (!existing) { publish_policy(prepared_policy.release()); }
             install_transaction transaction{ policy, commit, opaque };
+            transaction.owns_method_reason = (previous_reasons & method_reason) == 0;
             bool okay{ at_safepoint(&pause_and_exclude, &transaction) && transaction.okay };
             compiler_scan scan{};
             if (okay)
@@ -12132,6 +12177,7 @@ export namespace vmhook::detail::jit_backend
     {
         if (!opaque) { return; }
         auto& policy{ *static_cast<method_policy*>(opaque.get()) };
+        policy.invalidation_complete = false;
         if ((policy.reasons.fetch_and(~method_reason) & ~method_reason) == 0) { restore(policy); }
     }
 

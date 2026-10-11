@@ -28,6 +28,17 @@ first callback that cancels execution or sets a forced return wins; later
 callbacks are skipped. A callback failure cancels its own forced return and is
 counted. Argument writes already made by that callback are not rolled back.
 
+The first installation on a method pauses new compilation, drains outstanding
+compiler tasks and performs a real VM-wide deoptimization at a safepoint. A
+second observer or dormant-policy reuse publishes at a safepoint after checking
+the exact Method/ConstMethod, completed initial invalidation, normal/OSR
+compilation exclusions and `dont_inline`. Valid reuse preserves compiled code
+for unrelated methods and callers compiled under that exclusion. Missing
+provenance or exclusion requires the full transaction again. A failed addition
+keeps a prior observer's policy. See
+[the JIT coverage audit](selective-deoptimization.md) for the folded-inline
+counterexample and the remaining limits of selective invalidation.
+
 These callbacks observe method **entry**. `return_value::set()` chooses an early
 return; it does not report the original body's result or its duration.
 
