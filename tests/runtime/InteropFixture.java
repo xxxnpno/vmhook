@@ -32,6 +32,8 @@ public final class InteropFixture {
         }
         return 1234;
     }
+    public static Throwable throwable() { requireWorker(); return new IllegalStateException("interop-error"); }
+    public static String surrogate() { requireWorker(); return "\ud800X"; }
     public static void collect() { requireWorker(); System.gc(); }
     public static void verifyPrimitive(Object value, String descriptor, int length) {
         requireWorker();

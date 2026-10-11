@@ -13558,6 +13558,14 @@ export namespace vmhook
     [[nodiscard]] inline auto make_unique(args_t&&... args)
         -> std::unique_ptr<wrapper_type>;
 
+    template<typename wrapper_type, typename... args_t>
+        requires (vmhook::detail::is_java_wrapper_v<wrapper_type>
+            && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+            && (vmhook::detail::supported_java_argument_v<args_t> && ...))
+    [[nodiscard]] inline auto make_unique_with_descriptor(const std::string_view constructor_signature,
+                                                         args_t&&... args)
+        -> std::unique_ptr<wrapper_type>;
+
 
     // --- Field access ---------------------------------------------------------
 
@@ -18163,7 +18171,22 @@ export namespace vmhook
                         }
                         else
                         {
-                            std::memcpy(&v, &a, sizeof(clean_t));
+                            if constexpr (std::is_integral_v<clean_t>)
+                            {
+                                // JVM B/S parameters occupy int slots and must
+                                // be sign-extended. A one-byte memcpy of -12
+                                // instead supplies +244 to Java bytecode.
+                                switch (descriptor)
+                                {
+                                case 'Z': v = static_cast<bool>(a) ? 1 : 0; break;
+                                case 'B': v = static_cast<std::int8_t>(a); break;
+                                case 'S': v = static_cast<std::int16_t>(a); break;
+                                case 'C': v = static_cast<std::uint16_t>(a); break;
+                                case 'I': v = static_cast<std::int32_t>(a); break;
+                                default: std::memcpy(&v, &a, sizeof(clean_t)); break;
+                                }
+                            }
+                            else { std::memcpy(&v, &a, sizeof(clean_t)); }
                             params[param_idx++] = v;
                         }
                     }
@@ -18959,6 +18982,13 @@ export namespace vmhook
                 && (vmhook::detail::supported_java_argument_v<args_t> && ...))
         friend auto make_unique(args_t&&... args) -> std::unique_ptr<wrapper_type>;
         std::shared_ptr<void> metadata_lifetime_{};
+
+        template<typename wrapper_type, typename... args_t>
+            requires (vmhook::detail::is_java_wrapper_v<wrapper_type>
+                && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+                && (vmhook::detail::supported_java_argument_v<args_t> && ...))
+        friend auto make_unique_with_descriptor(const std::string_view constructor_signature,
+                                                args_t&&... args) -> std::unique_ptr<wrapper_type>;
     };
 
     // --- Object base class ----------------------------------------------------
@@ -20633,7 +20663,20 @@ export namespace vmhook
                     || container_class_assignable(declaring_class, candidate)))
                 { expected = dimensions == 0 ? candidate : array_of(candidate); }
             }
-            else { expected = vmhook::resolve_array_klass(descriptor); }
+            else
+            {
+                expected = vmhook::resolve_array_klass(descriptor);
+                if (!expected)
+                {
+                    // Primitive array identities are unique to the bootstrap
+                    // VM. Modern JVMs may omit the old Universe array statics;
+                    // exact live descriptors prove identity without a name-only
+                    // classloader graph search or an assumed static offset.
+                    auto* const actual{ vmhook::klass_from_oop(argument_root->resolve_under_vm()) };
+                    if (actual && actual->get_name() && actual->get_name()->to_string() == descriptor
+                        && vmhook::detail::array_layout(actual)) { expected = actual; }
+                }
+            }
 
             if (!expected)
             {
@@ -21273,7 +21316,10 @@ export namespace vmhook
         {
             native_backend::operation access{};
             if (!access) { throw vmhook::exception{ "Java bootstrap call requires a rooted VM context" }; }
-            const auto [target, target_root]{ ensure_bootstrap_class(class_name) };
+            auto resolved{ ensure_bootstrap_class(class_name) };
+            if (!vmhook::detail::class_initialized(resolved.first))
+            { resolved = ensure_bootstrap_class(class_name, true); }
+            auto* const target{ resolved.first };
             auto** const methods{ target->get_methods_ptr() };
             const auto count{ target->get_methods_count() };
             for (std::int32_t index{}; methods && index < count; ++index)
@@ -21336,10 +21382,14 @@ export namespace vmhook
         }
 
         [[nodiscard]] inline auto allocate_array_through_java(const std::string_view descriptor,
-            const std::int32_t length, const std::size_t requested_width) -> native_backend::root
+            const std::int32_t length, const std::size_t requested_width,
+            const native_backend::root& component_override = {}) -> native_backend::root
         {
+            native_backend::operation access{};
+            if (!access) { throw vmhook::exception{ "Java array allocation requires a rooted VM context" }; }
             if (length < 0) { throw vmhook::exception{ "Java array length must be nonnegative" }; }
-            const auto component{ array_component_mirror(descriptor) };
+            const auto component{ component_override
+                ? materialize_object<vmhook::any_object>(0, component_override) : array_component_mirror(descriptor) };
             auto result{ call_bootstrap_method("java/lang/reflect/Array", "newInstance",
                 "(Ljava/lang/Class;I)Ljava/lang/Object;", component, length) };
             const auto root{ container_result_root(result) };
@@ -21373,9 +21423,12 @@ export namespace vmhook
     /* Typed views retain the array, re-resolve it under every VM operation and
        bounds-check before access. Reference stores invoke Array.set so HotSpot
        performs covariance checks and the current collector's write barriers. */
-    template<vmhook::detail::java_array_element element_type>
+    // The element constraint is delayed until instantiation so mutually
+    // recursive wrappers can declare owning array results using forward types.
+    template<typename element_type>
     class array : public vmhook::oop_reflective_base
     {
+        static_assert(vmhook::detail::java_array_element<element_type>, "array elements must be Java primitives or wrappers");
         inline static constexpr bool references{ vmhook::detail::container_wrapper<element_type> };
         auto checked_root() const -> vmhook::detail::native_backend::root
         {
@@ -21408,7 +21461,26 @@ export namespace vmhook
         inline static constexpr bool java_array_wrapper{ true };
         inline static constexpr std::string_view java_contract{ references
             ? "[Ljava/lang/Object;" : vmhook::detail::primitive_array_descriptor<element_type> };
+        using java_element_type = element_type;
         using value_type = std::conditional_t<references, std::unique_ptr<element_type>, element_type>;
+        static auto descriptor() -> std::string
+        {
+            if constexpr (!references)
+            { return std::string{vmhook::detail::primitive_array_descriptor<element_type>}; }
+            else if constexpr (requires { element_type::java_array_wrapper; typename element_type::java_element_type; })
+            { return "[" + element_type::descriptor(); }
+            else
+            {
+                std::string component{ vmhook::detail::registered_class_name<element_type>() };
+                if (component.empty())
+                {
+                    if constexpr (requires { std::string_view{ element_type::java_contract }; })
+                    { component = element_type::java_contract; }
+                }
+                if (component.empty()) { throw vmhook::exception{ "Java array element wrapper is not registered" }; }
+                return "[L" + component + ";";
+            }
+        }
         auto size() const -> std::int32_t
         {
             vmhook::detail::native_backend::operation access{};
@@ -21485,6 +21557,25 @@ export namespace vmhook
                 { throw vmhook::exception{ "Java array bulk copy failed" }; }
             }
             return result;
+        }
+        auto copy_from(const std::unique_ptr<array>& source, const std::int32_t source_offset,
+                       const std::int32_t destination_offset, const std::int32_t count) const -> void
+        {
+            vmhook::detail::native_backend::operation access{};
+            if (!access) { throw vmhook::exception{ "Java array copy requires a rooted VM context" }; }
+            vmhook::detail::require_object_argument(source);
+            const auto destination{ vmhook::detail::materialize_object<vmhook::any_object>(0, checked_root()) };
+            (void)vmhook::detail::call_bootstrap_method("java/lang/System", "arraycopy",
+                "(Ljava/lang/Object;ILjava/lang/Object;II)V", source, source_offset, destination, destination_offset, count);
+        }
+        auto copy_from(const std::vector<bool>& values, const std::int32_t offset = 0) const -> void
+            requires (std::is_same_v<element_type, bool>)
+        {
+            const auto length{ size() };
+            if (offset < 0 || offset > length || values.size() > static_cast<std::size_t>(length - offset))
+            { throw vmhook::exception{ "Java boolean array copy is out of bounds" }; }
+            for (std::size_t index{}; index < values.size(); ++index)
+            { set(offset + static_cast<std::int32_t>(index), values[index]); }
         }
         auto copy_from(const std::span<const element_type> values, const std::int32_t offset = 0) const -> void
             requires (!references && !std::is_same_v<element_type, bool>)
@@ -25251,6 +25342,15 @@ namespace hotspot
             && (vmhook::detail::supported_java_argument_v<args_t> && ...))
     inline auto make_unique(args_t&&... args)
         -> std::unique_ptr<wrapper_type>
+    { return vmhook::make_unique_with_descriptor<wrapper_type>({}, std::forward<args_t>(args)...); }
+
+    template<typename wrapper_type, typename... args_t>
+        requires (vmhook::detail::is_java_wrapper_v<wrapper_type>
+            && std::is_same_v<wrapper_type, std::remove_cv_t<wrapper_type>>
+            && (vmhook::detail::supported_java_argument_v<args_t> && ...))
+    inline auto make_unique_with_descriptor(const std::string_view constructor_signature,
+                                           args_t&&... args)
+        -> std::unique_ptr<wrapper_type>
     {
         vmhook::detail::native_backend::operation native_operation{};
         const bool native_call{ vmhook::detail::native_backend::active() };
@@ -25270,7 +25370,20 @@ namespace hotspot
             throw vmhook::exception{ "Java object wrapper is not registered" };
         }
 
-        vmhook::hotspot::klass* const target_klass{ vmhook::detail::registered_class_klass<wrapper_type>() };
+        vmhook::hotspot::klass* target_klass{ vmhook::detail::registered_class_klass<wrapper_type>() };
+        vmhook::detail::native_backend::root builtin_class_root{};
+        if (!target_klass)
+        {
+            if constexpr (requires { std::string_view{ wrapper_type::java_contract }; })
+            {
+                if (std::string_view{wrapper_type::java_contract}.starts_with("java/"))
+                {
+                    const auto resolved{ vmhook::detail::ensure_bootstrap_class(class_name) };
+                    target_klass = resolved.first;
+                    builtin_class_root = resolved.second;
+                }
+            }
+        }
         if (!target_klass || !vmhook::hotspot::is_valid_pointer(target_klass))
         {
             ::vmhook::detail::log_line("{} make_unique(): class '{}' is not loaded in this VM.",
@@ -25308,7 +25421,8 @@ namespace hotspot
                     // <init> is spelled <init> under every mapping: the JVM
                     // reserves the name, so no obfuscator or remapper touches it.
                     if (candidate && vmhook::hotspot::is_valid_pointer(candidate)
-                        && candidate->get_name() == "<init>")
+                        && candidate->get_name() == "<init>"
+                        && (constructor_signature.empty() || candidate->get_signature() == constructor_signature))
                     {
                         initializer = candidate;
                         break;
@@ -25387,13 +25501,15 @@ namespace hotspot
                 for (std::int32_t index{ 0 }; index < count; ++index)
                 {
                     auto* const method{ methods[index] };
-                    if (method && method->get_name() == "<init>") { initializer = method; break; }
+                    if (method && method->get_name() == "<init>"
+                        && (constructor_signature.empty() || method->get_signature() == constructor_signature))
+                    { initializer = method; break; }
                 }
             }
             if (!initializer) { throw vmhook::exception{ "Java constructor metadata became unavailable after allocation" }; }
         }
         vmhook::method_proxy constructor{ allocated, initializer, initializer->get_signature(),
-            false, native_call ? &allocated : nullptr, allocated_root };
+            !constructor_signature.empty(), native_call ? &allocated : nullptr, allocated_root };
         if (native_call) { constructor.native_constructor_arguments = native_argument_roots; }
         const auto call_result{ constructor.call(std::forward<args_t>(args)...) };
         if (!call_result.was_invoked())
@@ -25473,23 +25589,26 @@ namespace hotspot
     [[nodiscard]] inline auto make_array(const std::int32_t length)
         -> std::unique_ptr<vmhook::array<element_type>>
     {
-        std::string descriptor{};
-        if constexpr (!vmhook::detail::container_wrapper<element_type>)
-        { descriptor = vmhook::detail::primitive_array_descriptor<element_type>; }
-        else
+        vmhook::detail::native_backend::operation access{};
+        if (!access) { throw vmhook::exception{ "Java array construction requires a rooted VM context" }; }
+        const auto descriptor{ vmhook::array<element_type>::descriptor() };
+        vmhook::detail::native_backend::root component_array{};
+        vmhook::detail::native_backend::root component_mirror{};
+        if constexpr (requires { element_type::java_array_wrapper; typename element_type::java_element_type; })
         {
-            std::string component{ vmhook::detail::registered_class_name<element_type>() };
-            if (component.empty())
-            {
-                if constexpr (requires { std::string_view{ element_type::java_contract }; })
-                { component = element_type::java_contract; }
-            }
-            if (component.empty()) { throw vmhook::exception{ "Java array element wrapper is not registered" }; }
-            descriptor = component.front() == '[' ? "[" + component : "[L" + component + ";";
+            // Construct a zero-length component array first when Java has not
+            // created its ArrayKlass yet; this uses the same collector-aware
+            // allocation path and preserves the exact nested wrapper type.
+            const auto component{ vmhook::make_array<typename element_type::java_element_type>(0) };
+            component_array = vmhook::detail::container_source_root(*component);
+            component_mirror = vmhook::detail::native_backend::retain_class(vmhook::klass_from_oop(
+                vmhook::detail::container_address(component_array)));
+            if (!component_mirror) { throw vmhook::exception{ "Nested Java array class could not be retained" }; }
         }
         constexpr auto width{ vmhook::detail::container_wrapper<element_type>
             ? sizeof(std::uint32_t) : sizeof(element_type) };
-        return vmhook::new_array<vmhook::array<element_type>>(descriptor, length, width);
+        const auto result{ vmhook::detail::allocate_array_through_java(descriptor, length, width, component_mirror) };
+        return vmhook::detail::materialize_object<vmhook::array<element_type>>(0, result);
     }
 
     template<typename wrapper_type = vmhook::any_object>
@@ -25534,6 +25653,220 @@ namespace hotspot
         vmhook::detail::native_backend::operation access{};
         return vmhook::detail::materialize_object<vmhook::any_object>(0, this->native_exception_root);
     }
+    template<vmhook::detail::container_wrapper collection_type = vmhook::array_list,
+             vmhook::detail::container_wrapper element_type>
+        requires std::is_base_of_v<vmhook::collection, collection_type>
+    [[nodiscard]] inline auto make_collection(const std::vector<std::unique_ptr<element_type>>& elements)
+        -> std::unique_ptr<collection_type>
+    {
+        auto result{ vmhook::make_unique<collection_type>() };
+        for (const auto& element : elements) { (void)result->add(element); }
+        return result;
+    }
+
+    template<vmhook::detail::container_wrapper map_type = vmhook::hash_map,
+             vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
+        requires std::is_base_of_v<vmhook::map, map_type>
+    [[nodiscard]] inline auto make_map(
+        const std::vector<std::pair<std::unique_ptr<key_type>, std::unique_ptr<mapped_type>>>& entries)
+        -> std::unique_ptr<map_type>
+    {
+        auto result{ vmhook::make_unique<map_type>() };
+        for (const auto& entry : entries) { (void)result->put(entry.first, entry.second); }
+        return result;
+    }
+
+    class java_string : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/lang/String" };
+        auto length() const -> std::int32_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "length", "()I"); }
+        auto is_empty() const -> bool { return length() == 0; }
+        auto char_at(const std::int32_t index) const -> std::uint16_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "charAt", "(I)C", index); }
+        auto to_string() const -> std::string
+        { return vmhook::detail::invoke_container(*this, java_contract, "toString", "()Ljava/lang/String;"); }
+        auto to_utf16() const -> std::u16string
+        {
+            const std::unique_ptr<vmhook::array<std::uint16_t>> characters =
+                vmhook::detail::invoke_container(*this, java_contract, "toCharArray", "()[C");
+            const auto values{ characters->to_vector() };
+            std::u16string result(values.size(), u'\0');
+            std::transform(values.begin(), values.end(), result.begin(),
+                [](const std::uint16_t value) { return static_cast<char16_t>(value); });
+            return result;
+        }
+        auto substring(const std::int32_t begin, const std::int32_t end) const -> std::unique_ptr<java_string>
+        { return vmhook::detail::invoke_container(*this, java_contract, "substring", "(II)Ljava/lang/String;", begin, end); }
+        auto starts_with(const std::string_view prefix) const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "startsWith", "(Ljava/lang/String;)Z", prefix); }
+        auto ends_with(const std::string_view suffix) const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "endsWith", "(Ljava/lang/String;)Z", suffix); }
+    };
+
+    class class_loader : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/lang/ClassLoader" };
+        auto load_class(const std::string_view binary_name) const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", binary_name); }
+        auto parent() const -> std::unique_ptr<class_loader>
+        { return vmhook::detail::invoke_container(*this, java_contract, "getParent", "()Ljava/lang/ClassLoader;"); }
+    };
+
+    class class_object : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/lang/Class" };
+        auto name() const -> std::string
+        { return vmhook::detail::invoke_container(*this, java_contract, "getName", "()Ljava/lang/String;"); }
+        auto is_array() const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "isArray", "()Z"); }
+        auto is_primitive() const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "isPrimitive", "()Z"); }
+        auto is_interface() const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "isInterface", "()Z"); }
+        auto loader() const -> std::unique_ptr<class_loader>
+        { return vmhook::detail::invoke_container(*this, java_contract, "getClassLoader", "()Ljava/lang/ClassLoader;"); }
+        auto super_class() const -> std::unique_ptr<class_object>
+        { return vmhook::detail::invoke_container(*this, java_contract, "getSuperclass", "()Ljava/lang/Class;"); }
+        auto component_type() const -> std::unique_ptr<class_object>
+        { return vmhook::detail::invoke_container(*this, java_contract, "getComponentType", "()Ljava/lang/Class;"); }
+        static auto for_name(const std::string_view binary_name, const std::unique_ptr<class_loader>& loader,
+                             const bool initialize = false) -> std::unique_ptr<class_object>
+        { return vmhook::detail::call_bootstrap_method(java_contract, "forName",
+            "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", binary_name, initialize, loader); }
+    };
+
+    class throwable : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/lang/Throwable" };
+        auto message() const -> std::unique_ptr<java_string>
+        { return vmhook::detail::invoke_container(*this, java_contract, "getMessage", "()Ljava/lang/String;"); }
+        auto cause() const -> std::unique_ptr<throwable>
+        { return vmhook::detail::invoke_container(*this, java_contract, "getCause", "()Ljava/lang/Throwable;"); }
+        auto to_string() const -> std::string
+        { return vmhook::detail::invoke_container(*this, java_contract, "toString", "()Ljava/lang/String;"); }
+        auto stack_trace() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "getStackTrace", "()[Ljava/lang/StackTraceElement;"); }
+    };
+
+    class java_enum : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/lang/Enum" };
+        auto name() const -> std::string
+        { return vmhook::detail::invoke_container(*this, java_contract, "name", "()Ljava/lang/String;"); }
+        auto ordinal() const -> std::int32_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "ordinal", "()I"); }
+    };
+
+    template<typename primitive_type>
+        requires (!vmhook::detail::primitive_array_descriptor<primitive_type>.empty())
+    class boxed : public vmhook::oop_reflective_base
+    {
+        inline static constexpr std::size_t index{
+            std::string_view{ "ZBCSIJFD" }.find(vmhook::detail::primitive_array_descriptor<primitive_type>[1]) };
+        inline static constexpr std::array<std::string_view, 8> contracts{
+            "java/lang/Boolean", "java/lang/Byte", "java/lang/Character", "java/lang/Short",
+            "java/lang/Integer", "java/lang/Long", "java/lang/Float", "java/lang/Double" };
+        inline static constexpr std::array<std::string_view, 8> accessors{
+            "booleanValue", "byteValue", "charValue", "shortValue", "intValue", "longValue", "floatValue", "doubleValue" };
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ contracts[index] };
+        auto value() const -> primitive_type
+        {
+            const std::string signature{ "()" + std::string{vmhook::detail::primitive_array_descriptor<primitive_type>.substr(1)} };
+            return vmhook::detail::invoke_container(*this, java_contract, accessors[index], signature);
+        }
+        static auto value_of(const primitive_type value) -> std::unique_ptr<boxed>
+        {
+            const std::string signature{ "(" + std::string{vmhook::detail::primitive_array_descriptor<primitive_type>.substr(1)}
+                + ")L" + std::string{java_contract} + ";" };
+            return vmhook::detail::call_bootstrap_method(java_contract, "valueOf", signature, value);
+        }
+    };
+    using java_boolean = boxed<bool>;
+    using java_byte = boxed<std::int8_t>;
+    using java_char = boxed<std::uint16_t>;
+    using java_short = boxed<std::int16_t>;
+    using java_integer = boxed<std::int32_t>;
+    using java_long = boxed<std::int64_t>;
+    using java_float = boxed<float>;
+    using java_double = boxed<double>;
+
+    class optional : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/util/Optional" };
+        auto is_present() const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "isPresent", "()Z"); }
+        auto is_empty() const -> bool { return !is_present(); }
+        auto get() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "get", "()Ljava/lang/Object;"); }
+        template<vmhook::detail::container_wrapper wrapper_type>
+        auto or_else(const std::unique_ptr<wrapper_type>& fallback) const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "orElse", "(Ljava/lang/Object;)Ljava/lang/Object;", fallback); }
+        static auto empty() -> std::unique_ptr<optional>
+        { return vmhook::detail::call_bootstrap_method(java_contract, "empty", "()Ljava/util/Optional;"); }
+        template<vmhook::detail::container_wrapper wrapper_type>
+        static auto of_nullable(const std::unique_ptr<wrapper_type>& value) -> std::unique_ptr<optional>
+        { return vmhook::detail::call_bootstrap_method(java_contract, "ofNullable", "(Ljava/lang/Object;)Ljava/util/Optional;", value); }
+    };
+
+    /* Buffer transfers copy bytes and preserve VM ownership. A direct buffer's
+       native storage remains owned by its Java Cleaner; no unrooted C++ span
+       escapes the context. to_vector observes remaining bytes without advancing
+       the original buffer, while put advances its position as Java does. */
+    class byte_buffer : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/nio/ByteBuffer" };
+        static auto allocate(const std::int32_t capacity) -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::call_bootstrap_method(java_contract, "allocate", "(I)Ljava/nio/ByteBuffer;", capacity); }
+        static auto allocate_direct(const std::int32_t capacity) -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::call_bootstrap_method(java_contract, "allocateDirect", "(I)Ljava/nio/ByteBuffer;", capacity); }
+        auto is_direct() const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "isDirect", "()Z"); }
+        auto capacity() const -> std::int32_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "capacity", "()I"); }
+        auto position() const -> std::int32_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "position", "()I"); }
+        auto position(const std::int32_t next) const -> void
+        { (void)vmhook::detail::invoke_container(*this, java_contract, "position", "(I)Ljava/nio/Buffer;", next); }
+        auto remaining() const -> std::int32_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "remaining", "()I"); }
+        auto get(const std::int32_t index) const -> std::int8_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "get", "(I)B", index); }
+        auto put(const std::int32_t index, const std::int8_t value) const -> void
+        { (void)vmhook::detail::invoke_container(*this, java_contract, "put", "(IB)Ljava/nio/ByteBuffer;", index, value); }
+        auto put(const std::span<const std::int8_t> bytes) const -> void
+        {
+            if (bytes.size() > static_cast<std::size_t>((std::numeric_limits<std::int32_t>::max)()))
+            { throw vmhook::exception{ "ByteBuffer copy exceeds the Java array length limit" }; }
+            const auto source{ vmhook::make_array<std::int8_t>(static_cast<std::int32_t>(bytes.size())) };
+            source->copy_from(bytes);
+            (void)vmhook::detail::invoke_container(*this, java_contract, "put", "([B)Ljava/nio/ByteBuffer;", source);
+        }
+        auto to_vector() const -> std::vector<std::int8_t>
+        {
+            const std::unique_ptr<byte_buffer> copy = vmhook::detail::invoke_container(*this, java_contract,
+                "duplicate", "()Ljava/nio/ByteBuffer;");
+            const auto destination{ vmhook::make_array<std::int8_t>(copy->remaining()) };
+            (void)vmhook::detail::invoke_container(*copy, java_contract, "get", "([B)Ljava/nio/ByteBuffer;", destination);
+            return destination->to_vector();
+        }
+    };
 
     inline auto field_proxy::value_t::operator->() const -> std::unique_ptr<vmhook::any_object>
     {
