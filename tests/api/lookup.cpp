@@ -68,19 +68,15 @@ public:
         get_method("say")->call("hello");
     }
 
-    auto ride(const vmhook::borrowed<entity>& passenger) const -> void
-    {
-        get_method("ride")->call(passenger);
-    }
-
-    auto ride(const vmhook::ref<entity>& passenger) const -> void
+    auto ride(const std::unique_ptr<entity>& passenger) const -> void
     {
         get_method("ride")->call(passenger);
     }
 
     auto dismount() const -> void
     {
-        get_method("ride")->call(nullptr);
+        const auto absent = std::make_unique<entity>(nullptr);
+        get_method("ride")->call(absent);
     }
 
     auto replace_arrays() const -> void
@@ -130,6 +126,21 @@ public:
     auto player_entities() const -> player_vector
     {
         return get_field("playerEntities")->get().to_vector();
+    }
+
+    auto owner() const -> std::unique_ptr<player>
+    {
+        return get_field("owner")->get();
+    }
+
+    auto owner(const std::unique_ptr<player>& next) const -> void
+    {
+        get_field("owner")->set(next);
+    }
+
+    auto find_player(const std::unique_ptr<player>& target) const -> std::unique_ptr<player>
+    {
+        return get_method("findPlayer")->call(target);
     }
 
     auto players_by_entity() const -> player_entries
@@ -232,6 +243,130 @@ static_assert(std::is_same_v<decltype(std::declval<const vmhook::method_proxy::v
                                         .to_vector<player>()), player_vector>);
 static_assert(std::is_same_v<decltype(std::declval<const vmhook::field_proxy::value_t&>()
                                         .to_vector<entity, player>()), player_entries>);
+
+// Java object ownership is explicit at every public method/field/hook boundary.
+// Primitive values and string copies remain ordinary C++ values.
+template<class argument_type>
+concept java_method_argument = requires(const vmhook::method_proxy& method, argument_type&& argument)
+{
+    method.call(std::forward<argument_type>(argument));
+};
+
+template<class argument_type>
+concept java_constructor_argument = requires(argument_type&& argument)
+{
+    vmhook::make_unique<player>(std::forward<argument_type>(argument));
+};
+
+template<class argument_type>
+concept java_field_argument = requires(const vmhook::field_proxy& field, argument_type&& argument)
+{
+    field.set(std::forward<argument_type>(argument));
+};
+
+template<class argument_type>
+concept java_hook_result = requires(vmhook::return_value& result, argument_type&& argument)
+{
+    result.set(std::forward<argument_type>(argument));
+};
+
+template<class argument_type>
+concept java_hook_argument_write = requires(vmhook::return_value& result, argument_type&& argument)
+{
+    result.set_arg(0, std::forward<argument_type>(argument));
+};
+
+template<class argument_type>
+concept java_hook_callback = requires
+{
+    vmhook::hook<player>("target", std::declval<void(*)(vmhook::return_value&, argument_type)>());
+};
+
+template<class argument_type>
+concept public_java_object_input = java_method_argument<argument_type>
+    && java_constructor_argument<argument_type> && java_field_argument<argument_type>
+    && java_hook_result<argument_type> && java_hook_argument_write<argument_type>;
+
+template<class argument_type>
+concept rejected_java_object_input = !java_method_argument<argument_type>
+    && !java_constructor_argument<argument_type> && !java_field_argument<argument_type>
+    && !java_hook_result<argument_type> && !java_hook_argument_write<argument_type>
+    && !java_hook_callback<argument_type>;
+
+static_assert(public_java_object_input<std::unique_ptr<player>>);
+static_assert(public_java_object_input<const std::unique_ptr<player>&>);
+static_assert(java_hook_callback<std::unique_ptr<player>>);
+static_assert(java_hook_callback<const std::unique_ptr<player>&>);
+static_assert(!java_hook_callback<std::unique_ptr<player>&>);
+static_assert(!java_hook_callback<std::unique_ptr<player>&&>);
+static_assert(rejected_java_object_input<player>);
+static_assert(rejected_java_object_input<const player&>);
+static_assert(rejected_java_object_input<vmhook::borrowed<player>>);
+static_assert(rejected_java_object_input<const vmhook::borrowed<player>&>);
+static_assert(rejected_java_object_input<vmhook::ref<player>>);
+static_assert(rejected_java_object_input<std::nullptr_t>);
+static_assert(rejected_java_object_input<void*>);
+static_assert(rejected_java_object_input<std::unique_ptr<int>>);
+static_assert(rejected_java_object_input<std::unique_ptr<const player>>);
+static_assert(java_method_argument<std::int32_t>);
+static_assert(java_method_argument<const std::string&>);
+static_assert(java_field_argument<std::vector<std::int32_t>>);
+static_assert(std::is_same_v<decltype(std::declval<const a&>().owner()), std::unique_ptr<player>>);
+static_assert(std::is_same_v<decltype(std::declval<const a&>().find_player(
+    std::declval<const std::unique_ptr<player>&>())), std::unique_ptr<player>>);
+
+template<class source_type>
+concept java_object_result = std::is_convertible_v<source_type, std::unique_ptr<player>>
+    && !std::is_convertible_v<source_type, player>
+    && !std::is_convertible_v<source_type, vmhook::borrowed<player>>
+    && !std::is_convertible_v<source_type, vmhook::ref<player>>
+    && !std::is_convertible_v<source_type, void*>
+    && !std::is_convertible_v<source_type, std::unique_ptr<int>>
+    && !std::is_convertible_v<source_type, std::unique_ptr<const player>>;
+
+static_assert(java_object_result<vmhook::field_proxy::value_t>);
+static_assert(java_object_result<vmhook::method_proxy::value_t>);
+static_assert(std::is_same_v<decltype(std::declval<const vmhook::field_proxy::value_t&>().operator->()),
+                             std::unique_ptr<vmhook::any_object>>);
+static_assert(std::is_same_v<decltype(std::declval<const vmhook::method_proxy::value_t&>().operator->()),
+                             std::unique_ptr<vmhook::any_object>>);
+static_assert(std::is_same_v<decltype(std::declval<const vmhook::root<player>&>().get()),
+                             std::unique_ptr<player>>);
+
+template<class argument_type>
+concept frame_java_argument = requires(const vmhook::hotspot::frame& frame)
+{
+    frame.template get_arguments<argument_type>();
+};
+
+static_assert(frame_java_argument<std::unique_ptr<player>>);
+static_assert(!frame_java_argument<player>);
+static_assert(!frame_java_argument<vmhook::borrowed<player>>);
+static_assert(!frame_java_argument<vmhook::ref<player>>);
+
+template<class wrapper_type>
+concept owning_creation_helpers = requires
+{
+    vmhook::new_object<wrapper_type>(nullptr, std::size_t{});
+    vmhook::new_array<wrapper_type>("[I", std::int32_t{}, sizeof(std::int32_t));
+    vmhook::new_string<wrapper_type>("value");
+};
+
+static_assert(owning_creation_helpers<player>);
+static_assert(!owning_creation_helpers<int>);
+static_assert(!owning_creation_helpers<const player>);
+static_assert(!owning_creation_helpers<volatile player>);
+static_assert(std::is_same_v<decltype(vmhook::new_object(nullptr, std::size_t{})),
+                             std::unique_ptr<vmhook::any_object>>);
+static_assert(std::is_same_v<decltype(vmhook::new_array("[I", std::int32_t{}, sizeof(std::int32_t))),
+                             std::unique_ptr<vmhook::any_object>>);
+static_assert(std::is_same_v<decltype(vmhook::new_string("value")), std::unique_ptr<vmhook::any_object>>);
+static_assert(std::is_same_v<decltype(vmhook::new_object<player>(nullptr, std::size_t{})),
+                             std::unique_ptr<player>>);
+static_assert(std::is_same_v<decltype(vmhook::new_array<player>("[I", std::int32_t{}, sizeof(std::int32_t))),
+                             std::unique_ptr<player>>);
+static_assert(std::is_same_v<decltype(vmhook::new_string<player>("value")), std::unique_ptr<player>>);
+static_assert(std::is_same_v<decltype(std::declval<const player&>().self()), std::unique_ptr<player>>);
 
 template<class wrapper>
 concept implicit_receiver_lookup = requires(const wrapper& object)
@@ -356,8 +491,10 @@ auto check_native_reference_handoff() -> bool
     const auto actual_null = vmhook::method_proxy::value_t::completed_native_reference(
         native_result{.invoked = true});
     player_vector null_vector = actual_null.to_vector();
+    const std::unique_ptr<player> null_object = actual_null;
     if (!actual_null.was_invoked() || !actual_null.reference_result
-        || actual_null.result_failed || !null_vector.empty())
+        || actual_null.result_failed || !null_vector.empty()
+        || !null_object || null_object->get_instance())
     {
         return false;
     }
@@ -392,7 +529,59 @@ auto check_native_reference_handoff() -> bool
         catch (const vmhook::exception&)
         {
         }
+        try
+        {
+            const std::unique_ptr<player> invalid = result;
+            (void)invalid;
+            return false;
+        }
+        catch (const vmhook::exception&)
+        {
+        }
     }
+    return true;
+}
+
+auto check_null_object_values() -> bool
+{
+    const vmhook::field_proxy::value_t null_field{std::uint32_t{}, "Ltest/Player;"};
+    const std::unique_ptr<player> first = null_field;
+    const std::unique_ptr<player> second = null_field;
+    const auto null_arrow = null_field.operator->();
+    if (!first || first->get_instance() || !second || second->get_instance()
+        || first.get() == second.get() || !null_arrow || null_arrow->get_instance())
+    { return false; }
+
+    // Zero primitive bits, a malformed reference alternative, an uninvoked
+    // result, and a lost non-null reference must never become Java null.
+    const std::array<vmhook::field_proxy::value_t, 3> bad_fields{
+        vmhook::field_proxy::value_t{std::int32_t{}, "I"},
+        vmhook::field_proxy::value_t{std::int32_t{}, "Ltest/Player;"},
+        vmhook::field_proxy::value_t{std::uint32_t{1}, "Ltest/Player;"}
+    };
+    for (const auto& field : bad_fields)
+    {
+        try { const std::unique_ptr<player> invalid = field; (void)invalid; return false; }
+        catch (const vmhook::exception&) {}
+    }
+    try
+    {
+        const std::unique_ptr<player> invalid = vmhook::method_proxy::value_t::completed(std::int32_t{});
+        (void)invalid;
+        return false;
+    }
+    catch (const vmhook::exception&) {}
+    return true;
+}
+
+auto check_creation_context_refusal() -> bool
+{
+    try { (void)vmhook::new_object(nullptr, std::size_t{}); return false; }
+    catch (const vmhook::exception&) {}
+    try { (void)vmhook::new_array("[I", std::int32_t{1}, sizeof(std::int32_t)); return false; }
+    catch (const vmhook::exception&) {}
+    try { (void)vmhook::new_string("value"); return false; }
+    catch (const vmhook::exception&) {}
     return true;
 }
 
@@ -403,6 +592,8 @@ auto main() -> int
     if (!other_translation_unit()) { return 10; }
     if (!check_container_adapters()) { return 11; }
     if (!check_native_reference_handoff()) { return 12; }
+    if (!check_null_object_values()) { return 13; }
+    if (!check_creation_context_refusal()) { return 14; }
     vmhook::member_lookup<vmhook::method_proxy> absent{
         std::optional<vmhook::method_proxy>{} };
     if (absent || absent.has_value())

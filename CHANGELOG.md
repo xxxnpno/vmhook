@@ -16,8 +16,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   full-PDB resolver for compatible unlisted builds. Thread lifecycle, private
   signatures, type layouts and VM metadata are checked before attachment.
 - Context-bound VM roots for constructed objects, object-valued results,
-  reference field reads, wrapper copies and supported `borrowed`/`ref`
-  conversions. Roots survive moving GC while the native worker is idle;
+  reference field reads and owning wrapper conversions. Roots survive moving
+  GC while the native worker is idle;
   foreign-thread use and use after context closure are refused. Temporary
   internal handles are released and persistent root slots can be reused.
 - Dedicated injected-runtime fixtures for direct native calls, construction,
@@ -39,6 +39,23 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- **Breaking Java object ownership contract:** object-valued field getters,
+  method returns, `self()` and `root<wrapper>::get()` produce
+  `std::unique_ptr<wrapper>`.
+  `new_object`, `new_array` and `new_string` also return owning wrappers,
+  defaulting to `any_object`, with explicit allocation/context/root errors.
+  `new_object` remains allocation-only and `new_array` retains its narrower
+  callback/TLAB requirements.
+  Java object setters, method/constructor arguments and hook receivers/arguments
+  use these owners or const references to them, rather than plain wrapper
+  values/references or raw addresses. Hook replacements take the owner itself.
+  Java nulls allocate non-empty C++ owners with null `get_instance()` values,
+  including collection elements and map keys/values. Empty C++ object inputs
+  are refused; allocation failure raises `std::bad_alloc`. Owning conversion
+  and construction errors raise `vmhook::exception`, and expired/foreign-thread
+  rooted wrappers throw instead of reporting Java null. Null source containers
+  still convert to empty vectors. Copied primitive and string values keep their
+  existing value semantics.
 - Object-valued method cancellation keeps its synthetic return stack cell
   visible to HotSpot's real GC frame walker. Moving collectors update the
   address consumed by the normal return epilogue, including its safepoint

@@ -41,6 +41,7 @@ public class NativeFixture extends NativeBase implements NativeOverride {
     public int value;
     public String text;
     public NativeFixture child;
+    public NativeFixture nullable;
 
     public NativeFixture() {
         value = 41;
@@ -55,6 +56,14 @@ public class NativeFixture extends NativeBase implements NativeOverride {
         value = initial;
         text = message;
         child = parent == null ? this : parent;
+    }
+
+    public NativeFixture(int initial) {
+        checkNativeThread();
+        if (initial == -100) { throw new IllegalArgumentException("expected constructor exception"); }
+        value = initial;
+        text = TEXT;
+        child = this;
     }
 
     private static void checkNativeThread() {
@@ -93,6 +102,22 @@ public class NativeFixture extends NativeBase implements NativeOverride {
         checkNativeThread();
         System.gc();
         return message;
+    }
+
+    public static NativeFixture echoObject(NativeFixture value) {
+        checkNativeThread();
+        System.gc();
+        return value;
+    }
+
+    public static NativeFixture nullObject() {
+        checkNativeThread();
+        return null;
+    }
+
+    public static NativeFixture failObject() {
+        checkNativeThread();
+        throw new IllegalStateException("expected object-return exception");
     }
 
     public static long wide(long first, double floating, int last) {

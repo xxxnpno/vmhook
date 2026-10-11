@@ -72,8 +72,8 @@ Java collector, not by the wrapper's C++ destructor.
 Constructed objects, object-valued call results, and reference field reads in a
 native context retain real VM-scanned root slots. The VM updates these slots
 when GC moves objects, including while the DLL worker is sleeping in native
-state. Wrapper copies, result-to-wrapper conversions, and supported
-`borrowed`/`ref` conversions share this context-bound lifetime. Field proxies
+state. Owning result conversions and their shared root tickets retain this
+context-bound lifetime. Field proxies
 rebuild the field address from the rooted receiver before accessing it. Class
 mirrors and method handles protect metadata while the operation uses it.
 
@@ -84,9 +84,10 @@ live root set.
 
 These references require their owning context and OS thread. Another context
 on another thread cannot use them, even if it belongs to the same JVM. Closing
-the context invalidates object-valued results, field receivers, wrapper copies
-and derived references. Copy ordinary C++ values when work must cross threads;
-those copied values remain usable after closure. A globally
+the context invalidates object-valued results, field receivers and derived
+rooted wrappers. Copy ordinary C++ values when work must cross threads;
+primitives and copied UTF-8 strings remain usable after closure, while Java
+wrapper elements of a vector still require their owning context. A globally
 retained raw `oop`, or a raw address passed to a new wrapper, does not acquire
 this protection automatically.
 
@@ -98,6 +99,40 @@ thread already executing their ASM stub. Those callback-owned wrappers survive
 GC and nested Java calls while the callback runs, but expire when it returns.
 They do not acquire the lifetime of a separately attached worker context.
 Neither route protects arbitrary raw objects captured before its roots existed.
+
+## Owning Java references and Java null
+
+An object field getter or object-valued Java call converts to
+`std::unique_ptr<wrapper>`. `self()` and `root<wrapper>::get()` return the same
+owning form. Object setters, Java method/constructor arguments and hook object
+parameters use these pointers or const references to them. Plain wrapper
+values, wrapper references and raw object addresses are not public object
+arguments.
+
+Every successful owning conversion allocates a C++ wrapper, even for a Java
+null. Test `pointer->get_instance() == nullptr`, rather than testing the unique
+pointer. To supply a Java null, create `std::make_unique<wrapper>(nullptr)` and
+pass that owner. An empty C++ pointer is refused. C++ wrapper allocation failure
+throws `std::bad_alloc`; unavailable invocation, Java exceptions, incompatible
+types and unavailable roots throw `vmhook::exception` on owning conversion.
+`vmhook::make_unique` likewise reports failed Java construction through an
+exception instead of returning a wrapper that looks like a Java null.
+
+For a rooted wrapper, `get_instance()` throws `vmhook::exception` when the
+context has closed or the wrong thread attempts to resolve it. A null instance
+therefore describes a genuine Java-null reference, not an expired object.
+The returned address remains a temporary snapshot subject to moving GC.
+Reference field stores still require Epsilon; passing an owning pointer does
+not supply the missing write barrier for another collector.
+
+The allocation helpers `new_object<wrapper>`, `new_array<wrapper>` and
+`new_string<wrapper>` also return `std::unique_ptr<wrapper>`, defaulting to
+`any_object` when no wrapper type is supplied. They require an active supported
+context and retain the allocated Java reference; backend, type and root
+failures throw. `new_object` performs allocation only, without running a Java
+constructor; use `vmhook::make_unique` for normal construction. `new_array`
+retains the narrower verified callback/TLAB allocator restrictions and does
+not add native-context array allocation.
 
 ## Collection conversion lifetime
 
@@ -118,9 +153,11 @@ addresses are resolved again after possible collection. Returned wrappers
 retain the same context-bound protection. They cannot cross threads or remain
 usable after context closure.
 
-Java null source references become empty vectors; null elements, keys and
-values remain `nullptr`. Invalid shapes, incompatible registered wrapper
-types, unavailable roots and failed calls are reported by `vmhook::exception`.
+Java null source references become empty vectors. Every element, key and value
+has an allocated wrapper; a Java-null entry has
+`pointer->get_instance() == nullptr`. Invalid shapes, incompatible registered
+wrapper types, unavailable roots and failed calls are reported by
+`vmhook::exception`.
 Java decides encounter order and concurrent-mutation behavior; conversion
 does not add locking or establish an atomic snapshot of a mutable collection.
 
@@ -274,9 +311,10 @@ exact images and default collectors, including receiver-bound instance calls
 and qualified static lookups. Two simultaneously retained sets of field and
 method proxies remain bound to distinct Java objects. Static-only lookup
 refuses instance members, and missing-member results remain observable.
-These runs predate the target-inferred collection conversion path.
+These runs predate the target-inferred collection conversion path and the
+allocated-wrapper Java-null contract.
 
-Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
+Native Windows CI results for the earlier receiver-bound API are recorded in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). They predate the allocated-wrapper Java-null contract. The Wine matrices above identify their separate frozen probes.
 
 The preceding API at [commit 6de00ce](https://github.com/xxxnpno/vmhook/commit/6de00ce0d4dd46b404ff24a4358a00b9d4f5e9d9) passed native Windows CI **53/53 in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38015950857) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38015954009). Each run passed 36 callback stress repetitions; actual GC frame scans visited 628/582 synthetic return slots. These runs predate the receiver-bound snake_case API.
 

@@ -78,11 +78,13 @@ namespace
         const bool installed = vmhook::hook<fixture>("mixed", "(IJIDI[Ljava/lang/Object;)I",
             [state](vmhook::return_value& result, const std::unique_ptr<fixture>& self,
                               std::int32_t first, std::int64_t wide, std::int32_t following,
-                              double floating, std::int32_t last, vmhook::oop_t array)
+                              double floating, std::int32_t last,
+                              const std::unique_ptr<vmhook::any_object>& array)
         {
             bool correct = self && self->get_instance() && self->value() == 15
                 && first == 3 && wide == 7 && following == 5 && floating == 6.5
-                && last == 9 && array != nullptr;
+                && last == 9 && array && array->get_instance() != nullptr;
+            const auto java_null = std::make_unique<vmhook::any_object>(nullptr);
             correct = correct && !result.set_arg(-1, std::int32_t{1})
                 && !result.set_arg(6, std::int32_t{1}) && !result.set_arg(0, std::int64_t{1})
                 && !result.set_arg(1, double{1}) && !result.set_arg(5, std::int32_t{1})
@@ -90,7 +92,7 @@ namespace
                 && result.set_arg(1, std::int64_t{0x1122334455667788LL})
                 && result.set_arg(2, std::int32_t{-3}) && result.set_arg(3, double{42.25})
                 && result.set_arg(4, std::int32_t{-7}) && result.set_arg(5, array)
-                && result.set_arg(5, nullptr);
+                && result.set_arg(5, java_null);
             const auto arguments = result.frame()->get_arguments<vmhook::oop_t, std::int32_t,
                 std::int64_t, std::int32_t, double, std::int32_t, vmhook::oop_t>();
             correct = correct && std::get<0>(arguments) == self->get_instance()

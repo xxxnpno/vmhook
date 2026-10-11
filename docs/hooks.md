@@ -32,6 +32,35 @@ descriptor. VMHook checks that signature before installation. Pass the
 descriptor when a name is overloaded. A duplicate hook on the same method is
 refused.
 
+Object receivers and arguments are `std::unique_ptr<wrapper>` values or
+`const std::unique_ptr<wrapper>&` parameters. Java null is an allocated wrapper
+whose `get_instance()` is null. Plain wrapper values/references and raw object
+addresses are refused as hook object parameters.
+
+For example, an object-returning Java `World.selectPlayer(Player)` can return
+a null argument unchanged without dereferencing its C++ owner:
+
+```cpp
+const bool installed = vmhook::hook<world>("selectPlayer",
+    "(Lexample/Player;)Lexample/Player;",
+    [](vmhook::return_value& result,
+       const std::unique_ptr<world>&,
+       const std::unique_ptr<player>& next)
+    {
+        if (next->get_instance() == nullptr)
+        {
+            result.set(next);
+        }
+    });
+```
+
+Use `result.set(pointer)` for an object return and
+`result.set_arg(index, pointer)` for an object argument replacement. Empty C++
+pointers are refused; to supply a Java null explicitly, use
+`std::make_unique<wrapper>(nullptr)`. Allocation failure raises
+`std::bad_alloc`. VMHook contains exceptions escaping a callback, so handle
+expected failures inside it when a particular replacement is required.
+
 For an object-valued cancellation, the returned object stays rooted across the
 VM-to-Java transition and the real HotSpot return epilogue. VMHook supplies its
 synthetic operand-stack cell to the genuine GC frame scanner; a moving collector
@@ -198,6 +227,8 @@ The callback has a temporary rooted context. Receivers, object arguments,
 constructed objects and object-valued results retain VM-scanned roots across
 nested calls and moving GC. That context ends when the callback returns;
 retaining a wrapper afterward or using it from another OS thread is refused.
+`get_instance()` throws `vmhook::exception` for an expired or foreign-thread
+rooted wrapper; it does not report these failures as a Java-null instance.
 An object forced as a method return is transferred through a VM-scanned thread
 result slot before the interpreter receives its relocated address. Raw heap
 address snapshots do not acquire an independent lifetime. See
@@ -295,9 +326,9 @@ genuine GC frame scanner while keeping HotSpot's normal return epilogue.
 Virtual thread frames remain outside this platform-frame validation.
 Both source and probe hashes remain unchanged through their matrices.
 These results cover the manifest's exact images and default collectors.
-The tested callbacks use the receiver-bound API examples from the README. These runs predate the collection conversion redesign.
+The tested callbacks use the receiver-bound API. These runs predate the collection conversion redesign and the allocated-wrapper Java-null contract.
 
-Native Windows CI results for this API are tracked in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). The Wine matrices above identify their separate frozen probes.
+Native Windows CI results for the earlier receiver-bound API are recorded in [PR #44](https://github.com/xxxnpno/vmhook/pull/44). They predate the allocated-wrapper Java-null contract. The Wine matrices above identify their separate frozen probes.
 
 The preceding API at [commit 6de00ce](https://github.com/xxxnpno/vmhook/commit/6de00ce0d4dd46b404ff24a4358a00b9d4f5e9d9) passed native Windows CI **53/53 in each run**: [push](https://github.com/xxxnpno/vmhook/actions/runs/38015950857) and [PR](https://github.com/xxxnpno/vmhook/actions/runs/38015954009). Each run passed 36 callback stress repetitions; actual GC frame scans visited 628/582 synthetic return slots. These runs predate the receiver-bound snake_case API.
 

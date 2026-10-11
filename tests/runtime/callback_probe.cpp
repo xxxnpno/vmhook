@@ -21,6 +21,7 @@ namespace
     std::atomic<unsigned> callback_count{}, nested_count{}, observed_gc{};
     std::atomic<bool> correct{true};
     std::atomic<const char*> first_failure{};
+    std::optional<vmhook::hotspot::method_args> escaped_arguments;
     std::ofstream report;
 
     auto check(const bool condition, const char* const label) noexcept -> void
@@ -51,7 +52,7 @@ namespace
                 || !vmhook::register_class<callback_node>("ObservationCallbackFixture$Node"))
             { throw vmhook::exception{"Callback fixture classes unavailable"}; }
             const bool nested{vmhook::hook<callback_fixture>("nested", "(LObservationCallbackFixture$Node;)I",
-                [](vmhook::return_value&, vmhook::borrowed<callback_node> original)
+                [](vmhook::return_value&, const std::unique_ptr<callback_node>& original)
                 {
                     check(vmhook::detail::native_backend::active(), "nested.context_active");
                     check(vmhook::detail::private_native::thread_state(
@@ -61,30 +62,52 @@ namespace
                     nested_count.fetch_add(1, std::memory_order_release);
                 })};
             const bool main{vmhook::hook<callback_fixture>("target",
-                "(LObservationCallbackFixture$Node;I)LObservationCallbackFixture$Node;",
-                [](vmhook::return_value& result, vmhook::borrowed<callback_node> input, std::int32_t expected)
+                "(LObservationCallbackFixture$Node;LObservationCallbackFixture$Node;I)LObservationCallbackFixture$Node;",
+                [](vmhook::return_value& result, const std::unique_ptr<callback_node>& input,
+                   const std::unique_ptr<callback_node>& nullable, std::int32_t expected)
                 {
                     check(vmhook::detail::native_backend::active(), "outer.context_active");
                     check(vmhook::detail::private_native::thread_state(
                         vmhook::hotspot::current_java_thread) == 4, "outer.native_state");
+                    const auto frame_arguments = result.frame()->get_arguments();
+                    check(frame_arguments.size() == 3, "outer.frame_argument_count");
                     const auto before{read_gc()};
                     vmhook::windows::Sleep(35);
                     if (read_gc() > before) { observed_gc.fetch_add(1, std::memory_order_relaxed); }
                     if (!input) { check(false, "outer.input_present_after_gc"); }
                     else { check(input->value() == expected, "outer.input_value_after_gc"); }
+                    check(static_cast<bool>(nullable), "outer.nullable_wrapper_allocated");
+                    if (nullable)
+                    {
+                        check(expected % 2 == 0 ? nullable->get_instance() == nullptr
+                            : nullable->get_instance() != nullptr && nullable->value() == -expected,
+                            "outer.nullable_java_instance");
+                    }
                     auto* const parent{vmhook::detail::native_backend::current_context_lifetime()};
                     const auto nested_result{callback_fixture::static_members::get_method("nested", "(LObservationCallbackFixture$Node;)I")->call(input)};
                     if (!nested_result.was_invoked()) { check(false, "outer.nested_invoked"); }
                     else { check(static_cast<std::int32_t>(nested_result) == expected, "outer.nested_value"); }
                     check(vmhook::detail::native_backend::current_context_lifetime() == parent,
                         "outer.parent_context_restored");
+                    const auto refreshed_input = frame_arguments.as<callback_node>(0);
+                    const auto refreshed_nullable = frame_arguments.as<callback_node>(1);
+                    check(refreshed_input && refreshed_input->value() == expected,
+                        "outer.frame_root_after_nested_gc");
+                    check(refreshed_nullable && (expected % 2 == 0
+                        ? refreshed_nullable->get_instance() == nullptr
+                        : refreshed_nullable->value() == -expected), "outer.frame_nullable_owner");
+                    try { (void)frame_arguments.as<callback_node>(2); check(false, "outer.frame_primitive_refused"); }
+                    catch (const vmhook::exception&) {}
+                    try { (void)frame_arguments[3]; check(false, "outer.frame_index_refused"); }
+                    catch (const vmhook::exception&) {}
+                    escaped_arguments = frame_arguments;
                     auto allocated{vmhook::make_unique<callback_node>(std::int32_t{expected + 1000})};
                     if (!allocated) { check(false, "outer.allocated_present"); }
                     else { check(static_cast<bool>(allocated->get_native_root()), "outer.allocated_root"); }
                     vmhook::windows::Sleep(35);
                     if (!allocated) { check(false, "outer.allocated_present_after_gc"); }
                     else { check(allocated->value() == expected + 1000, "outer.allocated_value_after_gc"); }
-                    if (allocated) { result.set(*allocated); }
+                    if (allocated) { result.set(allocated); }
                     callback_count.fetch_add(1, std::memory_order_release);
                 })};
             if (!nested || !main) { throw vmhook::exception{"Callback hooks refused"}; }
@@ -118,6 +141,12 @@ namespace
             else if (nested_count.load() != 24) { check(false, "worker.nested_count"); }
             else if (observed_gc.load() == 0) { check(false, "worker.gc_observed"); }
             else { check(returned == 24, "worker.valid_returns"); }
+            try
+            {
+                if (escaped_arguments) { (void)escaped_arguments->as<callback_node>(0); }
+                check(false, "worker.expired_frame_context_refused");
+            }
+            catch (const vmhook::exception&) {}
             if (const char* const failure{first_failure.load(std::memory_order_acquire)})
             { report << "first_failure=" << failure << '\n'; }
             report << "callback_proof=" << (correct.load() ? "pass" : "fail") << '\n';
