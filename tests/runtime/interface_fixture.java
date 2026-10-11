@@ -16,6 +16,7 @@ public class interface_fixture {
     }
     public static volatile api current;
     public static volatile api other;
+    public static volatile api alias;
     public static volatile boolean start;
     public static volatile boolean close_now;
     public static volatile boolean closed;
@@ -27,7 +28,11 @@ public class interface_fixture {
     public static final AtomicInteger gc_epoch = new AtomicInteger();
 
     public static callback_handler handler() { return new callback_handler(); }
-    public static void set_current(api value) { current = value; }
+    public static void set_current(api value) {
+        current = value;
+        alias = (api)Proxy.newProxyInstance(api.class.getClassLoader(),
+            new Class<?>[]{api.class}, Proxy.getInvocationHandler(value));
+    }
     public static void set_other(api value) { other = value; }
     public static void collect() { System.gc(); }
     public static Object raise() { throw original; }
@@ -44,6 +49,8 @@ public class interface_fixture {
         check(current.hashCode() == System.identityHashCode(current), "Object.hashCode");
         check(current.echo("hello \u0000\ud83d\ude00").equals("native:hello \u0000\ud83d\ude00"), "String roundtrip");
         check(other.echo("hello").equals("other:hello"), "two independent handlers");
+        try { alias.echo("alias"); throw new AssertionError("unowned proxy invoked C++"); }
+        catch (IllegalStateException error) { check(error.getMessage().contains("unavailable"), "same-handler proxy identity"); }
         check(current.add(37) == 42, "boxed primitive result");
         check(current.nullable(null) == null, "allocated owner representing Java null");
         Object token = new Object();

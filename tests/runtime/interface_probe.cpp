@@ -147,7 +147,7 @@ namespace
             report << "callbacks=" << calls.load() << "\nother_callbacks=" << other_calls.load()
                 << "\nroot_checks=" << root_checks.load() << "\njava_checks=" << valid
                 << "\njava_errors=" << errors << '\n';
-            passed("interface_roundtrip", finished && valid == 17 && !failure->get_instance());
+            passed("interface_roundtrip", finished && valid == 18 && !failure->get_instance());
             passed("interface_errors", errors == 3);
             passed("interface_gc", root_checks.load() > 0);
             bool reacquire_refused{};

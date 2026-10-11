@@ -25947,6 +25947,7 @@ namespace hotspot
         {
             retained_object<any_object> handler{};
             retained_object<interface_type> proxy{};
+            std::atomic<bool> ready{};
             std::atomic<bool> closed{};
             method_hook_id observer{};
             virtual ~interface_proxy_control() = default;
@@ -26000,13 +26001,15 @@ namespace hotspot
         [[nodiscard]] auto valid() const noexcept -> bool
         {
             const auto state{control_.load()};
-            return state && !state->closed.load(std::memory_order_acquire);
+            return state && state->ready.load(std::memory_order_acquire)
+                && !state->closed.load(std::memory_order_acquire);
         }
         explicit operator bool() const noexcept { return valid(); }
         [[nodiscard]] auto acquire() const -> std::unique_ptr<interface_type>
         {
             const auto state{control_.load()};
-            if (!state || state->closed.load(std::memory_order_acquire))
+            if (!state || !state->ready.load(std::memory_order_acquire)
+                || state->closed.load(std::memory_order_acquire))
             { throw exception{"Java interface callback resource is closed"}; }
             return state->proxy.acquire();
         }
@@ -26103,14 +26106,16 @@ namespace hotspot
             {
                 state->observer = add_hook<detail::interface_handler_binding>("invoke", invoke_descriptor,
                     [weak](return_value& result, const std::unique_ptr<any_object>& self,
-                        const std::unique_ptr<any_object>&, const std::unique_ptr<reflection_method>& method,
+                        const std::unique_ptr<any_object>& proxy, const std::unique_ptr<reflection_method>& method,
                         const std::unique_ptr<array<any_object>>& arguments)
                     {
                         const auto current{weak.lock()};
-                        if (!current || current->closed.load(std::memory_order_acquire)) { return; }
+                        if (!current || !current->ready.load(std::memory_order_acquire)
+                            || current->closed.load(std::memory_order_acquire)) { return; }
                         try
                         {
-                            if (!current->handler.is_same_object(self)) { return; }
+                            if (!current->handler.is_same_object(self)
+                                || !current->proxy.is_same_object(proxy)) { return; }
                             const auto name{method->name()};
                             if ((name == "equals" || name == "hashCode" || name == "toString")
                                 && method->declaring_class_name() == "java.lang.Object") { return; }
@@ -26143,6 +26148,7 @@ namespace hotspot
             const std::unique_ptr<interface_type> proxy = factory->call(interface_mirror);
             if (!proxy->get_instance()) { throw exception{"The normal Java proxy factory returned Java null"}; }
             state->proxy = retain(proxy);
+            state->ready.store(true, std::memory_order_release);
         }
         catch (...)
         {

@@ -47,6 +47,9 @@ obtained through an application method or field. A different ordinary
 `InvocationHandler` can expose the same `create_proxy(Class): Object` and
 `new_failure(int, String): Throwable` methods. Each supplied helper instance
 belongs to one proxy resource. VMHook does not load or define the helper class.
+Callbacks match both the retained handler and the created proxy by Java object
+identity. Another application-created proxy sharing that handler reaches the
+ordinary helper body. Callbacks begin after the proxy resource is constructed.
 
 The callback receives rooted owning wrappers through constant references. A
 zero-argument Java method has an allocated `arguments` wrapper whose
