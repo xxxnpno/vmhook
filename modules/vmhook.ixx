@@ -21065,7 +21065,7 @@ export namespace vmhook
                 constexpr std::string_view contract{wrapper_type::java_contract};
                 if constexpr (contract.starts_with("java/"))
                 {
-                    auto* const expected{vmhook::find_class(contract)};
+                    auto* const expected{registered_bootstrap_klass(contract)};
                     if (!expected) { throw vmhook::exception{"Built-in wrapper's Java class is unavailable"}; }
                     return expected;
                 }
@@ -21195,7 +21195,7 @@ export namespace vmhook
                 if constexpr (nested) { component = loaded_array_wrapper_class<element_type>(); }
                 else if constexpr (std::is_same_v<element_type, vmhook::any_object>)
                 {
-                    component = vmhook::find_class("java/lang/Object");
+                    component = registered_bootstrap_klass("java/lang/Object");
                     if (!component || !native_backend::retain_class(component))
                     { throw vmhook::exception{"Bootstrap Object Class could not be retained"}; }
                 }
