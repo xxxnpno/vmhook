@@ -41,7 +41,7 @@ CHECKS = {
                    "copied_observations_survive_close", "management_complete"],
     "lifetime": ["metadata", "native_attach", "ambiguous_name", "loader_binding", "constructor_identity",
                  "null_contract", "context_loader", "source_closed", "cross_context_gc",
-                 "released_resource", "unregister", "lifetime_complete"],
+                 "released_resource", "proxy_binding_lifetime", "unregister", "lifetime_complete"],
     "event_stream": ["context", "queued_observer", "deferred_registration", "initial_wait",
                      "copied_class_record", "deferred_native_install", "deferred_callback",
                      "deferred_removal", "deferred_original_body", "deferred_reclamation",
