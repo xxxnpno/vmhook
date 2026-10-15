@@ -210,7 +210,7 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   identifier metadata retains modified UTF-8, and internal loader/overload
   resolution converts that metadata to UTF-16 before calling Java.
 - Container method lookup now resolves inherited Java interface defaults.
-  Allocation failures in the checked default-method lookup propagate instead
+  Allocation failures in checked default-method lookup and adapter fingerprints propagate instead
   of crossing an incorrect `noexcept` boundary.
 - Enabled diagnostic logging catches formatting allocation failures inside its
   `noexcept` boundary. Checked formatting propagates the original `bad_alloc`

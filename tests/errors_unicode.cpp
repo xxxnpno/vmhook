@@ -153,6 +153,20 @@ int main()
     catch (const std::bad_alloc&) { metadata_allocation = true; }
     fail_next_allocation.store(false);
     check(metadata_allocation, "metadata conversion preserves the original C++ allocation failure");
+    constexpr std::string_view adapter_descriptor{"(IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII)V"};
+    check(vmhook::detail::adapter_fingerprint(adapter_descriptor, true)
+          == std::string(32, 'I'), "long adapter fingerprints retain every argument");
+    bool adapter_allocation{};
+    fail_next_allocation.store(true);
+    try { (void)vmhook::detail::adapter_fingerprint(adapter_descriptor, true); }
+    catch (const std::bad_alloc&) { adapter_allocation = true; }
+    fail_next_allocation.store(false);
+    check(adapter_allocation, "adapter fingerprint allocation propagates instead of terminating");
+    const std::string adapter_signature{adapter_descriptor};
+    fail_next_allocation.store(true);
+    const auto refused_adapter{vmhook::find_shared_c2i_entry(adapter_signature, true)};
+    fail_next_allocation.store(false);
+    check(refused_adapter == nullptr, "best-effort adapter lookup refuses an allocation failure");
     // Initialize Windows emulated TLS/destructor registration before faulting
     // the operation's own C++ allocation, rather than a runtime TLS allocation.
     (void)vmhook::detail::call_handle_pool();

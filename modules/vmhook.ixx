@@ -7389,7 +7389,7 @@ export namespace vmhook
             @return The key, or an empty string if the descriptor is malformed.
         */
         inline auto adapter_fingerprint(const std::string_view descriptor,
-                                        const bool is_static) noexcept
+                                        const bool is_static)
             -> std::string
         {
             const std::size_t open{ descriptor.find('(') };
