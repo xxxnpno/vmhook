@@ -24,6 +24,7 @@ from runtime_evidence import runtime_evidence, read_results
 
 
 CHECKS = {
+    "generated_wrapper": ['generated_context', 'generated_registration', 'generated_reserved_tokens', 'generated_class_name', 'generated_facade_names', 'generated_constructor_customization', 'generated_unicode_names', 'generated_unicode_descriptor', 'generated_gc', 'generated_complete'],
     "collection_views": ["views_context", "iterable_conversion", "iterable_gc_roots",
                          "iterable_nulls", "iterable_budgets", "iterable_java_failures",
                          "iterable_type_and_mutation", "collection_snapshot_route",
@@ -134,6 +135,7 @@ CHECKS = {
 }
 
 FIXTURES = {
+    "generated_wrapper": "GeneratedWrapperFixture",
     "collection_views": "CollectionViewsFixture",
     "coalesced_jit": "CoalescedJitFixture",
     "jit": "ObservationJitFixture",
@@ -163,6 +165,7 @@ FIXTURES = {
 
 
 OPTIONAL_PROBES = {
+    "generated_wrapper": "generated_wrapper_probe",
     "collection_views": "collection_views_probe",
     "coalesced_jit": "coalesced_jit_probe",
     "callbacks": "callback_probe",
@@ -187,6 +190,7 @@ OPTIONAL_PROBES = {
     "virtual_thread": "virtual_thread_probe",
 }
 TERMINAL_CHECK = {
+    "generated_wrapper": "generated_complete",
     "collection_views": "collection_views_proof",
     "coalesced_jit": "coalesced_jit_proof",
     "callbacks": "callback_proof",
