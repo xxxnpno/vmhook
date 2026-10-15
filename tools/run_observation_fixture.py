@@ -31,6 +31,13 @@ CHECKS = {
                          "iterable_interface_defaults", "iterable_cpp_allocation", "map_entry_views",
                          "nio_heap_views", "nio_direct_views", "views_foreign_context",
                          "views_expired_context", "collection_views_proof"],
+    "deadlock": ["deadlock_options", "deadlock_context_refusal", "deadlock_empty",
+                 "deadlock_normal_contention", "deadlock_platform_scope", "deadlock_monitor_cycle",
+                 "deadlock_monitor_identity", "deadlock_synchronizer_cycle", "deadlock_synchronizer_identity",
+                 "deadlock_scope_distinction", "deadlock_limits", "deadlock_stack_budget",
+                 "deadlock_unsupported_scope", "deadlock_raced_info", "deadlock_cpp_allocation",
+                 "deadlock_failure_cleanup", "deadlock_failure_retry", "deadlock_resources",
+                 "deadlock_context_closed", "deadlock_copied_lifetime", "deadlock_closed_refusal", "deadlock_complete"],
     "coalesced_jit": [
         "context", "registration", "compiled_baseline", "visible_inline_metadata",
         "first_hook", "first_global_invalidation", "direct_first_hook", "inlined_first_hook",
@@ -137,6 +144,7 @@ CHECKS = {
 FIXTURES = {
     "generated_wrapper": "GeneratedWrapperFixture",
     "collection_views": "CollectionViewsFixture",
+    "deadlock": "DeadlockFixture",
     "coalesced_jit": "CoalescedJitFixture",
     "jit": "ObservationJitFixture",
     "fields": "ObservationFieldFixture",
@@ -167,6 +175,7 @@ FIXTURES = {
 OPTIONAL_PROBES = {
     "generated_wrapper": "generated_wrapper_probe",
     "collection_views": "collection_views_probe",
+    "deadlock": "deadlock_probe",
     "coalesced_jit": "coalesced_jit_probe",
     "callbacks": "callback_probe",
     "hook_composition": "composition_probe",
@@ -192,6 +201,7 @@ OPTIONAL_PROBES = {
 TERMINAL_CHECK = {
     "generated_wrapper": "generated_complete",
     "collection_views": "collection_views_proof",
+    "deadlock": "deadlock_complete",
     "coalesced_jit": "coalesced_jit_proof",
     "callbacks": "callback_proof",
     "callback_throw": "callback_throw_proof",
@@ -485,6 +495,9 @@ def main():
             sources = [source / (name + ".java") for name in fixture_names]
             for fixture in sources:
                 evidence.add_input(fixture.stem + "_source", fixture)
+            if "deadlock" in modes:
+                evidence.add_input("deadlock_native_source", source / "deadlock_probe.cpp")
+                evidence.add_input("deadlock_canonical_source", source.parents[1] / "modules" / "vmhook.ixx")
             if "coalesced_jit" in modes:
                 evidence.add_input("coalesced_jit_native_source", source / "coalesced_jit_probe.cpp")
                 evidence.add_input("coalesced_jit_canonical_source", source.parents[1] / "modules" / "vmhook.ixx")

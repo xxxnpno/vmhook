@@ -29898,6 +29898,12 @@ export namespace vmhook
         bool native_method{};
     };
 
+    struct java_lock_snapshot final
+    {
+        std::string class_name{};
+        std::int32_t identity_hash{};
+    };
+
     struct java_thread_snapshot final
     {
         std::int64_t id{};
@@ -29907,6 +29913,33 @@ export namespace vmhook
         std::int64_t blocked_count{}, waited_count{};
         std::optional<std::int64_t> blocked_time_ms{}, waited_time_ms{}, cpu_time_ns{};
         std::vector<java_stack_frame_snapshot> stack{};
+        std::optional<java_lock_snapshot> waiting_on{};
+        std::optional<std::int64_t> lock_owner_id{};
+        std::optional<std::string> lock_owner_name{};
+    };
+
+    enum class deadlock_scope
+    {
+        monitors,
+        monitors_and_synchronizers
+    };
+
+    struct deadlock_options final
+    {
+        deadlock_scope scope{deadlock_scope::monitors_and_synchronizers};
+        std::size_t max_threads{256};
+        std::int32_t max_depth{64};
+    };
+
+    struct deadlock_snapshot final
+    {
+        std::chrono::steady_clock::time_point capture_started{}, capture_finished{};
+        deadlock_scope scope{deadlock_scope::monitors_and_synchronizers};
+        std::size_t max_threads{};
+        std::int32_t max_depth{};
+        std::size_t detected_thread_count{};
+        bool complete{true}, thread_limit{}, thread_info_raced{};
+        std::vector<java_thread_snapshot> threads{};
     };
 
     namespace detail
@@ -29947,6 +29980,103 @@ export namespace vmhook
             if (!usage) { throw exception{"Memory usage requires an allocated C++ owner"}; }
             if (!usage->get_instance()) { return std::nullopt; }
             return observe_memory_usage(usage);
+        }
+
+        inline auto copy_java_thread_info(const std::unique_ptr<any_object>& info,
+            const std::int64_t id) -> java_thread_snapshot
+        {
+            if (!info) { throw exception{"Thread information requires an allocated C++ owner"}; }
+            java_thread_snapshot snapshot{};
+            snapshot.id = id;
+            if (!info->get_instance()) { return snapshot; }
+            snapshot.alive = true;
+            constexpr std::string_view contract{"java/lang/management/ThreadInfo"};
+            snapshot.name = static_cast<std::string>(management_call(info, contract, "getThreadName", "()Ljava/lang/String;"));
+            const std::unique_ptr<any_object> state{management_call(info, contract, "getThreadState", "()Ljava/lang/Thread$State;")};
+            snapshot.state = static_cast<std::string>(management_call(state, "java/lang/Enum", "name", "()Ljava/lang/String;"));
+            snapshot.suspended = management_call(info, contract, "isSuspended", "()Z");
+            snapshot.in_native = management_call(info, contract, "isInNative", "()Z");
+            snapshot.blocked_count = management_call(info, contract, "getBlockedCount", "()J");
+            snapshot.waited_count = management_call(info, contract, "getWaitedCount", "()J");
+            const std::int64_t blocked{management_call(info, contract, "getBlockedTime", "()J")};
+            const std::int64_t waited{management_call(info, contract, "getWaitedTime", "()J")};
+            snapshot.blocked_time_ms = observed_nonnegative(blocked);
+            snapshot.waited_time_ms = observed_nonnegative(waited);
+            const std::unique_ptr<any_object> lock{management_call(info, contract, "getLockInfo", "()Ljava/lang/management/LockInfo;")};
+            if (lock->get_instance())
+            {
+                java_lock_snapshot copied{};
+                constexpr std::string_view lock_contract{"java/lang/management/LockInfo"};
+                copied.class_name = static_cast<std::string>(management_call(lock, lock_contract, "getClassName", "()Ljava/lang/String;"));
+                copied.identity_hash = management_call(lock, lock_contract, "getIdentityHashCode", "()I");
+                snapshot.waiting_on = std::move(copied);
+            }
+            const std::int64_t owner{management_call(info, contract, "getLockOwnerId", "()J")};
+            snapshot.lock_owner_id = observed_nonnegative(owner);
+            const auto owner_name{management_call(info, contract, "getLockOwnerName", "()Ljava/lang/String;")};
+            const std::unique_ptr<any_object> name_owner{owner_name};
+            if (name_owner->get_instance())
+            { snapshot.lock_owner_name = static_cast<std::string>(owner_name); }
+            const std::vector<std::unique_ptr<any_object>> frames{
+                management_call(info, contract, "getStackTrace", "()[Ljava/lang/StackTraceElement;").to_vector()};
+            snapshot.stack.reserve(frames.size());
+            for (const auto& frame : frames)
+            {
+                constexpr std::string_view frame_contract{"java/lang/StackTraceElement"};
+                java_stack_frame_snapshot copied{};
+                copied.class_name = static_cast<std::string>(management_call(frame, frame_contract, "getClassName", "()Ljava/lang/String;"));
+                copied.method_name = static_cast<std::string>(management_call(frame, frame_contract, "getMethodName", "()Ljava/lang/String;"));
+                copied.line_number = management_call(frame, frame_contract, "getLineNumber", "()I");
+                copied.native_method = management_call(frame, frame_contract, "isNativeMethod", "()Z");
+                snapshot.stack.push_back(std::move(copied));
+            }
+            return snapshot;
+        }
+
+        inline auto validate_deadlock_options(const deadlock_options& options) -> void
+        {
+            if ((options.scope != deadlock_scope::monitors
+                 && options.scope != deadlock_scope::monitors_and_synchronizers)
+                || options.max_threads == 0 || options.max_threads > 65536
+                || options.max_depth < 0 || options.max_depth > 1024)
+            { throw exception{"Deadlock snapshot options are out of range"}; }
+        }
+
+        inline auto observe_deadlocks_from_bean(const std::unique_ptr<any_object>& bean,
+            const deadlock_options& options) -> deadlock_snapshot
+        {
+            validate_deadlock_options(options);
+            deadlock_snapshot result{};
+            result.scope = options.scope;
+            result.max_threads = options.max_threads;
+            result.max_depth = options.max_depth;
+            result.capture_started = std::chrono::steady_clock::now();
+            constexpr std::string_view contract{"java/lang/management/ThreadMXBean"};
+            if (options.scope == deadlock_scope::monitors_and_synchronizers
+                && !static_cast<bool>(management_call(bean, contract, "isSynchronizerUsageSupported", "()Z")))
+            { throw exception{"Deadlock detection including synchronizers is unavailable"}; }
+            const std::string_view method{options.scope == deadlock_scope::monitors
+                ? "findMonitorDeadlockedThreads" : "findDeadlockedThreads"};
+            const std::unique_ptr<array<std::int64_t>> ids{management_call(bean, contract, method, "()[J")};
+            if (ids->get_instance())
+            {
+                result.detected_thread_count = static_cast<std::size_t>(ids->size());
+                const auto count{std::min(options.max_threads, result.detected_thread_count)};
+                result.thread_limit = count < result.detected_thread_count;
+                result.threads.reserve(count);
+                for (std::size_t index{}; index < count; ++index)
+                {
+                    const auto id{ids->get(static_cast<std::int32_t>(index))};
+                    const std::unique_ptr<any_object> info{management_call(bean, contract,
+                        "getThreadInfo", "(JI)Ljava/lang/management/ThreadInfo;", id, options.max_depth)};
+                    auto copied{copy_java_thread_info(info, id)};
+                    result.thread_info_raced = result.thread_info_raced || !copied.alive;
+                    result.threads.push_back(std::move(copied));
+                }
+            }
+            result.complete = !result.thread_limit && !result.thread_info_raced;
+            result.capture_finished = std::chrono::steady_clock::now();
+            return result;
         }
     }
 
@@ -30100,8 +30230,8 @@ export namespace vmhook
         return result;
     }
 
-    // Java ThreadMXBean snapshots include interpreted and compiled Java
-    // frames, subject to the JVM's ordinary stack-trace precision. They are
+    // Java ThreadMXBean snapshots cover platform threads, including their
+    // interpreted/compiled Java frames under the JVM's stack-trace rules. They are
     // synchronous observations, not asynchronous mixed-stack CPU samples.
     [[nodiscard]] inline auto observe_java_threads(const std::int32_t max_depth = 64,
         const std::size_t max_threads = 4096) -> std::vector<java_thread_snapshot>
@@ -30123,44 +30253,26 @@ export namespace vmhook
         result.reserve(infos.size());
         for (std::size_t index{}; index < infos.size(); ++index)
         {
-            java_thread_snapshot snapshot{};
-            snapshot.id = copied_ids[index];
-            const auto& info{ infos[index] };
-            if (!info->get_instance()) { result.push_back(std::move(snapshot)); continue; }
-            snapshot.alive = true;
-            constexpr std::string_view info_contract{ "java/lang/management/ThreadInfo" };
-            snapshot.name = static_cast<std::string>(detail::management_call(info, info_contract, "getThreadName", "()Ljava/lang/String;"));
-            const std::unique_ptr<any_object> state{ detail::management_call(info, info_contract, "getThreadState", "()Ljava/lang/Thread$State;") };
-            snapshot.state = static_cast<std::string>(detail::management_call(state, "java/lang/Enum", "name", "()Ljava/lang/String;"));
-            snapshot.suspended = detail::management_call(info, info_contract, "isSuspended", "()Z");
-            snapshot.in_native = detail::management_call(info, info_contract, "isInNative", "()Z");
-            snapshot.blocked_count = detail::management_call(info, info_contract, "getBlockedCount", "()J");
-            snapshot.waited_count = detail::management_call(info, info_contract, "getWaitedCount", "()J");
-            const std::int64_t blocked{ detail::management_call(info, info_contract, "getBlockedTime", "()J") };
-            const std::int64_t waited{ detail::management_call(info, info_contract, "getWaitedTime", "()J") };
-            snapshot.blocked_time_ms = detail::observed_nonnegative(blocked);
-            snapshot.waited_time_ms = detail::observed_nonnegative(waited);
-            if (cpu_supported)
+            auto snapshot{detail::copy_java_thread_info(infos[index], copied_ids[index])};
+            if (snapshot.alive && cpu_supported)
             {
-                const std::int64_t cpu{ detail::management_call(bean, contract, "getThreadCpuTime", "(J)J", snapshot.id) };
+                const std::int64_t cpu{detail::management_call(bean, contract, "getThreadCpuTime", "(J)J", snapshot.id)};
                 snapshot.cpu_time_ns = detail::observed_nonnegative(cpu);
-            }
-            const std::vector<std::unique_ptr<any_object>> frames{
-                detail::management_call(info, info_contract, "getStackTrace", "()[Ljava/lang/StackTraceElement;").to_vector() };
-            snapshot.stack.reserve(frames.size());
-            for (const auto& frame : frames)
-            {
-                constexpr std::string_view frame_contract{ "java/lang/StackTraceElement" };
-                java_stack_frame_snapshot copied{};
-                copied.class_name = static_cast<std::string>(detail::management_call(frame, frame_contract, "getClassName", "()Ljava/lang/String;"));
-                copied.method_name = static_cast<std::string>(detail::management_call(frame, frame_contract, "getMethodName", "()Ljava/lang/String;"));
-                copied.line_number = detail::management_call(frame, frame_contract, "getLineNumber", "()I");
-                copied.native_method = detail::management_call(frame, frame_contract, "isNativeMethod", "()Z");
-                snapshot.stack.push_back(std::move(copied));
             }
             result.push_back(std::move(snapshot));
         }
         return result;
+    }
+
+    // ThreadMXBean detects platform-thread cycles. The detector's own full
+    // search is not bounded by the copied-result budgets and is not atomic
+    // with the subsequent ThreadInfo reads.
+    [[nodiscard]] inline auto observe_deadlocks(const deadlock_options options = {})
+        -> deadlock_snapshot
+    {
+        detail::validate_deadlock_options(options);
+        const auto bean{detail::management_bean("getThreadMXBean", "()Ljava/lang/management/ThreadMXBean;")};
+        return detail::observe_deadlocks_from_bean(bean, options);
     }
 }
 // VMHOOK_MANAGEMENT_OBSERVATIONS_END
