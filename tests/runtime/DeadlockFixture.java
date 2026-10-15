@@ -146,15 +146,17 @@ public final class DeadlockFixture {
             }
         });
         await_state(contender, Thread.State.BLOCKED);
-        try {
+        String specification = System.getProperty("java.specification.version");
+        int feature = Integer.parseInt(specification.startsWith("1.")
+            ? specification.substring(2) : specification);
+        if (feature >= 21) {
+            // Java 19/20 expose the reflective method too, but invoking their
+            // preview API requires launch flags. Exercise only the stable API.
             Method start_virtual = Thread.class.getMethod("startVirtualThread", Runnable.class);
             virtual_thread = (Thread) start_virtual.invoke(null, new Runnable() {
                 public void run() { park(); }
             });
             await_state(virtual_thread, Thread.State.WAITING);
-        } catch (NoSuchMethodException older_java) {
-            // The source remains Java 8 compatible; stable virtual threads start
-            // only on Java 21+, without preview flags or a replacement JVM.
         }
         System.out.println("PID=" + ManagementFactory.getRuntimeMXBean().getName().split("@")[0]);
         System.out.println("READY");
