@@ -24,6 +24,12 @@ from runtime_evidence import runtime_evidence, read_results
 
 
 CHECKS = {
+    "collection_views": ["views_context", "iterable_conversion", "iterable_gc_roots",
+                         "iterable_nulls", "iterable_budgets", "iterable_java_failures",
+                         "iterable_type_and_mutation", "collection_snapshot_route",
+                         "iterable_interface_defaults", "iterable_cpp_allocation", "map_entry_views",
+                         "nio_heap_views", "nio_direct_views", "views_foreign_context",
+                         "views_expired_context", "collection_views_proof"],
     "coalesced_jit": [
         "context", "registration", "compiled_baseline", "visible_inline_metadata",
         "first_hook", "first_global_invalidation", "direct_first_hook", "inlined_first_hook",
@@ -128,6 +134,7 @@ CHECKS = {
 }
 
 FIXTURES = {
+    "collection_views": "CollectionViewsFixture",
     "coalesced_jit": "CoalescedJitFixture",
     "jit": "ObservationJitFixture",
     "fields": "ObservationFieldFixture",
@@ -156,6 +163,7 @@ FIXTURES = {
 
 
 OPTIONAL_PROBES = {
+    "collection_views": "collection_views_probe",
     "coalesced_jit": "coalesced_jit_probe",
     "callbacks": "callback_probe",
     "hook_composition": "composition_probe",
@@ -179,6 +187,7 @@ OPTIONAL_PROBES = {
     "virtual_thread": "virtual_thread_probe",
 }
 TERMINAL_CHECK = {
+    "collection_views": "collection_views_proof",
     "coalesced_jit": "coalesced_jit_proof",
     "callbacks": "callback_proof",
     "callback_throw": "callback_throw_proof",
