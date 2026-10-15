@@ -198,7 +198,7 @@ def compile_generated(args) -> None:
         information = json.loads((backend / 'build-info.json').read_text(encoding='utf-8'))
         mapper = directory / 'module.mapper'
         mapper.write_text((backend / 'module.mapper').read_text(encoding='utf-8')
-            + 'vmhook.generated_fixture ' + (directory / 'generated_fixture.gcm').as_posix() + '\n', encoding='utf-8')
+            + 'vmhook.generated_fixture ' + (directory / 'generated_fixture.gcm').as_posix() + '\n', encoding='utf-8', newline='\n')
         options = [value for value in information['consumer_flags'] if not value.startswith('-fmodule-mapper=')]
         options += ['-fmodule-mapper=' + mapper.as_posix(), '-DVMHOOK_TEST_MODULE']
         generated_object = directory / 'generated_fixture.o'
