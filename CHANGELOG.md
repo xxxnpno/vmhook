@@ -8,6 +8,10 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- Bounded snapshots of custom Java Iterable implementations, including selected
+  interface defaults, plus live Map.Entry access and owning NIO buffer views.
+- Copied platform-thread deadlock snapshots with explicit monitor/synchronizer
+  scopes, wait-owner information, truncation/race flags and capture intervals.
 - Bounded rooted reference-graph snapshots with cycle/shared-object IDs, explicit
   traversal budgets and copied records; weak-reference internals are excluded
   before reading.
@@ -201,6 +205,15 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Source archive permissions are pinned independently of the user's Git
+  `tar.umask`, preserving reproducible package bytes across configurations.
+- Generated wrappers escape all C++ tokens, injected class names and facade/type
+  name collisions while preserving their exact Java binding. Supplementary
+  identifier metadata retains modified UTF-8, and internal loader/overload
+  resolution converts that metadata to UTF-16 before calling Java.
+- Container method lookup now resolves inherited Java interface defaults.
+  Allocation failures in checked default-method lookup and adapter fingerprints propagate instead
+  of crossing an incorrect `noexcept` boundary.
 - Enabled diagnostic logging catches formatting allocation failures inside its
   `noexcept` boundary. Checked formatting propagates the original `bad_alloc`
   or `format_error` instead of silently returning an unformatted message.

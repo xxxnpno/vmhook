@@ -67,6 +67,33 @@ Built-in wrappers include `collection`, `list`, `array_list`, `linked_list`,
 `map`, `hash_map`, `linked_hash_map`, `tree_map`, and `concurrent_hash_map`.
 Concrete wrappers can be constructed with `vmhook::make_unique<T>()`.
 
+`iterable` also wraps implementations of `java.lang.Iterable` that do not
+implement `Collection`. Its `iterator()` result converts to an owning `iterator` wrapper.
+Inherited Java interface default methods are resolved through HotSpot's selected
+implementation, including default `iterator`, `hasNext` and `next` methods.
+
+```cpp
+const std::unique_ptr<vmhook::iterable> source =
+    get_field("playerSequence")->get();
+const std::vector<std::unique_ptr<player>> values = source->to_vector();
+const auto bounded = source->to_vector<player>(128);
+```
+
+An Iterable conversion visits at most 65,536 elements by default; an explicit
+budget can be zero through 1,048,576. An exact-bound finite source succeeds.
+If another element is available, conversion throws before calling `next()` for
+that element. It never returns a silently truncated vector. An empty source
+succeeds with budget zero; a null iterator returned by a nonnull source is an
+error. Use `iterator()` for streaming or side-effectful sequences. Java exceptions
+from iteration preserve the original Throwable. These budgets bound returned
+elements, not time spent inside application iterator code.
+
+Field and method `to_vector()` conversions also accept custom Iterable values.
+Collection values keep their public `toArray()` path and its Java concurrency
+contract; they are not converted by a new per-element iterator loop. Arrays
+retain their existing typed array path. A Java-null source yields an empty
+vector, matching the existing Collection conversion contract.
+
 ```cpp
 const auto players = vmhook::make_unique<vmhook::array_list>();
 players->add(first_player);
@@ -109,6 +136,24 @@ are Java views, with the original fail-fast or weak-consistency semantics.
 `to_vector()` is a snapshot, not an atomic transaction against concurrent
 mutations. A map's Java-null result can mean either an absent key or a stored
 null; use `contains_key()` when that distinction matters.
+
+`map_entry` wraps the live entries returned by `entry_set()`. Its `get_key`,
+`get_value` and `set_value` use owning wrapper conversions, including Java null:
+
+```cpp
+const std::unique_ptr<vmhook::set> entries = by_player->entry_set();
+const std::unique_ptr<vmhook::iterator> cursor = entries->iterator();
+if (cursor->has_next())
+{
+    const std::unique_ptr<vmhook::map_entry> entry = cursor->next();
+    const std::unique_ptr<player> key = entry->get_key();
+    const std::unique_ptr<player> previous = entry->set_value(first_player);
+}
+```
+
+Whether an entry supports `set_value`, remains valid after a map mutation, or
+shares later updates follows its Java implementation. Immutable entries raise
+the original Java exception; an empty C++ owner is refused as an argument.
 
 ## Strings, boxed values, and Optional
 
@@ -159,6 +204,13 @@ the position according to Java's `put(byte[])` contract.
 The API exposes copied C++ bytes, not a borrowed pointer to direct storage.
 The retained Java buffer and its Cleaner own direct-memory lifetime. Read-only
 buffers, invalid indices, and insufficient remaining space raise Java failures.
+
+`limit()` and `limit(next)` expose the Java buffer limit. `duplicate`, `slice`
+and `as_read_only_buffer` return owning buffer wrappers with independent position
+and limit state and shared Java storage. `is_read_only()` reports write access.
+The Java view retains its backing storage even if the original C++ wrapper is
+released. A read-only view still observes writes made through a writable peer;
+it is not an immutable copy. No raw pointer or span into that storage escapes.
 
 ## Inferred arguments
 

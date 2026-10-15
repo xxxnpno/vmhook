@@ -1335,11 +1335,13 @@ namespace vmhook
     // without naming a type.  Defined after oop_reflective_base, which
     // supplies the read-the-klass-out-of-the-header machinery it needs.
     class any_object;
+    class iterable;
     class collection;
     class list;
     class set;
     class linked_list;
     class map;
+    class map_entry;
     class hash_map;
     class array_list;
     class hash_set;
@@ -7499,7 +7501,7 @@ namespace vmhook
             @return The key, or an empty string if the descriptor is malformed.
         */
         inline auto adapter_fingerprint(const std::string_view descriptor,
-                                        const bool is_static) noexcept
+                                        const bool is_static)
             -> std::string
         {
             const std::size_t open{ descriptor.find('(') };
@@ -10007,6 +10009,39 @@ namespace vmhook
                 position += count;
             }
             return units;
+        }
+
+        /* HotSpot metadata uses class-file modified UTF-8: supplementary
+           characters are encoded as two UTF-16 surrogate units, and NUL as
+           C0 80. Decode those bytes before passing metadata names to Java;
+           ordinary Java String arguments retain their standard UTF-8 path. */
+        inline auto modified_utf8_to_utf16(const std::string_view value) -> std::u16string
+        {
+            std::u16string result;
+            result.reserve(value.size());
+            for (std::size_t position{}; position < value.size(); )
+            {
+                const auto lead{ static_cast<std::uint8_t>(value[position]) };
+                const std::size_t width{ lead > 0 && lead < 0x80u ? 1u
+                    : lead >= 0xc0u && lead <= 0xdfu ? 2u
+                    : lead >= 0xe0u && lead <= 0xefu ? 3u : 0u };
+                if (!width || width > value.size() - position)
+                { throw vmhook::exception{ "Invalid modified UTF-8 metadata" }; }
+                std::uint32_t unit{ width == 1 ? lead : lead & (0x7fu >> width) };
+                for (std::size_t index{ 1 }; index < width; ++index)
+                {
+                    const auto byte{ static_cast<std::uint8_t>(value[position + index]) };
+                    if ((byte & 0xc0u) != 0x80u)
+                    { throw vmhook::exception{ "Invalid modified UTF-8 metadata" }; }
+                    unit = (unit << 6) | (byte & 0x3fu);
+                }
+                if ((width == 2 && unit < 0x80u && unit != 0)
+                    || (width == 3 && unit < 0x800u))
+                { throw vmhook::exception{ "Overlong modified UTF-8 metadata" }; }
+                result.push_back(static_cast<char16_t>(unit));
+                position += width;
+            }
+            return result;
         }
 
         /* Java Strings may contain isolated UTF-16 surrogates. UTF-8 replaces
@@ -19858,7 +19893,7 @@ namespace vmhook
             class has overloaded Java methods with the same name but different signatures.
 
             Complexity: O(N * M) where N = methods in the hierarchy, M = name comparison cost.
-            Exception safety: does not throw; returns nullopt on failure.
+            Missing metadata returns nullopt; checked operation and allocation errors propagate.
 
             @param method_name       Exact Java method name.
             @param method_signature  JVM descriptor, e.g. "(I)Ljava/lang/String;".
@@ -19930,7 +19965,7 @@ namespace vmhook
             a null object pointer so it cannot be used to call instance methods.
 
             Complexity: O(N * M) where N = methods in the hierarchy, M = name comparison cost.
-            Exception safety: does not throw; returns nullopt on failure.
+            Missing metadata returns nullopt; checked operation and allocation errors propagate.
 
             @param wrapper_type  std::type_index of the registered C++ wrapper class.
             @param method_name   Exact Java method name.
@@ -19997,7 +20032,7 @@ namespace vmhook
             Java class has overloaded static methods.
 
             Complexity: O(N * M).
-            Exception safety: does not throw; returns nullopt on failure.
+            Missing metadata returns nullopt; checked operation and allocation errors propagate.
 
             @param wrapper_type      std::type_index of the registered C++ wrapper class.
             @param method_name       Exact Java method name.
@@ -20120,7 +20155,7 @@ namespace vmhook
             typeid(*this) because there is no object instance.
 
             Complexity: O(1) after the first call per type (cached in klass_lookup_cache).
-            Exception safety: does not throw; returns nullptr and logs on failure.
+            Missing metadata returns nullptr; checked operation and allocation errors propagate.
 
             @param wrapper_type  std::type_index of the C++ wrapper class.
             @return  klass*, or nullptr if the type is not registered or the class is not found.
@@ -20239,7 +20274,7 @@ namespace vmhook
         */
         static auto safe_method_name_signature(vmhook::hotspot::method* const current_method,
                                                std::string&                  name_out,
-                                               std::string&                  signature_out) noexcept
+                                               std::string&                  signature_out)
             -> bool
         {
             name_out.clear();
@@ -20398,7 +20433,7 @@ namespace vmhook
         */
         static auto find_interface_default_method(vmhook::hotspot::klass* const start_klass,
                                                   const std::string_view method_name,
-                                                  const std::string_view method_signature) noexcept
+                                                  const std::string_view method_signature)
             -> vmhook::hotspot::method*
         {
             if (!start_klass || !vmhook::hotspot::is_valid_pointer(start_klass))
@@ -21214,9 +21249,9 @@ namespace vmhook
                 if (!class_class || loader_of(class_class) != nullptr)
                 { throw vmhook::exception{ "Bootstrap java.lang.Class metadata is unavailable" }; }
                 const auto class_root{ native_backend::retain_class(class_class) };
-                std::string binary_name{ dimensions == 0 ? internal_name : descriptor };
-                std::replace(binary_name.begin(), binary_name.end(), '/', '.');
-                const auto name_root{ native_backend::make_string(binary_name) };
+                auto binary_name{ modified_utf8_to_utf16(dimensions == 0 ? internal_name : descriptor) };
+                std::replace(binary_name.begin(), binary_name.end(), u'/', u'.');
+                const auto name_root{ native_backend::make_string_utf16(binary_name) };
                 if (!class_root || !name_root)
                 { throw vmhook::exception{ "Java argument class-resolution inputs could not be retained" }; }
                 constexpr std::string_view lookup_signature{
@@ -21344,7 +21379,9 @@ namespace vmhook
         {
             vmhook::any_object source{ container_address(root) };
             source.set_native_root(root);
-            const auto method{ source.get_method(name, signature) };
+            // The selected implementation can be a Java 8 interface default,
+            // with no declaration in the concrete class or its superclasses.
+            const auto method{ source.object_base::get_method(name, signature) };
             if (!method)
             { throw vmhook::exception{ std::format("Java collection method '{}{}' is unavailable", name, signature) }; }
             auto result{ method->call(std::forward<argument_types>(arguments)...) };
@@ -21654,18 +21691,65 @@ namespace vmhook
     inline auto return_value::throw_exception(const std::unique_ptr<vmhook::any_object>& throwable) -> void
     { vmhook::detail::raise_callback_exception(this->return_slot, this->stack_frame, throwable); }
 
+    /* Iterable need not implement Collection or supply toArray. Its iterator
+       is rooted across calls, and a finite element budget rejects unbounded
+       sources without returning an apparently complete partial vector. */
+    class iterable : public vmhook::oop_reflective_base
+    {
+    public:
+        inline static constexpr std::string_view java_contract{ "java/lang/Iterable" };
+        explicit iterable(vmhook::oop_t oop = nullptr) noexcept : vmhook::oop_reflective_base{ oop } {}
+        template<typename wrapper_type>
+        explicit iterable(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::oop_reflective_base{ handle.resolve() }
+        { this->set_native_root(handle.get_native_root()); }
+
+        auto iterator() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "iterator", "()Ljava/util/Iterator;"); }
+
+        template<vmhook::detail::container_wrapper element_type>
+        auto to_vector(const std::size_t max_elements = 65'536) const
+            -> std::vector<std::unique_ptr<element_type>>
+        {
+            if (max_elements > 1'048'576)
+            { throw vmhook::exception{ "Iterable element budget exceeds 1048576" }; }
+            vmhook::detail::native_backend::operation access{};
+            const auto source{ vmhook::detail::container_source_root(*this) };
+            if (!source) { return {}; }
+            if (!access)
+            { throw vmhook::exception{ "Iterable conversion requires a rooted VM context" }; }
+            vmhook::detail::require_container_contract(source, java_contract);
+            const auto cursor{ vmhook::detail::container_result_root(
+                vmhook::detail::call_container_method(source, "iterator", "()Ljava/util/Iterator;")) };
+            if (!cursor) { throw vmhook::exception{ "Iterable.iterator returned null" }; }
+            vmhook::detail::require_container_contract(cursor, "java/util/Iterator");
+            std::vector<std::unique_ptr<element_type>> result;
+            while (static_cast<bool>(vmhook::detail::call_container_method(cursor, "hasNext", "()Z")))
+            {
+                if (result.size() == max_elements)
+                { throw vmhook::exception{ std::format("Iterable conversion exceeded its {} element budget", max_elements) }; }
+                const auto next{ vmhook::detail::container_result_root(
+                    vmhook::detail::call_container_method(cursor, "next", "()Ljava/lang/Object;")) };
+                result.push_back(vmhook::detail::wrap_container_element<element_type>(next));
+            }
+            return result;
+        }
+        auto to_vector() const -> vmhook::detail::vector_conversion<iterable>
+        { return vmhook::detail::vector_conversion<iterable>{ *this }; }
+    };
+
     /* Java Collection wrappers use the public toArray contract. Snapshot order
        and concurrent-mutation semantics are those of the Java implementation.
        Returned unique_ptrs own C++ wrappers; their Java roots belong to the
        current native-thread or validated callback context. */
-    class collection : public vmhook::oop_reflective_base
+    class collection : public vmhook::iterable
     {
     public:
         inline static constexpr std::string_view java_contract{ "java/util/Collection" };
-        explicit collection(vmhook::oop_t oop = nullptr) noexcept : vmhook::oop_reflective_base{ oop } {}
+        explicit collection(vmhook::oop_t oop = nullptr) noexcept : vmhook::iterable{ oop } {}
         template<typename wrapper_type>
         explicit collection(const vmhook::borrowed<wrapper_type>& handle) noexcept
-            : vmhook::oop_reflective_base{ handle.resolve() }
+            : vmhook::iterable{ handle.resolve() }
         { this->set_native_root(handle.get_native_root()); }
 
         auto size() const -> std::int32_t
@@ -21717,8 +21801,6 @@ namespace vmhook
         { return vmhook::detail::invoke_container(*this, java_contract, "retainAll", "(Ljava/util/Collection;)Z", elements); }
         auto clear() const -> void
         { (void)vmhook::detail::invoke_container(*this, java_contract, "clear", "()V"); }
-        auto iterator() const -> vmhook::method_proxy::value_t
-        { return vmhook::detail::invoke_container(*this, java_contract, "iterator", "()Ljava/util/Iterator;"); }
     };
 
     class list : public vmhook::collection
@@ -21917,6 +21999,20 @@ namespace vmhook
         { return vmhook::detail::invoke_container(*this, java_contract, "values", "()Ljava/util/Collection;"); }
         auto entry_set() const -> vmhook::method_proxy::value_t
         { return vmhook::detail::invoke_container(*this, java_contract, "entrySet", "()Ljava/util/Set;"); }
+    };
+
+    class map_entry : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/util/Map$Entry" };
+        auto get_key() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "getKey", "()Ljava/lang/Object;"); }
+        auto get_value() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "getValue", "()Ljava/lang/Object;"); }
+        template<vmhook::detail::container_wrapper element_type>
+        auto set_value(const std::unique_ptr<element_type>& value) const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "setValue", "(Ljava/lang/Object;)Ljava/lang/Object;", value); }
     };
 
     class iterator : public vmhook::oop_reflective_base
@@ -22335,6 +22431,26 @@ namespace vmhook
         return compressed;
     }
 
+    namespace detail
+    {
+        template<container_wrapper element_type>
+        auto container_object_vector(const native_backend::root& source)
+            -> std::vector<std::unique_ptr<element_type>>
+        {
+            auto* const contract{ vmhook::find_class("java/util/Collection") };
+            if (contract && container_class_assignable(
+                    vmhook::klass_from_oop(container_address(source)), contract))
+            {
+                vmhook::collection wrapped{};
+                wrapped.set_native_root(source);
+                return wrapped.template to_vector<element_type>();
+            }
+            vmhook::iterable wrapped{};
+            wrapped.set_native_root(source);
+            return wrapped.template to_vector<element_type>();
+        }
+    }
+
     template<vmhook::detail::container_wrapper element_type>
     auto field_proxy::value_t::to_vector() const -> std::vector<std::unique_ptr<element_type>>
     {
@@ -22352,9 +22468,7 @@ namespace vmhook
         if (this->signature.front() == '[' || vmhook::detail::array_layout(
                 vmhook::klass_from_oop(vmhook::detail::container_address(source))))
         { return vmhook::detail::container_array_vector<element_type>(source); }
-        collection wrapped{};
-        wrapped.set_native_root(source);
-        return wrapped.to_vector<element_type>();
+        return vmhook::detail::container_object_vector<element_type>(source);
     }
     template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
     auto field_proxy::value_t::to_entries() const
@@ -22392,9 +22506,7 @@ namespace vmhook
         if (!access) { throw vmhook::exception{ "Collection conversion requires a native-thread or rooted callback context" }; }
         if (vmhook::detail::array_layout(vmhook::klass_from_oop(vmhook::detail::container_address(source))))
         { return vmhook::detail::container_array_vector<element_type>(source); }
-        collection wrapped{};
-        wrapped.set_native_root(source);
-        return wrapped.to_vector<element_type>();
+        return vmhook::detail::container_object_vector<element_type>(source);
     }
     template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
     auto method_proxy::value_t::to_entries() const
@@ -26918,6 +27030,18 @@ namespace hotspot
         { (void)vmhook::detail::invoke_container(*this, java_contract, "position", "(I)Ljava/nio/Buffer;", next); }
         auto remaining() const -> std::int32_t
         { return vmhook::detail::invoke_container(*this, java_contract, "remaining", "()I"); }
+        auto limit() const -> std::int32_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "limit", "()I"); }
+        auto limit(const std::int32_t next) const -> void
+        { (void)vmhook::detail::invoke_container(*this, java_contract, "limit", "(I)Ljava/nio/Buffer;", next); }
+        auto is_read_only() const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "isReadOnly", "()Z"); }
+        auto duplicate() const -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::invoke_container(*this, java_contract, "duplicate", "()Ljava/nio/ByteBuffer;"); }
+        auto slice() const -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::invoke_container(*this, java_contract, "slice", "()Ljava/nio/ByteBuffer;"); }
+        auto as_read_only_buffer() const -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::invoke_container(*this, java_contract, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;"); }
         auto get(const std::int32_t index) const -> std::int8_t
         { return vmhook::detail::invoke_container(*this, java_contract, "get", "(I)B", index); }
         auto put(const std::int32_t index, const std::int8_t value) const -> void
@@ -26959,11 +27083,15 @@ namespace hotspot
         inline auto descriptor_class_mirror(const std::string_view descriptor,
             const native_backend::root& loader) -> native_backend::root
         {
-            std::string name{descriptor.front() == '[' ? descriptor : descriptor.substr(1, descriptor.size() - 2)};
-            std::replace(name.begin(), name.end(), '/', '.');
+            auto name{modified_utf8_to_utf16(descriptor.front() == '['
+                ? descriptor : descriptor.substr(1, descriptor.size() - 2))};
+            std::replace(name.begin(), name.end(), u'/', u'.');
+            const auto name_root{native_backend::make_string_utf16(name)};
+            if (!name_root) { throw vmhook::exception{"Descriptor class-name allocation was refused"}; }
+            auto name_owner{materialize_object<vmhook::any_object>(0, name_root)};
             auto loader_wrapper{materialize_object<vmhook::any_object>(0, loader)};
             return container_result_root(call_bootstrap_method("java/lang/Class", "forName",
-                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", name, false, loader_wrapper));
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", name_owner, false, loader_wrapper));
         }
 
         [[nodiscard]] inline auto method_parameters_more_specific(const std::string_view left,
@@ -29907,6 +30035,12 @@ namespace vmhook
         bool native_method{};
     };
 
+    struct java_lock_snapshot final
+    {
+        std::string class_name{};
+        std::int32_t identity_hash{};
+    };
+
     struct java_thread_snapshot final
     {
         std::int64_t id{};
@@ -29916,6 +30050,33 @@ namespace vmhook
         std::int64_t blocked_count{}, waited_count{};
         std::optional<std::int64_t> blocked_time_ms{}, waited_time_ms{}, cpu_time_ns{};
         std::vector<java_stack_frame_snapshot> stack{};
+        std::optional<java_lock_snapshot> waiting_on{};
+        std::optional<std::int64_t> lock_owner_id{};
+        std::optional<std::string> lock_owner_name{};
+    };
+
+    enum class deadlock_scope
+    {
+        monitors,
+        monitors_and_synchronizers
+    };
+
+    struct deadlock_options final
+    {
+        deadlock_scope scope{deadlock_scope::monitors_and_synchronizers};
+        std::size_t max_threads{256};
+        std::int32_t max_depth{64};
+    };
+
+    struct deadlock_snapshot final
+    {
+        std::chrono::steady_clock::time_point capture_started{}, capture_finished{};
+        deadlock_scope scope{deadlock_scope::monitors_and_synchronizers};
+        std::size_t max_threads{};
+        std::int32_t max_depth{};
+        std::size_t detected_thread_count{};
+        bool complete{true}, thread_limit{}, thread_info_raced{};
+        std::vector<java_thread_snapshot> threads{};
     };
 
     namespace detail
@@ -29956,6 +30117,103 @@ namespace vmhook
             if (!usage) { throw exception{"Memory usage requires an allocated C++ owner"}; }
             if (!usage->get_instance()) { return std::nullopt; }
             return observe_memory_usage(usage);
+        }
+
+        inline auto copy_java_thread_info(const std::unique_ptr<any_object>& info,
+            const std::int64_t id) -> java_thread_snapshot
+        {
+            if (!info) { throw exception{"Thread information requires an allocated C++ owner"}; }
+            java_thread_snapshot snapshot{};
+            snapshot.id = id;
+            if (!info->get_instance()) { return snapshot; }
+            snapshot.alive = true;
+            constexpr std::string_view contract{"java/lang/management/ThreadInfo"};
+            snapshot.name = static_cast<std::string>(management_call(info, contract, "getThreadName", "()Ljava/lang/String;"));
+            const std::unique_ptr<any_object> state{management_call(info, contract, "getThreadState", "()Ljava/lang/Thread$State;")};
+            snapshot.state = static_cast<std::string>(management_call(state, "java/lang/Enum", "name", "()Ljava/lang/String;"));
+            snapshot.suspended = management_call(info, contract, "isSuspended", "()Z");
+            snapshot.in_native = management_call(info, contract, "isInNative", "()Z");
+            snapshot.blocked_count = management_call(info, contract, "getBlockedCount", "()J");
+            snapshot.waited_count = management_call(info, contract, "getWaitedCount", "()J");
+            const std::int64_t blocked{management_call(info, contract, "getBlockedTime", "()J")};
+            const std::int64_t waited{management_call(info, contract, "getWaitedTime", "()J")};
+            snapshot.blocked_time_ms = observed_nonnegative(blocked);
+            snapshot.waited_time_ms = observed_nonnegative(waited);
+            const std::unique_ptr<any_object> lock{management_call(info, contract, "getLockInfo", "()Ljava/lang/management/LockInfo;")};
+            if (lock->get_instance())
+            {
+                java_lock_snapshot copied{};
+                constexpr std::string_view lock_contract{"java/lang/management/LockInfo"};
+                copied.class_name = static_cast<std::string>(management_call(lock, lock_contract, "getClassName", "()Ljava/lang/String;"));
+                copied.identity_hash = management_call(lock, lock_contract, "getIdentityHashCode", "()I");
+                snapshot.waiting_on = std::move(copied);
+            }
+            const std::int64_t owner{management_call(info, contract, "getLockOwnerId", "()J")};
+            snapshot.lock_owner_id = observed_nonnegative(owner);
+            const auto owner_name{management_call(info, contract, "getLockOwnerName", "()Ljava/lang/String;")};
+            const std::unique_ptr<any_object> name_owner{owner_name};
+            if (name_owner->get_instance())
+            { snapshot.lock_owner_name = static_cast<std::string>(owner_name); }
+            const std::vector<std::unique_ptr<any_object>> frames{
+                management_call(info, contract, "getStackTrace", "()[Ljava/lang/StackTraceElement;").to_vector()};
+            snapshot.stack.reserve(frames.size());
+            for (const auto& frame : frames)
+            {
+                constexpr std::string_view frame_contract{"java/lang/StackTraceElement"};
+                java_stack_frame_snapshot copied{};
+                copied.class_name = static_cast<std::string>(management_call(frame, frame_contract, "getClassName", "()Ljava/lang/String;"));
+                copied.method_name = static_cast<std::string>(management_call(frame, frame_contract, "getMethodName", "()Ljava/lang/String;"));
+                copied.line_number = management_call(frame, frame_contract, "getLineNumber", "()I");
+                copied.native_method = management_call(frame, frame_contract, "isNativeMethod", "()Z");
+                snapshot.stack.push_back(std::move(copied));
+            }
+            return snapshot;
+        }
+
+        inline auto validate_deadlock_options(const deadlock_options& options) -> void
+        {
+            if ((options.scope != deadlock_scope::monitors
+                 && options.scope != deadlock_scope::monitors_and_synchronizers)
+                || options.max_threads == 0 || options.max_threads > 65536
+                || options.max_depth < 0 || options.max_depth > 1024)
+            { throw exception{"Deadlock snapshot options are out of range"}; }
+        }
+
+        inline auto observe_deadlocks_from_bean(const std::unique_ptr<any_object>& bean,
+            const deadlock_options& options) -> deadlock_snapshot
+        {
+            validate_deadlock_options(options);
+            deadlock_snapshot result{};
+            result.scope = options.scope;
+            result.max_threads = options.max_threads;
+            result.max_depth = options.max_depth;
+            result.capture_started = std::chrono::steady_clock::now();
+            constexpr std::string_view contract{"java/lang/management/ThreadMXBean"};
+            if (options.scope == deadlock_scope::monitors_and_synchronizers
+                && !static_cast<bool>(management_call(bean, contract, "isSynchronizerUsageSupported", "()Z")))
+            { throw exception{"Deadlock detection including synchronizers is unavailable"}; }
+            const std::string_view method{options.scope == deadlock_scope::monitors
+                ? "findMonitorDeadlockedThreads" : "findDeadlockedThreads"};
+            const std::unique_ptr<array<std::int64_t>> ids{management_call(bean, contract, method, "()[J")};
+            if (ids->get_instance())
+            {
+                result.detected_thread_count = static_cast<std::size_t>(ids->size());
+                const auto count{std::min(options.max_threads, result.detected_thread_count)};
+                result.thread_limit = count < result.detected_thread_count;
+                result.threads.reserve(count);
+                for (std::size_t index{}; index < count; ++index)
+                {
+                    const auto id{ids->get(static_cast<std::int32_t>(index))};
+                    const std::unique_ptr<any_object> info{management_call(bean, contract,
+                        "getThreadInfo", "(JI)Ljava/lang/management/ThreadInfo;", id, options.max_depth)};
+                    auto copied{copy_java_thread_info(info, id)};
+                    result.thread_info_raced = result.thread_info_raced || !copied.alive;
+                    result.threads.push_back(std::move(copied));
+                }
+            }
+            result.complete = !result.thread_limit && !result.thread_info_raced;
+            result.capture_finished = std::chrono::steady_clock::now();
+            return result;
         }
     }
 
@@ -30109,8 +30367,8 @@ namespace vmhook
         return result;
     }
 
-    // Java ThreadMXBean snapshots include interpreted and compiled Java
-    // frames, subject to the JVM's ordinary stack-trace precision. They are
+    // Java ThreadMXBean snapshots cover platform threads, including their
+    // interpreted/compiled Java frames under the JVM's stack-trace rules. They are
     // synchronous observations, not asynchronous mixed-stack CPU samples.
     [[nodiscard]] inline auto observe_java_threads(const std::int32_t max_depth = 64,
         const std::size_t max_threads = 4096) -> std::vector<java_thread_snapshot>
@@ -30132,44 +30390,26 @@ namespace vmhook
         result.reserve(infos.size());
         for (std::size_t index{}; index < infos.size(); ++index)
         {
-            java_thread_snapshot snapshot{};
-            snapshot.id = copied_ids[index];
-            const auto& info{ infos[index] };
-            if (!info->get_instance()) { result.push_back(std::move(snapshot)); continue; }
-            snapshot.alive = true;
-            constexpr std::string_view info_contract{ "java/lang/management/ThreadInfo" };
-            snapshot.name = static_cast<std::string>(detail::management_call(info, info_contract, "getThreadName", "()Ljava/lang/String;"));
-            const std::unique_ptr<any_object> state{ detail::management_call(info, info_contract, "getThreadState", "()Ljava/lang/Thread$State;") };
-            snapshot.state = static_cast<std::string>(detail::management_call(state, "java/lang/Enum", "name", "()Ljava/lang/String;"));
-            snapshot.suspended = detail::management_call(info, info_contract, "isSuspended", "()Z");
-            snapshot.in_native = detail::management_call(info, info_contract, "isInNative", "()Z");
-            snapshot.blocked_count = detail::management_call(info, info_contract, "getBlockedCount", "()J");
-            snapshot.waited_count = detail::management_call(info, info_contract, "getWaitedCount", "()J");
-            const std::int64_t blocked{ detail::management_call(info, info_contract, "getBlockedTime", "()J") };
-            const std::int64_t waited{ detail::management_call(info, info_contract, "getWaitedTime", "()J") };
-            snapshot.blocked_time_ms = detail::observed_nonnegative(blocked);
-            snapshot.waited_time_ms = detail::observed_nonnegative(waited);
-            if (cpu_supported)
+            auto snapshot{detail::copy_java_thread_info(infos[index], copied_ids[index])};
+            if (snapshot.alive && cpu_supported)
             {
-                const std::int64_t cpu{ detail::management_call(bean, contract, "getThreadCpuTime", "(J)J", snapshot.id) };
+                const std::int64_t cpu{detail::management_call(bean, contract, "getThreadCpuTime", "(J)J", snapshot.id)};
                 snapshot.cpu_time_ns = detail::observed_nonnegative(cpu);
-            }
-            const std::vector<std::unique_ptr<any_object>> frames{
-                detail::management_call(info, info_contract, "getStackTrace", "()[Ljava/lang/StackTraceElement;").to_vector() };
-            snapshot.stack.reserve(frames.size());
-            for (const auto& frame : frames)
-            {
-                constexpr std::string_view frame_contract{ "java/lang/StackTraceElement" };
-                java_stack_frame_snapshot copied{};
-                copied.class_name = static_cast<std::string>(detail::management_call(frame, frame_contract, "getClassName", "()Ljava/lang/String;"));
-                copied.method_name = static_cast<std::string>(detail::management_call(frame, frame_contract, "getMethodName", "()Ljava/lang/String;"));
-                copied.line_number = detail::management_call(frame, frame_contract, "getLineNumber", "()I");
-                copied.native_method = detail::management_call(frame, frame_contract, "isNativeMethod", "()Z");
-                snapshot.stack.push_back(std::move(copied));
             }
             result.push_back(std::move(snapshot));
         }
         return result;
+    }
+
+    // ThreadMXBean detects platform-thread cycles. The detector's own full
+    // search is not bounded by the copied-result budgets and is not atomic
+    // with the subsequent ThreadInfo reads.
+    [[nodiscard]] inline auto observe_deadlocks(const deadlock_options options = {})
+        -> deadlock_snapshot
+    {
+        detail::validate_deadlock_options(options);
+        const auto bean{detail::management_bean("getThreadMXBean", "()Ljava/lang/management/ThreadMXBean;")};
+        return detail::observe_deadlocks_from_bean(bean, options);
     }
 }
 // VMHOOK_MANAGEMENT_OBSERVATIONS_END

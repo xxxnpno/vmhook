@@ -24,7 +24,8 @@ PRIMITIVES = {
 BUILTINS = {
     'java/lang/String': 'vmhook::java_string', 'java/lang/Class': 'vmhook::class_object',
     'java/lang/ClassLoader': 'vmhook::class_loader', 'java/lang/Throwable': 'vmhook::throwable',
-    'java/lang/Enum': 'vmhook::java_enum', 'java/util/Collection': 'vmhook::collection',
+    'java/lang/Enum': 'vmhook::java_enum', 'java/lang/Iterable': 'vmhook::iterable',
+    'java/util/Map$Entry': 'vmhook::map_entry', 'java/util/Collection': 'vmhook::collection',
     'java/util/List': 'vmhook::list', 'java/util/ArrayList': 'vmhook::array_list',
     'java/util/LinkedList': 'vmhook::linked_list', 'java/util/Set': 'vmhook::set',
     'java/util/HashSet': 'vmhook::hash_set', 'java/util/LinkedHashSet': 'vmhook::linked_hash_set',
@@ -39,21 +40,28 @@ BUILTINS = {
     'java/lang/Integer': 'vmhook::java_integer', 'java/lang/Long': 'vmhook::java_long',
     'java/lang/Float': 'vmhook::java_float', 'java/lang/Double': 'vmhook::java_double',
 }
-CPP_KEYWORDS = set(('alignas alignof and asm auto bitand bitor bool break case catch char char8_t '
+CPP_KEYWORDS = set(('alignas alignof and and_eq asm auto bitand bitor bool break case catch char char8_t '
     'char16_t char32_t class compl concept const consteval constexpr constinit const_cast continue '
-    'co_await co_return co_yield decltype default delete do double dynamic_cast else enum explicit '
+    'co_await co_return co_yield contract_assert decltype default delete do double dynamic_cast else enum explicit '
     'export extern false float for friend goto if inline int long mutable namespace new noexcept '
-    'not nullptr operator or private protected public register reinterpret_cast requires return '
+    'not not_eq nullptr operator or or_eq private protected public register reinterpret_cast requires return '
     'short signed sizeof static static_assert static_cast struct switch template this thread_local '
     'throw true try typedef typeid typename union unsigned using virtual void volatile wchar_t while '
-    'xor get_field get_method static_members get_instance set_native_root self register_java_class').split())
+    'xor xor_eq').split())
+# A generated Java member must not hide the CRTP lookup/root facade, its type
+# traits, or the optional C++ post-construction customization point.
+VMHOOK_MEMBERS = set(('object object_base get_field get_method static_members get_instance '
+    'set_native_root get_native_root self is resolve_klass is_uncallable static_method_only '
+    'safe_interface_methods safe_method_name_signature safe_method_is_default '
+    'find_interface_default_method instance native_root construct descriptor java_contract '
+    'java_array_wrapper java_element_type register_java_class register_java_classes').split())
 
 
 def snake_case(text: str) -> str:
     text = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', text)
     text = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', text)
-    text = re.sub(r'[^a-zA-Z0-9_]', '_', text).lower().strip('_') or 'member'
-    if text[0].isdigit() or text in CPP_KEYWORDS:
+    text = re.sub(r'_+', '_', re.sub(r'[^a-zA-Z0-9_]', '_', text)).lower().strip('_') or 'member'
+    if text[0].isdigit() or text in CPP_KEYWORDS or text in VMHOOK_MEMBERS:
         text = 'java_' + text
     return text
 
@@ -228,21 +236,38 @@ def cpp_type(descriptor: str, names: dict[str, str]) -> str:
         raise ValueError('trailing characters after field descriptor')
     if parsed[0] == '[':
         child = cpp_type(parsed[1:], names)
-        if child.startswith('std::unique_ptr<'):
-            child = child[len('std::unique_ptr<'):-1]
-        return f'std::unique_ptr<vmhook::array<{child}>>'
+        if child.startswith('::std::unique_ptr<'):
+            child = child[len('::std::unique_ptr<'):-1]
+        return f'::std::unique_ptr<::vmhook::array<{child}>>'
     if parsed[0] == 'L':
         name = parsed[1:-1]
-        return f'std::unique_ptr<{names.get(name, BUILTINS.get(name, "vmhook::any_object"))}>'
-    return PRIMITIVES[parsed]
+        target = names.get(name, BUILTINS.get(name, 'vmhook::any_object'))
+        if target.startswith('vmhook::'):
+            target = '::' + target
+        return f'::std::unique_ptr<{target}>'
+    primitive = PRIMITIVES[parsed]
+    return '::' + primitive if primitive.startswith('std::') else primitive
 
 
 def cpp_literal(text: str) -> str:
-    # Names and descriptors are identifiers, not arbitrary Java string values.
-    # Non-ASCII names remain UTF-8 with explicit bytes; adjacent literals ensure
-    # a following hexadecimal character cannot extend a \x escape.
+    # HotSpot Symbol names/descriptors retain class-file modified UTF-8. Standard
+    # UTF-8 would change supplementary characters into four-byte sequences and
+    # make the runtime's bytewise metadata lookup miss the original definition.
+    # This encoding is only for metadata literals, never Java String values.
+    encoded = bytearray()
+    units = text.encode('utf-16-be', errors='surrogatepass')
+    for offset in range(0, len(units), 2):
+        unit = int.from_bytes(units[offset:offset + 2], 'big')
+        if 0 < unit < 0x80:
+            encoded.append(unit)
+        elif unit < 0x800:
+            encoded.extend((0xc0 | (unit >> 6), 0x80 | (unit & 0x3f)))
+        else:
+            encoded.extend((0xe0 | (unit >> 12), 0x80 | ((unit >> 6) & 0x3f), 0x80 | (unit & 0x3f)))
+    # Adjacent literals prevent a following hexadecimal character from being
+    # absorbed into a preceding byte escape.
     parts = []
-    for byte in text.encode('utf-8', errors='strict'):
+    for byte in encoded:
         if 32 <= byte < 127 and byte not in (34, 92):
             parts.append(chr(byte))
         else:
@@ -251,30 +276,47 @@ def cpp_literal(text: str) -> str:
 
 
 def generate(classes: list[JavaClass], namespace: str, module: str | None = None) -> str:
-    if not re.fullmatch(r'[a-z][a-z0-9_]*', namespace) or namespace in CPP_KEYWORDS:
+    if (not re.fullmatch(r'[a-z][a-z0-9_]*', namespace) or '__' in namespace
+            or namespace == 'std' or namespace in CPP_KEYWORDS or namespace in VMHOOK_MEMBERS):
         raise ValueError('namespace must be a non-keyword snake_case identifier')
     names: dict[str, str] = {}
     for java_class in classes:
         name = snake_case(java_class.name)
         if name in names.values():
-            name += '_' + hashlib.sha256(java_class.name.encode()).hexdigest()[:8]
+            stem = name + '_' + hashlib.sha256(java_class.name.encode('utf-8', errors='surrogatepass')).hexdigest()[:8]
+            name = stem
+            suffix = 2
+            while name in names.values():
+                name = stem + '_' + str(suffix)
+                suffix += 1
         names[java_class.name] = name
+    reference_names = {java_name: '::' + namespace + '::' + cpp_name for java_name, cpp_name in names.items()}
     declarations = []
     definitions = []
     for java_class in classes:
         cls = names[java_class.name]
-        annotation = ' [[=vmhook::java_class(' + cpp_literal(java_class.name) + ')]]' if module else ''
-        declaration = [f'class{annotation} {cls} : public vmhook::object<{cls}>', '{', 'public:',
-            f'    using vmhook::object<{cls}>::object;', '    static auto register_java_class() -> bool;']
+        annotation = ' [[=::vmhook::java_class(' + cpp_literal(java_class.name) + ')]]' if module else ''
+        declaration = [f'class{annotation} {cls} : public ::vmhook::object<{cls}>', '{', 'public:',
+            f'    using ::vmhook::object<{cls}>::object;', '    static auto register_java_class() -> bool;']
         registration = '' if module else cpp_literal(java_class.name)
         definitions.append(f'inline auto {cls}::register_java_class() -> bool\n'
-            '{\n    return vmhook::register_class<' + cls + '>(' + registration + ');\n}\n')
+            '{\n    return ::vmhook::register_class<' + reference_names[java_class.name] + '>(' + registration + ');\n}\n')
         used: set[tuple[str, str]] = set()
 
         def member(name: str, result: str, params: list[tuple[str, str]], body: str, static: bool) -> None:
+            # Field accessor prefixes can create a reserved facade name even
+            # when the field itself is harmless (field -> get_field). A Java
+            # method can also normalize to this class's injected C++ name.
+            while name == cls or name in CPP_KEYWORDS or name in VMHOOK_MEMBERS:
+                name = 'java_' + name
             signature = ', '.join(kind for kind, _ in params)
             if (name, signature) in used:
-                name += '_' + hashlib.sha256((name + signature + body).encode()).hexdigest()[:8]
+                stem = name + '_' + hashlib.sha256((name + signature + body).encode()).hexdigest()[:8]
+                name = stem
+                suffix = 2
+                while (name, signature) in used or name == cls:
+                    name = stem + '_' + str(suffix)
+                    suffix += 1
             used.add((name, signature))
             parameters = ', '.join(kind + ' ' + label for kind, label in params)
             const = '' if static else ' const'
@@ -285,7 +327,7 @@ def generate(classes: list[JavaClass], namespace: str, module: str | None = None
         for field in java_class.fields:
             if not field.flags & 0x0001 or field.flags & 0x1000:
                 continue
-            result = cpp_type(field.descriptor, names)
+            result = cpp_type(field.descriptor, reference_names)
             if result == 'void':
                 raise ValueError('field descriptor cannot be void')
             static = bool(field.flags & 0x0008)
@@ -293,7 +335,7 @@ def generate(classes: list[JavaClass], namespace: str, module: str | None = None
             expression = lookup + '(' + cpp_literal(field.name) + ')'
             member('get_' + snake_case(field.name), result, [], 'return ' + expression + '->get();', static)
             if not field.flags & 0x0010:
-                param_type = 'const ' + result + '&' if result.startswith('std::unique_ptr<') else result
+                param_type = 'const ' + result + '&' if result.startswith('::std::unique_ptr<') else result
                 member('set_' + snake_case(field.name), 'void', [(param_type, 'value')], expression + '->set(value);', static)
         for method in java_class.methods:
             if not method.flags & 0x0001 or method.flags & (0x0040 | 0x1000) or method.name == '<clinit>':
@@ -304,18 +346,18 @@ def generate(classes: list[JavaClass], namespace: str, module: str | None = None
                 raise ValueError('instance method descriptor exceeds JVM parameter slots')
             params = []
             for index, argument in enumerate(args):
-                kind = cpp_type(argument, names)
-                if kind.startswith('std::unique_ptr<'):
+                kind = cpp_type(argument, reference_names)
+                if kind.startswith('::std::unique_ptr<'):
                     kind = 'const ' + kind + '&'
                 params.append((kind, f'arg_{index}'))
             forwarded = ', '.join(name for _, name in params)
             if method.name == '<init>':
                 if java_class.flags & (0x0200 | 0x0400):
                     continue
-                member('create', 'std::unique_ptr<' + cls + '>', params,
-                       'return vmhook::make_unique_with_descriptor<' + cls + '>(' + cpp_literal(method.descriptor) + (', ' + forwarded if forwarded else '') + ');', True)
+                member('create', '::std::unique_ptr<' + reference_names[java_class.name] + '>', params,
+                       'return ::vmhook::make_unique_with_descriptor<' + reference_names[java_class.name] + '>(' + cpp_literal(method.descriptor) + (', ' + forwarded if forwarded else '') + ');', True)
                 continue
-            result = cpp_type(result_descriptor, names)
+            result = cpp_type(result_descriptor, reference_names)
             lookup = 'static_members::get_method' if static else 'get_method'
             invocation = lookup + '(' + cpp_literal(method.name) + ', ' + cpp_literal(method.descriptor) + ')->call(' + forwarded + ')'
             member(snake_case(method.name), result, params,
@@ -323,11 +365,12 @@ def generate(classes: list[JavaClass], namespace: str, module: str | None = None
         declaration.append('};\n')
         declarations.append('\n'.join(declaration))
     registrations = ['inline auto register_java_classes() -> bool', '{', '    bool success{true};']
-    registrations.extend('    success = ' + name + '::register_java_class() && success;' for name in names.values())
+    registrations.extend('    success = ' + name + '::register_java_class() && success;' for name in reference_names.values())
     registrations.extend(['    return success;', '}\n'])
     definitions.append('\n'.join(registrations))
     if module:
-        if not re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*', module):
+        if (not re.fullmatch(r'[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*', module)
+                or any(part in CPP_KEYWORDS or '__' in part for part in module.split('.'))):
             raise ValueError('module name must contain snake_case identifiers')
         prefix = f'export module {module};\nimport std;\nimport vmhook;\n\nexport '
     else:

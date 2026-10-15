@@ -57,6 +57,13 @@ jobs:
           }
           "GXX=$compiler" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
           $bin | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Prepare the pinned Java 8 compiler for generated-wrapper fixtures
+        shell: pwsh
+        run: >-
+          python tools/build_private_profiles.py
+          --prepare-jdk 8
+          --cache "$env:RUNNER_TEMP/vmhook-generator-jdk"
+          --github-env "$env:GITHUB_ENV"
       - name: Configure C++23 header or C++26 reflection module
         shell: pwsh
         run: >-
@@ -71,6 +78,7 @@ jobs:
           -DVMHOOK_BUILD_BENCHMARKS=ON
           -DVMHOOK_BENCHMARK_MODULE=${{ matrix.module }}
           -DVMHOOK_WARNINGS_AS_ERRORS=ON
+          "-DVMHOOK_TEST_JAVAC=$env:JAVA_HOME/bin/javac.exe"
       - name: Build
         run: cmake --build build --parallel
       - name: Test
@@ -225,6 +233,9 @@ jobs:
             h2_application_probe: vmhook_h2_application_probe.dll
             reference_graph_probe: vmhook_reference_graph_probe.dll
             coalesced_jit_probe: vmhook_coalesced_jit_probe.dll
+            collection_views_probe: vmhook_collection_views_probe.dll
+            deadlock_probe: vmhook_deadlock_probe.dll
+            generated_wrapper_probe: vmhook_generated_wrapper_probe.dll
           - toolchain: module
             probe: vmhook_module_native_probe.dll
             observation_probe: vmhook_module_observation_probe.dll
@@ -253,6 +264,9 @@ jobs:
             h2_application_probe: vmhook_module_h2_application_probe.dll
             reference_graph_probe: vmhook_module_reference_graph_probe.dll
             coalesced_jit_probe: vmhook_module_coalesced_jit_probe.dll
+            collection_views_probe: vmhook_module_collection_views_probe.dll
+            deadlock_probe: vmhook_module_deadlock_probe.dll
+            generated_wrapper_probe: vmhook_module_generated_wrapper_probe.dll
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -339,6 +353,9 @@ jobs:
           --direct-array-probe runtime-binaries/${{ matrix.direct_array_probe }}
           --reference-graph-probe runtime-binaries/${{ matrix.reference_graph_probe }}
           --coalesced-jit-probe runtime-binaries/${{ matrix.coalesced_jit_probe }}
+          --collection-views-probe runtime-binaries/${{ matrix.collection_views_probe }}
+          --deadlock-probe runtime-binaries/${{ matrix.deadlock_probe }}
+          --generated-wrapper-probe runtime-binaries/${{ matrix.generated_wrapper_probe }}
           --evidence observation-${{ matrix.java }}-${{ matrix.toolchain }}.json
       - name: Verify the heap liveness gate with class unloading disabled
         if: ${{ !cancelled() && steps.prepare_jdk.outcome == 'success' && contains(fromJSON('[9,16,17,21,27]'), matrix.java) }}

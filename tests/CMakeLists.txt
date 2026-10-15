@@ -1,3 +1,34 @@
+# Real Java schemas exercise emitted C++ identifiers and metadata bytes against
+# the actual header/module compiler. The runtime DLL joins the existing staged
+# probes, so the same generated code can be checked in an owned ordinary JVM.
+find_program(VMHOOK_TEST_JAVAC NAMES javac HINTS "$ENV{JAVA_HOME}/bin" NO_CMAKE_FIND_ROOT_PATH)
+if(Python3_Interpreter_FOUND AND VMHOOK_TEST_JAVAC)
+    set(_generator_compile_args
+        --compile-generated --compiler "${CMAKE_CXX_COMPILER}"
+        --javac "${VMHOOK_TEST_JAVAC}")
+    if(TARGET vmhook::module)
+        list(APPEND _generator_compile_args
+            --module-build-dir "${CMAKE_BINARY_DIR}/vmhook-module/$<CONFIG>")
+        set(_generator_interface module)
+        set(_generator_probe vmhook_module_generated_wrapper_probe.dll)
+    else()
+        set(_generator_interface header)
+        set(_generator_probe vmhook_generated_wrapper_probe.dll)
+    endif()
+    list(APPEND _generator_compile_args
+        --output-dir "${CMAKE_CURRENT_BINARY_DIR}/generated-wrappers-${_generator_interface}"
+        --probe-output "${CMAKE_CURRENT_BINARY_DIR}/${_generator_probe}")
+    if(CMAKE_CROSSCOMPILING_EMULATOR AND NOT CMAKE_CROSSCOMPILING_EMULATOR MATCHES ";")
+        list(APPEND _generator_compile_args --emulator "${CMAKE_CROSSCOMPILING_EMULATOR}")
+    endif()
+    add_test(NAME vmhook.generated_wrapper_compile
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/wrapper_generator.py"
+            ${_generator_compile_args})
+    set_tests_properties(vmhook.generated_wrapper_compile PROPERTIES TIMEOUT 600)
+else()
+    message(STATUS "Generated-wrapper compiler fixture requires Python and javac")
+endif()
+
 add_executable(vmhook_api api/lookup.cpp api/second.cpp)
 target_link_libraries(vmhook_api PRIVATE vmhook::vmhook)
 add_executable(vmhook_safety safety.cpp)
@@ -101,8 +132,8 @@ if(VMHOOK_BUILD_RUNTIME_TESTS)
     vmhook_static_runtime(vmhook_hook_composition_probe)
     vmhook_apply_warnings(vmhook_hook_composition_probe)
     set_target_properties(vmhook_hook_composition_probe PROPERTIES PREFIX "")
-    set(_optional_runtime_fixtures callback_throw virtual_thread interface reference_field class_inventory method_exit runtime_init monitor_fault heap_liveness heap_concurrent special_reference hook_roots method_binding argument_descriptor direct_array h2_application coalesced_jit reference_graph)
-    foreach(_runtime IN ITEMS interop lifetime event_stream management executor callback_throw virtual_thread interface reference_field class_inventory method_exit runtime_init monitor_fault heap_liveness heap_concurrent special_reference hook_roots method_binding argument_descriptor direct_array h2_application coalesced_jit reference_graph)
+    set(_optional_runtime_fixtures callback_throw virtual_thread interface reference_field class_inventory method_exit runtime_init monitor_fault heap_liveness heap_concurrent special_reference hook_roots method_binding argument_descriptor direct_array h2_application coalesced_jit reference_graph collection_views deadlock)
+    foreach(_runtime IN ITEMS interop lifetime event_stream management executor callback_throw virtual_thread interface reference_field class_inventory method_exit runtime_init monitor_fault heap_liveness heap_concurrent special_reference hook_roots method_binding argument_descriptor direct_array h2_application coalesced_jit reference_graph collection_views deadlock)
         if(_runtime IN_LIST _optional_runtime_fixtures AND NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/${_runtime}_probe.cpp")
             continue()
         endif()
