@@ -78,7 +78,8 @@ The default limits are 256 copied thread records and 64 Java frames per record.
 Thread limits must be between 1 and 65,536; frame depth must be between 0 and
 1,024. Invalid limits or scope values are refused before any Java call. Depth
 zero omits stack frames and still copies lock/owner information. The snapshot
-retains the requested limits and scope. If the detector returns more IDs than
+retains the requested limits and scope. Deadlock records do not request per-thread
+CPU time, so their `cpu_time_ns` remains unavailable. If the detector returns more IDs than
 `max_threads`, a prefix in the JVM's unspecified order is copied:
 `detected_thread_count` retains the full detected count, `thread_limit` is true
 and `complete` is false. Omitted IDs are not silently interpreted as absent

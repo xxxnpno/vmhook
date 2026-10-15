@@ -222,7 +222,9 @@ Removal does not authorize unloading the DLL.
 
 `runtime_capabilities()` provides a passive preflight. `observe_runtime`,
 `observe_java_threads`, `observe_memory_pools` and `observe_thread_allocations`
-copy management counters and Java stack frames into ordinary C++ data.
+copy management counters and platform-thread Java stack frames into ordinary C++ data.
+`observe_deadlocks()` reports monitor/synchronizer cycles with copied wait-owner
+information and explicit result limits.
 [Observation contracts](docs/observations.md) distinguish sequential snapshots
 from allocation/GC events and mixed-stack CPU profiling.
 

@@ -78,9 +78,7 @@ jobs:
           -DVMHOOK_BUILD_BENCHMARKS=ON
           -DVMHOOK_BENCHMARK_MODULE=${{ matrix.module }}
           -DVMHOOK_WARNINGS_AS_ERRORS=ON
-          "-DJava_JAVA_EXECUTABLE=$env:JAVA_HOME/bin/java.exe"
-          "-DJava_JAVAC_EXECUTABLE=$env:JAVA_HOME/bin/javac.exe"
-          "-DJava_JAR_EXECUTABLE=$env:JAVA_HOME/bin/jar.exe"
+          "-DVMHOOK_TEST_JAVAC=$env:JAVA_HOME/bin/javac.exe"
       - name: Build
         run: cmake --build build --parallel
       - name: Test

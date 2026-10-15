@@ -9901,6 +9901,39 @@ export namespace vmhook
             return units;
         }
 
+        /* HotSpot metadata uses class-file modified UTF-8: supplementary
+           characters are encoded as two UTF-16 surrogate units, and NUL as
+           C0 80. Decode those bytes before passing metadata names to Java;
+           ordinary Java String arguments retain their standard UTF-8 path. */
+        inline auto modified_utf8_to_utf16(const std::string_view value) -> std::u16string
+        {
+            std::u16string result;
+            result.reserve(value.size());
+            for (std::size_t position{}; position < value.size(); )
+            {
+                const auto lead{ static_cast<std::uint8_t>(value[position]) };
+                const std::size_t width{ lead > 0 && lead < 0x80u ? 1u
+                    : lead >= 0xc0u && lead <= 0xdfu ? 2u
+                    : lead >= 0xe0u && lead <= 0xefu ? 3u : 0u };
+                if (!width || width > value.size() - position)
+                { throw vmhook::exception{ "Invalid modified UTF-8 metadata" }; }
+                std::uint32_t unit{ width == 1 ? lead : lead & (0x7fu >> width) };
+                for (std::size_t index{ 1 }; index < width; ++index)
+                {
+                    const auto byte{ static_cast<std::uint8_t>(value[position + index]) };
+                    if ((byte & 0xc0u) != 0x80u)
+                    { throw vmhook::exception{ "Invalid modified UTF-8 metadata" }; }
+                    unit = (unit << 6) | (byte & 0x3fu);
+                }
+                if ((width == 2 && unit < 0x80u && unit != 0)
+                    || (width == 3 && unit < 0x800u))
+                { throw vmhook::exception{ "Overlong modified UTF-8 metadata" }; }
+                result.push_back(static_cast<char16_t>(unit));
+                position += width;
+            }
+            return result;
+        }
+
         /* Java Strings may contain isolated UTF-16 surrogates. UTF-8 replaces
            those with U+FFFD; read_java_string_utf16 preserves every code unit. */
         inline auto utf16_to_utf8(const std::u16string_view text) -> std::string
@@ -21106,9 +21139,9 @@ export namespace vmhook
                 if (!class_class || loader_of(class_class) != nullptr)
                 { throw vmhook::exception{ "Bootstrap java.lang.Class metadata is unavailable" }; }
                 const auto class_root{ native_backend::retain_class(class_class) };
-                std::string binary_name{ dimensions == 0 ? internal_name : descriptor };
-                std::replace(binary_name.begin(), binary_name.end(), '/', '.');
-                const auto name_root{ native_backend::make_string(binary_name) };
+                auto binary_name{ modified_utf8_to_utf16(dimensions == 0 ? internal_name : descriptor) };
+                std::replace(binary_name.begin(), binary_name.end(), u'/', u'.');
+                const auto name_root{ native_backend::make_string_utf16(binary_name) };
                 if (!class_root || !name_root)
                 { throw vmhook::exception{ "Java argument class-resolution inputs could not be retained" }; }
                 constexpr std::string_view lookup_signature{
@@ -26948,11 +26981,15 @@ namespace hotspot
         inline auto descriptor_class_mirror(const std::string_view descriptor,
             const native_backend::root& loader) -> native_backend::root
         {
-            std::string name{descriptor.front() == '[' ? descriptor : descriptor.substr(1, descriptor.size() - 2)};
-            std::replace(name.begin(), name.end(), '/', '.');
+            auto name{modified_utf8_to_utf16(descriptor.front() == '['
+                ? descriptor : descriptor.substr(1, descriptor.size() - 2))};
+            std::replace(name.begin(), name.end(), u'/', u'.');
+            const auto name_root{native_backend::make_string_utf16(name)};
+            if (!name_root) { throw vmhook::exception{"Descriptor class-name allocation was refused"}; }
+            auto name_owner{materialize_object<vmhook::any_object>(0, name_root)};
             auto loader_wrapper{materialize_object<vmhook::any_object>(0, loader)};
             return container_result_root(call_bootstrap_method("java/lang/Class", "forName",
-                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", name, false, loader_wrapper));
+                "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", name_owner, false, loader_wrapper));
         }
 
         [[nodiscard]] inline auto method_parameters_more_specific(const std::string_view left,

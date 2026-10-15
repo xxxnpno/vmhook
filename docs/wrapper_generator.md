@@ -70,3 +70,9 @@ or module against the selected GNU toolchain and produces a runtime probe for
 the ordinary-JVM fixture. Compilation checks legal Java names that would
 otherwise be invalid C++; the runtime probe resolves supplementary metadata
 names through the VM backend.
+
+Internal descriptor-based loader and overload resolution decodes metadata to
+UTF-16 before constructing Java class-name Strings. This preserves supplementary
+characters through both explicit and inferred Java calls. Ordinary Java String
+arguments retain VMHook's separate standard UTF-8 contract. The encoding follows
+[JVMS 4.4.7](https://docs.oracle.com/javase/specs/jvms/se25/html/jvms-4.html#jvms-4.4.7).

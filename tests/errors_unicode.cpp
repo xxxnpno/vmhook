@@ -65,6 +65,25 @@ int main()
           "isolated UTF16 surrogates are replaced with valid UTF8");
     check(decode({}).empty() && vmhook::detail::utf16_to_utf8({}).empty(),
           "empty strings remain successful empty conversions");
+    const std::string metadata{"A\xc0\x80\xed\xa0\x81\xed\xb0\x80Z"};
+    const std::u16string metadata_units{u'A', char16_t{}, char16_t{0xd801}, char16_t{0xdc00}, u'Z'};
+    check(vmhook::detail::modified_utf8_to_utf16(metadata) == metadata_units,
+          "metadata preserves modified UTF8 NUL and supplementary UTF16 units");
+    check(vmhook::detail::modified_utf8_to_utf16("\xed\xa0\x80")
+          == std::u16string{char16_t{0xd800}}, "metadata preserves isolated UTF16 units");
+    check(vmhook::detail::modified_utf8_to_utf16(
+              "\x7f\xc2\x80\xdf\xbf\xe0\xa0\x80\xed\x9f\xbf\xee\x80\x80\xef\xbf\xbf")
+          == std::u16string{char16_t{0x7f}, char16_t{0x80}, char16_t{0x7ff},
+                           char16_t{0x800}, char16_t{0xd7ff}, char16_t{0xe000}, char16_t{0xffff}},
+          "modified UTF8 metadata preserves every one/two/three-byte boundary");
+    for (const std::string_view malformed : std::array<std::string_view, 9>{std::string_view{"\0", 1}, "\xc0\x81", "\xc1\xbf",
+            "\xe0\x80\x80", "\xc2", "\xe2\x82", "\xe2" "A\xa1", "\x80", "\xf0\x90\x90\x80"})
+    {
+        bool refused_metadata{};
+        try { (void)vmhook::detail::modified_utf8_to_utf16(malformed); }
+        catch (const vmhook::exception&) { refused_metadata = true; }
+        check(refused_metadata, "malformed modified UTF8 metadata is refused without replacement");
+    }
     bool null_refused{};
     try { (void)vmhook::read_java_string_utf16(nullptr); }
     catch (const vmhook::exception&) { null_refused = true; }
@@ -128,6 +147,12 @@ int main()
     try { (void)vmhook::detail::utf8_to_utf16("allocate"); }
     catch (const std::bad_alloc&) { utf_allocation = true; }
     check(utf_allocation, "Unicode allocation failure propagates std::bad_alloc");
+    bool metadata_allocation{};
+    fail_next_allocation.store(true);
+    try { (void)vmhook::detail::modified_utf8_to_utf16(std::string_view{scalar_bytes, sizeof(scalar_bytes) - 1}); }
+    catch (const std::bad_alloc&) { metadata_allocation = true; }
+    fail_next_allocation.store(false);
+    check(metadata_allocation, "metadata conversion preserves the original C++ allocation failure");
     // Initialize Windows emulated TLS/destructor registration before faulting
     // the operation's own C++ allocation, rather than a runtime TLS allocation.
     (void)vmhook::detail::call_handle_pool();
