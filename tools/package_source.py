@@ -37,7 +37,7 @@ def main() -> int:
     # Freeze Git blobs once. A later checkout/edit cannot silently enter an
     # archive labelled with this commit, even during a concurrent build.
     files, modes = {}, {}
-    with tarfile.open(fileobj=io.BytesIO(git("archive", "--format=tar", revision))) as snapshot:
+    with tarfile.open(fileobj=io.BytesIO(git("-c", "tar.umask=0022", "archive", "--format=tar", revision))) as snapshot:
         for entry in snapshot:
             if entry.isdir():
                 continue

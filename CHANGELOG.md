@@ -205,6 +205,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- Source archive permissions are pinned independently of the user's Git
+  `tar.umask`, preserving reproducible package bytes across configurations.
 - Generated wrappers escape all C++ tokens, injected class names and facade/type
   name collisions while preserving their exact Java binding. Supplementary
   identifier metadata retains modified UTF-8, and internal loader/overload
