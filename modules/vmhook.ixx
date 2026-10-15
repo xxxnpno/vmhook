@@ -1189,11 +1189,13 @@ export namespace vmhook
     // without naming a type.  Defined after oop_reflective_base, which
     // supplies the read-the-klass-out-of-the-header machinery it needs.
     class any_object;
+    class iterable;
     class collection;
     class list;
     class set;
     class linked_list;
     class map;
+    class map_entry;
     class hash_map;
     class array_list;
     class hash_set;
@@ -19748,7 +19750,7 @@ export namespace vmhook
             class has overloaded Java methods with the same name but different signatures.
 
             Complexity: O(N * M) where N = methods in the hierarchy, M = name comparison cost.
-            Exception safety: does not throw; returns nullopt on failure.
+            Missing metadata returns nullopt; checked operation and allocation errors propagate.
 
             @param method_name       Exact Java method name.
             @param method_signature  JVM descriptor, e.g. "(I)Ljava/lang/String;".
@@ -19820,7 +19822,7 @@ export namespace vmhook
             a null object pointer so it cannot be used to call instance methods.
 
             Complexity: O(N * M) where N = methods in the hierarchy, M = name comparison cost.
-            Exception safety: does not throw; returns nullopt on failure.
+            Missing metadata returns nullopt; checked operation and allocation errors propagate.
 
             @param wrapper_type  std::type_index of the registered C++ wrapper class.
             @param method_name   Exact Java method name.
@@ -19887,7 +19889,7 @@ export namespace vmhook
             Java class has overloaded static methods.
 
             Complexity: O(N * M).
-            Exception safety: does not throw; returns nullopt on failure.
+            Missing metadata returns nullopt; checked operation and allocation errors propagate.
 
             @param wrapper_type      std::type_index of the registered C++ wrapper class.
             @param method_name       Exact Java method name.
@@ -20010,7 +20012,7 @@ export namespace vmhook
             typeid(*this) because there is no object instance.
 
             Complexity: O(1) after the first call per type (cached in klass_lookup_cache).
-            Exception safety: does not throw; returns nullptr and logs on failure.
+            Missing metadata returns nullptr; checked operation and allocation errors propagate.
 
             @param wrapper_type  std::type_index of the C++ wrapper class.
             @return  klass*, or nullptr if the type is not registered or the class is not found.
@@ -20129,7 +20131,7 @@ export namespace vmhook
         */
         static auto safe_method_name_signature(vmhook::hotspot::method* const current_method,
                                                std::string&                  name_out,
-                                               std::string&                  signature_out) noexcept
+                                               std::string&                  signature_out)
             -> bool
         {
             name_out.clear();
@@ -20288,7 +20290,7 @@ export namespace vmhook
         */
         static auto find_interface_default_method(vmhook::hotspot::klass* const start_klass,
                                                   const std::string_view method_name,
-                                                  const std::string_view method_signature) noexcept
+                                                  const std::string_view method_signature)
             -> vmhook::hotspot::method*
         {
             if (!start_klass || !vmhook::hotspot::is_valid_pointer(start_klass))
@@ -21234,7 +21236,9 @@ export namespace vmhook
         {
             vmhook::any_object source{ container_address(root) };
             source.set_native_root(root);
-            const auto method{ source.get_method(name, signature) };
+            // The selected implementation can be a Java 8 interface default,
+            // with no declaration in the concrete class or its superclasses.
+            const auto method{ source.object_base::get_method(name, signature) };
             if (!method)
             { throw vmhook::exception{ std::format("Java collection method '{}{}' is unavailable", name, signature) }; }
             auto result{ method->call(std::forward<argument_types>(arguments)...) };
@@ -21544,18 +21548,65 @@ export namespace vmhook
     inline auto return_value::throw_exception(const std::unique_ptr<vmhook::any_object>& throwable) -> void
     { vmhook::detail::raise_callback_exception(this->return_slot, this->stack_frame, throwable); }
 
+    /* Iterable need not implement Collection or supply toArray. Its iterator
+       is rooted across calls, and a finite element budget rejects unbounded
+       sources without returning an apparently complete partial vector. */
+    class iterable : public vmhook::oop_reflective_base
+    {
+    public:
+        inline static constexpr std::string_view java_contract{ "java/lang/Iterable" };
+        explicit iterable(vmhook::oop_t oop = nullptr) noexcept : vmhook::oop_reflective_base{ oop } {}
+        template<typename wrapper_type>
+        explicit iterable(const vmhook::borrowed<wrapper_type>& handle) noexcept
+            : vmhook::oop_reflective_base{ handle.resolve() }
+        { this->set_native_root(handle.get_native_root()); }
+
+        auto iterator() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "iterator", "()Ljava/util/Iterator;"); }
+
+        template<vmhook::detail::container_wrapper element_type>
+        auto to_vector(const std::size_t max_elements = 65'536) const
+            -> std::vector<std::unique_ptr<element_type>>
+        {
+            if (max_elements > 1'048'576)
+            { throw vmhook::exception{ "Iterable element budget exceeds 1048576" }; }
+            vmhook::detail::native_backend::operation access{};
+            const auto source{ vmhook::detail::container_source_root(*this) };
+            if (!source) { return {}; }
+            if (!access)
+            { throw vmhook::exception{ "Iterable conversion requires a rooted VM context" }; }
+            vmhook::detail::require_container_contract(source, java_contract);
+            const auto cursor{ vmhook::detail::container_result_root(
+                vmhook::detail::call_container_method(source, "iterator", "()Ljava/util/Iterator;")) };
+            if (!cursor) { throw vmhook::exception{ "Iterable.iterator returned null" }; }
+            vmhook::detail::require_container_contract(cursor, "java/util/Iterator");
+            std::vector<std::unique_ptr<element_type>> result;
+            while (static_cast<bool>(vmhook::detail::call_container_method(cursor, "hasNext", "()Z")))
+            {
+                if (result.size() == max_elements)
+                { throw vmhook::exception{ std::format("Iterable conversion exceeded its {} element budget", max_elements) }; }
+                const auto next{ vmhook::detail::container_result_root(
+                    vmhook::detail::call_container_method(cursor, "next", "()Ljava/lang/Object;")) };
+                result.push_back(vmhook::detail::wrap_container_element<element_type>(next));
+            }
+            return result;
+        }
+        auto to_vector() const -> vmhook::detail::vector_conversion<iterable>
+        { return vmhook::detail::vector_conversion<iterable>{ *this }; }
+    };
+
     /* Java Collection wrappers use the public toArray contract. Snapshot order
        and concurrent-mutation semantics are those of the Java implementation.
        Returned unique_ptrs own C++ wrappers; their Java roots belong to the
        current native-thread or validated callback context. */
-    class collection : public vmhook::oop_reflective_base
+    class collection : public vmhook::iterable
     {
     public:
         inline static constexpr std::string_view java_contract{ "java/util/Collection" };
-        explicit collection(vmhook::oop_t oop = nullptr) noexcept : vmhook::oop_reflective_base{ oop } {}
+        explicit collection(vmhook::oop_t oop = nullptr) noexcept : vmhook::iterable{ oop } {}
         template<typename wrapper_type>
         explicit collection(const vmhook::borrowed<wrapper_type>& handle) noexcept
-            : vmhook::oop_reflective_base{ handle.resolve() }
+            : vmhook::iterable{ handle.resolve() }
         { this->set_native_root(handle.get_native_root()); }
 
         auto size() const -> std::int32_t
@@ -21607,8 +21658,6 @@ export namespace vmhook
         { return vmhook::detail::invoke_container(*this, java_contract, "retainAll", "(Ljava/util/Collection;)Z", elements); }
         auto clear() const -> void
         { (void)vmhook::detail::invoke_container(*this, java_contract, "clear", "()V"); }
-        auto iterator() const -> vmhook::method_proxy::value_t
-        { return vmhook::detail::invoke_container(*this, java_contract, "iterator", "()Ljava/util/Iterator;"); }
     };
 
     class list : public vmhook::collection
@@ -21807,6 +21856,20 @@ export namespace vmhook
         { return vmhook::detail::invoke_container(*this, java_contract, "values", "()Ljava/util/Collection;"); }
         auto entry_set() const -> vmhook::method_proxy::value_t
         { return vmhook::detail::invoke_container(*this, java_contract, "entrySet", "()Ljava/util/Set;"); }
+    };
+
+    class map_entry : public vmhook::oop_reflective_base
+    {
+    public:
+        using oop_reflective_base::oop_reflective_base;
+        inline static constexpr std::string_view java_contract{ "java/util/Map$Entry" };
+        auto get_key() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "getKey", "()Ljava/lang/Object;"); }
+        auto get_value() const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "getValue", "()Ljava/lang/Object;"); }
+        template<vmhook::detail::container_wrapper element_type>
+        auto set_value(const std::unique_ptr<element_type>& value) const -> vmhook::method_proxy::value_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "setValue", "(Ljava/lang/Object;)Ljava/lang/Object;", value); }
     };
 
     class iterator : public vmhook::oop_reflective_base
@@ -22225,6 +22288,26 @@ export namespace vmhook
         return compressed;
     }
 
+    namespace detail
+    {
+        template<container_wrapper element_type>
+        auto container_object_vector(const native_backend::root& source)
+            -> std::vector<std::unique_ptr<element_type>>
+        {
+            auto* const contract{ vmhook::find_class("java/util/Collection") };
+            if (contract && container_class_assignable(
+                    vmhook::klass_from_oop(container_address(source)), contract))
+            {
+                vmhook::collection wrapped{};
+                wrapped.set_native_root(source);
+                return wrapped.template to_vector<element_type>();
+            }
+            vmhook::iterable wrapped{};
+            wrapped.set_native_root(source);
+            return wrapped.template to_vector<element_type>();
+        }
+    }
+
     template<vmhook::detail::container_wrapper element_type>
     auto field_proxy::value_t::to_vector() const -> std::vector<std::unique_ptr<element_type>>
     {
@@ -22242,9 +22325,7 @@ export namespace vmhook
         if (this->signature.front() == '[' || vmhook::detail::array_layout(
                 vmhook::klass_from_oop(vmhook::detail::container_address(source))))
         { return vmhook::detail::container_array_vector<element_type>(source); }
-        collection wrapped{};
-        wrapped.set_native_root(source);
-        return wrapped.to_vector<element_type>();
+        return vmhook::detail::container_object_vector<element_type>(source);
     }
     template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
     auto field_proxy::value_t::to_entries() const
@@ -22282,9 +22363,7 @@ export namespace vmhook
         if (!access) { throw vmhook::exception{ "Collection conversion requires a native-thread or rooted callback context" }; }
         if (vmhook::detail::array_layout(vmhook::klass_from_oop(vmhook::detail::container_address(source))))
         { return vmhook::detail::container_array_vector<element_type>(source); }
-        collection wrapped{};
-        wrapped.set_native_root(source);
-        return wrapped.to_vector<element_type>();
+        return vmhook::detail::container_object_vector<element_type>(source);
     }
     template<vmhook::detail::container_wrapper key_type, vmhook::detail::container_wrapper mapped_type>
     auto method_proxy::value_t::to_entries() const
@@ -26816,6 +26895,18 @@ namespace hotspot
         { (void)vmhook::detail::invoke_container(*this, java_contract, "position", "(I)Ljava/nio/Buffer;", next); }
         auto remaining() const -> std::int32_t
         { return vmhook::detail::invoke_container(*this, java_contract, "remaining", "()I"); }
+        auto limit() const -> std::int32_t
+        { return vmhook::detail::invoke_container(*this, java_contract, "limit", "()I"); }
+        auto limit(const std::int32_t next) const -> void
+        { (void)vmhook::detail::invoke_container(*this, java_contract, "limit", "(I)Ljava/nio/Buffer;", next); }
+        auto is_read_only() const -> bool
+        { return vmhook::detail::invoke_container(*this, java_contract, "isReadOnly", "()Z"); }
+        auto duplicate() const -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::invoke_container(*this, java_contract, "duplicate", "()Ljava/nio/ByteBuffer;"); }
+        auto slice() const -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::invoke_container(*this, java_contract, "slice", "()Ljava/nio/ByteBuffer;"); }
+        auto as_read_only_buffer() const -> std::unique_ptr<byte_buffer>
+        { return vmhook::detail::invoke_container(*this, java_contract, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;"); }
         auto get(const std::int32_t index) const -> std::int8_t
         { return vmhook::detail::invoke_container(*this, java_contract, "get", "(I)B", index); }
         auto put(const std::int32_t index, const std::int8_t value) const -> void

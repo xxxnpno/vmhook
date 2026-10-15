@@ -164,6 +164,8 @@ using inferred_field_vector =
     decltype(std::declval<const vmhook::field_proxy::value_t&>().to_vector());
 using inferred_collection_vector =
     decltype(std::declval<const vmhook::collection&>().to_vector());
+using inferred_iterable_vector =
+    decltype(std::declval<const vmhook::iterable&>().to_vector());
 using inferred_map_vector =
     decltype(std::declval<const vmhook::map&>().to_vector());
 using inferred_map_entries =
@@ -188,6 +190,8 @@ concept map_tag =
     && std::is_constructible_v<wrapper_type, const vmhook::borrowed<player>&>;
 
 static_assert(collection_tag<vmhook::collection>);
+static_assert(std::is_base_of_v<vmhook::iterable, vmhook::collection>);
+static_assert(std::is_constructible_v<vmhook::iterable, const vmhook::borrowed<player>&>);
 static_assert(collection_tag<vmhook::list>);
 static_assert(collection_tag<vmhook::array_list>);
 static_assert(collection_tag<vmhook::linked_list>);
@@ -211,12 +215,14 @@ static_assert(std::is_convertible_v<inferred_field_vector, player_vector>);
 static_assert(std::is_convertible_v<const inferred_field_vector&, player_vector>);
 static_assert(std::is_convertible_v<inferred_field_vector, player_entries>);
 static_assert(std::is_convertible_v<inferred_collection_vector, player_vector>);
+static_assert(std::is_convertible_v<inferred_iterable_vector, player_vector>);
 static_assert(std::is_convertible_v<inferred_map_vector, player_entries>);
 static_assert(std::is_convertible_v<inferred_map_entries, player_entries>);
 static_assert(std::is_convertible_v<inferred_field_entries, player_entries>);
 static_assert(std::is_convertible_v<inferred_method_vector, player_vector>);
 static_assert(std::is_convertible_v<inferred_method_vector, player_entries>);
 static_assert(!std::is_convertible_v<inferred_collection_vector, player_entries>);
+static_assert(!std::is_convertible_v<inferred_iterable_vector, player_entries>);
 static_assert(!std::is_convertible_v<inferred_map_vector, player_vector>);
 static_assert(!std::is_convertible_v<inferred_field_entries, player_vector>);
 static_assert(!std::is_convertible_v<inferred_field_vector, std::vector<int>>);
@@ -235,6 +241,13 @@ static_assert(std::is_same_v<decltype(std::declval<const vmhook::field_proxy::va
                                         .to_vector<player>()), player_vector>);
 static_assert(std::is_same_v<decltype(std::declval<const vmhook::collection&>()
                                         .to_vector<player>()), player_vector>);
+static_assert(std::is_same_v<decltype(std::declval<const vmhook::iterable&>()
+                                        .to_vector<player>(128)), player_vector>);
+static_assert(std::is_same_v<decltype(std::declval<const vmhook::map_entry&>()
+                                        .set_value(std::declval<const std::unique_ptr<player>&>())),
+                             vmhook::method_proxy::value_t>);
+static_assert(std::is_same_v<decltype(std::declval<const vmhook::byte_buffer&>().slice()),
+                             std::unique_ptr<vmhook::byte_buffer>>);
 static_assert(std::is_same_v<decltype(std::declval<const vmhook::map&>()
                                         .to_vector<entity, player>()), player_entries>);
 static_assert(std::is_same_v<decltype(std::declval<const vmhook::map&>()
