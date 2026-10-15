@@ -1,3 +1,34 @@
+# Real Java schemas exercise emitted C++ identifiers and metadata bytes against
+# the actual header/module compiler. The runtime DLL joins the existing staged
+# probes, so the same generated code can be checked in an owned ordinary JVM.
+find_program(VMHOOK_TEST_JAVAC NAMES javac HINTS "$ENV{JAVA_HOME}/bin" NO_CMAKE_FIND_ROOT_PATH)
+if(Python3_Interpreter_FOUND AND VMHOOK_TEST_JAVAC)
+    set(_generator_compile_args
+        --compile-generated --compiler "${CMAKE_CXX_COMPILER}"
+        --javac "${VMHOOK_TEST_JAVAC}")
+    if(TARGET vmhook::module)
+        list(APPEND _generator_compile_args
+            --module-build-dir "${CMAKE_BINARY_DIR}/vmhook-module/$<CONFIG>")
+        set(_generator_interface module)
+        set(_generator_probe vmhook_module_generated_wrapper_probe.dll)
+    else()
+        set(_generator_interface header)
+        set(_generator_probe vmhook_generated_wrapper_probe.dll)
+    endif()
+    list(APPEND _generator_compile_args
+        --output-dir "${CMAKE_CURRENT_BINARY_DIR}/generated-wrappers-${_generator_interface}"
+        --probe-output "${CMAKE_CURRENT_BINARY_DIR}/${_generator_probe}")
+    if(CMAKE_CROSSCOMPILING_EMULATOR AND NOT CMAKE_CROSSCOMPILING_EMULATOR MATCHES ";")
+        list(APPEND _generator_compile_args --emulator "${CMAKE_CROSSCOMPILING_EMULATOR}")
+    endif()
+    add_test(NAME vmhook.generated_wrapper_compile
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/wrapper_generator.py"
+            ${_generator_compile_args})
+    set_tests_properties(vmhook.generated_wrapper_compile PROPERTIES TIMEOUT 600)
+else()
+    message(STATUS "Generated-wrapper compiler fixture requires Python and javac")
+endif()
+
 add_executable(vmhook_api api/lookup.cpp api/second.cpp)
 target_link_libraries(vmhook_api PRIVATE vmhook::vmhook)
 add_executable(vmhook_safety safety.cpp)
