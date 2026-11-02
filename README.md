@@ -113,9 +113,10 @@ roots raise `vmhook::exception`, including for primitive and void results.
 and `try_set` counterparts allow explicit inspection; a retained Java Throwable
 is available from `get_throwable()` in its live originating context.
 
-`std::string` converts strict UTF-8; `std::u16string` and `new_string`'s UTF-16
-form preserve Java code units, including isolated surrogates. Invalid UTF-8 is
-refused. Java null, empty text and failed conversion remain distinct.
+`std::string` uses standard UTF-8: malformed input bytes and isolated Java
+UTF-16 surrogates are replaced with U+FFFD. `std::u16string` and `new_string`'s
+UTF-16 form preserve every Java code unit, including isolated surrogates.
+Java null, empty text and failed conversion remain distinct.
 
 Owning pointers own C++ wrappers. Their Java roots belong to the current
 context, follow moving GC and expire when it closes. Transfer an object between
@@ -151,11 +152,18 @@ auto get_relationships() const
 { return get_field("relationships")->get().to_entries(); }
 ```
 
-The built-in wrappers cover collections, lists, sets, maps, queues, deques and
-common concrete implementations. Their CRUD operations execute ordinary Java
-methods. Conversions use Java's `toArray()` and `entrySet()` and preserve its
-encounter order and concurrent-mutation semantics. Every Java-null element has
-an allocated wrapper; a Java-null source converts to an empty vector.
+The built-in wrappers cover Iterable, collections, lists, sets, maps, queues,
+deques and common concrete implementations. Their CRUD operations execute
+ordinary Java methods. Collection snapshots use Java's `toArray()`; map snapshots
+use `entrySet()`. Their encounter order and concurrent-mutation semantics follow
+the Java implementation. Every Java-null element has an allocated wrapper;
+a Java-null source converts to an empty vector.
+
+Custom Iterable values use their Java iterator with a default budget of 65,536
+elements. Exceeding the budget raises an error; `vmhook::iterable::to_vector`
+also accepts an explicit budget. `vmhook::map_entry` wraps live Map.Entry values
+with `get_key`, `get_value` and `set_value`, following the Java implementation's
+mutation rules.
 
 With an `auto` destination, use `to_vector<player>()` to obtain the vector
 immediately. Without an explicit type, `auto` keeps a conversion object that
@@ -165,9 +173,12 @@ must be converted on its owning thread before its context closes.
 nested arrays, with checked indexed/bulk access. `make_array<T>(length)` uses
 ordinary VM allocation and exact bound component classes. Standard wrappers
 include Java strings, class objects, class loaders, Throwables, enums, boxed
-primitives, Optional and copied heap/direct ByteBuffer access.
+primitives, Optional and heap/direct ByteBuffer access. ByteBuffer's `duplicate`,
+`slice` and `as_read_only_buffer` return owning views with shared Java storage
+and independent position/limit state. Vector conversions copy bytes into C++.
 The optional [class/JAR generator](docs/wrapper_generator.md) creates short
-wrappers for either interface with exact descriptors and owning object types.
+wrappers for either interface, escapes C++ name collisions and preserves Unicode
+metadata, exact descriptors and owning object types.
 See [arrays and standard wrappers](docs/containers.md) for complete examples.
 
 ## Persistent hooks and observation
@@ -223,8 +234,10 @@ Removal does not authorize unloading the DLL.
 `runtime_capabilities()` provides a passive preflight. `observe_runtime`,
 `observe_java_threads`, `observe_memory_pools` and `observe_thread_allocations`
 copy management counters and platform-thread Java stack frames into ordinary C++ data.
-`observe_deadlocks()` reports monitor/synchronizer cycles with copied wait-owner
-information and explicit result limits.
+`observe_deadlocks()` reports platform-thread monitor/synchronizer cycles with
+copied wait-owner information and explicit result limits. Those limits bound
+copied records and requested frames; they do not bound the JVM's deadlock search
+or its pause duration.
 [Observation contracts](docs/observations.md) distinguish sequential snapshots
 from allocation/GC events and mixed-stack CPU profiling.
 
@@ -269,6 +282,7 @@ For C++26 use `COMPONENTS module`, link `vmhook::module`, then `import std;`
 and `import vmhook;`. The installed package rebuilds module sources with the
 consumer's compiler/configuration. It requires CMake 4.0+, Python 3.10+, Ninja
 and a Windows G++ toolchain providing the required reflection and std module.
+The installed package ships module sources rather than precompiled `.gcm` caches.
 Neither module interface contains preprocessor directives.
 
 The [packaging guide](docs/packaging.md) documents source packages, independent
