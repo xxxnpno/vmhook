@@ -6,6 +6,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [8.0.0] — 2026-11-03
+
 ### Added
 
 - Bounded snapshots of custom Java Iterable implementations, including selected
@@ -23,8 +25,9 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   per-wrapper defining-loader bindings and generation-pinned proxies/caches.
 - Typed primitive/object/nested arrays, collection CRUD/builders, standard Java
   wrappers, copied ByteBuffer access and optional class/JAR wrapper generation.
-- Checked primitive, object and void errors, retained Java Throwables, strict
-  UTF-8 and lossless UTF-16; allocation failure preserves `std::bad_alloc`.
+- Checked primitive, object and void errors, retained Java Throwables, standard
+  UTF-8 with U+FFFD replacement and lossless UTF-16; allocation failure
+  preserves `std::bad_alloc`.
 - Persistent ordered method observers with explicit removal, recursion control,
   callback counters, bounded copied-data event queues and native deferred hooks.
 - Committed normal-return telemetry records copied primitive bits or reference
@@ -212,8 +215,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   identifier metadata retains modified UTF-8, and internal loader/overload
   resolution converts that metadata to UTF-16 before calling Java.
 - Container method lookup now resolves inherited Java interface defaults.
-  Allocation failures in checked default-method lookup and adapter fingerprints propagate instead
-  of crossing an incorrect `noexcept` boundary.
+  Allocation failures in checked default-method lookup and adapter fingerprints
+  propagate instead of crossing an incorrect `noexcept` boundary.
 - Enabled diagnostic logging catches formatting allocation failures inside its
   `noexcept` boundary. Checked formatting propagates the original `bad_alloc`
   or `format_error` instead of silently returning an unformatted message.
@@ -1150,7 +1153,8 @@ README and current source for supported behavior.
   cancel, arg mutation), `make_unique` Java-object allocation, class
   lookup via VMStructs with JNI fallback.
 
-[Unreleased]: https://github.com/xxxnpno/vmhook/compare/v7.0.0...HEAD
+[Unreleased]: https://github.com/xxxnpno/vmhook/compare/v8.0.0...HEAD
+[8.0.0]: https://github.com/xxxnpno/vmhook/compare/v7.0.0...v8.0.0
 [7.0.0]: https://github.com/xxxnpno/vmhook/compare/v6.0.0...v7.0.0
 [0.4.0]: https://github.com/xxxnpno/vmhook/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/xxxnpno/vmhook/compare/v0.2.0...v0.3.0
